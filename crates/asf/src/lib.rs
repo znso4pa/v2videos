@@ -326,6 +326,14 @@ impl<R: Read> AsfDemuxer<R> {
             if cur_replic == 1 {
                 cur_ts = time_start;
                 time_start += time_delta as i64;
+                // ⚠️ 先读长度字节，**发现「池子已经空了」必须把它退回去** ——
+                // 与 ffmpeg 一致：它读完长度字节后做 `avio_skip(pb, packet_multi_size)`，
+                // 此时 multi_size 是负数，等于**后退**一个字节。
+                //
+                // 不退的后果（真样本实测）：同一个包里**后面那个常规载荷**（视频）
+                // 的流号字节会被当成「子载荷长度」吃掉 → 位流从此错位 → 读到包尾之外。
+                // 触发条件是「压缩载荷（音频）+ 常规载荷（视频）混在一个包」，
+                // 我们原来那个纯视频样本走不到这条路，所以一直没暴露。
                 let sz = c.u8()? as usize;
                 obj_size = sz;
                 frag_size = sz;
@@ -334,8 +342,12 @@ impl<R: Read> AsfDemuxer<R> {
                 multi_size -= 1;
                 if multi_size < obj_size as i64 {
                     time_start = 0;
-                    let skip = multi_size.max(0) as usize;
-                    c.skip(skip.min(c.remaining()))?;
+                    // 退回刚读的那一字节（multi_size 至多 -1），并把 size_left 补回来。
+                    let back = (-multi_size).clamp(0, 1) as usize;
+                    if back > 0 {
+                        let p = c.pos() - back;
+                        c.seek(p)?;
+                    }
                     size_left -= multi_size;
                     continue;
                 }

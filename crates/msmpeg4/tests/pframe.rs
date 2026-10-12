@@ -17,19 +17,25 @@ use std::process::{Child, ChildStdout, Command, Stdio};
 
 mod common;
 
-use common::{all_video_frames, compare, ffmpeg_frames, first_video_frames, sample, unique_temp, yuv420p_frame_len, wrap_single_frame_avi};
+use common::{all_video_frames, compare, ffmpeg_frames, first_video_frames, sample, sample_list, unique_temp, yuv420p_frame_len, wrap_single_frame_avi};
 use v2v_msmpeg4::{decode_i_frame, parse_frame_header, Decoder, PictureType};
 
+/// 对**一个**样本做逐帧对账（`V2V_ASF_SAMPLE` 里 `:` 分隔的每个样本都跑一遍）。
 #[test]
 fn p_frames_match_ffmpeg() {
-    let path = match sample() {
-        Some(p) => p,
-        None => {
-            eprintln!("SKIP: V2V_ASF_SAMPLE 未设置或样本不存在");
-            return;
-        }
-    };
-    let (samples, w, h) = match all_video_frames(&path) {
+    let list = sample_list();
+    if list.is_empty() {
+        eprintln!("SKIP: V2V_ASF_SAMPLE 未设置或样本不存在");
+        return;
+    }
+    for path in &list {
+        eprintln!("==== 样本：{path} ====");
+        check_p_frames(path);
+    }
+}
+
+fn check_p_frames(path: &str) {
+    let (samples, w, h) = match all_video_frames(path) {
         Some(v) => v,
         None => {
             eprintln!("SKIP: 没找到视频帧");
@@ -37,7 +43,7 @@ fn p_frames_match_ffmpeg() {
         }
     };
     let want = samples.len().min(MAX_FRAMES);
-    let refs = match ffmpeg_frames(&path, want, w, h) {
+    let refs = match ffmpeg_frames(path, want, w, h) {
         Some(v) => v,
         None => {
             eprintln!("SKIP: 没有可用的 ffmpeg");

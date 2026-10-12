@@ -157,6 +157,23 @@ pub fn sample() -> Option<String> {
     Path::new(&p).is_file().then_some(p)
 }
 
+/// **多个**样本：`V2V_ASF_SAMPLE` 里用 `:` 分隔多个路径。
+///
+/// 存在的理由：一个样本只能覆盖它自己走过的路径 —— 实测过好几次
+/// 「换一个真样本就崩」（压缩载荷、1000fps 的 AVI、混装载荷…）。
+/// 让同一条对账测试跑多个样本，等于把「只对一个样本调通」这个坑堵上。
+/// 空项与不存在的路径会被跳过（缺样本照样 SKIP）。
+pub fn sample_list() -> Vec<String> {
+    let Ok(v) = std::env::var("V2V_ASF_SAMPLE") else {
+        return Vec::new();
+    };
+    v.split(':')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty() && Path::new(s).is_file())
+        .map(|s| s.to_string())
+        .collect()
+}
+
 
 /// yuv420p 一帧的字节数。
 pub fn yuv420p_frame_len(w: u32, h: u32) -> usize {
