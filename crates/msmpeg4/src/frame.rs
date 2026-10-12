@@ -68,12 +68,25 @@ pub struct Frame {
 }
 
 /// 宏块对齐、**未裁剪**的平面。P 帧的运动补偿要在它上面做（会读到真实高度以外的行）。
-struct Planes {
-    pw: usize,
-    ph: usize,
-    y: Vec<u8>,
-    u: Vec<u8>,
-    v: Vec<u8>,
+pub(crate) struct Planes {
+    pub(crate) pw: usize,
+    pub(crate) ph: usize,
+    pub(crate) y: Vec<u8>,
+    pub(crate) u: Vec<u8>,
+    pub(crate) v: Vec<u8>,
+}
+
+impl Planes {
+    /// 宏块对齐、清零的平面组。
+    pub(crate) fn new(pw: usize, ph: usize) -> Self {
+        Self {
+            pw,
+            ph,
+            y: vec![0u8; pw * ph],
+            u: vec![0u8; (pw / 2) * (ph / 2)],
+            v: vec![0u8; (pw / 2) * (ph / 2)],
+        }
+    }
 }
 
 /// 解码**通路覆盖**统计。
@@ -683,7 +696,7 @@ fn mid_pred(a: i32, b: i32, c: i32) -> i32 {
 ///
 /// 邻居是**左(A) / 上(B) / 右上(C)**；片首行特殊：第一个宏块取 0，其余只取左邻
 /// （`if (s->first_slice_line && block<3)` 那一支）。
-fn pred_motion(g: &Grid<(i32, i32)>, mbx: usize, mby: usize, first_slice_line: bool) -> (i32, i32) {
+pub(crate) fn pred_motion(g: &Grid<(i32, i32)>, mbx: usize, mby: usize, first_slice_line: bool) -> (i32, i32) {
     let xy = g.idx(mbx, mby);
     let a = g.data[xy - 1];
     if first_slice_line {
@@ -790,10 +803,102 @@ fn put_pixels(
     }
 }
 
-/// 一个宏块的 16×16 运动补偿（`mpeg_motion` 的 `MV_TYPE_16X16` 一路）。
-///
-/// 返回 `(dxy, 是否走了边缘复制)`，给通路覆盖统计用。
-fn mc_mb(
+/// 一次运动补偿的参数：半像素相位、参考坐标、是否需要边缘复制。
+pub(crate) struct McParams {
+    pub(crate) dxy: usize,
+    pub(crate) uvdxy: usize,
+    pub(crate) src_x: i32,
+    pub(crate) src_y: i32,
+    pub(crate) need_emu: bool,
+}
+
+/// 算一个宏块的 MC 参数（H.263 / MPEG-4 的半像素一路）。
+pub(crate) fn mc_params(
+    mbx: usize,
+    mby: usize,
+    mv: (i32, i32),
+    pw: usize,
+    ph: usize,
+) -> McParams {
+    let (mx, my) = mv;
+    let dxy = (((my & 1) << 1) | (mx & 1)) as usize;
+    let src_x = (mbx as i32) * 16 + (mx >> 1);
+    let src_y = (mby as i32) * 16 + (my >> 1);
+
+    let h_edge = pw as i32;
+    let v_edge = ph as i32;
+    // 越界判据：`(unsigned)` 强制转换让负数必然触发（等价于「任一坐标为负就触发」）。
+    let limit_x = (h_edge - (mx & 1) - 15).max(0);
+    let limit_y = (v_edge - (my & 1) - 16 + 1).max(0);
+    let need_emu = (src_x as u32) >= (limit_x as u32) || (src_y as u32) >= (limit_y as u32);
+    let uvdxy = dxy | ((my as usize) & 2) | (((mx as usize) & 2) >> 1);
+    McParams {
+        dxy,
+        uvdxy,
+        src_x,
+        src_y,
+        need_emu,
+    }
+}
+
+/// 16×16 亮度块的半像素搬运（写到 `dest` 的 `(dx,dy)` 处）。返回是否走了边缘复制。
+pub(crate) fn mc_luma16(
+    dest: &mut [u8],
+    dstride: usize,
+    dx: usize,
+    dy: usize,
+    refp: &Planes,
+    p: &McParams,
+    no_rounding: bool,
+) -> bool {
+    // 裁剪范围用**参考帧自己的**尺寸：它才是真正被索引的缓冲。
+    let ybuf = if p.need_emu {
+        edge_emu(&refp.y, refp.pw, p.src_x, p.src_y, 17, 17, refp.pw, refp.ph)
+    } else {
+        Vec::new()
+    };
+    let (ysrc, ystride, yx, yy) = if p.need_emu {
+        (&ybuf[..], 17usize, 0usize, 0usize)
+    } else {
+        (&refp.y[..], refp.pw, p.src_x as usize, p.src_y as usize)
+    };
+    put_pixels(
+        dest, dstride, dx, dy, ysrc, ystride, yx, yy, 16, 16, p.dxy, no_rounding,
+    );
+    p.need_emu
+}
+
+/// 8×8 色度块的半像素搬运（`which`：0 = U，1 = V）。半像素相位由 `uvdxy` 表示。
+pub(crate) fn mc_chroma8(
+    dest: &mut [u8],
+    dstride: usize,
+    dx: usize,
+    dy: usize,
+    refp: &Planes,
+    which: usize,
+    p: &McParams,
+    no_rounding: bool,
+) {
+    let cw = refp.pw / 2;
+    let (ew, eh) = (refp.pw >> 1, refp.ph >> 1);
+    let uvsrc_x = p.src_x >> 1;
+    let uvsrc_y = p.src_y >> 1;
+    let plane: &[u8] = if which == 0 { &refp.u } else { &refp.v };
+    let buf = if p.need_emu {
+        edge_emu(plane, cw, uvsrc_x, uvsrc_y, 9, 9, ew, eh)
+    } else {
+        Vec::new()
+    };
+    let (src, sstride, sx, sy) = if p.need_emu {
+        (&buf[..], 9usize, 0usize, 0usize)
+    } else {
+        (plane, cw, uvsrc_x as usize, uvsrc_y as usize)
+    };
+    put_pixels(dest, dstride, dx, dy, src, sstride, sx, sy, 8, 8, p.uvdxy, no_rounding);
+}
+
+/// 一个宏块的 16×16 运动补偿（`MV_TYPE_16X16` 一路）。返回 `(dxy, 是否走了边缘复制)`。
+pub(crate) fn mc_mb(
     dest: &mut Planes,
     refp: &Planes,
     mbx: usize,
@@ -801,102 +906,11 @@ fn mc_mb(
     mv: (i32, i32),
     no_rounding: bool,
 ) -> (usize, bool) {
-    let (mx, my) = mv;
-    let dxy = (((my & 1) << 1) | (mx & 1)) as usize;
-    let src_x = (mbx as i32) * 16 + (mx >> 1);
-    let src_y = (mby as i32) * 16 + (my >> 1);
-
-    let h_edge = dest.pw as i32;
-    let v_edge = dest.ph as i32;
-    // 越界判据：`(unsigned)` 强制转换让负数必然触发（等价于「任一坐标为负就触发」）。
-    let limit_x = (h_edge - (mx & 1) - 15).max(0);
-    let limit_y = (v_edge - (my & 1) - 16 + 1).max(0);
-    let need_emu = (src_x as u32) >= (limit_x as u32) || (src_y as u32) >= (limit_y as u32);
-
-    // ---- 亮度：17×17 边缘缓冲（半像素要多一行一列）----
-    // 裁剪范围用**参考帧自己的**尺寸：它才是真正被索引的缓冲。
-    let ybuf = if need_emu {
-        edge_emu(&refp.y, refp.pw, src_x, src_y, 17, 17, refp.pw, refp.ph)
-    } else {
-        Vec::new()
-    };
-    let (ysrc, ystride, yx, yy) = if need_emu {
-        (&ybuf[..], 17usize, 0usize, 0usize)
-    } else {
-        (&refp.y[..], refp.pw, src_x as usize, src_y as usize)
-    };
-    put_pixels(
-        &mut dest.y,
-        dest.pw,
-        mbx * 16,
-        mby * 16,
-        ysrc,
-        ystride,
-        yx,
-        yy,
-        16,
-        16,
-        dxy,
-        no_rounding,
-    );
-
-    // ---- 色度：8×8，半像素相位由 uvdxy 表示（9×9 边缘缓冲）----
-    let uvdxy = dxy | ((my as usize) & 2) | (((mx as usize) & 2) >> 1);
-    let uvsrc_x = src_x >> 1;
-    let uvsrc_y = src_y >> 1;
-    let cw = refp.pw / 2;
-    let (ew, eh) = (refp.pw >> 1, refp.ph >> 1);
-
-    let ubuf = if need_emu {
-        edge_emu(&refp.u, cw, uvsrc_x, uvsrc_y, 9, 9, ew, eh)
-    } else {
-        Vec::new()
-    };
-    let vbuf = if need_emu {
-        edge_emu(&refp.v, cw, uvsrc_x, uvsrc_y, 9, 9, ew, eh)
-    } else {
-        Vec::new()
-    };
-    let (usrc, ux, uy) = if need_emu {
-        (&ubuf[..], 0usize, 0usize)
-    } else {
-        (&refp.u[..], uvsrc_x as usize, uvsrc_y as usize)
-    };
-    let (vsrc, vx, vy) = if need_emu {
-        (&vbuf[..], 0usize, 0usize)
-    } else {
-        (&refp.v[..], uvsrc_x as usize, uvsrc_y as usize)
-    };
-    let stride = if need_emu { 9 } else { cw };
-    put_pixels(
-        &mut dest.u,
-        cw,
-        mbx * 8,
-        mby * 8,
-        usrc,
-        stride,
-        ux,
-        uy,
-        8,
-        8,
-        uvdxy,
-        no_rounding,
-    );
-    put_pixels(
-        &mut dest.v,
-        cw,
-        mbx * 8,
-        mby * 8,
-        vsrc,
-        stride,
-        vx,
-        vy,
-        8,
-        8,
-        uvdxy,
-        no_rounding,
-    );
-    (dxy, need_emu)
+    let p = mc_params(mbx, mby, mv, dest.pw, dest.ph);
+    let emu = mc_luma16(&mut dest.y, dest.pw, mbx * 16, mby * 16, refp, &p, no_rounding);
+    mc_chroma8(&mut dest.u, dest.pw / 2, mbx * 8, mby * 8, refp, 0, &p, no_rounding);
+    mc_chroma8(&mut dest.v, dest.pw / 2, mbx * 8, mby * 8, refp, 1, &p, no_rounding);
+    (p.dxy, emu)
 }
 
 /// `ff_rl_table` 的 6 张表。0/1/2 = 帧内亮度（低/高/中运动），3/4/5 = 色度 / 帧间。

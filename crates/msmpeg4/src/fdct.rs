@@ -25,6 +25,17 @@ fn cos_table() -> [[f64; 8]; 8] {
 /// 正向 8×8 DCT。`pix` 是 8×8 像素块（`stride` = 一行字节数），
 /// 结果写进 `out`（自然序 `out[v*8+u]`：`u` 水平频率、`v` 垂直频率）。
 pub fn fdct(pix: &[u8], stride: usize, out: &mut [i32; 64]) {
+    let mut tmp = [0i32; 64];
+    for y in 0..8 {
+        for x in 0..8 {
+            tmp[y * 8 + x] = pix[y * stride + x] as i32;
+        }
+    }
+    fdct_i(&tmp, 8, out)
+}
+
+/// 同 `fdct`，但输入是 **i32**（编码 P 帧时要对**残差**做正向变换，残差可负）。
+pub fn fdct_i(pix: &[i32], stride: usize, out: &mut [i32; 64]) {
     let c = cos_table();
     let mut tmp = [[0f64; 8]; 8];
 

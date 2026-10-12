@@ -29,6 +29,11 @@ pub fn unique_temp(prefix: &str, ext: &str) -> std::path::PathBuf {
 /// 为什么需要这个：手头 .wmv 里的帧数据是**跨 ASF 包分片**的，没法在文件里直接改一位；
 /// 而 AVI 是 RIFF，单帧就是一个 `00dc` 块 —— 想喂什么就喂什么（补丁帧、手写帧都行）。
 pub fn wrap_single_frame_avi(frame: &[u8], w: u32, h: u32) -> Vec<u8> {
+    wrap_avi(&[frame], w, h)
+}
+
+/// 把**若干帧裸 MP43** 包成一个最小 AVI（I 在前、P 在后，按顺序）。
+pub fn wrap_avi(frames: &[&[u8]], w: u32, h: u32) -> Vec<u8> {
     fn u32le(v: &mut Vec<u8>, x: u32) {
         v.extend_from_slice(&x.to_le_bytes());
     }
@@ -83,8 +88,8 @@ pub fn wrap_single_frame_avi(frame: &[u8], w: u32, h: u32) -> Vec<u8> {
     u32le(&mut strh, 1); // scale
     u32le(&mut strh, 60); // rate → 60 fps
     u32le(&mut strh, 0); // start
-    u32le(&mut strh, 1); // length = 1 帧
-    u32le(&mut strh, frame.len() as u32);
+    u32le(&mut strh, frames.len() as u32); // length
+    u32le(&mut strh, frames.iter().map(|f| f.len()).max().unwrap_or(0) as u32);
     u32le(&mut strh, 0); // quality
     u32le(&mut strh, 0); // sample size
     u16le(&mut strh, 0);
@@ -99,10 +104,10 @@ pub fn wrap_single_frame_avi(frame: &[u8], w: u32, h: u32) -> Vec<u8> {
     u32le(&mut avih, 0);
     u32le(&mut avih, 0);
     u32le(&mut avih, 0x10); // AVIF_HASINDEX
-    u32le(&mut avih, 1); // 总帧数
+    u32le(&mut avih, frames.len() as u32); // 总帧数
     u32le(&mut avih, 0);
     u32le(&mut avih, 1); // 流数
-    u32le(&mut avih, frame.len() as u32);
+    u32le(&mut avih, frames.iter().map(|f| f.len()).max().unwrap_or(0) as u32);
     u32le(&mut avih, w);
     u32le(&mut avih, h);
     for _ in 0..4 {
@@ -120,13 +125,19 @@ pub fn wrap_single_frame_avi(frame: &[u8], w: u32, h: u32) -> Vec<u8> {
     hdrl_body.extend_from_slice(&list(b"strl", &strl_body));
 
     let mut movi_body = Vec::new();
-    chunk(&mut movi_body, b"00dc", frame);
+    for f in frames {
+        chunk(&mut movi_body, b"00dc", f);
+    }
 
     let mut idx1 = Vec::new();
-    fourcc(&mut idx1, b"00dc");
-    u32le(&mut idx1, 4); // AVIIF_KEYFRAME
-    u32le(&mut idx1, 4); // 相对 movi 数据区起点
-    u32le(&mut idx1, frame.len() as u32);
+    let mut off = 4usize; // 'movi' fourcc 之后
+    for f in frames {
+        fourcc(&mut idx1, b"00dc");
+        u32le(&mut idx1, 4); // AVIIF_KEYFRAME
+        u32le(&mut idx1, off as u32);
+        u32le(&mut idx1, f.len() as u32);
+        off += 8 + f.len() + (f.len() % 2);
+    }
 
     let mut body = Vec::new();
     body.extend_from_slice(&list(b"hdrl", &hdrl_body));
