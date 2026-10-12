@@ -210,15 +210,16 @@ fn decoded_pcm_matches_ffmpeg() {
         }
     }
 
+    // ---- 帧级互相关（v1 定位用）----
     // ---- 帧级互相关（v1 定位用）：我们的内容帧最像 ffmpeg 的哪一帧、相关多少 ----
     {
         let fl0 = params.frame_len;
-        for f in [30usize, 45, 60] {
+        for f in 18..(n / fl0).min(48) {
             if (f + 1) * fl0 > n {
                 break;
             }
             let mut best = (0f64, 0i64, 1i64);
-            for g in 0..60i64 {
+            for g in (f as i64 + shift_frames - 2)..=(f as i64 + shift_frames + 2) {
                 for sgn in [1i64, -1] {
                     let mut ab = 0f64;
                     let mut aa = 0f64;

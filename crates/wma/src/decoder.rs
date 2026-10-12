@@ -633,6 +633,16 @@ impl WmaDecoder {
                 return Err(Error::Bad("指数没初始化"));
             }
         }
+        // A/B 实验（V2V_WMA_FLAT_EXP=1）：把指数曲线换成平谱。
+        // 若平谱比真曲线更接近 ffmpeg，说明曲线本身错了（频带映射 / 差分累加）。
+        if std::env::var("V2V_WMA_FLAT_EXP").is_ok() {
+            for ch in 0..channels {
+                for v in self.exponents[ch][..self.block_len].iter_mut() {
+                    *v = 1.0;
+                }
+                self.max_exponent[ch] = 1.0;
+            }
+        }
 
         if std::env::var("V2V_WMA_DEBUG").is_ok() {
             eprintln!(
