@@ -210,6 +210,44 @@ fn decoded_pcm_matches_ffmpeg() {
         }
     }
 
+    // ---- 帧级互相关（v1 定位用）：我们的内容帧最像 ffmpeg 的哪一帧、相关多少 ----
+    {
+        let fl0 = params.frame_len;
+        for f in [30usize, 45, 60] {
+            if (f + 1) * fl0 > n {
+                break;
+            }
+            let mut best = (0f64, 0i64, 1i64);
+            for g in 0..60i64 {
+                for sgn in [1i64, -1] {
+                    let mut ab = 0f64;
+                    let mut aa = 0f64;
+                    let mut bb = 0f64;
+                    for i in 0..fl0 {
+                        let idx = (g as usize) * fl0 + i;
+                        if idx * channels + channels > pcm.len() {
+                            break;
+                        }
+                        let a = got[0][f * fl0 + i] as f64;
+                        let b = sgn as f64 * pcm[idx * channels] as f64;
+                        ab += a * b;
+                        aa += a * a;
+                        bb += b * b;
+                    }
+                    let den = (aa * bb).sqrt();
+                    let c = if den > 0.0 { ab / den } else { 0.0 };
+                    if c.abs() > best.0.abs() {
+                        best = (c, g, sgn);
+                    }
+                }
+            }
+            eprintln!(
+                "我们帧 {f}: 最佳相关 {:.3}（ffmpeg 帧 {}，符号 {}）",
+                best.0, best.1, if best.2 > 0 { "+" } else { "−" }
+            );
+        }
+    }
+
     // ⚠️ 「静音 vs 静音」会假绿 —— 必须确认两边都真的出了声音。
     assert!(
         ours_peak > 1.0 && ref_peak > 1,

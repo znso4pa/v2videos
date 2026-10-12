@@ -1060,10 +1060,16 @@ impl WmaDecoder {
     }
 }
 
-/// `pow_tab[i] = 10^((i - 60) / 16)` —— ffmpeg 的那张表就是这么生成的（156 项）。
-/// 指数解出来的是 `10^(exp/16)`，用**双精度算完再收成 f32**，与 ffmpeg 的表对齐。
-fn pow_tab(i: i32) -> f32 {
-    10f64.powf((i - 60) as f64 / 16.0) as f32
+/// 指数值：`10^(exp / 16)`。
+///
+/// ⚠️ ffmpeg 的表是 `pow_tab[i] = 10^((i-60)/16)`（156 项，第 60 项 = 1.0），
+/// 而代码里取的是 `ptab = pow_tab + 60` 再 `ptab[last_exp]` —— 也就是
+/// **`10^(last_exp/16)`**。第一版把表的公式当成了调用公式，指数小了 55 倍，
+/// `mult` 就大了 55 倍 —— v1 的 PCM 全错（幅度比乱、峰值高 21%）。
+///
+/// 用 f64 算完再收 f32，与 ffmpeg 的表生成方式一致。
+fn pow_tab(exp: i32) -> f32 {
+    10f64.powf(exp as f64 / 16.0) as f32
 }
 
 /// `ff_wma_total_gain_to_bits`。
