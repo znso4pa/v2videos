@@ -265,9 +265,23 @@ def gen_mp4v():
     o.flat("INTRA_MCBPC_CODE", "u8", flat(hd, "ff_h263_intra_MCBPC_code"), 9)
     o.flat("INTRA_MCBPC_BITS", "u8", flat(hd, "ff_h263_intra_MCBPC_bits"), 9)
 
+    # P 帧的 28 项，分 7 组各 4 项（低 2 位都是色度 CBP）：
+    #   0..3 inter / 4..7 intra / 8..11 interQ / 12..15 intraQ
+    #   16..19 inter4v / 20..23 stuffing（**码长 0**）/ 24..27 inter4v+Q
+    # 解码端 `do { cbpc = get_vlc2(...) } while (cbpc == 20)` —— stuffing 靠循环跳过。
+    o.flat("INTER_MCBPC_CODE", "u8", flat(hd, "ff_h263_inter_MCBPC_code"), 28)
+    o.flat("INTER_MCBPC_BITS", "u8", flat(hd, "ff_h263_inter_MCBPC_bits"), 28)
+
     # CBPY：`{code, len}`（注意顺序 —— 跟 MCBPC 的「两张平行数组」不同）。
-    # 索引是亮度 4 块的 CBP，但**取反**：解码端 `cbp |= (cbpy ^ 0xf) << 2`。
+    # ⚠️ 索引是**取反后**的亮度 4 块 CBP：I 帧直取，**P 帧要 `cbpy ^ 0xF`**
+    # （`mpeg4_decode_mb` 的帧间分支就是 `get_vlc2(...) ^ 0x0F`）。
     o.pairs("CBPY", pairs(hd, "ff_h263_cbpy_tab"), "u8")
+
+    # ── 运动矢量 ───────────────────────────────────────────────────────────
+    # `ff_mvtab[code] = (码, 码长)`，`code` 是「绝对值的量化档」而不是矢量本身：
+    # 解码端 `val = (code - 1) << (f_code - 1)` 再补 `f_code - 1` 个低位、读一个符号位。
+    # `code == 0` 是**零矢量**（只写一个 `1` 位，不读符号也不读低位）。
+    o.pairs("MV_TAB", pairs(hd, "ff_mvtab"), "u8")
 
     # ── DC ─────────────────────────────────────────────────────────────────
     # `DC_LUM[size] = (code, len)`，`size` 是 DC 差的**位长**（不是值本身）。

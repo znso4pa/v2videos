@@ -8,7 +8,7 @@
 //!   -q, --qscale <1..31>  量化尺度（默认 6；越大越小越糊）
 //!       --mp4             输出 MP4（MPEG-4 Part 2）；默认是 WMV（MP43 in ASF）
 //!       --fps <N>         只对 --mp4 有效：VOL 里声明的帧率（默认从时间戳推）
-//!   -g, --gop <N>         周期 I 帧间隔，0=只首帧（默认 250；只对 WMV 有效）
+//!   -g, --gop <N>         周期 I 帧间隔，0=只首帧（默认 250）
 //!   -n, --max-frames <N>  最多转多少帧（默认全部；预览/局部转换用）
 //!       --no-audio        不搬/不转音频
 //!       --no-verify       不校验输出（默认会解码回来比 PSNR；只对 WMV 有效）
@@ -33,7 +33,8 @@ v2v —— WMV/ASF 批量转码（纯 Rust：解封装 → 解码 → 编码 →
   -q, --qscale <1..31>  量化尺度（默认 6；越大文件越小、越糊）
       --mp4             输出 .mp4（MPEG-4 Part 2 + PCM），默认输出 .wmv（MP43 in ASF）
       --fps <N>         --mp4 专用：VOL 里声明的帧率（默认从样本时间戳推）
-  -g, --gop <N>         周期 I 帧间隔（默认 250；0 = 只首帧是 I）—— 只对 .wmv 有效
+  -g, --gop <N>         周期 I 帧间隔（默认 250；0 = 只首帧是 I）
+                        对 .mp4 也有效 —— 传 0 就是全 I 帧（大但每帧独立可解）
   -n, --max-frames <N>  最多转多少帧（默认全部）
       --no-audio        不搬/不转音频
       --no-verify       跳过输出校验（默认解码回来与源比 PSNR）—— 只对 .wmv 有效
@@ -43,9 +44,10 @@ v2v —— WMV/ASF 批量转码（纯 Rust：解封装 → 解码 → 编码 →
 
 两条输出路：
   .wmv  视频重编码成 MP43，音频**直通**（零损失）。会做 PSNR 校验。
-  .mp4  视频重编码成 MPEG-4 Part 2（**全 I 帧**，文件较大），音频解成 PCM。
+  .mp4  视频重编码成 MPEG-4 Part 2（I+P，GOP 由 -g 控制），音频解成 PCM。
         MP43 / WMA 都进不了 MP4 容器，所以这条路**必须**重编码；
         我们只有 mp4v 编码器没有解码器，所以这条路**不做** PSNR 校验。
+        -g 0 会编成全 I 帧（文件大得多，但每帧独立可解、适合剪辑）。
 ";
 
 fn main() -> ExitCode {
@@ -161,13 +163,11 @@ fn run(args: &[String]) -> Result<bool, String> {
         out_dir.display(),
         match opts.format {
             OutputFormat::Asf => ".wmv / MP43",
-            OutputFormat::Mp4 => ".mp4 / MPEG-4 Part 2（全 I 帧）",
+            OutputFormat::Mp4 => ".mp4 / MPEG-4 Part 2",
         },
         opts.qscale,
-        if opts.format == OutputFormat::Mp4 {
-            "不适用".to_string()
-        } else if opts.keyframe_interval == 0 {
-            "关".into()
+        if opts.keyframe_interval == 0 {
+            "关（全 I 帧）".into()
         } else {
             opts.keyframe_interval.to_string()
         },

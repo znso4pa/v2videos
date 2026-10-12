@@ -174,12 +174,21 @@ fn psnr(a: &[u8], b: &[u8], frames: usize) -> f64 {
 // ==================== 测试 ====================
 
 /// 把我们的编码结果写成一个裸 `.m4v` 基本流。
+///
+/// ⚠️ `cfg.keyframe_interval == 0` 时走 **`encode_i_frame`（全 I 帧）**，
+/// 而不是 `encode_frame` —— 后者在 `mp4v` 里的语义是「无 GOP」（首帧 I、其余全 P），
+/// 是个容易写错的坑（第一个 P 帧会因为没有参考帧而报错）。
+/// 非 0 时才用 `encode_frame`，按 GOP 真编 P 帧。
 fn encode_raw_es(cfg: EncoderConfig, frames: &[Frame]) -> (Vec<u8>, Vec<Vec<u8>>) {
     let mut e = Encoder::new(cfg).expect("建编码器");
     let mut es = e.elementary_stream_header();
     let mut samples = Vec::new();
     for f in frames {
-        let s = e.encode_i_frame(f).expect("编一帧");
+        let s = if cfg.keyframe_interval == 0 {
+            e.encode_i_frame(f).expect("编一帧")
+        } else {
+            e.encode_frame(f).expect("编一帧")
+        };
         es.extend_from_slice(&s);
         samples.push(s);
     }
@@ -367,4 +376,277 @@ fn ffprobe_probe(args: &[&str]) -> (bool, String, String) {
 /// `ffmpeg -i` 的 probe 分支走的是同一个 `ffprobe` 库，直接复用它省一层壳。
 fn ffmpeg_probe(args: &[&str]) -> (bool, String, String) {
     ffprobe_probe(args)
+}
+
+/// 一段**低运动**序列：静态背景 + 缓慢平移的方块。
+///
+/// 真实视频里绝大多数帧是这样的，而 `test_frame` 那种「斜向渐变 + 每帧平移 3 像素的
+/// 细条纹」在 qscale=4 下几乎不可预测 —— 实测最佳整帧平移的 MSE（1100）比「压根不动」
+/// （1008）还差，也就是说相邻帧之间**没有可用的运动相关性**。
+/// 所以体积那条判据要在这段上量，不然量的是「这段素材本来就压不动」。
+fn low_motion_frame(t: usize) -> Frame {
+    let (w, h) = (W as usize, H as usize);
+    let mut y = vec![0u8; w * h];
+    // 静态背景：平滑的横向渐变
+    for j in 0..h {
+        for i in 0..w {
+            y[j * w + i] = (60 + (i * 120 / w)) as u8;
+        }
+    }
+    // 一个缓慢右移的方块（每帧 2 像素 → MV (4,0) 半像素单位）
+    let ox = (w / 4 + t * 2).min(w - 48);
+    let oy = h / 3;
+    for r in 0..48usize {
+        for c in 0..48usize {
+            y[(oy + r) * w + ox + c] = if (r / 8 + c / 8) % 2 == 0 { 40 } else { 230 };
+        }
+    }
+    let (cw, ch) = (w / 2, h / 2);
+    Frame {
+        width: W,
+        height: H,
+        y,
+        u: vec![110; cw * ch],
+        v: vec![150; cw * ch],
+    }
+}
+
+// ==================== P 帧 ====================
+
+/// 一个 **I+P 序列**要同时满足三件事，缺一不可：
+///
+/// 1. **ffmpeg 解得开、不报错** —— 位流语法对；
+/// 2. **画质没崩** —— MV / 残差 / 重建这一套全对（错一处画质会断崖式下跌）；
+/// 3. **体积真的小了** —— 不然就是「P 帧编出来了但等于没用」。
+///
+/// 第 3 条尤其重要：前两条在「P 帧全部退化成帧内宏块」时**照样能过**。
+/// 所以要顺带断言「帧间宏块确实占了多数」。
+#[test]
+fn p_frames_cut_the_bitrate_without_breaking_the_stream() {
+    let frames: Vec<Frame> = (0..FRAMES).map(test_frame).collect();
+
+    // 全 I 帧（基准）
+    let all_i = EncoderConfig {
+        width: W,
+        height: H,
+        fps_num: FPS,
+        keyframe_interval: 0,
+        ..Default::default()
+    };
+    let (es_i, samples_i) = encode_raw_es(all_i, &frames);
+
+    // GOP = 250 → 只有首帧是 I，其余全是 P
+    let with_p = EncoderConfig {
+        keyframe_interval: 250,
+        ..all_i
+    };
+    let (es_p, samples_p) = encode_raw_es(with_p, &frames);
+
+    // ---- 1. ffmpeg 解得开 ----
+    let path_i = std::env::temp_dir().join("v2v_mp4v_alli.m4v");
+    std::fs::write(&path_i, &es_i).expect("写");
+    let path_p = std::env::temp_dir().join("v2v_mp4v_withp.m4v");
+    std::fs::write(&path_p, &es_p).expect("写");
+
+    let (got_i, log_i) = decode_to_yuv(path_i.to_str().unwrap());
+    let (got_p, log_p) = decode_to_yuv(path_p.to_str().unwrap());
+    for (tag, log) in [("全 I", &log_i), ("I+P", &log_p)] {
+        for bad in ["error", "corrupt", "invalid", "damaged"] {
+            assert!(
+                !log.to_lowercase().contains(bad),
+                "{tag} 的流里 ffmpeg 报了「{bad}」：\n{log}"
+            );
+        }
+    }
+
+    // ---- 2. 画质 ----
+    let mut src = Vec::new();
+    for f in &frames {
+        src.extend_from_slice(&frame_bytes(f));
+    }
+    let p_i = psnr(&src, &got_i, FRAMES);
+    let p_p = psnr(&src, &got_p, FRAMES);
+    println!("[全 I] PSNR {p_i:.2} dB，基本流 {} 字节", es_i.len());
+    println!("[I+P] PSNR {p_p:.2} dB，基本流 {} 字节", es_p.len());
+    // P 帧会累积漂移，比全 I 差一点是正常的 —— 但不能崩。
+    assert!(
+        p_p >= PSNR_MIN_DB,
+        "I+P 的画质崩了（{p_p:.2} dB）—— MV / 残差 / 重建里有一处错"
+    );
+    assert!(
+        p_i - p_p <= 6.0,
+        "P 帧把画质拖低了 {:.2} dB，太多了",
+        p_i - p_p
+    );
+
+    // ---- 3. 体积 ----
+    // 逐帧比：首帧 I 两边一样，从第 2 帧起 P 应当明显小。
+    let first_p = samples_p[1].len();
+    let first_i = samples_i[1].len();
+    println!("[第 2 帧] 全 I {first_i} 字节 → P {first_p} 字节");
+    assert!(
+        es_p.len() < es_i.len(),
+        "P 帧没把体积压下来（{} vs {}）",
+        es_p.len(),
+        es_i.len()
+    );
+    // ⚠️ **在这段素材上只能要求「有节省」，不能要求省多少** ——
+    // 它是斜向渐变 + 每帧平移 3 像素的细条纹，相邻帧之间几乎没有可用的运动相关性
+    // （实测最佳整帧平移的 MSE 比「压根不动」还差）。体积的判据放在下面那条
+    // 低运动序列上量才有意义。
+    assert!(
+        es_p.len() * 10 < es_i.len() * 9,
+        "P 帧一点没省（{} vs {}）",
+        es_p.len(),
+        es_i.len()
+    );
+
+    let _ = std::fs::remove_file(&path_i);
+    let _ = std::fs::remove_file(&path_p);
+}
+
+/// **压缩率**这条判据要在有运动相关性的素材上量。
+///
+/// 低运动序列（静态背景 + 每帧移 2 像素的方块）是真实视频的常态：
+/// 绝大部分宏块一个 skip 位（1 bit）就过去了。这里要求 P 帧把体积压到 **1/4 以下**。
+///
+/// 这条测试是「P 帧真的在干活」的硬判据 —— 前面那些（ffmpeg 解得开、画质没崩）
+/// 在「P 帧全部退化成帧内宏块」时**照样能过**。
+#[test]
+fn p_frames_compress_a_low_motion_sequence() {
+    let frames: Vec<Frame> = (0..FRAMES).map(low_motion_frame).collect();
+
+    let base = EncoderConfig {
+        width: W,
+        height: H,
+        fps_num: FPS,
+        ..Default::default()
+    };
+    let (es_i, _) = encode_raw_es(
+        EncoderConfig {
+            keyframe_interval: 0,
+            ..base
+        },
+        &frames,
+    );
+    let (es_p, samples_p) = encode_raw_es(
+        EncoderConfig {
+            keyframe_interval: 250,
+            ..base
+        },
+        &frames,
+    );
+
+    // ffmpeg 也得解得开、画质也得对。
+    let path = std::env::temp_dir().join("v2v_mp4v_lowmotion.m4v");
+    std::fs::write(&path, &es_p).expect("写");
+    let (got, log) = decode_to_yuv(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    for bad in ["error", "corrupt", "invalid", "damaged"] {
+        assert!(
+            !log.to_lowercase().contains(bad),
+            "ffmpeg 报错：
+{log}"
+        );
+    }
+    let mut src = Vec::new();
+    for f in &frames {
+        src.extend_from_slice(&frame_bytes(f));
+    }
+    let p = psnr(&src, &got, FRAMES);
+    let ratio = es_p.len() as f64 / es_i.len() as f64;
+    println!(
+        "[低运动] 全 I {} 字节 → I+P {} 字节（{:.0}%），PSNR {p:.2} dB",
+        es_i.len(),
+        es_p.len(),
+        ratio * 100.0
+    );
+    println!(
+        "[低运动] 第 2 帧：全 I {} 字节 → P {} 字节",
+        es_i.len() / FRAMES,
+        samples_p[1].len()
+    );
+    assert!(p >= PSNR_MIN_DB, "低运动序列的画质崩了（{p:.2} dB）");
+    assert!(
+        ratio < 0.25,
+        "P 帧只压到 {:.0}% —— 低运动序列该压到 25% 以下",
+        ratio * 100.0
+    );
+    // 低运动素材里第 2 帧该是「大部分 skip + 少量帧间宏块」。剩下的那点字节主要来自
+    // **跟着方块走的那几个宏块**（残差 + MV）—— 方块有强边缘，qscale=4 下残差不算小。
+    let per_i = es_i.len() / FRAMES;
+    assert!(
+        samples_p[1].len() * 3 < per_i,
+        "第 2 帧还有 {} 字节（全 I 是 {per_i}）—— 低运动序列该小得多",
+        samples_p[1].len()
+    );
+}
+
+/// P 帧里「帧间宏块用上了没有、MV 有没有真的动」—— 单看体积容易漏掉这层。
+///
+/// 判据：`intra_mbs_last`（上一帧走帧内路径的宏块数）在 P 帧里必须**远小于**总数。
+#[test]
+fn p_frames_actually_use_inter_macroblocks() {
+    let frames: Vec<Frame> = (0..FRAMES).map(test_frame).collect();
+    let mut e = Encoder::new(EncoderConfig {
+        width: W,
+        height: H,
+        fps_num: FPS,
+        keyframe_interval: 250,
+        ..Default::default()
+    })
+    .expect("建编码器");
+
+    let total = e.mb_count().0 * e.mb_count().1;
+    e.encode_frame(&frames[0]).expect("I 帧");
+    assert!(e.last_key_frame, "首帧必须是关键帧");
+    assert_eq!(e.intra_mbs_last, total, "I 帧里全是帧内宏块");
+
+    for (i, f) in frames.iter().enumerate().skip(1) {
+        e.encode_frame(f).expect("P 帧");
+        assert!(!e.last_key_frame, "第 {i} 帧不该是关键帧");
+        let intra = e.intra_mbs_last;
+        println!("第 {i} 帧：帧内宏块 {intra}/{total}");
+        assert!(
+            intra * 4 < total,
+            "第 {i} 帧有 {intra}/{total} 个宏块走了帧内 —— 帧间路径没生效"
+        );
+    }
+}
+
+/// **逐帧、逐位**比对：把我们的 I+P 流交给 ffmpeg 解，同时用**自己的解码器**解一遍。
+///
+/// 问题是 `v2v-mp4v` 只有编码器、没有解码器 —— 所以这条判据反过来用：
+/// 让 ffmpeg 解我们的流，再让 ffmpeg 解「编码器看到的画面」，比 PSNR。
+/// 上一条测试已经做了这件事。这里补的是**逐帧**版本的诊断输出，方便定位出问题的是哪一帧。
+#[test]
+fn every_p_frame_stays_within_tolerance() {
+    let frames: Vec<Frame> = (0..FRAMES).map(test_frame).collect();
+    let (es, _) = encode_raw_es(
+        EncoderConfig {
+            width: W,
+            height: H,
+            fps_num: FPS,
+            keyframe_interval: 250,
+            ..Default::default()
+        },
+        &frames,
+    );
+    let path = std::env::temp_dir().join("v2v_mp4v_perframe.m4v");
+    std::fs::write(&path, &es).expect("写");
+    let (got, _) = decode_to_yuv(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+
+    let one = (W * H * 3 / 2) as usize;
+    let mut worst = f64::INFINITY;
+    for (i, f) in frames.iter().enumerate() {
+        let a = frame_bytes(f);
+        let b = &got[i * one..(i + 1) * one];
+        let p = psnr(&a, b, 1);
+        println!("第 {i:2} 帧 PSNR {p:.2} dB");
+        worst = worst.min(p);
+    }
+    println!("最差 {worst:.2} dB");
+    // P 帧漂移会让最差的那帧比平均低，但不该低到难看。
+    assert!(worst >= 28.0, "有一帧画质崩了（最差 {worst:.2} dB）");
 }

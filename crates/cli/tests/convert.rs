@@ -672,6 +672,9 @@ fn psnr(a: &[u8], b: &[u8]) -> f64 {
 /// 判据是「换容器不换内容」之外还多一条 —— MP4 的 `esds` 里那 40 多字节
 /// `DecoderSpecificInfo` 必须是**完整**的 VOS + 视觉对象 + VOL，
 /// 少了 VOS 那两级 `ffprobe` 就报不出 `profile` / `level`。
+///
+/// 这条用**全 I 帧**（`-g 0`）：`stss` 会被整个省掉，正好是「全 I 帧不必写 `stss`」
+/// 这条约定的判据。P 帧那条路上 `stss` 必须写，见 `mp4_p_frames_write_stss`。
 #[test]
 fn mp4_output_has_a_valid_isobmff_structure() {
     let dir = temp_dir("mp4_struct");
@@ -684,6 +687,8 @@ fn mp4_output_has_a_valid_isobmff_structure() {
     let opts = ConvertOptions {
         qscale: 6,
         format: v2v_cli::OutputFormat::Mp4,
+        // 全 I 帧：`stss` 该被整个省掉。
+        keyframe_interval: 0,
         verify: true,
         max_frames: None,
         copy_audio: true,
@@ -1085,6 +1090,122 @@ fn mp4_from_real_sample_keeps_audio_in_sync() {
         "音频偏移了 {sh} 个采样点 —— WMA 的编码器延迟没跳干净？"
     );
     assert!(mse < 1000.0, "音频内容对不上（MSE {mse:.2}）");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **P 帧那条路**的结构：`stss` 必须写出来，而且关键帧数要对得上。
+///
+/// ⚠️ 这条判据很关键：全 I 帧时 `stss` 是**省掉**的（缺省 = 全是关键帧），
+/// 于是「忘了写 `stss`」和「全 I 帧」在文件上长得一模一样 —— 一旦编出 P 帧，
+/// 缺 `stss` 的后果就是**播放器以为每帧都能独立解**，seek 到 P 帧上直接花屏。
+#[test]
+fn mp4_p_frames_write_stss() {
+    let dir = temp_dir("mp4_stss");
+    let (w, h) = (64u32, 48u32);
+    let n = 12usize;
+    let frames = moving_sequence(w, h, n);
+    let input = dir.join("in.wmv");
+    let output = dir.join("out.mp4");
+    make_wmv(&input, &frames, MP43, 4);
+
+    let gop = 5usize;
+    let opts = ConvertOptions {
+        qscale: 6,
+        format: v2v_cli::OutputFormat::Mp4,
+        keyframe_interval: gop,
+        verify: false,
+        max_frames: None,
+        copy_audio: true,
+        ..Default::default()
+    };
+    let rep = convert_file(&input, &output, &opts).expect("转 MP4");
+    eprintln!("报告：{rep:?}");
+    assert_eq!(rep.frames, n);
+    // GOP=5、12 帧 → 关键帧在 0 与 5 与 10，共 3 个。
+    assert_eq!(rep.key_frames, 3, "GOP={gop} 时 {n} 帧应有 3 个关键帧");
+
+    let d = std::fs::read(&output).expect("读输出");
+    let mut types = Vec::new();
+    isobmff::all_types(&d, 0, d.len(), &mut types);
+    assert!(
+        types.iter().any(|t| t == b"stss"),
+        "编出 P 帧之后必须写 stss —— 否则播放器会以为每帧都能独立解"
+    );
+
+    // `stss` 的条目数 = 关键帧数，且第一项是 1（1 起编号）。
+    let stss = isobmff::find(
+        &d,
+        0,
+        d.len(),
+        &[b"moov", b"trak", b"mdia", b"minf", b"stbl", b"stss"],
+    )
+    .expect("stss");
+    let count = isobmff::be32(&d[stss.0 + 4..]) as usize;
+    assert_eq!(count, rep.key_frames, "stss 的条目数应等于关键帧数");
+    let mut entries = Vec::new();
+    for i in 0..count {
+        entries.push(isobmff::be32(&d[stss.0 + 8 + i * 4..]));
+    }
+    eprintln!("stss 条目：{entries:?}");
+    assert_eq!(entries[0], 1, "第一项应当是 1（样本号 1 起数）");
+
+    // 编出来的流还得 ffmpeg 解得开、画质还得对。
+    if has_ffmpeg() {
+        let got = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-i",
+                output.to_str().unwrap(),
+                "-fps_mode",
+                "passthrough",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv420p",
+                "-",
+            ])
+            .output()
+            .expect("跑 ffmpeg");
+        assert!(
+            got.status.success(),
+            "ffmpeg 解不开：{}",
+            String::from_utf8_lossy(&got.stderr)
+        );
+        let log = String::from_utf8_lossy(&got.stderr).to_lowercase();
+        for bad in ["error", "corrupt", "invalid", "damaged"] {
+            assert!(!log.contains(bad), "ffmpeg 报了「{bad}」：{log}");
+        }
+        let mut src = Vec::new();
+        {
+            let mut dd =
+                AsfDemuxer::new(std::fs::File::open(&input).expect("开输入")).expect("解封装");
+            let (vnum, ww, hh) = {
+                let v = dd
+                    .streams()
+                    .iter()
+                    .find(|s| s.kind == StreamKind::Video)
+                    .expect("视频轨");
+                let vf = v.video.as_ref().expect("视频格式");
+                (v.number, vf.width, vf.height)
+            };
+            let mut dec = Decoder::new();
+            while let Some(s) = dd.next_sample().expect("读") {
+                if s.stream == vnum {
+                    let f = dec.decode(&s.data, ww, hh).expect("解输入");
+                    src.extend_from_slice(&f.y);
+                    src.extend_from_slice(&f.u);
+                    src.extend_from_slice(&f.v);
+                }
+            }
+        }
+        let p = psnr(&src, &got.stdout);
+        eprintln!("P 帧 MP4 端到端 PSNR = {p:.2} dB");
+        assert!(p > 30.0, "P 帧那条路画质太差（{p:.2} dB）");
+    } else {
+        eprintln!("SKIP: PATH 上没有 ffmpeg，跳过解码校验");
+    }
 
     let _ = std::fs::remove_dir_all(&dir);
 }

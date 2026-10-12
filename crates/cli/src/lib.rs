@@ -76,7 +76,9 @@ pub struct ConvertOptions {
     pub format: OutputFormat,
     /// 周期 I 帧间隔（帧数）。`0` = 只首帧是 I。
     ///
-    /// 只对 `.wmv` 有效 —— `.mp4` 目前是**全 I 帧**（`crates/mp4v` 还没做 P 帧）。
+    /// ⚠️ 两种容器的**默认含义不同**：`.wmv` 的默认是 250（有小 GOP）；
+    /// `.mp4` 的默认是 0（**全 I 帧**，文件大但每帧都能独立解）。
+    /// 给 `.mp4` 传个非零值就会真的编 P 帧 —— 低运动素材能压到 1/10 左右。
     pub keyframe_interval: usize,
     /// 转完把输出**解码回来**与源帧比 PSNR（慢一倍，但能证明「转出来的东西真能放」）。
     ///
@@ -589,6 +591,7 @@ fn convert_to_mp4(
         height: h,
         fps_num: fps,
         qscale: opts.qscale,
+        keyframe_interval: opts.keyframe_interval,
         ..Default::default()
     })?;
 
@@ -626,6 +629,7 @@ fn convert_to_mp4(
 
     let mut dec = Decoder::new();
     let mut frames = 0usize;
+    let mut key_frames = 0usize;
     let mut audio_points = 0usize;
     let mut skipped_audio = 0usize;
     // WMA 解码器与要跳的延迟样本数（`plan_audio` 里算好的）—— 拿出来单独持有，
@@ -683,9 +687,20 @@ fn convert_to_mp4(
         prev_vts = Some(s.timestamp_ms);
 
         let frame = dec.decode(&s.data, w, h)?;
-        let stream = enc.encode_i_frame(&frame)?;
-        // 全 I 帧 → 每帧都是关键帧（`stss` 会因此被整个省掉）。
-        mux.write_video(&stream, true, last_dur)?;
+        // ⚠️ **`-g 0` 在 `.mp4` 这条路上就是「全 I 帧」** ——
+        // 这条路的默认值是 0（每个 I 帧都独立可解，见 `ConvertOptions` 的说明），
+        // 所以不能直接调 `encode_frame`（在 `mp4v` 里 `0` 的含义是「无 GOP」，会编 P 帧、
+        // 而且第一个 P 帧会因为没有参考帧而报错）。
+        let stream = if opts.keyframe_interval == 0 {
+            enc.encode_i_frame(&frame)?
+        } else {
+            enc.encode_frame(&frame)?
+        };
+        // 关键帧位来自编码器 —— 全 I 帧时 `stss` 会被整个省掉。
+        mux.write_video(&stream, enc.last_key_frame, last_dur)?;
+        if enc.last_key_frame {
+            key_frames += 1;
+        }
         frames += 1;
         if let Some(max) = opts.max_frames {
             if frames >= max {
@@ -700,7 +715,7 @@ fn convert_to_mp4(
 
     Ok(ConvertReport {
         frames,
-        key_frames: frames, // 全 I 帧
+        key_frames,
         audio_payloads: audio_points,
         skipped_audio,
         bytes_in,

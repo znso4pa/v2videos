@@ -67,18 +67,22 @@ pub struct Frame {
     pub v: Vec<u8>,
 }
 
-/// 宏块对齐、**未裁剪**的平面。P 帧的运动补偿要在它上面做（会读到真实高度以外的行）。
-pub(crate) struct Planes {
-    pub(crate) pw: usize,
-    pub(crate) ph: usize,
-    pub(crate) y: Vec<u8>,
-    pub(crate) u: Vec<u8>,
-    pub(crate) v: Vec<u8>,
+/// 宏块对齐、**未裁剪**的平面。运动补偿要在它上面做（会读到真实高度以外的行）。
+///
+/// ⚠️ 这是**共享**的：`crates/mp4v` 的 P 帧编码也用它（连同下面那几个 MC 内核）。
+/// 从解码器里提出来公开，是因为半像素搬运那一套在 H.263 / MPEG-4 系里是同一份 ——
+/// 复刻第二份才是真会跑偏的那份。
+pub struct Planes {
+    pub pw: usize,
+    pub ph: usize,
+    pub y: Vec<u8>,
+    pub u: Vec<u8>,
+    pub v: Vec<u8>,
 }
 
 impl Planes {
     /// 宏块对齐、清零的平面组。
-    pub(crate) fn new(pw: usize, ph: usize) -> Self {
+    pub fn new(pw: usize, ph: usize) -> Self {
         Self {
             pw,
             ph,
@@ -297,9 +301,7 @@ impl Decoder {
         // 尺寸算 `src_x/src_y` 去索引**参考帧**的缓冲 —— 尺寸不一致就是越界（曾经真的 panic 过）。
         if let Some(p) = &self.prev {
             if p.pw != pw || p.ph != ph {
-                return Err(Error::Bad(
-                    "参考帧尺寸与当前帧不一致（流中途换分辨率？）",
-                ));
+                return Err(Error::Bad("参考帧尺寸与当前帧不一致（流中途换分辨率？）"));
             }
         }
 
@@ -556,8 +558,11 @@ impl Decoder {
                         for i in 1..64usize {
                             let v = block[i] as i32;
                             if v != 0 {
-                                block[i] =
-                                    if v < 0 { v * qmul - qadd } else { v * qmul + qadd } as i16;
+                                block[i] = if v < 0 {
+                                    v * qmul - qadd
+                                } else {
+                                    v * qmul + qadd
+                                } as i16;
                             }
                         }
                     } else {
@@ -588,7 +593,11 @@ impl Decoder {
                     if mb_intra && dump_mb == Some((mbx, mby)) {
                         let mut line = String::new();
                         for j in 0..64 {
-                            let v = if j == 0 { block[0] / scale as i16 } else { block[j] };
+                            let v = if j == 0 {
+                                block[0] / scale as i16
+                            } else {
+                                block[j]
+                            };
                             line.push_str(&format!("{v:6}"));
                         }
                         eprintln!(
@@ -599,7 +608,12 @@ impl Decoder {
 
                     // ---- IDCT → 像素 ----
                     let (plane, stride, px, py) = if luma {
-                        (&mut out.y, pw, mbx * 16 + (n & 1) * 8, mby * 16 + (n >> 1) * 8)
+                        (
+                            &mut out.y,
+                            pw,
+                            mbx * 16 + (n & 1) * 8,
+                            mby * 16 + (n >> 1) * 8,
+                        )
                     } else if n == 4 {
                         (&mut out.u, pw / 2, mbx * 8, mby * 8)
                     } else {
@@ -660,10 +674,7 @@ fn crop(src: &[u8], sw: usize, cw: usize, ch: usize) -> Vec<u8> {
 
 /// 解一帧 **I 帧**（一次性，不带参考帧）。P 帧请用 `Decoder`。
 pub fn decode_i_frame(data: &[u8], width: u32, height: u32) -> Result<Frame> {
-    let (mb_w, mb_h) = (
-        width.div_ceil(16) as u32,
-        height.div_ceil(16) as u32,
-    );
+    let (mb_w, mb_h) = (width.div_ceil(16) as u32, height.div_ceil(16) as u32);
     let (header, _) = parse_frame_header(data, mb_w, mb_h)?;
     if header.picture_type != PictureType::I {
         return Err(Error::Unsupported("decode_i_frame 只支持 I 帧".into()));
@@ -672,7 +683,7 @@ pub fn decode_i_frame(data: &[u8], width: u32, height: u32) -> Result<Frame> {
 }
 
 /// H.263 的中值预测（`mid_pred`）。
-fn mid_pred(a: i32, b: i32, c: i32) -> i32 {
+pub fn mid_pred(a: i32, b: i32, c: i32) -> i32 {
     let mut b = b;
     if a > b {
         if c > b {
@@ -696,7 +707,12 @@ fn mid_pred(a: i32, b: i32, c: i32) -> i32 {
 ///
 /// 邻居是**左(A) / 上(B) / 右上(C)**；片首行特殊：第一个宏块取 0，其余只取左邻
 /// （`if (s->first_slice_line && block<3)` 那一支）。
-pub(crate) fn pred_motion(g: &Grid<(i32, i32)>, mbx: usize, mby: usize, first_slice_line: bool) -> (i32, i32) {
+pub(crate) fn pred_motion(
+    g: &Grid<(i32, i32)>,
+    mbx: usize,
+    mby: usize,
+    first_slice_line: bool,
+) -> (i32, i32) {
     let xy = g.idx(mbx, mby);
     let a = g.data[xy - 1];
     if first_slice_line {
@@ -787,7 +803,11 @@ fn put_pixels(
 ) {
     let hx = dxy & 1 != 0;
     let hy = dxy & 2 != 0;
-    let (r1, r2) = if no_rounding { (0u32, 1u32) } else { (1u32, 2u32) };
+    let (r1, r2) = if no_rounding {
+        (0u32, 1u32)
+    } else {
+        (1u32, 2u32)
+    };
     for y in 0..h {
         for x in 0..w {
             // ⚠️ 这里必须把 `y` / `x` 一起加进去 —— 只写相对偏移会让每一行/列都复制块首行。
@@ -804,22 +824,16 @@ fn put_pixels(
 }
 
 /// 一次运动补偿的参数：半像素相位、参考坐标、是否需要边缘复制。
-pub(crate) struct McParams {
-    pub(crate) dxy: usize,
-    pub(crate) uvdxy: usize,
-    pub(crate) src_x: i32,
-    pub(crate) src_y: i32,
-    pub(crate) need_emu: bool,
+pub struct McParams {
+    pub dxy: usize,
+    pub uvdxy: usize,
+    pub src_x: i32,
+    pub src_y: i32,
+    pub need_emu: bool,
 }
 
 /// 算一个宏块的 MC 参数（H.263 / MPEG-4 的半像素一路）。
-pub(crate) fn mc_params(
-    mbx: usize,
-    mby: usize,
-    mv: (i32, i32),
-    pw: usize,
-    ph: usize,
-) -> McParams {
+pub fn mc_params(mbx: usize, mby: usize, mv: (i32, i32), pw: usize, ph: usize) -> McParams {
     let (mx, my) = mv;
     let dxy = (((my & 1) << 1) | (mx & 1)) as usize;
     let src_x = (mbx as i32) * 16 + (mx >> 1);
@@ -842,7 +856,7 @@ pub(crate) fn mc_params(
 }
 
 /// 16×16 亮度块的半像素搬运（写到 `dest` 的 `(dx,dy)` 处）。返回是否走了边缘复制。
-pub(crate) fn mc_luma16(
+pub fn mc_luma16(
     dest: &mut [u8],
     dstride: usize,
     dx: usize,
@@ -863,13 +877,24 @@ pub(crate) fn mc_luma16(
         (&refp.y[..], refp.pw, p.src_x as usize, p.src_y as usize)
     };
     put_pixels(
-        dest, dstride, dx, dy, ysrc, ystride, yx, yy, 16, 16, p.dxy, no_rounding,
+        dest,
+        dstride,
+        dx,
+        dy,
+        ysrc,
+        ystride,
+        yx,
+        yy,
+        16,
+        16,
+        p.dxy,
+        no_rounding,
     );
     p.need_emu
 }
 
 /// 8×8 色度块的半像素搬运（`which`：0 = U，1 = V）。半像素相位由 `uvdxy` 表示。
-pub(crate) fn mc_chroma8(
+pub fn mc_chroma8(
     dest: &mut [u8],
     dstride: usize,
     dx: usize,
@@ -894,11 +919,24 @@ pub(crate) fn mc_chroma8(
     } else {
         (plane, cw, uvsrc_x as usize, uvsrc_y as usize)
     };
-    put_pixels(dest, dstride, dx, dy, src, sstride, sx, sy, 8, 8, p.uvdxy, no_rounding);
+    put_pixels(
+        dest,
+        dstride,
+        dx,
+        dy,
+        src,
+        sstride,
+        sx,
+        sy,
+        8,
+        8,
+        p.uvdxy,
+        no_rounding,
+    );
 }
 
 /// 一个宏块的 16×16 运动补偿（`MV_TYPE_16X16` 一路）。返回 `(dxy, 是否走了边缘复制)`。
-pub(crate) fn mc_mb(
+pub fn mc_mb(
     dest: &mut Planes,
     refp: &Planes,
     mbx: usize,
@@ -907,9 +945,35 @@ pub(crate) fn mc_mb(
     no_rounding: bool,
 ) -> (usize, bool) {
     let p = mc_params(mbx, mby, mv, dest.pw, dest.ph);
-    let emu = mc_luma16(&mut dest.y, dest.pw, mbx * 16, mby * 16, refp, &p, no_rounding);
-    mc_chroma8(&mut dest.u, dest.pw / 2, mbx * 8, mby * 8, refp, 0, &p, no_rounding);
-    mc_chroma8(&mut dest.v, dest.pw / 2, mbx * 8, mby * 8, refp, 1, &p, no_rounding);
+    let emu = mc_luma16(
+        &mut dest.y,
+        dest.pw,
+        mbx * 16,
+        mby * 16,
+        refp,
+        &p,
+        no_rounding,
+    );
+    mc_chroma8(
+        &mut dest.u,
+        dest.pw / 2,
+        mbx * 8,
+        mby * 8,
+        refp,
+        0,
+        &p,
+        no_rounding,
+    );
+    mc_chroma8(
+        &mut dest.v,
+        dest.pw / 2,
+        mbx * 8,
+        mby * 8,
+        refp,
+        1,
+        &p,
+        no_rounding,
+    );
     (p.dxy, emu)
 }
 

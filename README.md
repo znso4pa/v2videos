@@ -60,7 +60,7 @@ V2V_ASF_SAMPLE=/path/to/sample.wmv cargo test --release -- --ignored
 | **解封装** | ASF / WMV（`v2v-asf`）、AVI（`v2v-avi`）                      | 与 `ffprobe` 逐字段对：轨道、尺寸、包数、关键帧数       |
 | **解码**  | MS-MPEG-4 v3（MP43）：I 帧 + P 帧（skip、MV 中值预测、半像素运动补偿、帧间残差） | 与 `ffmpeg` **逐像素**对：整段样本**每一帧最大差 0** |
 | **编码**  | MP43 **I 帧 + P 帧**：正向 DCT + 量化 + DC / RL 熵编码、运动估计（整像素粗搜 + 半像素细化）、skip 宏块 | 编出来的 I+P 序列交给 `ffmpeg` 解，与自己的解码器**逐像素一致** |
-| **编码**  | MPEG-4 Part 2（`v2v-mp4v`）**全 I 帧**：DC 预测 / AC 预测（逐宏块比位数择优）/ H.263 量化 | 编出来的流交给 `ffmpeg` 解，真样本 **44.5 dB**（同 qscale 下 ffmpeg 自己的 mpeg4 是 43.6 dB） |
+| **编码**  | MPEG-4 Part 2（`v2v-mp4v`）**I 帧 + P 帧**：DC / AC 预测（逐宏块比位数择优）、运动估计（整像素粗搜 + 半像素细化）、中值 MV 预测、skip 宏块、逐宏块帧内/帧间判决 | 编出来的流交给 `ffmpeg` 解，真样本 **44.8 dB**（同 qscale 下 ffmpeg 自己的 mpeg4 是 43.6 dB）；**视频载荷比全 I 帧小 2.3 倍** |
 | **音频直通** | 转换时原样搬音频轨（ASF 多流复用） | 真样本整文件（208 秒音乐）：输出音频与源**逐样本 0 差异**（36,700,160 字节完全一致） |
 | **音频解码** | WMA v1/v2（`v2v-wma`）→ PCM | 真样本整轨与 ffmpeg 的 PCM **最大差 2**（s16 满量程 32768）；转进 MP4 后**对齐偏移 0 采样点** |
 | **封装**  | ASF 写（`.wmv`，单视频流） | `ffprobe` 认；自己解封装字节一致；ffmpeg 解出来的像素与我们的解码器**逐位一致** |
@@ -72,8 +72,8 @@ V2V_ASF_SAMPLE=/path/to/sample.wmv cargo test --release -- --ignored
 # .wmv：视频重编码成 MP43，音频**直通**（零损失），会做 PSNR 校验
 v2v convert in.wmv -o out/
 
-# .mp4：视频重编码成 MPEG-4 Part 2，音频解成 PCM
-v2v convert --mp4 in.wmv -o out/
+# .mp4：视频重编码成 MPEG-4 Part 2（-g 给 GOP；默认 0 = 全 I 帧），音频解成 PCM
+v2v convert --mp4 -g 12 in.wmv -o out/
 ```
 
 **为什么 `.mp4` 必须重编码**：MP4 / 3GP 容器**不收 MP43**（`mp4`/`3gp`/`3g2` 三个 muxer 都报
@@ -81,14 +81,14 @@ v2v convert --mp4 in.wmv -o out/
 自己读不回来。WMA 同理。所以 `.wmv → .mp4` 这条路上视频必须过一遍 MPEG-4 Part 2 编码器，
 音频必须解成 PCM（`sowt`）。
 
-**还没做**：MPEG-4 Part 2 的 **P 帧 / B 帧**（现在全 I 帧，所以 `.mp4` 比 ffmpeg 编的大 3 倍左右）、
-音频**编码**（WMA 只能解；`.wmv` 走直通、`.mp4` 走 PCM）、Simple Index、其他容器与编解码器。
+**还没做**：MPEG-4 Part 2 的 **B 帧**与 8×8 运动补偿、AAC 编码器（现在 `.mp4` 的音频是未压缩 PCM，
+是文件体积的大头）、音频**编码**（WMA 只能解）、Simple Index、其他容器与编解码器。
 
 ## 命令行
 
 ```bash
 cargo run --release -p v2v-cli -- convert <输入.wmv>... -o <输出目录> [-q 6] [-g 250] [-n 100]
-cargo run --release -p v2v-cli -- convert --mp4 <输入.wmv>... -o <输出目录> [-q 6] [--fps 25]
+cargo run --release -p v2v-cli -- convert --mp4 <输入.wmv>... -o <输出目录> [-q 6] [-g 12] [--fps 25]
 ```
 
 批量：一个输入失败不影响其他。默认（`.wmv`）转完会把输出**解码回来**与源帧比 PSNR；

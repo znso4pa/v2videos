@@ -35,19 +35,22 @@ mod grid;
 mod header;
 mod idct;
 mod predict;
+pub mod tables;
 #[cfg(test)]
 mod testbit;
-pub mod tables;
 mod vlc;
 
 pub use bitreader::BitReader;
 pub use bitwriter::BitWriter;
-pub use error::{Error, Result};
-pub use header::{decode012, parse_frame_header, FrameHeader, PictureType};
 pub use block::RlTable;
 pub use encode::{Encoder, EncoderConfig};
-pub use fdct::fdct;
-pub use frame::{decode_i_frame, AcPredRead, Decoder, Frame, Stats, ZIGZAG};
+pub use error::{Error, Result};
+pub use fdct::{fdct, fdct_i};
+pub use frame::{
+    decode_i_frame, mc_chroma8, mc_luma16, mc_mb, mc_params, mid_pred, AcPredRead, Decoder, Frame,
+    McParams, Planes, Stats, ZIGZAG,
+};
+pub use header::{decode012, parse_frame_header, FrameHeader, PictureType};
 pub use idct::{idct_add, idct_put};
 pub use predict::{ac_predict, coded_block_predict, dc_predict, AcVal};
 pub use vlc::Vlc;
@@ -57,8 +60,5 @@ pub const MB_SIZE: u32 = 16;
 
 /// 由像素尺寸算宏块数。
 pub fn mb_count(width: u32, height: u32) -> (u32, u32) {
-    (
-        width.div_ceil(MB_SIZE),
-        height.div_ceil(MB_SIZE),
-    )
+    (width.div_ceil(MB_SIZE), height.div_ceil(MB_SIZE))
 }

@@ -1,20 +1,21 @@
-//! MPEG-4 Part 2（`mp4v`）**全 I 帧**编码器。
+//! MPEG-4 Part 2（`mp4v`）编码器 —— **I 帧 + P 帧**。
 //!
-//! 一条窄路径：不做 P 帧、不做运动估计、不做码率控制、不做 dquant —— 整帧一个 qscale。
-//! 目的是把 `.wmv → .mp4` 打通（`msmpeg4` 只有解码，MP4 容器又不收 MP43），
-//! 而不是一步做到 ffmpeg 的压缩率。
+//! 不做 B 帧、不做码率控制、不做 dquant、不做 8×8 运动补偿 —— 整帧一个 qscale、
+//! 宏块级 16×16 的 MV。目标是「`.wmv → .mp4` 的体积别离谱」，不是做到 ffmpeg 的压缩率。
 //!
-//! ## 与 MP43 编码器的关系：**只有地基能复用**
+//! ## 与 MP43 编码器的关系：**地基复用，语法各写**
 //!
 //! | 能复用（`v2v_msmpeg4`） | 不能复用 |
 //! |---|---|
-//! | `fdct`（正向 DCT，定标一致） | 宏块类型表：MP43 是 `MB_INTRA`，这里是 H.263 的 `ff_h263_intra_MCBPC` |
+//! | `fdct` / `fdct_i`（正向 DCT，定标一致） | 宏块类型表：MP43 是 `MB_INTRA`/`MB_NON_INTRA`，这里是 H.263 的 `ff_h263_{intra,inter}_MCBPC` |
 //! | `BitWriter`（MSB 优先） | DC 熵编码：MP43 是「符号 + 8 位 escape」，这里是「**位长** VLC」 |
 //! | `RlTable` / `Vlc`（前缀码容器） | AC escape：MP43 有三种、含义不同；这里是统一表挑最短 |
 //! | `Frame`、`Error`/`Result`、`ZIGZAG` | DC/AC **预测**：tie-break 判据不同（MP43 是 `<=`，这里是 `<`） |
 //! | `tables::RL_INTRA_*`（同一张表） | DC 缩放表：MP43 用 `OLD_Y_DC_SCALE`，这里用 `ff_mpeg4_y_dc_scale_table` |
+//! | `Planes` / `mc_params` / `mc_luma16` / `mc_chroma8` / `mc_mb`（半像素 MC） | **运动矢量 VLC**：MP43 是 1100 项的 `ff_msmp4_mv_table`，这里是 33 项的 `ff_mvtab` |
+//! | `idct_put` / `idct_add`（重建） | 帧间 RL 表的**取用方式**：MP43 按 qscale 分档，这里用第 0 档（恒等） |
 //!
-//! ## 一帧的处理顺序（每一步的顺序都是语法的一部分，不能换）
+//! ## I 帧的处理顺序（每一步的顺序都是语法的一部分，不能换）
 //!
 //! ```text
 //! 1. 6 个块各做正向 DCT → 量化（DC 用 dc_scale，AC 用 H.263 的 qmul/qadd）
@@ -24,6 +25,22 @@
 //! 4. 由**扫描序里最后一个非零系数**定 cbp
 //! 5. 写 MCBPC（I 表）→ ac_pred 位 → CBPY → 6 个块（每块：DC 再 AC）
 //! ```
+//!
+//! ## P 帧的处理顺序
+//!
+//! ```text
+//! 1. MV 预测（`ff_h263_pred_motion` 的 16×16 一路：中值预测 + 首行的特例）
+//! 2. 运动估计 → MV（差分夹在 ±31，配 f_code = 1）
+//! 3. 半像素运动补偿 → 预测宏块；残差 = 当前 − 预测
+//! 4. 残差 → 正向 DCT → 量化。**帧间没有独立的 DC 一趟**：64 个系数一视同仁
+//! 5. cbp：6 个块**任一系数非零**（含 DC）就置位
+//! 6. 三条候选比位数：**skip**（MV=0 且无残差，只花 1 位）/ **帧间** / **帧内**
+//! 7. 写：`mb_coded` → inter MCBPC → CBPY（**要 `^0xF`**）→ MV → 6 个块（只有 AC）
+//! ```
+//!
+//! **帧内宏块在 P 帧里的写法不同**：`mb_coded = 0` 之后接的是
+//! `inter_MCBPC[cbpc + 4]`（而不是 `intra_MCBPC`），后面才是 `ac_pred` 位与
+//! **不取反**的 CBPY。顺序和 I 帧不一样，抄错了位流就整体错位。
 //!
 //! ## `ac_pred` 是逐宏块试出来的，不是拍脑袋开的
 //!
@@ -36,28 +53,59 @@
 //! （解码端加完预测后正好还原成预测前的值），所以试两种**不用回滚网格**，
 //! 这让「比位数」变得很便宜。
 //!
-//! ## 全 I 帧为什么不用重建
+//! ## 帧内/帧间的判决也是比位数
 //!
-//! 没有 P 帧就没有参考帧，所以**不需要反量化 + IDCT** 那一趟。
-//! 代价是误差不累积（对全 I 帧反而是好事），而且少一整条容易错的路径。
+//! 每条候选都先写进**临时** `BitWriter`，比 `bit_pos()`，赢的那条整段 `append` 进正式位流。
+//! 好处是「比较时的位数」和「实际写出的位数」是同一个数 —— 不需要码率模型，也不会
+//! 出现「模型说便宜、实际更贵」。
+//!
+//! 代价是帧内候选会**顺手改掉 DC / AC 网格**（DC 预测本来就要写网格）。所以：
+//! - 试帧内之前先**拍快照**（只拍本宏块会写的那 6 个槽）；
+//! - 帧内赢了 → 保留网格；帧间赢了 → 还原快照（也就是 1024 / 0，与解码端的
+//!   `ff_clean_intra_table_entries` 一致）。
 //!
 //! ## DC / AC 网格**每帧重建**
 //!
 //! ffmpeg 的 `dc_val` / `ac_val` 是跨帧复用的（`mpegvideo.c` 只在初始化时填 1024）。
-//! 但全 I 帧时每个在帧内的格子都是「先写后读」，帧外的格子恒为 1024 / 0，
+//! 但一帧里每个帧内格子都是「先写后读」、每个帧间格子都被清成 1024 / 0，
 //! 所以每帧重建与跨帧复用**结果相同** —— 重建更省心，也就没有跨帧脏状态可错。
 
-use v2v_msmpeg4::{fdct, BitWriter, Error, Frame, Result, RlTable, ZIGZAG};
+use v2v_msmpeg4::{
+    fdct, fdct_i, idct_add, idct_put, mc_chroma8, mc_luma16, mc_mb, mc_params, mid_pred, BitWriter,
+    Error, Frame, Planes, Result, RlTable, ZIGZAG,
+};
 
 use crate::header::{
     time_increment_bits, write_user_data, write_visual_object_header, write_vol, write_vop_header,
-    VolParams, VopParams, PROFILE_SIMPLE_LEVEL1,
+    VolParams, VopKind, VopParams, PROFILE_SIMPLE_LEVEL1,
 };
 use crate::tables;
 
 /// 越界的 DC 邻居值。ffmpeg 把整块 `dc_val_base` 填成 1024
 /// （`mpegvideo.c:607`），所以帧外读到的是 1024 而不是 0。
 const DC_NONE: i32 = 1024;
+
+/// 半像素舍入方式。0 = 四舍五入。**必须与 `mc_*` 的 `no_rounding` 参数一致**，
+/// 否则编码器的重建会与解码器差半个像素，误差逐帧累积。
+const NO_ROUNDING: bool = false;
+
+/// P 帧的 `f_code`。见 `VopParams::f_code` 的说明 —— 取 1 时 MV 差分限在 ±31，
+/// 我们的运动估计就按这个夹。
+const F_CODE: u8 = 1;
+
+/// MV 差分（半像素单位）的可表示范围上限，配 `F_CODE = 1`。
+///
+/// `ff_mvtab` 有 33 项，`code = |d|`（`f_code = 1` 时没有低位），最大 `|d| = 32`；
+/// 但解码端把**重建后的绝对 MV** 也 `sign_extend(.., 6)`，`+32` 会绕成 `-32`，
+/// 所以实际安全上限是 **31**（与 `msmpeg4` 的 MP43 编码器同口径）。
+const MV_DIFF_MAX: i32 = 31;
+
+/// `sign_extend(val, 6)` 的值域：绝对 MV 必须落在这里面。
+const MV_MIN: i32 = -32;
+const MV_MAX: i32 = 31;
+
+/// 运动估计的整像素搜索半径（两个中心各搜这么大，再各做一圈半像素细化）。
+const ME_RANGE: i32 = 8;
 
 /// 一个块留给邻居的 16 个值：`[1..8]` 是**首列**（给右边用），`[9..16]` 是**首行**（给下面用）。
 /// `[0]` 与 `[8]` 是 DC 的槽位，格式里不参与 AC 预测，恒 0（与 ffmpeg 的 `ac_val` 布局一致）。
@@ -80,6 +128,11 @@ pub struct EncoderConfig {
     pub qscale: u8,
     /// 要不要逐宏块试 AC 预测（见模块文档）。默认开。
     pub ac_pred: bool,
+    /// **周期 I 帧间隔**（帧数）。`0` = 只首帧是 I（默认，与「全 I 帧」行为一致）。
+    ///
+    /// 开着的意义：P 帧只参考前一帧，误差会累积（漂移）；周期 I 帧还能让播放器 seek。
+    /// 转换工具按秒数换算后传进来。
+    pub keyframe_interval: usize,
     /// VOL 里的 `low_delay`。恒 1 更省事（没有 B 帧）。
     pub low_delay: bool,
     /// 视觉对象序列头的 profile_and_level_indication。
@@ -94,9 +147,9 @@ impl Default for EncoderConfig {
             width: 0,
             height: 0,
             fps_num: 25,
-            // 全 I 帧没有 P 帧帮忙补，qscale 取 8 会明显糊；4 是「看着还行、文件别太离谱」的点。
             qscale: 4,
             ac_pred: true,
+            keyframe_interval: 0,
             low_delay: true,
             profile_and_level: PROFILE_SIMPLE_LEVEL1,
             user_data: "v2video",
@@ -104,7 +157,7 @@ impl Default for EncoderConfig {
     }
 }
 
-/// MPEG-4 Part 2 编码器（全 I 帧）。
+/// MPEG-4 Part 2 编码器。有状态：P 帧的参考帧与 MV 网格都要跨帧留着。
 pub struct Encoder {
     cfg: EncoderConfig,
     mb_w: usize,
@@ -114,6 +167,18 @@ pub struct Encoder {
     frame_index: u64,
     /// 上一次时间基回绕的次数（`frame_index / fps_num` 的旧值）。
     last_time_base: u64,
+    /// 上一帧的**重建**（P 帧运动补偿的参考）。`None` = 还没编过 I 帧。
+    ///
+    /// ⚠️ 存的是**重建**而不是原始帧 —— 解码器手里只有重建，编码器要是拿原始帧当参考，
+    /// 误差就会一帧一帧地分叉出去。
+    reference: Option<Planes>,
+    /// 距上一个 I 帧编了多少帧（周期 I 帧用）。
+    frames_since_i: usize,
+    /// **上一帧是不是关键帧（I 帧）** —— 封装器写载荷的关键帧位要用。
+    pub last_key_frame: bool,
+    /// **上一帧里走了帧内路径的宏块数**（P 帧判决的结果；I 帧恒为全部）。
+    /// 测试与调用方用它确认「画面切换时帧内真的接管了」。
+    pub intra_mbs_last: usize,
 }
 
 impl Encoder {
@@ -137,6 +202,10 @@ impl Encoder {
             time_increment_bits: time_increment_bits(cfg.fps_num),
             frame_index: 0,
             last_time_base: 0,
+            reference: None,
+            frames_since_i: 0,
+            last_key_frame: false,
+            intra_mbs_last: 0,
             cfg,
         })
     }
@@ -191,6 +260,30 @@ impl Encoder {
         self.encode_i_frame_with_vol(frame, false)
     }
 
+    /// 编一帧：按 `keyframe_interval` 决定 I 还是 P。
+    ///
+    /// 首帧恒为 I，之后每 `keyframe_interval` 帧插一个 I。
+    ///
+    /// ⚠️ `keyframe_interval == 0` 是**关掉 GOP** —— 首帧 I、其余**全是 P**，
+    /// 与 `v2v_msmpeg4` 的语义一致。注意这**不是**「全 I 帧」；想要全 I 帧就别调这个函数、
+    /// 直接调 `encode_i_frame`。
+    pub fn encode_frame(&mut self, frame: &Frame) -> Result<Vec<u8>> {
+        // ⚠️ 先把「距上个 I 帧多远」记到**当前帧**上，再判要不要 I ——
+        // 反过来写会整整多一帧（12 帧 / GOP 5 会变成 0、6 两个关键帧，而不是 0、5、10）。
+        // 这个顺序与 `msmpeg4::Encoder::encode_frame` 一致，两边的 GOP 才对得上。
+        if self.reference.is_some() {
+            self.frames_since_i += 1;
+        }
+        let force_i = self.reference.is_none()
+            || (self.cfg.keyframe_interval > 0
+                && self.frames_since_i >= self.cfg.keyframe_interval);
+        if force_i {
+            self.encode_i_frame_with_vol(frame, false)
+        } else {
+            self.encode_p_frame(frame)
+        }
+    }
+
     /// 同 `encode_i_frame`，但可以要求在 VOP 前重写一遍 VOL。
     pub fn encode_i_frame_with_vol(&mut self, frame: &Frame, with_vol: bool) -> Result<Vec<u8>> {
         if frame.width != self.cfg.width || frame.height != self.cfg.height {
@@ -218,18 +311,27 @@ impl Encoder {
         write_vop_header(
             &mut w,
             &VopParams {
+                kind: VopKind::I,
                 time_mod: (self.frame_index % u64::from(self.cfg.fps_num)) as u32,
                 time_incr: (time_base - self.last_time_base) as u32,
                 time_increment_bits: self.time_increment_bits,
                 qscale,
+                no_rounding: NO_ROUNDING,
+                f_code: F_CODE,
             },
         );
         self.last_time_base = time_base;
         self.frame_index += 1;
+        // 单独调 `encode_i_frame` 也要把计数清掉，不然之后接 `encode_frame` 会把
+        // 间隔算多。`encode_frame` 自己也会在编完 I 时清，这里重复一次是幂等的。
+        self.frames_since_i = 0;
+        self.last_key_frame = true;
 
         // DC / AC 网格：每帧重建（见模块文档）。
         let mut dc = DcGrid::new(mb_w, mb_h, y_dc_scale, c_dc_scale);
         let mut ac = AcGrid::new(mb_w, mb_h);
+        // 重建缓冲：**下一帧的 P 要拿它当参考**，所以即使这帧是 I 也要重建。
+        let mut cur = Planes::new(pw, ph);
 
         let mut blocks = [[0i32; 64]; 6];
         for mby in 0..mb_h {
@@ -254,39 +356,106 @@ impl Encoder {
                 }
 
                 // ---- 3+4+5. AC 预测（两种都试）+ 定 cbp + 写宏块 ----
-                // 试两种写法：普通扫描 vs AC 预测。哪种位流短用哪种。
-                // `ac` 网格两种写法留下的一样（见 `write_mb` 的说明），所以先跑「预测版」再跑
-                // 「普通版」不会互相污染。
-                if self.cfg.ac_pred {
-                    let mut predicted = BitWriter::new();
-                    write_mb(
-                        &mut predicted,
-                        mbx,
-                        mby,
-                        &blocks,
-                        &dc_diff,
-                        &dir,
-                        true,
-                        &rl,
-                        &mut ac,
-                    )?;
-                    let mut plain = BitWriter::new();
-                    write_mb(
-                        &mut plain, mbx, mby, &blocks, &dc_diff, &dir, false, &rl, &mut ac,
-                    )?;
-                    if predicted.bit_pos() < plain.bit_pos() {
-                        w.append(&predicted);
-                    } else {
-                        w.append(&plain);
-                    }
-                } else {
-                    write_mb(
-                        &mut w, mbx, mby, &blocks, &dc_diff, &dir, false, &rl, &mut ac,
-                    )?;
-                }
+                let (best, _) = intra_try(
+                    MbFlavour::IntraI,
+                    mbx,
+                    mby,
+                    &blocks,
+                    &dc_diff,
+                    &dir,
+                    self.cfg.ac_pred,
+                    &rl,
+                    &mut ac,
+                )?;
+                w.append(&best);
+
+                // ---- 6. 重建（AC 预测不影响重建 —— 解码端会把预测加回来）----
+                reconstruct_intra(
+                    &mut cur, mbx, mby, &blocks, qmul, qadd, y_dc_scale, c_dc_scale,
+                );
             }
         }
 
+        self.intra_mbs_last = mb_w * mb_h;
+        self.reference = Some(cur);
+        Ok(w.finish())
+    }
+
+    /// 编一个 **P 帧**（只含 VOP 头 + 宏块）。
+    ///
+    /// 前提：之前编过至少一个 I 帧（参考帧由 `encode_i_frame*` 建起来）。
+    pub fn encode_p_frame(&mut self, frame: &Frame) -> Result<Vec<u8>> {
+        if frame.width != self.cfg.width || frame.height != self.cfg.height {
+            return Err(Error::Bad("帧尺寸与配置不一致"));
+        }
+        // 参考帧**取出来**：既绕开借用检查，也顺带保证「编完一定换成新的」。
+        let refp = self
+            .reference
+            .take()
+            .ok_or(Error::Bad("P 帧之前必须先编一个 I 帧"))?;
+
+        let (mb_w, mb_h) = (self.mb_w, self.mb_h);
+        let (pw, ph) = (mb_w * 16, mb_h * 16);
+        let (sy, su, sv) = pad_planes(frame, pw, ph);
+
+        let qscale = self.cfg.qscale;
+        let q = i32::from(qscale);
+        let (qmul, qadd) = (q << 1, (q - 1) | 1);
+        let y_dc_scale = i32::from(tables::Y_DC_SCALE[qscale as usize]);
+        let c_dc_scale = i32::from(tables::C_DC_SCALE[qscale as usize]);
+
+        let rl_intra = intra_rl_table();
+        let rl_inter = inter_rl_table();
+
+        let mut w = BitWriter::new();
+        let time_base = self.frame_index / u64::from(self.cfg.fps_num);
+        write_vop_header(
+            &mut w,
+            &VopParams {
+                kind: VopKind::P,
+                time_mod: (self.frame_index % u64::from(self.cfg.fps_num)) as u32,
+                time_incr: (time_base - self.last_time_base) as u32,
+                time_increment_bits: self.time_increment_bits,
+                qscale,
+                no_rounding: NO_ROUNDING,
+                f_code: F_CODE,
+            },
+        );
+        self.last_time_base = time_base;
+        self.frame_index += 1;
+        // 计数归 `encode_frame` 管（它在判定前 +1）。这里不再动 ——
+        // 两处都加会变成每帧 +2，GOP 直接减半。
+        self.last_key_frame = false;
+
+        let mut st = PState {
+            refp: &refp,
+            cur: Planes::new(pw, ph),
+            sy: &sy,
+            su: &su,
+            sv: &sv,
+            pw,
+            mb_w,
+            mb_h,
+            qmul,
+            qadd,
+            y_dc_scale,
+            c_dc_scale,
+            use_ac_pred: self.cfg.ac_pred,
+            dc: DcGrid::new(mb_w, mb_h, y_dc_scale, c_dc_scale),
+            ac: AcGrid::new(mb_w, mb_h),
+            mv: vec![(0, 0); mb_w * mb_h],
+            intra_mbs: 0,
+            rl_intra: &rl_intra,
+            rl_inter: &rl_inter,
+        };
+        for mby in 0..mb_h {
+            for mbx in 0..mb_w {
+                st.mb(&mut w, mbx, mby)?;
+            }
+        }
+
+        self.intra_mbs_last = st.intra_mbs;
+        self.reference = Some(st.cur);
         Ok(w.finish())
     }
 }
@@ -301,23 +470,49 @@ fn intra_rl_table() -> RlTable {
     )
 }
 
+/// 帧间 RL 表：`ff_h263_rl_inter`（就是 `ff_rl_table[5]`），`n = 102`、`last = 58`。
+///
+/// 注意取的是**第 0 档**（恒等）—— ffmpeg 的 `ff_rl_init` 会按 qscale 预乘出 1..31 档，
+/// 解码端帧间取第 `qscale` 档；那是「解出来即最终系数」的便利做法。
+/// **编码器要的是量化后的原始 level**，所以用恒等的第 0 档，反量化自己另算一趟。
+fn inter_rl_table() -> RlTable {
+    RlTable::new(
+        &tables::RL_INTER_VLC,
+        &tables::RL_INTER_RUN,
+        &tables::RL_INTER_LEVEL,
+        58,
+    )
+}
+
 // ───────────────────────── 宏块 / 块 写出 ─────────────────────────
 
-/// 写一个 I 宏块。`use_ac_pred` 决定走哪条路（两种写法各写一遍，由调用方比位数）。
+/// 帧内宏块走哪条语法分支（帧间走 `write_inter_mb`，不在这里）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MbFlavour {
+    /// I 帧里的帧内宏块：`intra_MCBPC`，CBPY **不**取反。
+    IntraI,
+    /// P 帧里的帧内宏块：`mb_coded = 0` + `inter_MCBPC[cbpc + 4]`，CBPY **不**取反。
+    IntraP,
+}
+
+/// 写一个宏块（帧内两路 + 帧间）。`use_ac_pred` 只对帧内有效。
 ///
-/// 无论走哪条路，`ac_val` 网格都要更新，而且存的是**预测前**的值 ——
+/// 帧内：`ac_val` 网格无论走哪条路都要更新，而且存的是**预测前**的值 ——
 /// 解码端加完预测正好还原成它，所以两种写法留下的是同一份网格，
 /// 试两种**不用回滚**（这是「比位数」能做得这么便宜的原因）。
+///
+/// 帧间：`blocks` 是**量化后的残差**，没有独立的 DC 一趟，扫描序恒 zig-zag。
 #[allow(clippy::too_many_arguments)]
 fn write_mb(
     w: &mut BitWriter,
+    flavour: MbFlavour,
     mbx: usize,
     mby: usize,
     blocks: &[[i32; 64]; 6],
     dc_diff: &[i32; 6],
     dir: &[usize; 6],
     use_ac_pred: bool,
-    rl: &RlTable,
+    rl_intra: &RlTable,
     ac: &mut AcGrid,
 ) -> Result<()> {
     // ---- AC 预测：按 n = 0..5 走（块 1 要读块 0 刚存进去的值）----
@@ -348,17 +543,448 @@ fn write_mb(
         }
     }
 
-    // ---- 宏块头：MCBPC → ac_pred 位 → CBPY ----
-    write_mcbpc(w, cbp & 3)?;
+    // ---- 宏块头 ----
+    match flavour {
+        MbFlavour::IntraI => write_intra_mcbpc(w, cbp & 3)?,
+        MbFlavour::IntraP => {
+            w.put(0, 1); // mb coded
+            write_inter_mcbpc(w, (cbp & 3) + 4)?;
+        }
+    }
     w.put(u32::from(use_ac_pred), 1);
+    // 帧内的 CBPY **不取反**（只有帧间才 `^0xF`）。
     write_cbpy(w, cbp >> 2)?;
 
     // ---- 6 个块：每块先 DC 再 AC ----
     for n in 0..6 {
         write_dc(w, dc_diff[n], n < 4)?;
-        write_ac(w, rl, &work[n], scan[n])?;
+        write_ac(w, rl_intra, &work[n], scan[n], true)?;
     }
     Ok(())
+}
+
+/// 写一个 **P 帧里的帧间宏块**（不含 skip 那一位 —— 调用方先写 `mb_coded`）。
+///
+/// 顺序：`inter_MCBPC` → CBPY（取反）→ MV → 6 个块的 AC。
+/// **帧间没有 DC 这一趟**，6 个块都是「整块 64 个系数」。
+fn write_inter_mb(
+    w: &mut BitWriter,
+    cbp: usize,
+    mv: (i32, i32),
+    pred: (i32, i32),
+    blocks: &[[i32; 64]; 6],
+    rl_inter: &RlTable,
+) -> Result<()> {
+    write_inter_mcbpc(w, cbp & 3)?;
+    write_cbpy(w, (cbp >> 2) ^ 0xF)?;
+    write_motion(w, mv.0 - pred.0)?;
+    write_motion(w, mv.1 - pred.1)?;
+    for b in blocks {
+        write_ac(w, rl_inter, b, &ZIGZAG, false)?;
+    }
+    Ok(())
+}
+
+/// 帧间宏块的 cbp：**任一系数非零**（含 DC）就置位 —— 帧间没有单独的 DC 一趟。
+fn inter_cbp(blocks: &[[i32; 64]; 6]) -> usize {
+    let mut cbp = 0usize;
+    for (n, b) in blocks.iter().enumerate() {
+        if b.iter().any(|&v| v != 0) {
+            cbp |= 1 << (5 - n);
+        }
+    }
+    cbp
+}
+
+/// 帧内宏块：AC 预测的两种写法都写一遍，返回**位流更短的那条**与它的 `ac_pred` 值。
+///
+/// `ac` 网格两次调用留下的是同一份（存的是「预测前」的值），所以**不用回滚**。
+fn intra_try(
+    flavour: MbFlavour,
+    mbx: usize,
+    mby: usize,
+    blocks: &[[i32; 64]; 6],
+    dc_diff: &[i32; 6],
+    dir: &[usize; 6],
+    use_ac_pred: bool,
+    rl_intra: &RlTable,
+    ac: &mut AcGrid,
+) -> Result<(BitWriter, bool)> {
+    let mut plain = BitWriter::new();
+    write_mb(
+        &mut plain, flavour, mbx, mby, blocks, dc_diff, dir, false, rl_intra, ac,
+    )?;
+    if !use_ac_pred {
+        return Ok((plain, false));
+    }
+    let mut predicted = BitWriter::new();
+    write_mb(
+        &mut predicted,
+        flavour,
+        mbx,
+        mby,
+        blocks,
+        dc_diff,
+        dir,
+        true,
+        rl_intra,
+        ac,
+    )?;
+    if predicted.bit_pos() < plain.bit_pos() {
+        Ok((predicted, true))
+    } else {
+        Ok((plain, false))
+    }
+}
+
+// ───────────────────────── P 帧的逐宏块决策 ─────────────────────────
+
+/// P 帧编码的每帧状态。
+///
+/// 单独抽一个结构是为了把「哪些量在宏块之间累积」说清楚 ——
+/// DC / AC 网格、MV 网格、重建缓冲，三样都是逐宏块推进、跨宏块可见的。
+struct PState<'a> {
+    refp: &'a Planes,
+    /// 本帧的重建 —— 编完就是下一帧的参考。
+    cur: Planes,
+    sy: &'a [u8],
+    su: &'a [u8],
+    sv: &'a [u8],
+    pw: usize,
+    mb_w: usize,
+    mb_h: usize,
+    qmul: i32,
+    qadd: i32,
+    y_dc_scale: i32,
+    c_dc_scale: i32,
+    use_ac_pred: bool,
+    dc: DcGrid,
+    ac: AcGrid,
+    /// 每宏块一个 MV（只做 16×16 模式，亮度那 2×2 个格子填的是同一个值）。
+    mv: Vec<(i32, i32)>,
+    intra_mbs: usize,
+    rl_intra: &'a RlTable,
+    rl_inter: &'a RlTable,
+}
+
+impl PState<'_> {
+    /// H.263 的中值预测（`ff_h263_pred_motion` 的 16×16 一路）。
+    ///
+    /// 我们只做 16×16 的 MV，亮度那 2×2 个格子填的是同一个值 —— 于是：
+    /// `A` = 左宏块、`B` = 上宏块、`C` = **右上**宏块，取三者的中值。
+    ///
+    /// ⚠️ **首行的特例不能省**：`first_slice_line`（`mby == 0`）时没有上一行，
+    /// 此时预测值是 `mbx == 0 ? (0,0) : 左邻居`，**不是中值**。
+    fn mv_predict(&self, mbx: usize, mby: usize) -> (i32, i32) {
+        let at = |x: i64, y: i64| -> (i32, i32) {
+            if x < 0 || y < 0 || x >= self.mb_w as i64 || y >= self.mb_h as i64 {
+                // 帧外恒 (0,0)：ffmpeg 每帧开始把整张 motion_val 清零。
+                (0, 0)
+            } else {
+                self.mv[y as usize * self.mb_w + x as usize]
+            }
+        };
+        let a = at(mbx as i64 - 1, mby as i64);
+        if mby == 0 {
+            return if mbx == 0 { (0, 0) } else { a };
+        }
+        let b = at(mbx as i64, mby as i64 - 1);
+        let c = at(mbx as i64 + 1, mby as i64 - 1);
+        (mid_pred(a.0, b.0, c.0), mid_pred(a.1, b.1, c.1))
+    }
+
+    /// 运动估计：整像素粗搜（两个中心各 ±`ME_RANGE`）+ 半像素细化。
+    ///
+    /// 两个中心是 `(0,0)`（静止场景）与预测值（运动场景）。结果再夹进
+    /// `clamp_mv` 的可表示集合 —— 夹完的 MV 一定能被解码端原样还原。
+    fn motion_estimate(&self, mbx: usize, mby: usize, pred: (i32, i32)) -> (i32, i32) {
+        let (pw, ph) = (self.pw, self.refp.ph);
+        let refp = self.refp;
+        let mut cur = [0u8; 256];
+        for r in 0..16usize {
+            for c in 0..16usize {
+                cur[r * 16 + c] = self.sy[(mby * 16 + r) * self.pw + mbx * 16 + c];
+            }
+        }
+        let mut tmp = [0u8; 256];
+        let mut sad_of = |mv: (i32, i32)| -> u64 {
+            let p = mc_params(mbx, mby, mv, pw, ph);
+            mc_luma16(&mut tmp, 16, 0, 0, refp, &p, NO_ROUNDING);
+            let mut acc = 0u64;
+            for i in 0..256usize {
+                acc += (cur[i] as i32 - tmp[i] as i32).unsigned_abs() as u64;
+            }
+            acc
+        };
+
+        let mut best = (0i32, 0i32);
+        let mut best_sad = sad_of(best);
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(best);
+        for (cx, cy) in [(0i32, 0i32), pred] {
+            for dy in -ME_RANGE..=ME_RANGE {
+                for dx in -ME_RANGE..=ME_RANGE {
+                    let cand = (cx + dx, cy + dy);
+                    if !seen.insert(cand) {
+                        continue;
+                    }
+                    let s = sad_of(cand);
+                    if s < best_sad {
+                        best_sad = s;
+                        best = cand;
+                        if s == 0 {
+                            // 完全匹配，再搜也不会有更低的。
+                            return clamp_mv(best, pred);
+                        }
+                    }
+                }
+            }
+        }
+        // 半像素细化：最优整像素周围 ±1 个半像素。
+        let base = best;
+        for dy in -1..=1i32 {
+            for dx in -1..=1i32 {
+                let cand = (base.0 + dx, base.1 + dy);
+                let s = sad_of(cand);
+                if s < best_sad {
+                    best_sad = s;
+                    best = cand;
+                }
+            }
+        }
+        clamp_mv(best, pred)
+    }
+
+    /// 帧内候选：把当前帧的**原始像素**当 I 帧宏块编一遍。
+    ///
+    /// ⚠️ 它会**就地更新 DC 网格**（DC 预测本来就要写网格）—— 调用方必须先用
+    /// `snap` 拍快照，输了再 `restore`。
+    fn intra_candidate(
+        &mut self,
+        mbx: usize,
+        mby: usize,
+    ) -> Result<([[i32; 64]; 6], [i32; 6], [usize; 6], bool, BitWriter)> {
+        let mut blocks = [[0i32; 64]; 6];
+        for (n, slot) in blocks.iter_mut().enumerate() {
+            let (plane, stride, px, py) = block_at(self.sy, self.su, self.sv, self.pw, mbx, mby, n);
+            let mut coeff = [0i32; 64];
+            fdct(&plane[py * stride + px..], stride, &mut coeff);
+            quantize_block(
+                &mut coeff,
+                n,
+                self.qmul,
+                self.qadd,
+                self.y_dc_scale,
+                self.c_dc_scale,
+            );
+            *slot = coeff;
+        }
+        let mut dc_diff = [0i32; 6];
+        let mut dir = [0usize; 6];
+        for n in 0..6 {
+            let (pred_level, d) = self.dc.predict(n, mbx, mby);
+            dc_diff[n] = blocks[n][0] - pred_level;
+            dir[n] = d;
+            self.dc.update(blocks[n][0], n, mbx, mby);
+        }
+        let (best, ac_pred) = intra_try(
+            MbFlavour::IntraP,
+            mbx,
+            mby,
+            &blocks,
+            &dc_diff,
+            &dir,
+            self.use_ac_pred,
+            self.rl_intra,
+            &mut self.ac,
+        )?;
+        Ok((blocks, dc_diff, dir, ac_pred, best))
+    }
+
+    /// 一个 P 帧宏块：三条候选（skip / 帧间 / 帧内）比位数，赢的写进位流并重建。
+    fn mb(&mut self, w: &mut BitWriter, mbx: usize, mby: usize) -> Result<()> {
+        // ---------- 帧间候选 ----------
+        let pred = self.mv_predict(mbx, mby);
+        let mv = self.motion_estimate(mbx, mby, pred);
+        let p = mc_params(mbx, mby, mv, self.pw, self.refp.ph);
+        let mut pred16 = [0u8; 256];
+        mc_luma16(&mut pred16, 16, 0, 0, self.refp, &p, NO_ROUNDING);
+        let mut predu = [0u8; 64];
+        let mut predv = [0u8; 64];
+        mc_chroma8(&mut predu, 8, 0, 0, self.refp, 0, &p, NO_ROUNDING);
+        mc_chroma8(&mut predv, 8, 0, 0, self.refp, 1, &p, NO_ROUNDING);
+
+        let mut qb = [[0i32; 64]; 6];
+        for (n, slot) in qb.iter_mut().enumerate() {
+            let mut res = [0i32; 64];
+            if n < 4 {
+                let ox = mbx * 16 + (n & 1) * 8;
+                let oy = mby * 16 + (n >> 1) * 8;
+                for r in 0..8usize {
+                    for c in 0..8usize {
+                        res[r * 8 + c] = self.sy[(oy + r) * self.pw + ox + c] as i32
+                            - pred16[((n >> 1) * 8 + r) * 16 + (n & 1) * 8 + c] as i32;
+                    }
+                }
+            } else {
+                let cw = self.pw / 2;
+                let (plane, prd) = if n == 4 {
+                    (self.su, &predu)
+                } else {
+                    (self.sv, &predv)
+                };
+                for r in 0..8usize {
+                    for c in 0..8usize {
+                        res[r * 8 + c] =
+                            plane[(mby * 8 + r) * cw + mbx * 8 + c] as i32 - prd[r * 8 + c] as i32;
+                    }
+                }
+            }
+            let mut coef = [0i32; 64];
+            fdct_i(&res, 8, &mut coef);
+            for (k, v) in coef.iter().enumerate() {
+                slot[k] = quantize_ac(*v, self.qmul, self.qadd);
+            }
+        }
+        let cbp_i = inter_cbp(&qb);
+        let skip = mv == (0, 0) && cbp_i == 0;
+
+        let mut wi = BitWriter::new();
+        if skip {
+            // skip 宏块：一个 `1` 位搞定，MV 恒 (0,0)、没有残差。
+            wi.put(1, 1);
+        } else {
+            wi.put(0, 1); // mb coded
+            write_inter_mb(&mut wi, cbp_i, mv, pred, &qb, self.rl_inter)?;
+        }
+
+        // ---------- 帧内候选（会改 DC / AC 网格，先拍快照）----------
+        let dc_snap = self.dc.snap(mbx, mby);
+        let ac_snap = self.ac.snap(mbx, mby);
+        let (ib, idc_diff, idir, iac_pred, wi2) = self.intra_candidate(mbx, mby)?;
+
+        // ---------- 定胜负 ----------
+        if wi2.bit_pos() < wi.bit_pos() {
+            // 帧内赢了：DC / AC 网格保留（`intra_candidate` 已经写进去了）。
+            w.append(&wi2);
+            reconstruct_intra(
+                &mut self.cur,
+                mbx,
+                mby,
+                &ib,
+                self.qmul,
+                self.qadd,
+                self.y_dc_scale,
+                self.c_dc_scale,
+            );
+            // 帧内宏块在 MV 网格上留 (0,0) —— 与解码端一致（它不给帧内宏块写 motion_val）。
+            self.mv[mby * self.mb_w + mbx] = (0, 0);
+            self.intra_mbs += 1;
+            let _ = (idc_diff, idir, iac_pred);
+        } else {
+            // 帧间赢了：还原网格（= 清成 1024 / 0，等价于解码端的
+            // `ff_clean_intra_table_entries`）。
+            self.dc.restore(mbx, mby, &dc_snap);
+            self.ac.restore(mbx, mby, &ac_snap);
+            w.append(&wi);
+            if skip {
+                self.mv[mby * self.mb_w + mbx] = (0, 0);
+                mc_mb(&mut self.cur, self.refp, mbx, mby, (0, 0), NO_ROUNDING);
+            } else {
+                self.mv[mby * self.mb_w + mbx] = mv;
+                mc_mb(&mut self.cur, self.refp, mbx, mby, mv, NO_ROUNDING);
+                reconstruct_inter(&mut self.cur, mbx, mby, &qb, self.qmul, self.qadd);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 把 MV 夹进「解码端能原样还原」的集合：
+/// 既要 `MV_MIN <= mv <= MV_MAX`（**绝对** MV 会走 `sign_extend(.., 6)`），
+/// 又要 `|mv - pred| <= MV_DIFF_MAX`（**差分**走 `ff_mvtab`）。
+///
+/// 两个区间一定相交 —— `pred` 本身就在里面，所以 `clamp` 不会 panic。
+fn clamp_mv(mv: (i32, i32), pred: (i32, i32)) -> (i32, i32) {
+    let one = |v: i32, p: i32| -> i32 {
+        let lo = MV_MIN.max(p - MV_DIFF_MAX);
+        let hi = MV_MAX.min(p + MV_DIFF_MAX);
+        debug_assert!(lo <= hi, "MV 可行区间空了（pred={p}）");
+        v.clamp(lo, hi)
+    };
+    (one(mv.0, pred.0), one(mv.1, pred.1))
+}
+
+// ───────────────────────── 重建 ─────────────────────────
+
+/// 宏块里第 `n` 个块在重建缓冲上的 `(平面切片, 行距)` —— 切片从块的左上角开始。
+fn recon_at(cur: &mut Planes, n: usize, mbx: usize, mby: usize) -> (&mut [u8], usize) {
+    let pw = cur.pw;
+    let cw = pw / 2;
+    if n < 4 {
+        let px = mbx * 16 + (n & 1) * 8;
+        let py = mby * 16 + (n >> 1) * 8;
+        (&mut cur.y[py * pw + px..], pw)
+    } else if n == 4 {
+        (&mut cur.u[mby * 8 * cw + mbx * 8..], cw)
+    } else {
+        (&mut cur.v[mby * 8 * cw + mbx * 8..], cw)
+    }
+}
+
+/// 反量化（帧内 AC 与帧间通用）：`level > 0 → level*qmul + qadd`，反之减。
+fn dequant(level: i32, qmul: i32, qadd: i32) -> i16 {
+    if level > 0 {
+        (level * qmul + qadd) as i16
+    } else if level < 0 {
+        (level * qmul - qadd) as i16
+    } else {
+        0
+    }
+}
+
+/// 帧内宏块的重建：反量化后 `idct_put` **覆盖**。
+///
+/// ⚠️ 用的是**预测前**的 `blocks` —— 解码端会把 AC 预测加回来，还原出的正是它。
+fn reconstruct_intra(
+    cur: &mut Planes,
+    mbx: usize,
+    mby: usize,
+    blocks: &[[i32; 64]; 6],
+    qmul: i32,
+    qadd: i32,
+    y_dc_scale: i32,
+    c_dc_scale: i32,
+) {
+    for n in 0..6 {
+        let scale = if n < 4 { y_dc_scale } else { c_dc_scale };
+        let mut rb = [0i16; 64];
+        rb[0] = (blocks[n][0] * scale) as i16;
+        for k in 1..64 {
+            rb[k] = dequant(blocks[n][k], qmul, qadd);
+        }
+        let (plane, stride) = recon_at(cur, n, mbx, mby);
+        idct_put(&mut rb, plane, stride);
+    }
+}
+
+/// 帧间宏块的重建：`cur` 里已经铺好了 MC 预测，这里只把反量化后的残差叠上去。
+fn reconstruct_inter(
+    cur: &mut Planes,
+    mbx: usize,
+    mby: usize,
+    blocks: &[[i32; 64]; 6],
+    qmul: i32,
+    qadd: i32,
+) {
+    for n in 0..6 {
+        let mut rb = [0i16; 64];
+        for (k, slot) in rb.iter_mut().enumerate() {
+            *slot = dequant(blocks[n][k], qmul, qadd);
+        }
+        let (plane, stride) = recon_at(cur, n, mbx, mby);
+        idct_add(&mut rb, plane, stride);
+    }
 }
 
 /// 块在扫描序 `scan` 下有没有 AC 系数（扫描序下标 >= 1）。
@@ -487,11 +1113,37 @@ impl DcGrid {
     fn update(&mut self, level: i32, n: usize, mbx: usize, mby: usize) {
         let scale = if n < 4 { self.y_scale } else { self.c_scale };
         let v = (level * scale).clamp(0, 2047);
+        self.set(n, mbx, mby, v);
+    }
+
+    /// 直接写一个格子（`snap` / `restore` 用）。
+    fn set(&mut self, n: usize, mbx: usize, mby: usize, v: i32) {
         let (col, row) = cell_of(n, mbx, mby);
+        let (c, r) = (col as usize, row as usize);
         if n < 4 {
-            self.luma[row as usize * (2 * self.mb_w) + col as usize] = v;
+            self.luma[r * (2 * self.mb_w) + c] = v;
         } else {
-            self.chroma[n - 4][row as usize * self.mb_w + col as usize] = v;
+            self.chroma[n - 4][r * self.mb_w + c] = v;
+        }
+    }
+
+    /// 读本宏块自己的 6 个格子（亮度 4 + 色度 2）。
+    fn snap(&self, mbx: usize, mby: usize) -> [i32; 6] {
+        let mut out = [DC_NONE; 6];
+        for (n, slot) in out.iter_mut().enumerate() {
+            let (col, row) = cell_of(n, mbx, mby);
+            *slot = self.at(n, col, row);
+        }
+        out
+    }
+
+    /// 还原 `snap` 拍下的 6 个格子。
+    ///
+    /// 因为每个格子一帧里只被写一次，快照的值必然是初值 —— 也就是说「还原」等价于
+    /// 「清成 1024」，正是解码端 `ff_clean_intra_table_entries` 对**帧间宏块**做的事。
+    fn restore(&mut self, mbx: usize, mby: usize, snap: &[i32; 6]) {
+        for (n, &v) in snap.iter().enumerate() {
+            self.set(n, mbx, mby, v);
         }
     }
 }
@@ -560,6 +1212,24 @@ impl AcGrid {
             self.chroma[n - 4][row * self.mb_w + col] = v;
         }
     }
+
+    /// 读本宏块自己的 6 个格子（亮度 4 + 色度 2）。
+    fn snap(&self, mbx: usize, mby: usize) -> [AcVal; 6] {
+        let mut out = [[0i16; 16]; 6];
+        for (n, slot) in out.iter_mut().enumerate() {
+            let (col, row) = cell_of(n, mbx, mby);
+            *slot = self.get(n, col as usize, row as usize);
+        }
+        out
+    }
+
+    /// 还原 `snap` 拍下的 6 个格子（= 清成全 0，与解码端对帧间宏块做的一致）。
+    fn restore(&mut self, mbx: usize, mby: usize, snap: &[AcVal; 6]) {
+        for (n, &v) in snap.iter().enumerate() {
+            let (col, row) = cell_of(n, mbx, mby);
+            self.put(n, col as usize, row as usize, v);
+        }
+    }
 }
 
 /// `ff_mpeg4_pred_ac` 的编码侧：把邻居的首行/首列**减**掉。
@@ -594,17 +1264,27 @@ fn store_ac_val(ac: &mut AcGrid, n: usize, cell: (usize, usize), block: &[i32; 6
 
 /// 一个块的 AC：MPEG-4 的 RL 前缀码 + 三种 escape。
 ///
+/// `intra` 决定起点：帧内从扫描序**第 1 个**开始（下标 0 是 DC，走单独的 DC VLC）；
+/// 帧间从**第 0 个**开始（帧间没有 DC 这一趟，DC 就是普通 AC 系数）。
+///
 /// 与 MP43 的 `write_ac` **不是一回事**：MP43 的三种 escape 含义不同
 /// （第一 escape 补 level、第二 escape 补 run、第三 escape 明文 1+6+8 位）。
 /// 这里 ffmpeg 是预先算好一张「统一表」在 ESC0/ESC1/ESC2/ESC3 里挑最短的 ——
 /// 我们**在写的时候现算**同样的挑选，省掉那张 8192 项的表。
-fn write_ac(w: &mut BitWriter, rl: &RlTable, block: &[i32; 64], scan: &[u8; 64]) -> Result<()> {
-    // 帧内 DC 已经单独写过，AC 从扫描序第 1 个开始。
-    let Some(last_index) = (1..64).rev().find(|&i| block[scan[i] as usize] != 0) else {
+fn write_ac(
+    w: &mut BitWriter,
+    rl: &RlTable,
+    block: &[i32; 64],
+    scan: &[u8; 64],
+    intra: bool,
+) -> Result<()> {
+    let start = if intra { 1 } else { 0 };
+    let Some(last_index) = (start..64).rev().find(|&i| block[scan[i] as usize] != 0) else {
         return Ok(());
     };
-    let mut last_non_zero: i32 = 0;
-    for i in 1..=last_index {
+    // `last_non_zero` 初值 = 「起点之前那一个」：帧内是 0（DC），帧间是 -1。
+    let mut last_non_zero: i32 = start as i32 - 1;
+    for i in start..=last_index {
         let level = block[scan[i] as usize];
         if level == 0 {
             continue;
@@ -731,9 +1411,9 @@ fn bit_length(v: u32) -> u32 {
     }
 }
 
-/// I 宏块的 MCBPC：低 2 位是色度 CBP，第 3 位（值 4）表示「本宏块带 dquant」。
-/// 全 I 帧不做 dquant，所以只用 0..=3。
-fn write_mcbpc(w: &mut BitWriter, cbpc: usize) -> Result<()> {
+/// I 宏块（以及 P 帧里的帧内宏块）的 MCBPC：低 2 位是色度 CBP，
+/// 第 3 位（值 4）表示「本宏块带 dquant」。不做 dquant，所以只用 0..=3。
+fn write_intra_mcbpc(w: &mut BitWriter, cbpc: usize) -> Result<()> {
     let code = *tables::INTRA_MCBPC_CODE
         .get(cbpc)
         .ok_or(Error::Bad("cbpc 越界"))?;
@@ -744,14 +1424,73 @@ fn write_mcbpc(w: &mut BitWriter, cbpc: usize) -> Result<()> {
     Ok(())
 }
 
+/// P 帧的 28 项 MCBPC。索引的含义见 `tables.rs` 里那段注释：
+/// `0..3` 帧间、`4..7` 帧内、`8..15` 带 dquant、`16..19` 8×8 MV、`20..23` stuffing。
+fn write_inter_mcbpc(w: &mut BitWriter, cbpc: usize) -> Result<()> {
+    let code = *tables::INTER_MCBPC_CODE
+        .get(cbpc)
+        .ok_or(Error::Bad("P 帧 cbpc 越界"))?;
+    let bits = *tables::INTER_MCBPC_BITS
+        .get(cbpc)
+        .ok_or(Error::Bad("P 帧 cbpc 越界"))?;
+    // stuffing 那 4 项码长是 0 —— 写进去等于没写，位流会静默错位。
+    if bits == 0 {
+        return Err(Error::Bad("P 帧 cbpc 落到了 stuffing 项"));
+    }
+    w.put(u32::from(code), u32::from(bits));
+    Ok(())
+}
+
 /// CBPY：`ff_h263_cbpy_tab[cbpy] = (code, len)`。
 ///
-/// ⚠️ **不做取反**。H.263P 与 MPEG-4 的 **P** 帧要 `cbpy ^ 0xF`，
-/// 但 MPEG-4 的 **I** 帧是直取（`mpeg4_decode_mb`：`cbp = (cbpc & 3) | (cbpy << 2)`）。
+/// ⚠️ **取不取反由帧类型决定**，这是最容易抄错的一处：
+/// - MPEG-4 的 **I 帧** 与 **P 帧里的帧内宏块**：直取；
+/// - MPEG-4 的 **帧间宏块**：`cbpy ^ 0xF`（`mpeg4_decode_mb` 帧间分支就是 `get_vlc2(...) ^ 0x0F`）。
+///
+/// 取反在调用方做（`write_mb` / `write_inter_mb`），这里只管查表。
 fn write_cbpy(w: &mut BitWriter, cbpy: usize) -> Result<()> {
     let e = tables::CBPY.get(cbpy).ok_or(Error::Bad("cbpy 越界"))?;
     w.put(u32::from(e[0]), u32::from(e[1]));
     Ok(())
+}
+
+/// 一个 MV 分量（`ff_h263_encode_motion`）。
+///
+/// 位流形状：`ff_mvtab[code]` + 符号位 + `bit_size` 个低位；`val == 0` 时只写一个 `1` 位。
+/// `code` 是**绝对值的量化档**而不是矢量本身 ——
+/// 解码端 `val = (code - 1) << bit_size` 再补低位、读符号，所以 `code = (|d| - 1) >> bit_size + 1`。
+///
+/// 我们恒用 `f_code = 1` → `bit_size = 0`，于是 `code = |d|`、不写低位。
+fn write_motion(w: &mut BitWriter, d: i32) -> Result<()> {
+    if d == 0 {
+        // 零矢量就是 `ff_mvtab[0]`：一个 `1` 位，后面没有符号位也没有低位。
+        w.put(1, 1);
+        return Ok(());
+    }
+    let bit_size = u32::from(F_CODE) - 1;
+    let range = 1i32 << bit_size;
+    // 模 `2^(6 + bit_size)` 回绕 —— 与解码端对**重建后的绝对 MV** 做的那次
+    // `sign_extend(val, 5 + f_code)` 是同一个模数（5 + f_code == 6 + bit_size）。
+    let d = sign_extend(d, 6 + bit_size);
+    let sign = u32::from(d < 0);
+    let mag = d.unsigned_abs() - 1;
+    let code = (mag >> bit_size) + 1;
+    let low = mag & (range as u32 - 1);
+    let (c, len) = tables::MV_TAB
+        .get(code as usize)
+        .map(|e| (e[0], e[1]))
+        .ok_or(Error::Bad("MV 超出 ff_mvtab 能表示的范围"))?;
+    w.put((u32::from(c) << 1) | sign, u32::from(len) + 1);
+    if bit_size > 0 {
+        w.put(low, bit_size);
+    }
+    Ok(())
+}
+
+/// 按 `bits` 位做符号扩展（`ffmpeg` 的 `sign_extend`）。
+fn sign_extend(x: i32, bits: u32) -> i32 {
+    let m = 1i32 << (bits - 1);
+    ((x & ((1 << bits) - 1)) ^ m) - m
 }
 
 // ───────────────────────── 像素搬运 ─────────────────────────

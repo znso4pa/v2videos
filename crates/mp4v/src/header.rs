@@ -160,29 +160,48 @@ pub fn write_user_data(w: &mut BitWriter, s: &str) {
     }
 }
 
+/// 帧类型 —— 只做 I 与 P。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VopKind {
+    I,
+    P,
+}
+
 /// VOP 头要写的东西。
 #[derive(Debug, Clone, Copy)]
 pub struct VopParams {
+    pub kind: VopKind,
     /// 本帧在时间基里的余数（`frame_index % fps_num`）。
     pub time_mod: u32,
     /// 时间基回绕了多少次（`frame_index / fps_num` 的增量）。每个 `1` 位算一次。
     pub time_incr: u32,
     pub time_increment_bits: u32,
     pub qscale: u8,
+    /// **只对 P 帧有效**：半像素舍入方式。0 = 四舍五入（`+r1/r2`），1 = 截断。
+    /// 必须与运动补偿用的口径一致，否则编码器的重建会和解码器差半个像素。
+    pub no_rounding: bool,
+    /// **只对 P 帧有效**：运动矢量的 `f_code`（1..=7）。
+    ///
+    /// 它决定两件事：MV 差分的可表示范围（`±(2^(4+f_code) - 1)`）与**每个分量多写
+    /// `f_code - 1` 个低位**。取 1 时范围是 `±31`（半像素单位），且不写低位 ——
+    /// 我们的运动估计把差分夹在 `±31` 内，所以恒取 1。
+    pub f_code: u8,
 }
 
 /// 一个 **I** 帧的 VOP 头（不含宏块数据）。
-///
-/// 只做 I 帧，所以省掉了 P 帧的 `no_rounding` / `f_code`。
 pub fn write_vop_header(w: &mut BitWriter, p: &VopParams) {
     assert!((1..=31).contains(&p.qscale), "qscale 是 5 位，1..=31");
     assert!(
         p.time_mod < (1 << p.time_increment_bits),
         "time_mod 超出 time_increment_bits 能表示的范围"
     );
+    if p.kind == VopKind::P {
+        assert!((1..=7).contains(&p.f_code), "f_code 是 3 位，1..=7");
+    }
 
     w.put(VOP_STARTCODE, 32);
-    w.put(0, 2); // pict_type - 1 = 0 → I 帧
+    // `pict_type - 1`：I = 0，P = 1。
+    w.put(u32::from(p.kind == VopKind::P), 2);
 
     // 时间基回绕：每回绕一次补一个 1 位。
     for _ in 0..p.time_incr {
@@ -195,6 +214,11 @@ pub fn write_vop_header(w: &mut BitWriter, p: &VopParams) {
     w.put(1, 1); // marker
     w.put(1, 1); // vop_coded = 1
 
+    // 只有 P 帧有这一位。
+    if p.kind == VopKind::P {
+        w.put(u32::from(p.no_rounding), 1);
+    }
+
     // intra_dc_vlc_threshold：3 位**索引**，不是阈值本身。
     // 解码端 `intra_dc_threshold = ff_mpeg4_dc_threshold[bits]`，索引 0 → 99；
     // 而 `use_intra_dc_vlc = qscale < intra_dc_threshold`，qscale 最大 31 < 99，
@@ -203,6 +227,11 @@ pub fn write_vop_header(w: &mut BitWriter, p: &VopParams) {
     w.put(0, 3);
 
     w.put(u32::from(p.qscale), 5);
+
+    // 只有 P 帧有 `f_code`。
+    if p.kind == VopKind::P {
+        w.put(u32::from(p.f_code), 3);
+    }
 }
 
 #[cfg(test)]
