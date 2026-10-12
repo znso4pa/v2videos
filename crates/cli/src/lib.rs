@@ -4,8 +4,8 @@
 //!
 //! ## 现状
 //!
-//! - 输入：ASF（`.wmv`）里的 **MP43** 视频轨。别的 codec / 容器会明确报
-//!   `Unsupported`，不猜、不静默跳过。
+//! - 输入：**ASF（`.wmv`）/ AVI（`.avi`）** 里的 **MP43** 视频轨 —— 容器按魔数自动认。
+//!   别的容器 / codec 会明确报 `Unsupported`，不猜、不静默跳过。
 //! - 输出：**MP43 in ASF**（`.wmv`）。
 //! - 音频轨：目前**不搬**（WMA 解/编还没做），转换时跳过并计数，报告里说清楚。
 
@@ -14,6 +14,8 @@ use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 pub use v2v_asf::{AsfDemuxer, AsfMuxer, StreamKind, VideoStreamInfo};
+pub use v2v_avi::AviDemuxer;
+pub use v2v_container::Sample;
 pub use v2v_msmpeg4::{Decoder, Encoder, EncoderConfig, Frame};
 
 /// MP43 的 FourCC（本工具唯一的输出编码）。
@@ -64,6 +66,7 @@ pub enum Error {
     Io(std::io::Error),
     Asf(v2v_asf::Error),
     Msmpeg4(v2v_msmpeg4::Error),
+    Avi(v2v_avi::Error),
     Unsupported(String),
 }
 
@@ -73,6 +76,7 @@ impl std::fmt::Display for Error {
             Error::Io(e) => write!(f, "IO 错误：{e}"),
             Error::Asf(e) => write!(f, "容器错误：{e}"),
             Error::Msmpeg4(e) => write!(f, "编解码错误：{e}"),
+            Error::Avi(e) => write!(f, "AVI 错误：{e}"),
             Error::Unsupported(s) => write!(f, "不支持：{s}"),
         }
     }
@@ -95,6 +99,68 @@ impl From<v2v_msmpeg4::Error> for Error {
         Error::Msmpeg4(e)
     }
 }
+impl From<v2v_avi::Error> for Error {
+    fn from(e: v2v_avi::Error) -> Self {
+        Error::Avi(e)
+    }
+}
+
+/// 「能吐视频样本的东西」—— ASF / AVI 解封装器都实现它。
+///
+/// 存在的理由：转码管线只关心「视频流是谁、多大、什么 codec」和「下一个样本」，
+/// 不该为每种容器写一份管线。加容器 = 加一个实现，管线不动。
+trait VideoSource {
+    /// `(流号, 宽, 高, fourcc)`；没有视频轨就 `None`。
+    fn video_stream(&self) -> Option<(u8, u32, u32, u32)>;
+    fn next(&mut self) -> Result<Option<Sample>, Error>;
+}
+
+struct AsfSource(v2v_asf::AsfDemuxer<BufReader<File>>);
+
+impl VideoSource for AsfSource {
+    fn video_stream(&self) -> Option<(u8, u32, u32, u32)> {
+        let v = self.0.streams().iter().find(|s| s.kind == StreamKind::Video)?;
+        let vf = v.video.as_ref()?;
+        Some((v.number, vf.width, vf.height, vf.fourcc))
+    }
+    fn next(&mut self) -> Result<Option<Sample>, Error> {
+        Ok(self.0.next_sample()?)
+    }
+}
+
+struct AviSource(v2v_avi::AviDemuxer<BufReader<File>>);
+
+impl VideoSource for AviSource {
+    fn video_stream(&self) -> Option<(u8, u32, u32, u32)> {
+        let v = self.0.streams().iter().find(|s| s.kind == StreamKind::Video)?;
+        let vf = v.video.as_ref()?;
+        Some((v.number, vf.width, vf.height, vf.fourcc))
+    }
+    fn next(&mut self) -> Result<Option<Sample>, Error> {
+        Ok(self.0.next_sample()?)
+    }
+}
+
+/// 按**魔数**选解封装器（不看扩展名 —— 扩展名会骗人，字节不会）。
+fn open_source(path: &Path) -> Result<Box<dyn VideoSource>, Error> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut f = BufReader::new(File::open(path)?);
+    let mut head = [0u8; 16];
+    let n = f.read(&mut head)?;
+    // ⚠️ 探测读掉了开头 16 字节，必须倒回去 —— 解封装器都假设自己从 0 开始读。
+    f.seek(SeekFrom::Start(0))?;
+
+    if v2v_avi::is_avi(&head[..n]) {
+        return Ok(Box::new(AviSource(v2v_avi::AviDemuxer::new(f)?)));
+    }
+    if v2v_asf::is_asf(&head[..n]) {
+        return Ok(Box::new(AsfSource(v2v_asf::AsfDemuxer::new(f)?)));
+    }
+    Err(Error::Unsupported(
+        "认不出容器（目前支持 ASF/.wmv 与 AVI/.avi）".into(),
+    ))
+}
 
 /// 把一个文件转成 `.wmv`（MP43 in ASF）。
 ///
@@ -109,21 +175,12 @@ pub fn convert_file(
     }
     let bytes_in = std::fs::metadata(input)?.len();
 
-    let mut demux = AsfDemuxer::new(BufReader::new(File::open(input)?))?;
+    let mut demux = open_source(input)?;
 
     // ---- 找视频轨；只认 MP43 ----
-    let (vnum, w, h, fourcc) = {
-        let v = demux
-            .streams()
-            .iter()
-            .find(|s| s.kind == StreamKind::Video)
-            .ok_or_else(|| Error::Unsupported("文件里没有视频轨".into()))?;
-        let vf = v
-            .video
-            .as_ref()
-            .ok_or_else(|| Error::Unsupported("视频轨没有格式信息".into()))?;
-        (v.number, vf.width, vf.height, vf.fourcc)
-    };
+    let (vnum, w, h, fourcc) = demux
+        .video_stream()
+        .ok_or_else(|| Error::Unsupported("文件里没有视频轨（或没有格式信息）".into()))?;
     if fourcc != MP43 {
         return Err(Error::Unsupported(format!(
             "输入视频是 {}，本工具目前只解 MP43",
@@ -151,7 +208,7 @@ pub fn convert_file(
     let mut sq_err = 0f64;
     let mut n_px = 0u64;
 
-    while let Some(s) = demux.next_sample()? {
+    while let Some(s) = demux.next()? {
         if s.stream != vnum {
             skipped_audio += 1;
             continue;

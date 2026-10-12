@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/asf", "crates/msmpeg4", "crates/cli"]
+members = ["crates/container", "crates/asf", "crates/avi", "crates/msmpeg4", "crates/cli"]
 resolver = "2"
 
 [workspace.package]

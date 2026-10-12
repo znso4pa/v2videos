@@ -324,3 +324,157 @@ fn converts_real_sample_and_ffmpeg_agrees() {
     eprintln!("真样本闭环：{n} 帧逐位一致（{w}×{h}）");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------- AVI 输入 ----------
+
+/// 把若干帧裸 MP43 包成一个最小 AVI（自包含：不依赖 ffmpeg）。
+/// 结构：`RIFF/AVI ` + `LIST hdrl`（avih + strl{strh, strf}）+ `LIST movi`（`00dc` 块）+ `idx1`。
+fn wrap_avi(frames: &[&[u8]], w: u32, h: u32, key_first: bool) -> Vec<u8> {
+    fn u32le(v: &mut Vec<u8>, x: u32) {
+        v.extend_from_slice(&x.to_le_bytes());
+    }
+    fn u16le(v: &mut Vec<u8>, x: u16) {
+        v.extend_from_slice(&x.to_le_bytes());
+    }
+    fn chunk(id: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(id);
+        u32le(&mut v, body.len() as u32);
+        v.extend_from_slice(body);
+        if body.len() % 2 == 1 {
+            v.push(0);
+        }
+        v
+    }
+    fn list(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut inner = Vec::new();
+        inner.extend_from_slice(kind);
+        inner.extend_from_slice(body);
+        chunk(b"LIST", &inner)
+    }
+
+    let mut avih = Vec::new();
+    u32le(&mut avih, 33333);
+    u32le(&mut avih, 0);
+    u32le(&mut avih, 0);
+    u32le(&mut avih, 0x10);
+    u32le(&mut avih, frames.len() as u32);
+    u32le(&mut avih, 0);
+    u32le(&mut avih, 1);
+    u32le(&mut avih, 0);
+    u32le(&mut avih, w);
+    u32le(&mut avih, h);
+    for _ in 0..4 {
+        u32le(&mut avih, 0);
+    }
+
+    let mut strh = Vec::new();
+    strh.extend_from_slice(b"vids");
+    strh.extend_from_slice(b"MP43");
+    u32le(&mut strh, 0);
+    u16le(&mut strh, 0);
+    u16le(&mut strh, 0);
+    u32le(&mut strh, 0);
+    u32le(&mut strh, 1); // scale
+    u32le(&mut strh, 30); // rate
+    u32le(&mut strh, 0);
+    u32le(&mut strh, frames.len() as u32);
+    u32le(&mut strh, 0);
+    u32le(&mut strh, 0xFFFF_FFFF);
+    u32le(&mut strh, 0);
+    for _ in 0..4 {
+        u16le(&mut strh, 0);
+    }
+
+    let mut strf = Vec::new();
+    u32le(&mut strf, 40);
+    u32le(&mut strf, w);
+    u32le(&mut strf, h);
+    u16le(&mut strf, 1);
+    u16le(&mut strf, 24);
+    strf.extend_from_slice(b"MP43");
+    u32le(&mut strf, w * h * 3);
+    for _ in 0..4 {
+        u32le(&mut strf, 0);
+    }
+
+    let strl = list(b"strl", &[chunk(b"strh", &strh), chunk(b"strf", &strf)].concat());
+    let hdrl = list(b"hdrl", &[chunk(b"avih", &avih), strl].concat());
+
+    let mut movi_body = Vec::new();
+    let mut offsets = Vec::new();
+    for f in frames {
+        offsets.push(movi_body.len() as u32);
+        movi_body.extend_from_slice(&chunk(b"00dc", f));
+    }
+    let movi = list(b"movi", &movi_body);
+
+    let mut idx1 = Vec::new();
+    for (i, f) in frames.iter().enumerate() {
+        idx1.extend_from_slice(b"00dc");
+        u32le(&mut idx1, if i == 0 && key_first { 0x10 } else { 0 });
+        // 偏移相对 `movi` 四字（= 列表数据体 - 4），与 ffmpeg 的写法一致
+        u32le(&mut idx1, offsets[i] + 4);
+        u32le(&mut idx1, f.len() as u32);
+    }
+    let idx1 = chunk(b"idx1", &idx1);
+
+    let body = [hdrl, movi, idx1].concat();
+    let mut out = Vec::new();
+    out.extend_from_slice(b"RIFF");
+    u32le(&mut out, (body.len() + 4) as u32);
+    out.extend_from_slice(b"AVI ");
+    out.extend_from_slice(&body);
+    out
+}
+
+/// **AVI 输入**：把我们自己编的 MP43 帧包成 AVI，转成 WMV —— 输出要能被自己读回、
+/// 帧数与内容都对得上。容器按**魔数**自动认（不看扩展名）。
+#[test]
+fn converts_avi_input() {
+    let dir = temp_dir("avi_in");
+    let (w, h) = (160u32, 128u32);
+    let frames = moving_sequence(w, h, 5);
+
+    // 先编出裸 MP43 帧
+    let mut enc = Encoder::new(EncoderConfig {
+        qscale: 4,
+        ..Default::default()
+    });
+    let mut streams = Vec::new();
+    for f in &frames {
+        streams.push(enc.encode_frame(f).expect("编码"));
+    }
+
+    // 包成 AVI，故意用 `.bin` 后缀 —— 逼着它按魔数认容器
+    let avi = wrap_avi(
+        &streams.iter().map(|s| s.as_slice()).collect::<Vec<_>>(),
+        w,
+        h,
+        true,
+    );
+    let input = dir.join("input.bin");
+    std::fs::write(&input, &avi).expect("写 AVI");
+
+    let output = dir.join("out.wmv");
+    let opts = ConvertOptions {
+        qscale: 6,
+        keyframe_interval: 0,
+        verify: true,
+        max_frames: None,
+    };
+    let rep = convert_file(&input, &output, &opts).expect("转 AVI");
+    eprintln!("AVI → WMV：{rep:?}");
+    assert_eq!(rep.frames, 5, "AVI 里的帧数不对");
+    assert_eq!(rep.key_frames, 1, "只有首帧是关键帧");
+    assert!(rep.psnr_db.unwrap() > 25.0, "画质太差");
+
+    // 输出仍是我们自己的 ASF，能读回
+    let mut d = AsfDemuxer::new(std::fs::File::open(&output).expect("开")).expect("解输出");
+    let mut n = 0usize;
+    while d.next_sample().expect("读").is_some() {
+        n += 1;
+    }
+    assert_eq!(n, 5);
+    let _ = std::fs::remove_dir_all(&dir);
+}

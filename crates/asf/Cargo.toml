@@ -6,4 +6,5 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-# 无。纯 std。
+# 容器无关的共用类型（流 / 样本 / 格式）。
+v2v-container = { path = "../container" }

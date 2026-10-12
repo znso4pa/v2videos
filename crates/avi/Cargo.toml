@@ -1,0 +1,14 @@
+[package]
+name = "v2v-avi"
+description = "纯 Rust 的 AVI（RIFF）解封装 —— 无 C、无 FFI、零依赖"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dev-dependencies]
+# 同流异容器对账要用 ASF 解封装器。
+v2v-asf = { path = "../asf" }
+
+[dependencies]
+# 容器无关的共用类型（流 / 样本 / 格式）。
+v2v-container = { path = "../container" }

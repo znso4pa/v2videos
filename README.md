@@ -21,7 +21,9 @@
 
 ```text
 crates/
-  asf      ASF（.wmv / .wma）解封装 + **封装** —— 纯 std、零依赖
+  container 各容器共用的数据模型（流 / 格式 / 样本）—— 零依赖
+  asf      ASF（.wmv / .wma）解封装 + **封装** —— 纯 std
+  avi      AVI（RIFF）解封装
   msmpeg4  MS-MPEG-4 v3（MP43）解码（I / P）+ 编码（I / P，含运动估计与帧内/帧间判决）
   cli      `v2v` 命令行：**批量转码**（解封装 → 解码 → 编码 → 封装）
 tools/
@@ -67,7 +69,8 @@ cargo run --release -p v2v-cli -- convert <输入.wmv>... -o <输出目录> [-q 
 ```
 
 批量：一个输入失败不影响其他；默认转完会把输出**解码回来**与源帧比 PSNR。
-输入目前只支持 ASF 里的 MP43 视频轨（别的 codec 会明确报「不支持」，不静默跳过）。
+输入容器按**魔数**自动认（`ASF` / `AVI`，不看扩展名），视频轨目前只支持 **MP43**；
+别的容器 / codec 会明确报「不支持」，不静默跳过。
 
 ## 许可证
 

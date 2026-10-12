@@ -1,0 +1,9 @@
+[package]
+name = "v2v-container"
+description = "v2video 各容器解封装器共用的数据模型（流、格式、样本）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# 无。纯 std。

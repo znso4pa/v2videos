@@ -50,6 +50,11 @@ use types::PayloadExt;
 /// 一帧 payload 头的最小长度。
 const FRAME_HEADER_SIZE: i64 = 6;
 
+/// 按魔数判断是不是 ASF（给「自动选解封装器」用）。
+pub fn is_asf(head: &[u8]) -> bool {
+    head.len() >= 16 && head[..16] == guid::HEADER
+}
+
 /// 每条流的重组状态。
 struct StreamState {
     /// 正在拼装的样本缓冲（长度 = `packet_obj_size`）。

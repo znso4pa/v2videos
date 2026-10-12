@@ -11,4 +11,6 @@ path = "src/main.rs"
 
 [dependencies]
 v2v-asf = { path = "../asf" }
+v2v-avi = { path = "../avi" }
+v2v-container = { path = "../container" }
 v2v-msmpeg4 = { path = "../msmpeg4" }
