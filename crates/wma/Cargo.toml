@@ -1,0 +1,13 @@
+[package]
+name = "v2v-wma"
+description = "纯 Rust 的 WMA（v1/v2）解码 —— 无 C、无 FFI、零依赖"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# 无。纯 std。
+
+[dev-dependencies]
+# 集成测试要拿真样本的音频载荷（经 ASF 解封装）。
+v2v-asf = { path = "../asf" }
