@@ -146,8 +146,13 @@ pub struct Encoder {
     frame_index: u64,
     /// 每个频带的边界（含末尾），长 `num_sfb + 1`。
     swb: Vec<u16>,
-    /// λ（失真 → 位数的换算）。按 `bitrate` 与采样率估出来，一帧内固定。
-    lambda: f32,
+    /// 每帧的**位数预算**（`bitrate / 帧率 / 声道数`）。
+    ///
+    /// ⚠️ 用「预算 + 二分搜偏移」而不是「λ 权重」——
+    /// λ 那条路我试过：`λ ≈ 1e-4` 而失真项 `≈ 1e9`，λ 被完全淹没、等于不起作用，
+    /// 实测码率 432 kbps（目标是 128k，差 3.4 倍）。
+    /// 位数预算是个**硬约束**，二分搜能保证逼近它 —— 见 `encode_channel` 的说明。
+    bits_per_frame: u32,
 }
 
 impl Encoder {
@@ -172,19 +177,18 @@ impl Encoder {
             sine_window(LONG_LEN)
         };
 
-        // λ：把「量化失真」换成「位数」。粗略标定 ——
-        // 一帧的位数预算 ≈ `bitrate / (sample_rate / 1024)`，失真与 λ 的乘积要能
-        // 与位数同量级。常数是实测调出来的（见 `lambda_is_in_a_sane_range` 测试）。
-        let frames_per_sec = cfg.sample_rate as f32 / LONG_LEN as f32;
-        let bits_per_frame = cfg.bitrate as f32 / frames_per_sec / cfg.channels as f32;
-        let lambda = 1.0 / (bits_per_frame.max(1.0) * 64.0);
+        // 每帧的位数预算。`bitrate` 是**目标**不是保证 —— 编码器靠
+        // 「二分搜整帧 sf 偏移」逼近它（见 `encode_channel`）。
+        let frames_per_sec = f64::from(cfg.sample_rate) / LONG_LEN as f64;
+        let bits_per_frame =
+            (f64::from(cfg.bitrate) / frames_per_sec / f64::from(cfg.channels)).max(1.0);
 
         Ok(Self {
             overlap: vec![vec![0f32; LONG_LEN]; cfg.channels as usize],
             window,
             frame_index: 0,
             swb,
-            lambda,
+            bits_per_frame: bits_per_frame as u32,
             cfg,
         })
     }
@@ -258,7 +262,164 @@ impl Encoder {
         Ok(w.finish())
     }
 
+    /// **编一「趟」**：给定整帧 `sf_offset`，选出逐带 sf/码本、写出一条完整的
+    /// 通道元素位流（含 `global_gain` / `ics_info` / `section_data` /
+    /// `scalefactor_data` / 谱系数），返回 `(字节, 位数)`。
+    ///
+    /// ## 为什么要有「趟」这个概念
+    ///
+    /// `bitrate` 是个**硬预算**，而 sf 与位数是单调关系：
+    /// **偏移越大 → 量化越粗 → 位数越少、失真越大**。
+    /// 于是外层（`encode_channel`）二分搜「位数刚好不超过预算的最小偏移」，
+    /// 就是在「码率不超标」的前提下拿到最好的音质。
+    ///
+    /// ⚠️ 这条路的**每一趟都必须自己把位流写全**，不能只算位数 ——
+    /// 因为选中的那一趟要直接作为输出。只算位数、最后再编一次的做法，
+    /// 会让「算出来的位数」与「真正写出的位数」在两个不同的代码路径上，
+    /// 一旦不一致（我踩过：`band_cost` 与 `write_band` 的 escape 计数写法不同），
+    /// 预算就形同虚设。**同一条路径既算又写**是这里刻意选的。
+    ///
+    /// `sf_floor` 是整帧 sf 的下界（不把峰值裁到 `MAX_QUANT` 之上）。
+    fn encode_pass(
+        &self,
+        spec: &[f32],
+        sf_floor: i32,
+        sf_offset: i32,
+    ) -> crate::Result<(BitWriter, u32)> {
+        let max_sfb = self.num_sfb();
+        // ⚠️ `band_sf` 就是要写进位流、且**与 `global_gain` 同域**（0..255）的那个值。
+        // 解码端解出来的 `sfo = band_sf − 100` —— 那个 100 只在解码端出现一次。
+        let mut band_sf = vec![0i32; max_sfb];
+        let mut band_cb = vec![0u8; max_sfb];
+        let mut band_zero = vec![false; max_sfb];
+
+        // ⚠️ **先选 sf、再写位流** —— 不先写再回填。
+        //
+        // 因为 `global_gain` **就是第一个非零带的 sf**（`rusty_aac::global_gain` 逐字如此），
+        // 而它写在最前面。若先写占位再回填，就得有位级 patch 的能力；
+        // 把「选」与「写」分开就没有这个问题，而且更省（不用回填）。
+        let mut prev_sf: Option<i32> = None;
+        for sfb in 0..max_sfb {
+            let lo = self.swb[sfb] as usize;
+            let hi = self.swb[sfb + 1] as usize;
+            let band = &spec[lo..hi];
+
+            // 搜索窗口 = 「整帧下界 + 偏移」∩「差分约束 ±60」∩ `0..=255`。
+            //
+            // ⚠️ 三个都必要：下界保证峰值不被裁；差分约束是位流硬要求；
+            // `0..=255` 是 `sf` 自己的位宽。**偏移只抬下界** ——
+            // 若把上界也压低，会挡住「该带本来想用更粗的 sf」的合法选择。
+            let floor = (sf_floor + sf_offset).clamp(0, 255);
+            let (lo_sf, hi_sf) = match prev_sf {
+                Some(p) => (
+                    floor.max(p - SCALE_MAX_DIFF).clamp(0, 255),
+                    (p + SCALE_MAX_DIFF).clamp(0, 255),
+                ),
+                None => (floor, 255),
+            };
+            if lo_sf > hi_sf {
+                // 窗口空了（极少见）：退化成「贴着上一个带」，至少位流合法。
+                let sf = prev_sf.unwrap_or(floor).clamp(0, 255);
+                band_sf[sfb] = sf;
+                band_cb[sfb] = 0;
+                band_zero[sfb] = true;
+                prev_sf = None;
+                continue;
+            }
+
+            // 逐带找「失真最小」的 sf（λ 项已去掉 —— 见本函数的说明，
+            // 码率由外层二分控，代价函数只管保真）。
+            let mut best: Option<(f32, u8, u8)> = None; // (代价, sf, cb)
+            let step = 4.max((hi_sf - lo_sf) / 24);
+            let mut cand: Vec<i32> = Vec::new();
+            let mut sd = lo_sf;
+            while sd <= hi_sf {
+                cand.push(sd);
+                sd += step;
+            }
+            for &sf in &cand {
+                let (cost, cb) = band_cost(band, sf as u8);
+                if best.is_none_or(|(bc, _, _)| cost < bc) {
+                    best = Some((cost, sf as u8, cb));
+                }
+            }
+            // 在最优附近再细扫 ±3（步长 1），避免粗扫步长漏掉最优点。
+            if let Some((_, sf0, _)) = best {
+                for sf in (i32::from(sf0) - 3).max(lo_sf)..=(i32::from(sf0) + 3).min(hi_sf) {
+                    let (cost, cb) = band_cost(band, sf as u8);
+                    if best.is_none_or(|(bc, _, _)| cost < bc) {
+                        best = Some((cost, sf as u8, cb));
+                    }
+                }
+            }
+
+            let (_, sf, cb) = best.expect("候选集非空");
+            band_sf[sfb] = i32::from(sf);
+            band_cb[sfb] = cb;
+            band_zero[sfb] = cb == 0 || band_is_zero(band, sf);
+            if !band_zero[sfb] {
+                prev_sf = Some(i32::from(sf));
+            }
+        }
+
+        // ---- 写位流 ----
+        //
+        // `global_gain` = 第一个非零带的 sf（全零帧用 100）。
+        let global_gain: u8 = band_sf
+            .iter()
+            .zip(&band_zero)
+            .find(|(_, z)| !**z)
+            .map_or(100, |(sf, _)| (*sf).clamp(0, 255) as u8);
+
+        let mut w = BitWriter::new();
+        w.put(u32::from(global_gain), 8);
+        write_ics_info(&mut w, max_sfb as u8);
+        write_sections(&mut w, &band_cb, &band_zero);
+        write_scalefactors(&mut w, &band_sf, &band_zero, global_gain);
+
+        // pulse / tns / gain：都不做，各写一个 0 位。
+        w.put(0, 1);
+        w.put(0, 1);
+        w.put(0, 1);
+
+        for sfb in 0..max_sfb {
+            if band_zero[sfb] {
+                continue;
+            }
+            let lo = self.swb[sfb] as usize;
+            let hi = self.swb[sfb + 1] as usize;
+            write_band(
+                &mut w,
+                &spec[lo..hi],
+                band_sf[sfb].clamp(0, 255) as u8,
+                band_cb[sfb],
+            )?;
+        }
+
+        let bits = w.bit_pos() as u32;
+        Ok((w, bits))
+    }
+
     /// 一个通道元素（`single_channel_element`）的完整编码。
+    ///
+    /// ## 结构
+    ///
+    /// ```text
+    /// 1. 攒 2N 个样本 → 开窗 → MDCT
+    /// 2. 算什么都不裁的 sf 下界（sf_floor）
+    /// 3. 写元素头
+    /// 4. 二分搜「位数 ≤ 预算」的最小 sf 偏移，取那一趟的位流
+    /// ```
+    ///
+    /// ## 为什么第 3 步和第 4 步是分开写的
+    ///
+    /// `encode_pass` 每次调用**都从零编出一条完整的通道元素位流**
+    /// （从 `global_gain` 开始），不含元素头。所以这里的写法是：
+    /// **先把元素头写进正式位流，再把二分选中的那一趟整段接上去**。
+    ///
+    /// 换句话说 `encode_pass` 的「趟」= 通道元素体，元素头归这里管。
+    /// 这个分界是刻意的：元素头（`ID_SCE` + 标签）跟 `sf_offset` 无关，
+    /// 让每趟都带一遍只是白算计数的次数。
     fn encode_channel(
         &mut self,
         w: &mut BitWriter,
@@ -267,7 +428,7 @@ impl Encoder {
     ) -> crate::Result<()> {
         // ---- 1. 攒 2N 个样本 → 开窗 → MDCT ----
         let mut buf = vec![0f32; 2 * LONG_LEN];
-        // 左半 = 上一帧的后半
+        // 左半 = 上一帧的后半（AAC 是 50% 重叠）
         buf[..LONG_LEN].copy_from_slice(&self.overlap[ch]);
         // 右半 = 这一帧（不足补 0）
         let n = samples.len().min(LONG_LEN);
@@ -284,154 +445,42 @@ impl Encoder {
         let mut spec = vec![0f32; LONG_LEN];
         mdct(&buf, &mut spec);
 
-        // ---- 2. 定全局增益 ----
-        //
-        // AAC 的 sf 有两个来源：**全局增益**（8 位，紧跟在元素头之后）与
-        // **逐频带的 sf**（`scalefactor_data`）。解码端是
-        // `offset[0] = global_gain`，然后逐带 `offset[0] += diff`，
-        // 最后 `sfo = offset[0] - 100` —— 也就是 **`sfo = global_gain - 100 + Σdiff`**。
-        //
-        // 整帧 sf 的**下界**：再小就会把峰值系数裁到 `MAX_QUANT` 之上。
-        // 上界是 255。真正的取值由 `band_cost` 逐带挑（它同时管量化精度与位数）。
+        // ---- 2. sf 的下界：不把峰值系数裁到 MAX_QUANT 之上 ----
         let sf_floor = min_sf_for_peak(&spec, &self.swb);
 
-        // ---- 3. 逐频带量化 ----
-        let max_sfb = self.num_sfb();
-        // ⚠️ `band_sf` 存的是**要写进位流的那个值**（`sfo + 100`），
-        // 不是解码端最终算出来的 `sfo`。差分链是围绕它在走的，
-        // 而解码端最后会减掉那个 100 —— 见 `global_gain_for`。
-        let mut band_sf = vec![0i32; max_sfb];
-        let mut band_cb = vec![0u8; max_sfb];
-        let mut band_zero = vec![false; max_sfb];
-        let mut band_bits = vec![0u32; max_sfb];
+        // ⚠️ **这里不写元素头** —— `ID_SCE`/`ID_CPE` 与标签由 `encode_frame` 写。
+        // 一开始在这里又写了一遍（3+4 位），整条位流错位 7 位，
+        // ffmpeg 报的是「scalefactor bands 56 > 49」这种看着像频带表错的信息。
+        // **症状与根因隔得很远**，所以这条注释留在这里。
 
-        // 差分链的"上一个非零带"。初值是 `global_gain` —— 这正是解码端的起头。
-        let mut prev_sf: Option<i32> = None;
-
-        // 逐频带的**搜索窗口**：下界是「不把峰值裁到 MAX_QUANT 之上」，
-        // 上界是 255（`sf` 本身就是 8 位）。另受差分约束（与上一个非零带差 ≤ 60）。
+        // ---- 3. 二分搜「位数 ≤ 预算」的最小偏移 ----
         //
-        // ⚠️ 这里**没有**「中心 ±24」那种写法 —— `rusty_aac` 是二分搜一个公共
-        // base、再逐带微调；我们是逐带直接搜。两种都行，但窗口必须是
-        // `[max(sf_floor, prev−60), min(255, prev+60)]`，不能拿一个凭空算出来的
-        // 「中心」去夹 —— 那样会把合法的 sf 挡在窗口外。
-        for sfb in 0..max_sfb {
-            let lo = self.swb[sfb] as usize;
-            let hi = self.swb[sfb + 1] as usize;
-            let band = &spec[lo..hi];
-
-            // 搜索窗口 = 「不低于整帧下界」∩「与上一个非零带差 ≤ 60」∩ `0..=255`。
-            //
-            // ⚠️ 三个都必要：`sf_floor` 保证峰值不被裁到 `MAX_QUANT` 之上；
-            // 差分约束是位流的硬要求（`SCALE_MAX_DIFF`）；
-            // `0..=255` 是 `sf` 自己的位宽。
-            let (lo_sf, hi_sf) = match prev_sf {
-                Some(p) => (
-                    sf_floor.max(p - SCALE_MAX_DIFF).clamp(0, 255),
-                    (p + SCALE_MAX_DIFF).clamp(0, 255),
-                ),
-                None => (sf_floor.clamp(0, 255), 255),
-            };
-            if lo_sf > hi_sf {
-                // 窗口空了（极少见）：退化成「贴着上一个带」，至少位流合法。
-                let sf = prev_sf.unwrap_or(sf_floor).clamp(0, 255);
-                band_sf[sfb] = sf;
-                band_cb[sfb] = 0;
-                band_zero[sfb] = true;
-                prev_sf = None;
-                continue;
-            }
-
-            let mut best: Option<(f32, u8, u8, u32)> = None; // (代价, sf, cb, bits)
-            let mut cand: Vec<i32> = Vec::new();
-            let step = 4.max((hi_sf - lo_sf) / 24);
-            let mut s = lo_sf;
-            while s <= hi_sf {
-                cand.push(s);
-                s += step;
-            }
-            // 再补上边界附近的密集点。
-            if let Some(&c0) = cand.first() {
-                for d in 1..step.min(8) {
-                    cand.push(c0 + d);
-                }
-            }
-
-            for &sf in &cand {
-                if sf < lo_sf || sf > hi_sf {
-                    continue;
-                }
-                // 量化口径与 `rusty_aac` 一致：`q = pow(|x|,0.75) · 2^(-0.1875(sf-100))`。
-                // `sf` 就是这个 0..255 的域，**不做任何 ±100 的换算**。
-                let (cost, cb, bits) = band_cost(band, sf as u8, self.lambda);
-                if best.is_none_or(|(bc, _, _, _)| cost < bc) {
-                    best = Some((cost, sf as u8, cb, bits));
-                }
-            }
-            // 在最优附近再细扫 ±3（步长 1）。
-            if let Some((_, sf0, _, _)) = best {
-                for sf in (i32::from(sf0) - 3).max(lo_sf)..=(i32::from(sf0) + 3).min(hi_sf) {
-                    let (cost, cb, bits) = band_cost(band, sf as u8, self.lambda);
-                    if best.is_none_or(|(bc, _, _, _)| cost < bc) {
-                        best = Some((cost, sf as u8, cb, bits));
-                    }
-                }
-            }
-
-            let (_, sf, cb, bits) = best.expect("候选集非空");
-            band_sf[sfb] = i32::from(sf);
-            band_cb[sfb] = cb;
-            band_bits[sfb] = bits;
-            // cbp == 0 表示这一带全被量化成 0（全零带）。
-            band_zero[sfb] = cb == 0 || band_is_zero(band, sf);
-            if !band_zero[sfb] {
-                prev_sf = Some(i32::from(sf));
+        // 偏移越大 → 量化越粗 → 位数越少、失真越大，所以「位数」关于偏移单调。
+        // 二分出的这个最小偏移就是「码率不超标的前提下保真最好」的那一档。
+        let budget = self.bits_per_frame;
+        let mut lo = 0i32;
+        // 上界 120：够粗了（偏移每 +4 让量化精度翻一倍；+120 相当于把每带
+        // 的 sf 抬到几乎全零带）。再往上位数不再降（全零带位数是常数）。
+        let mut hi = 120i32;
+        let mut chosen: Option<BitWriter> = None;
+        while lo <= hi {
+            let mid = (lo + hi) / 2;
+            let (pass, bits) = self.encode_pass(&spec, sf_floor, mid)?;
+            if bits <= budget {
+                chosen = Some(pass);
+                hi = mid - 1;
+            } else {
+                lo = mid + 1;
             }
         }
-
-        // ---- 4. 写 global_gain 与 ICS ----
-        //
-        // ⚠️ **顺序是 `global_gain` 在前、`ics_info` 在后** ——
-        // 见 `ff_aac_decode_ics`：`global_gain = get_bits(gb, 8)` 在
-        // `if (!common_window && !scale_flag) decode_ics_info(...)` **之前**。
-        // 与「先写帧头再写载荷」的直觉相反，写反了整条位流就错 8 位。
-        // `global_gain` **就是第一个非零带的 sf**（差分链的参考值）——
-        // `rusty_aac::global_gain` 逐字如此。全零帧用 100。
-        let global_gain: u8 = band_sf
-            .iter()
-            .zip(&band_zero)
-            .find(|(_, z)| !**z)
-            .map_or(100, |(sf, _)| (*sf).clamp(0, 255) as u8);
-        w.put(u32::from(global_gain), 8);
-        write_ics_info(w, max_sfb as u8);
-
-        // ---- 5. section_data ----
-        write_sections(w, &band_cb, &band_zero);
-
-        // ---- 6. scalefactor_data ----
-        write_scalefactors(w, &band_sf, &band_zero, global_gain);
-
-        // ---- 7. pulse / tns / gain：都不做，各写一个 0 位 ----
-        w.put(0, 1); // pulse_data_present
-        w.put(0, 1); // tns_data_present
-        w.put(0, 1); // gain_control_data_present
-
-        // ---- 8. 谱系数 ----
-        for sfb in 0..max_sfb {
-            if band_zero[sfb] {
-                continue;
-            }
-            let lo = self.swb[sfb] as usize;
-            let hi = self.swb[sfb + 1] as usize;
-            write_band(
-                w,
-                &spec[lo..hi],
-                band_sf[sfb].clamp(0, 255) as u8,
-                band_cb[sfb],
-            )?;
-        }
-
-        let _ = band_bits;
+        // ⚠️ **一趟都不够省**时（预算小到连最粗的量化都塞不下）退化成
+        // 「用偏移上界那一趟」：位数超预算，但**位流仍然合法**。
+        // 让码率超标比「编不出东西」好 —— 而且这种情况只会在极端配置下出现。
+        let pass = match chosen {
+            Some(p) => p,
+            None => self.encode_pass(&spec, sf_floor, hi.max(0))?.0,
+        };
+        w.append(&pass);
         Ok(())
     }
 }
@@ -541,24 +590,27 @@ fn band_is_zero(band: &[f32], sf: u8) -> bool {
     band.iter().all(|&c| quant_one(c.abs(), q34v, 16) == 0)
 }
 
-/// 一个频带在给定 `sf` 下的 `(代价, 最优码本, 位数)`。
+/// 一个频带在给定 `sf` 下的 `(代价, 最优码本)`。
 ///
-/// 代价 = 量化失真（平方误差）+ λ · 位数。逐码本比，取最小的。
-fn band_cost(band: &[f32], sf: u8, lambda: f32) -> (f32, u8, u32) {
-    let mut best: Option<(f32, u8, u32)> = None;
+/// **代价就是量化失真**（平方误差），逐码本比、取最小的。
+///
+/// ⚠️ 这里**故意没有 λ · 位数那一项**。原因见 `encode_pass` 的说明：
+/// 码率由外层的「二分搜 sf 偏移」用**硬预算**控制；
+/// 再在这里掺一个软权重只会互相干扰，而且 λ 的量级（1e-4）在失真（1e9）
+/// 面前根本不起作用 —— 实测踩过，白忙一场。
+fn band_cost(band: &[f32], sf: u8) -> (f32, u8) {
+    let mut best: Option<(f32, u8)> = None;
     for cb in 1..=11usize {
-        let (bits, dist) = band_code(band, sf, cb);
-        let cost = dist + lambda * bits as f32;
-        if best.is_none_or(|(bc, _, _)| cost < bc) {
-            best = Some((cost, cb as u8, bits));
+        let (_bits, dist) = band_code(band, sf, cb);
+        if best.is_none_or(|(bc, _)| dist < bc) {
+            best = Some((dist, cb as u8));
         }
     }
     // cb == 0 是「全零带」的伪码本，作为兜底参与比较。
     let zero_dist: f64 = band.iter().map(|&c| f64::from(c) * f64::from(c)).sum();
-    let cost0 = zero_dist as f32 + lambda * 0.0;
     match best {
-        Some((c, cb, bits)) if c <= cost0 => (c, cb, bits),
-        _ => (cost0, 0, 0),
+        Some((c, cb)) if c <= zero_dist as f32 => (c, cb),
+        _ => (zero_dist as f32, 0),
     }
 }
 

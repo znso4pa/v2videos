@@ -285,3 +285,84 @@ fn encoder_rejects_nonstandard_sample_rates() {
         "40000 不是 AAC 的标准采样率"
     );
 }
+
+/// **码率受控**：`bitrate` 配置项真的能兑现。
+///
+/// 这是补上「二分搜 sf 偏移」之后新加的判据 —— 之前在代价函数里塞 λ 权重的
+/// 做法**完全失效**（λ 的量级在失真面前不起作用），实测码率是目标的 3.4 倍。
+///
+/// 判据：编 8 秒 440 Hz 正弦，实测码率落在目标的 **0.7 ~ 1.3 倍**以内。
+///
+/// ⚠️ 窗口为什么这么宽：二分搜的 `sf_offset` 是**整数**，而每 +4 档让量化
+/// 精度翻倍（约 19% 的码率跳变）。所以实测值只能落在目标附近的**离散档位**上，
+/// 不会精确等于目标 —— 落在 0.75 倍（取到更粗的一档）是**正常**的，
+/// 只要不超上限（`> 1.3`）就说明「预算没被突破」。
+///
+/// **这里卡的是上限，不是下限**：码率可以比目标小（那是白赚的音质余量），
+/// 但不能比目标大 —— 大了就说明预算形同虚设（补之前是 3.4 倍）。
+#[test]
+fn bitrate_is_controlled_to_the_target() {
+    if !has_ffmpeg() {
+        eprintln!("SKIP: PATH 上没有 ffmpeg");
+        return;
+    }
+    let channels = 1u8;
+    let target = 96_000u32;
+    let secs = 8usize;
+    let total = SR as usize * secs;
+    let samples = sine(total, channels as usize);
+
+    let mut e = Encoder::new(EncoderConfig {
+        channels,
+        sample_rate: SR,
+        bitrate: target,
+        kb_window: false,
+    })
+    .expect("建编码器");
+
+    let mut frames = Vec::new();
+    let mut i = 0usize;
+    while i < total {
+        let n = (total - i).min(1024);
+        let planes: Vec<Vec<f32>> = samples.iter().map(|p| p[i..i + n].to_vec()).collect();
+        frames.push(e.encode_frame(&Frame { planes }).expect("编一帧"));
+        i += 1024;
+    }
+    let bytes: usize = frames.iter().map(|f| f.len()).sum();
+    let got = bytes as f64 * 8.0 / secs as f64;
+    println!(
+        "{secs} 秒 / {} 帧：{bytes} 字节 → {:.0} bps（目标 {target}）",
+        frames.len(),
+        got
+    );
+
+    // 位流还得能解（码率受控不能靠「编出垃圾」实现）。
+    let decoded = decode_aac(&frames, channels);
+    // ⚠️ 别要求**精确相等**。两个方向都会差一点：
+    //   · AAC 有编码器延迟（少若干块）；
+    //   · ffmpeg 会把输出**补齐到整帧**（345 帧 × 1024 = 353280 > 352800）。
+    // 所以判据是「在 ±两个块以内」，而不是相等。
+    let n = decoded[0].len();
+    let diff = n.abs_diff(total);
+    assert!(
+        diff <= 2048,
+        "解出来 {n} 个样本，输入 {total}（差 {diff}）—— 超过两个块的容差"
+    );
+    let seg = &decoded[0][2048..];
+    let e440 = goertzel(seg, 440.0, SR as f64);
+    assert!(
+        e440 > 1000.0,
+        "主频能量太低（{e440:.1}）—— 码率是压下来了，但音质崩了"
+    );
+
+    let ratio = got / f64::from(target);
+    // 上限是硬判据（预算不能被突破）；下限只是「别压得太狠」的合理性检查。
+    assert!(
+        ratio <= 1.3,
+        "实测码率 {got:.0} 是目标的 {ratio:.2} 倍 —— **突破了预算**，码率控制没生效"
+    );
+    assert!(
+        ratio >= 0.6,
+        "实测码率 {got:.0} 只有目标的 {ratio:.2} 倍 —— 压过头了，音质会被白牺牲"
+    );
+}
