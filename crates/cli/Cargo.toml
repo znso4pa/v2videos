@@ -14,3 +14,7 @@ v2v-asf = { path = "../asf" }
 v2v-avi = { path = "../avi" }
 v2v-container = { path = "../container" }
 v2v-msmpeg4 = { path = "../msmpeg4" }
+# MP4 那条路：容器 + MPEG-4 Part 2 编码器 + WMA 解码（→ PCM）。
+v2v-mp4 = { path = "../mp4" }
+v2v-mp4v = { path = "../mp4v" }
+v2v-wma = { path = "../wma" }

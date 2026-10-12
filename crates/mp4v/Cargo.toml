@@ -1,0 +1,15 @@
+[package]
+name = "v2v-mp4v"
+description = "纯 Rust 的 MPEG-4 Part 2（mp4v）视频编码 —— 目前只做全 I 帧，无 C、无 FFI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# DCT / 位写入器 / 前缀码 / RL 表这几件「与具体编码格式无关」的东西在 msmpeg4 里，
+# 直接复用 —— 不复刻一遍（复刻出来的第二份才是真会跑偏的那份）。
+v2v-msmpeg4 = { path = "../msmpeg4" }
+
+[dev-dependencies]
+# 对账测试要把编出来的流封成 MP4 再让 ffmpeg 解，所以容器也要能用。
+v2v-mp4 = { path = "../mp4" }

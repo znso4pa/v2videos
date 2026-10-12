@@ -6,9 +6,34 @@
 //!
 //! - 输入：**ASF（`.wmv`）/ AVI（`.avi`）** 里的 **MP43** 视频轨 —— 容器按魔数自动认。
 //!   别的容器 / codec 会明确报 `Unsupported`，不猜、不静默跳过。
-//! - 输出：**MP43 in ASF**（`.wmv`）。
-//! - 音频轨：目前**不搬**（WMA 解/编还没做），转换时跳过并计数，报告里说清楚。
+//! - 输出：**两种容器**（`ConvertOptions::format`）
+//!
+//!   | | 视频 | 音频 |
+//!   |---|---|---|
+//!   | `OutputFormat::Asf`（`.wmv`） | MP43 **重编码** | WMA **直通**（载荷原样搬） |
+//!   | `OutputFormat::Mp4`（`.mp4`） | **MPEG-4 Part 2** 重编码（`v2v-mp4v`） | WMA **解码成 PCM**（`sowt`） |
+//!
+//! ## `.mp4` 那条路为什么必须重编码
+//!
+//! 不是因为「想换个编码器」，而是**没得选**：MP4 / 3GP 容器不收 MP43
+//! （`mp4`/`3gp`/`3g2` 三个 muxer 都报 `codec not currently supported in container`），
+//! `mov` 收但是单向街 —— 写出来的东西 ffmpeg 自己读不回来。所以视频必须过一遍
+//! MPEG-4 Part 2 编码器（见 `crates/mp4v`）。
+//!
+//! 音频那边不用写编码器：**PCM（`sowt`）** 塞进 `isom` 品牌的文件里 ffmpeg 读得好好的
+//! （见 `crates/mp4` 的模块文档）。代价是文件变大（44.1 kHz 立体声约 176 KB/s）。
+//!
+//! ## `.mp4` 的校验为什么是「未校验」
+//!
+//! `verify` 的做法是「把编出来的码流解回来和源帧比 PSNR」。`.wmv` 那条路能做到，
+//! 因为我们**自己就有 MP43 解码器**；`.mp4` 这条路做不到 —— 我们只有 `mp4v`
+//! **编码器**，没有解码器。所以 `psnr_db` 是 `None`，报告里显示「未校验」。
+//!
+//! 这不是「没测」：编码器的正确性由 `crates/mp4v/tests/ffmpeg_roundtrip.rs` 钉着
+//! （ffmpeg 解得开、PSNR 与 ffmpeg 自己的 mpeg4 编码器同档、`esds` 里的 VOL 完整）。
+//! 只是那条判据需要 ffmpeg，不能进 CLI 的运行时。
 
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -18,36 +43,68 @@ pub use v2v_avi::AviDemuxer;
 pub use v2v_container::{AudioFormat, Sample};
 pub use v2v_msmpeg4::{Decoder, Encoder, EncoderConfig, Frame};
 
-/// MP43 的 FourCC（本工具唯一的输出编码）。
+/// MP43 的 FourCC（`.wmv` 输出用的编码）。
 pub const MP43: u32 = u32::from_le_bytes(*b"MP43");
+
+/// 输出容器。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputFormat {
+    /// MP43 in ASF（`.wmv`）。
+    Asf,
+    /// MPEG-4 Part 2（`mp4v`）in MP4（`.mp4`）。
+    Mp4,
+}
+
+impl OutputFormat {
+    pub fn extension(self) -> &'static str {
+        match self {
+            OutputFormat::Asf => "wmv",
+            OutputFormat::Mp4 => "mp4",
+        }
+    }
+}
 
 /// 转码参数。
 #[derive(Debug, Clone)]
 pub struct ConvertOptions {
-    /// 目标 qscale（1..=31）。越大越小越糊。编码器必要时会自己往上抬。
+    /// 目标 qscale（1..=31）。越大越小越糊。
+    ///
+    /// ⚠️ **两种输出容器的含义不完全一样**：`.wmv` 走 MP43，量化后的 level 必须塞进
+    /// 8 位 escape，编码器会自己往上抬；`.mp4` 走 MPEG-4 Part 2，ESC3 是 12 位、没有这个约束。
     pub qscale: u8,
+    /// 输出容器。
+    pub format: OutputFormat,
     /// 周期 I 帧间隔（帧数）。`0` = 只首帧是 I。
+    ///
+    /// 只对 `.wmv` 有效 —— `.mp4` 目前是**全 I 帧**（`crates/mp4v` 还没做 P 帧）。
     pub keyframe_interval: usize,
     /// 转完把输出**解码回来**与源帧比 PSNR（慢一倍，但能证明「转出来的东西真能放」）。
+    ///
+    /// 只对 `.wmv` 有效；`.mp4` 没有解码器可比，见模块文档。
     pub verify: bool,
     /// 最多转多少帧（`None` = 全部）。做局部转换/预览用 —— 也让真样本的
     /// 端到端验证能在几秒内跑完。
     pub max_frames: Option<usize>,
     /// **音频直通**（默认开）：把源的音频载荷**原样**搬进输出，不重编码。
     ///
-    /// 为什么是直通：我们还没有 WMA **编码器**，重编码做不到；而直通不但零损失，
-    /// 还顺带证明了「封装器能复用多流」。代价是输入输出必须是同一个音频编码。
+    /// 只对 `.wmv` 有效（输入输出都是 WMA 才有意义）。`.mp4` 里 WMA 装不进去，
+    /// 这一项被忽略、音频一律解成 PCM。
     pub copy_audio: bool,
+    /// `.mp4` 的帧率分子（写进 VOL 的 `vop_time_increment_resolution`）。
+    /// `None` = 从视频样本的时间戳推。
+    pub fps: Option<u32>,
 }
 
 impl Default for ConvertOptions {
     fn default() -> Self {
         Self {
             qscale: 6,
+            format: OutputFormat::Asf,
             keyframe_interval: 250,
             verify: true,
             max_frames: None,
             copy_audio: true,
+            fps: None,
         }
     }
 }
@@ -56,15 +113,20 @@ impl Default for ConvertOptions {
 #[derive(Debug, Clone)]
 pub struct ConvertReport {
     pub frames: usize,
-    /// 关键帧数（含首帧）。
+    /// 关键帧数（含首帧）。`.mp4` 目前是**全 I 帧**，所以这里等于 `frames`。
     pub key_frames: usize,
-    /// **直通**的音频载荷数。
+    /// 写进输出的音频样本数。
+    ///
+    /// ⚠️ 两种容器的单位不同：`.wmv` 是**载荷数**（一个 ASF 载荷可能含多帧）；
+    /// `.mp4` 是 **PCM 采样点**数（一个采样点 = 一条 `stsz` 记录，见 `crates/mp4`）。
     pub audio_payloads: usize,
-    /// 没搬的音频载荷数（音频编码还没做时会有；见 `ConvertOptions::copy_audio`）。
+    /// 没搬的音频样本数（`copy_audio = false`）。
     pub skipped_audio: usize,
     pub bytes_in: u64,
     pub bytes_out: u64,
     /// `verify` 打开时的平均 PSNR（dB，YUV 三平面合计）。
+    ///
+    /// `.mp4` 恒为 `None` —— 我们只有 `mp4v` 编码器、没有解码器，没法自己校验，见模块文档。
     pub psnr_db: Option<f64>,
 }
 
@@ -73,8 +135,12 @@ pub struct ConvertReport {
 pub enum Error {
     Io(std::io::Error),
     Asf(v2v_asf::Error),
+    /// 视频编解码错误。**MP43 与 MPEG-4 Part 2 共用这一个** ——
+    /// `v2v_mp4v::Error` 就是 `v2v_msmpeg4::Error`（见那个 crate 的 `lib.rs`）。
     Msmpeg4(v2v_msmpeg4::Error),
     Avi(v2v_avi::Error),
+    Mp4(v2v_mp4::Error),
+    Wma(v2v_wma::Error),
     Unsupported(String),
 }
 
@@ -85,6 +151,8 @@ impl std::fmt::Display for Error {
             Error::Asf(e) => write!(f, "容器错误：{e}"),
             Error::Msmpeg4(e) => write!(f, "编解码错误：{e}"),
             Error::Avi(e) => write!(f, "AVI 错误：{e}"),
+            Error::Mp4(e) => write!(f, "MP4 封装错误：{e}"),
+            Error::Wma(e) => write!(f, "WMA 解码错误：{e}"),
             Error::Unsupported(s) => write!(f, "不支持：{s}"),
         }
     }
@@ -112,6 +180,16 @@ impl From<v2v_avi::Error> for Error {
         Error::Avi(e)
     }
 }
+impl From<v2v_mp4::Error> for Error {
+    fn from(e: v2v_mp4::Error) -> Self {
+        Error::Mp4(e)
+    }
+}
+impl From<v2v_wma::Error> for Error {
+    fn from(e: v2v_wma::Error) -> Self {
+        Error::Wma(e)
+    }
+}
 
 /// 「能吐视频样本的东西」—— ASF / AVI 解封装器都实现它。
 ///
@@ -129,12 +207,20 @@ struct AsfSource(v2v_asf::AsfDemuxer<BufReader<File>>);
 
 impl VideoSource for AsfSource {
     fn video_stream(&self) -> Option<(u8, u32, u32, u32)> {
-        let v = self.0.streams().iter().find(|s| s.kind == StreamKind::Video)?;
+        let v = self
+            .0
+            .streams()
+            .iter()
+            .find(|s| s.kind == StreamKind::Video)?;
         let vf = v.video.as_ref()?;
         Some((v.number, vf.width, vf.height, vf.fourcc))
     }
     fn audio_stream(&self) -> Option<(u8, AudioFormat)> {
-        let a = self.0.streams().iter().find(|s| s.kind == StreamKind::Audio)?;
+        let a = self
+            .0
+            .streams()
+            .iter()
+            .find(|s| s.kind == StreamKind::Audio)?;
         Some((a.number, a.audio.clone()?))
     }
     fn next(&mut self) -> Result<Option<Sample>, Error> {
@@ -146,12 +232,20 @@ struct AviSource(v2v_avi::AviDemuxer<BufReader<File>>);
 
 impl VideoSource for AviSource {
     fn video_stream(&self) -> Option<(u8, u32, u32, u32)> {
-        let v = self.0.streams().iter().find(|s| s.kind == StreamKind::Video)?;
+        let v = self
+            .0
+            .streams()
+            .iter()
+            .find(|s| s.kind == StreamKind::Video)?;
         let vf = v.video.as_ref()?;
         Some((v.number, vf.width, vf.height, vf.fourcc))
     }
     fn audio_stream(&self) -> Option<(u8, AudioFormat)> {
-        let a = self.0.streams().iter().find(|s| s.kind == StreamKind::Audio)?;
+        let a = self
+            .0
+            .streams()
+            .iter()
+            .find(|s| s.kind == StreamKind::Audio)?;
         Some((a.number, a.audio.clone()?))
     }
     fn next(&mut self) -> Result<Option<Sample>, Error> {
@@ -180,7 +274,7 @@ fn open_source(path: &Path) -> Result<Box<dyn VideoSource>, Error> {
     ))
 }
 
-/// 把一个文件转成 `.wmv`（MP43 in ASF）。
+/// 把一个文件转成 `opts.format` 指定的容器。
 ///
 /// 逐帧流式：读一帧 → 解码 → 编码 → 写进封装器（封装器内部缓冲，最后一次性落盘）。
 pub fn convert_file(
@@ -189,8 +283,23 @@ pub fn convert_file(
     opts: &ConvertOptions,
 ) -> Result<ConvertReport, Error> {
     if !(1..=31).contains(&opts.qscale) {
-        return Err(Error::Unsupported(format!("qscale {} 不在 1..=31", opts.qscale)));
+        return Err(Error::Unsupported(format!(
+            "qscale {} 不在 1..=31",
+            opts.qscale
+        )));
     }
+    match opts.format {
+        OutputFormat::Asf => convert_to_asf(input, output, opts),
+        OutputFormat::Mp4 => convert_to_mp4(input, output, opts),
+    }
+}
+
+/// `.wmv`（MP43 in ASF）那条路。
+fn convert_to_asf(
+    input: &Path,
+    output: &Path,
+    opts: &ConvertOptions,
+) -> Result<ConvertReport, Error> {
     let bytes_in = std::fs::metadata(input)?.len();
 
     let mut demux = open_source(input)?;
@@ -215,11 +324,7 @@ pub fn convert_file(
     // 音频：直通（只支持 WMA，因为输出要写同样的 WAVEFORMATEX）
     let audio = if opts.copy_audio {
         match demux.audio_stream() {
-            Some((_, af))
-                if af.format_tag == 0x0160 || af.format_tag == 0x0161 =>
-            {
-                Some(af)
-            }
+            Some((_, af)) if af.format_tag == 0x0160 || af.format_tag == 0x0161 => Some(af),
             Some((_, af)) => {
                 return Err(Error::Unsupported(format!(
                     "音频是 0x{:04X}，直通只支持 WMA（0x0160/0x0161）",
@@ -241,7 +346,11 @@ pub fn convert_file(
         audio,
     );
     // 校验用的第二个解码器（与解码源帧的那个分开 —— 状态独立）。
-    let mut vdec = if opts.verify { Some(Decoder::new()) } else { None };
+    let mut vdec = if opts.verify {
+        Some(Decoder::new())
+    } else {
+        None
+    };
 
     let mut frames = 0usize;
     let mut key_frames = 0usize;
@@ -265,9 +374,8 @@ pub fn convert_file(
         if s.stream != vnum {
             continue;
         }
-        let pts = u32::try_from(s.timestamp_ms.max(0)).map_err(|_| {
-            Error::Unsupported(format!("时间戳 {} ms 超出 u32", s.timestamp_ms))
-        })?;
+        let pts = u32::try_from(s.timestamp_ms.max(0))
+            .map_err(|_| Error::Unsupported(format!("时间戳 {} ms 超出 u32", s.timestamp_ms)))?;
 
         let frame = dec.decode(&s.data, w, h)?;
         let stream = enc.encode_frame(&frame)?;
@@ -299,17 +407,10 @@ pub fn convert_file(
     }
 
     let wmv = mux.finish();
-    let mut f = BufWriter::new(File::create(output)?);
-    f.write_all(&wmv)?;
-    f.flush()?;
+    write_out(output, &wmv)?;
 
     let psnr_db = if opts.verify && n_px > 0 {
-        let mse = sq_err / n_px as f64;
-        Some(if mse == 0.0 {
-            f64::INFINITY
-        } else {
-            10.0 * (255.0 * 255.0 / mse).log10()
-        })
+        Some(psnr(sq_err, n_px as u64))
     } else {
         None
     };
@@ -325,6 +426,340 @@ pub fn convert_file(
     })
 }
 
+// ==================== .mp4（MPEG-4 Part 2）那条路 ====================
+
+/// 音频怎么进 `.mp4`。
+///
+/// 必须在读到第一个样本**之前**定下来 —— MP4 的 `stsd`（音频 sample entry）是
+/// 封装器构造时就写死的，中途换不了。
+struct AudioPlan {
+    /// 源里的流号。
+    stream: u8,
+    /// 一个 PCM 采样点占多少字节（`声道数 × 2`）。
+    ///
+    /// ⚠️ MP4 的 `sowt` 轨里**一个采样点就是一条样本记录**（`stsz` 靠
+    /// `default_sample_size` 压缩，`stts` 是一条 `(N, 1)`），所以写的时候要一个点一次。
+    /// 见 `crates/mp4` 的模块文档。
+    point: usize,
+    /// 开头要丢掉的样本数（WMA 的编码器延迟）。
+    skip: usize,
+    /// `None` = 源本来就是 PCM，直接搬；`Some` = 要过 WMA 解码器。
+    decoder: Option<v2v_wma::WmaDecoder>,
+}
+
+/// 决定音频轨怎么走。返回 `None` = 输出不带音频。
+fn plan_audio(demux: &dyn VideoSource, enabled: bool) -> Result<Option<AudioPlan>, Error> {
+    if !enabled {
+        return Ok(None);
+    }
+    let Some((num, af)) = demux.audio_stream() else {
+        return Ok(None);
+    };
+    let point = af.channels as usize * 2;
+    match af.format_tag {
+        // WMA v1 / v2：解成 16 位 PCM。
+        0x0160 | 0x0161 => {
+            let version = if af.format_tag == 0x0160 { 1 } else { 2 };
+            let params = v2v_wma::WmaParams::new(
+                version,
+                af.channels as usize,
+                af.sample_rate,
+                af.avg_bytes_per_sec * 8,
+                af.block_align as usize,
+                &af.extra,
+            )?;
+            let decoder = v2v_wma::WmaDecoder::new(params.clone())?;
+            // ⚠️ **编码器延迟**：WMA 编码器开头灌了两帧的静音，ffmpeg 的解码器
+            // `skip_samples = frame_len * 2` 把它丢掉。不跟着丢，音频会整体晚
+            // 两帧（44.1 kHz、帧长 2048 → 约 93 ms），与视频明显对不上。
+            Ok(Some(AudioPlan {
+                stream: num,
+                point,
+                skip: params.frame_len * 2,
+                decoder: Some(decoder),
+            }))
+        }
+        // 本来就是 16 位 PCM：不用解，直接搬。
+        0x0001 if af.bits_per_sample == 16 => Ok(Some(AudioPlan {
+            stream: num,
+            point,
+            skip: 0,
+            decoder: None,
+        })),
+        other => Err(Error::Unsupported(format!(
+            "音频是 0x{other:04X}，`.mp4` 这条路只支持 WMA（0x0160/0x0161）与 16 位 PCM（0x0001）\
+             —— 用 --no-audio 只转视频"
+        ))),
+    }
+}
+
+/// 把 WMA 解出来的一帧（每声道一串 f32）交织成小端 16 位 PCM。
+///
+/// ⚠️ 解码器给的是**已经落在 `[-32768, 32767]` 的浮点**，不是 `[-1, 1)` ——
+/// 直接截断即可，**不要**再乘 32768（乘了会整体溢出成噪声）。
+/// 口径与 `crates/wma/tests/pcm.rs` 的对账测试一致。
+fn wma_frame_to_pcm(frames: Vec<Vec<Vec<f32>>>) -> Vec<u8> {
+    let mut out = Vec::new();
+    for f in frames {
+        let n = f.first().map_or(0, |p| p.len());
+        out.reserve(n * f.len() * 2);
+        for i in 0..n {
+            for plane in &f {
+                let v = plane[i].clamp(-32768.0, 32767.0) as i16;
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+    }
+    out
+}
+
+/// `.mp4`（MPEG-4 Part 2 in MP4）那条路。
+///
+/// 与 `.wmv` 那条的三个实质差别：
+///
+/// 1. **视频必须重编码**成 MPEG-4 Part 2（MP43 进不了 MP4，见模块文档），而且目前是**全 I 帧**；
+/// 2. **音频解成 PCM**（WMA 也进不了 MP4）；
+/// 3. **没有校验** —— 我们只有 `mp4v` 编码器、没有解码器。
+///
+/// ## 帧率与时间基
+///
+/// 帧率必须在**建编码器之前**知道（要写进 VOL 的 `vop_time_increment_resolution`），
+/// 而解封装器是单向流式的 —— 所以先预读开头几个样本定帧率，再把它们喂回去处理。
+///
+/// 视频轨的时间基取 **1000（毫秒）**，`stts` 里写**真实的帧间隔**。这样 29.97 / 23.976
+/// 这类非整数帧率也不用去找最小公倍数，播放节奏就是源文件的节奏。
+/// VOL 里声明的整数帧率只影响 VOP 头的 `time_mod` 记账，不影响播放。
+fn convert_to_mp4(
+    input: &Path,
+    output: &Path,
+    opts: &ConvertOptions,
+) -> Result<ConvertReport, Error> {
+    let bytes_in = std::fs::metadata(input)?.len();
+    let mut demux = open_source(input)?;
+
+    let (vnum, w, h, fourcc) = demux
+        .video_stream()
+        .ok_or_else(|| Error::Unsupported("文件里没有视频轨（或没有格式信息）".into()))?;
+    if fourcc != MP43 {
+        return Err(Error::Unsupported(format!(
+            "输入视频是 {}，本工具目前只解 MP43",
+            v2v_asf::fourcc_string(fourcc)
+        )));
+    }
+
+    // 源里那条音频轨的格式（有没有音频、采样率多少）—— 封装器的 `stsd` 要用。
+    let src_audio = demux.audio_stream().map(|(_, af)| af);
+    let mut audio = plan_audio(demux.as_ref(), opts.copy_audio)?;
+    if src_audio.is_none() {
+        audio = None; // 没有音频轨就别留下一个「以为有」的 plan
+    }
+    let audio_num = audio.as_ref().map(|a| a.stream);
+    // `--no-audio` 时源里的音频样本要计数，报告里说清楚跳过了多少。
+    let skipped_num = if audio_num.is_none() {
+        demux.audio_stream().map(|(n, _)| n)
+    } else {
+        None
+    };
+
+    // ---- 预读：攒够几个视频样本就能定帧率 ----
+    //
+    // 队列里存的是**原样**的样本，处理时按同样的顺序吐出来（用 VecDeque 的
+    // `pop_front` —— 用 `Vec::pop` 会倒着放，那是个很难看出来的坑）。
+    let mut queue: VecDeque<Sample> = VecDeque::new();
+    let mut vts: Vec<i64> = Vec::new();
+    while let Some(s) = demux.next()? {
+        if s.stream == vnum {
+            vts.push(s.timestamp_ms);
+        }
+        let enough = vts.len() >= FPS_PROBE_SAMPLES;
+        queue.push_back(s);
+        if enough {
+            break;
+        }
+    }
+    let fps = opts
+        .fps
+        .or_else(|| fps_from_timestamps(&vts))
+        .unwrap_or(DEFAULT_FPS)
+        .clamp(1, 120);
+
+    // ---- 视频编码器：MPEG-4 Part 2，全 I 帧 ----
+    let mut enc = v2v_mp4v::Encoder::new(v2v_mp4v::EncoderConfig {
+        width: w,
+        height: h,
+        fps_num: fps,
+        qscale: opts.qscale,
+        ..Default::default()
+    })?;
+
+    // ---- 封装器 ----
+    //
+    // ⚠️ `decoder_specific_info()` 必须在 `Mp4Muxer::new` 时给出去，之后改不了；
+    // 它是「VOS + 视觉对象 + VOL + 用户数据」整段，`ffprobe` 靠它报 profile / level。
+    const VTS: u32 = 1000;
+    let vtrack = v2v_mp4::VideoTrack {
+        width: w as u16,
+        height: h as u16,
+        timescale: VTS,
+        decoder_specific_info: enc.decoder_specific_info(),
+        avg_bitrate: 0,
+    };
+    let mut mux = match (audio.as_ref(), src_audio.as_ref()) {
+        (Some(_), Some(af)) => {
+            v2v_mp4::Mp4Muxer::with_audio(
+                vtrack,
+                v2v_mp4::AudioTrack {
+                    channels: af.channels,
+                    sample_rate: af.sample_rate,
+                    // `sowt` 的时间基就是采样率（一个采样点 = 一个 tick）。
+                    timescale: af.sample_rate,
+                    avg_bitrate: af.sample_rate * af.channels as u32 * 16,
+                    codec: v2v_mp4::AudioCodec::Pcm {
+                        bits: 16,
+                        big_endian: false,
+                    },
+                },
+            )
+        }
+        _ => v2v_mp4::Mp4Muxer::new(vtrack),
+    };
+
+    let mut dec = Decoder::new();
+    let mut frames = 0usize;
+    let mut audio_points = 0usize;
+    let mut skipped_audio = 0usize;
+    // WMA 解码器与要跳的延迟样本数（`plan_audio` 里算好的）—— 拿出来单独持有，
+    // 因为循环里要 `&mut`。
+    let (mut wma_dec, mut skip_left) = match audio.as_mut() {
+        Some(a) => (a.decoder.take(), a.skip),
+        None => (None, 0),
+    };
+    // 上一帧的视频时间戳（毫秒）—— `stts` 写的是**真实间隔**。
+    let mut prev_vts: Option<i64> = None;
+    let mut last_dur = (VTS as f64 / fps as f64).round().max(1.0) as u32;
+    let mut stop = false;
+
+    loop {
+        let s = match queue.pop_front() {
+            Some(s) => Some(s),
+            None if !stop => demux.next()?,
+            None => None,
+        };
+        let Some(s) = s else { break };
+
+        // ---- 音频 ----
+        if Some(s.stream) == audio_num {
+            let plan = audio.as_ref().expect("audio_num 有值就一定有 plan");
+            let mut pcm = match wma_dec.as_mut() {
+                Some(d) => wma_frame_to_pcm(d.decode_superframe(&s.data)?),
+                None => s.data.clone(),
+            };
+            if skip_left > 0 {
+                let drop = (skip_left * plan.point).min(pcm.len());
+                pcm.drain(..drop);
+                skip_left -= drop / plan.point;
+            }
+            for c in pcm.chunks_exact(plan.point) {
+                mux.write_audio(c, 1)?;
+                audio_points += 1;
+            }
+            continue;
+        }
+        if Some(s.stream) == skipped_num {
+            skipped_audio += 1;
+            continue;
+        }
+        if s.stream != vnum {
+            continue;
+        }
+
+        // ---- 视频 ----
+        if let Some(p) = prev_vts {
+            let d = s.timestamp_ms - p;
+            if d > 0 {
+                last_dur = d.min(u32::MAX as i64) as u32;
+            }
+        }
+        prev_vts = Some(s.timestamp_ms);
+
+        let frame = dec.decode(&s.data, w, h)?;
+        let stream = enc.encode_i_frame(&frame)?;
+        // 全 I 帧 → 每帧都是关键帧（`stss` 会因此被整个省掉）。
+        mux.write_video(&stream, true, last_dur)?;
+        frames += 1;
+        if let Some(max) = opts.max_frames {
+            if frames >= max {
+                stop = true;
+                // 已经预读进队列的音频还要写完，所以不能直接 break。
+            }
+        }
+    }
+
+    let mp4 = mux.finish();
+    write_out(output, &mp4)?;
+
+    Ok(ConvertReport {
+        frames,
+        key_frames: frames, // 全 I 帧
+        audio_payloads: audio_points,
+        skipped_audio,
+        bytes_in,
+        bytes_out: mp4.len() as u64,
+        // 没有 mp4v 解码器可比，见模块文档。
+        psnr_db: None,
+    })
+}
+
+/// 默认帧率 —— 推不出来时用（WMV 绝大多数是 25 或 30）。
+const DEFAULT_FPS: u32 = 25;
+
+/// 定帧率前预读多少个视频样本。
+///
+/// 只取前两个不够 —— ASF 里可能有**两条视频轨**（`wma1.asf` 就是），
+/// 首两个样本的间隔可能落在两条轨的边界上，或者干脆是 0。
+const FPS_PROBE_SAMPLES: usize = 8;
+
+/// 从视频样本的时间戳推帧率。
+///
+/// 取**间隔的中位数**而不是第一个间隔 —— 时间戳偶尔会有一个不规整的
+/// （ASF 的分组边界、重复帧），只看第一个会被带跑。
+///
+/// ⚠️ 这里推的是**整数**帧率（要写进 VOL 的 `vop_time_increment_resolution`，
+/// 那个字段是整数）。12.5 fps 这种会被推成 12 或 13 —— 但**播放节奏不受影响**：
+/// 真正决定节奏的是 `stts` 里逐帧写的**真实毫秒间隔**，这里只影响
+/// `ffprobe` 报的 `r_frame_rate` 那个数。非整数帧率想声明准，得改成
+/// 「时间基 = 1001 × 帧率」那一套，目前没做。
+fn fps_from_timestamps(ts: &[i64]) -> Option<u32> {
+    let mut ds: Vec<i64> = ts
+        .windows(2)
+        .map(|w| w[1] - w[0])
+        .filter(|&d| d > 0)
+        .collect();
+    if ds.is_empty() {
+        return None;
+    }
+    ds.sort_unstable();
+    let d = ds[ds.len() / 2];
+    let fps = (1000.0 / d as f64).round() as i64;
+    Some(fps.clamp(1, 120) as u32)
+}
+
+fn psnr(sq_err: f64, n: u64) -> f64 {
+    let mse = sq_err / n as f64;
+    if mse == 0.0 {
+        f64::INFINITY
+    } else {
+        10.0 * (255.0 * 255.0 / mse).log10()
+    }
+}
+
+fn write_out(path: &Path, data: &[u8]) -> Result<(), Error> {
+    let mut f = BufWriter::new(File::create(path)?);
+    f.write_all(data)?;
+    f.flush()?;
+    Ok(())
+}
+
 /// 批量：逐个转，返回每个文件的 `(输入, 结果)`。**一个失败不影响其他**。
 pub fn convert_batch(
     inputs: &[PathBuf],
@@ -334,22 +769,24 @@ pub fn convert_batch(
     inputs
         .iter()
         .map(|input| {
-            let out = output_path_for(input, out_dir);
+            let out = output_path_for(input, out_dir, opts.format);
             let r = convert_file(input, &out, opts).map(|rep| (out, rep));
             (input.clone(), r)
         })
         .collect()
 }
 
-/// 输出路径：`<out_dir>/<输入文件名去扩展>.wmv`；与输入同路径时加 `.conv` 后缀。
-pub fn output_path_for(input: &Path, out_dir: &Path) -> PathBuf {
+/// 输出路径：`<out_dir>/<输入文件名去扩展>.<容器扩展名>`；与输入同路径时插一个 `.conv`。
+pub fn output_path_for(input: &Path, out_dir: &Path, format: OutputFormat) -> PathBuf {
     let stem = input
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "out".into());
-    let mut out = out_dir.join(format!("{stem}.wmv"));
+    let ext = format.extension();
+    let out = out_dir.join(format!("{stem}.{ext}"));
     if out == input {
-        out = out_dir.join(format!("{stem}.conv.wmv"));
+        out_dir.join(format!("{stem}.conv.{ext}"))
+    } else {
+        out
     }
-    out
 }

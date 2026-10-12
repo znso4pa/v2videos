@@ -9,12 +9,22 @@
 //!
 //! ## 许可
 //!
-//! 生成器目前读的是 FFmpeg 7.1 的 `libavcodec/msmpeg4data.c` 与
-//! `libavcodec/msmpeg4_vc1_data.c`（LGPL-2.1-or-later）—— 与本仓的许可一致，
-//! 整个仓库统一按 LGPL-2.1-or-later 使用。详见 README 的「许可证」一节。
+//! 生成器读的是 FFmpeg 7.1 的 `libavcodec/` 下这些文件（LGPL-2.1-or-later）：
+//! msmpeg4data.c
+//! msmpeg4_vc1_data.c
+//! mpeg4data.h
+//! h263data.c
+//! mpegvideodata.c
+//!
+//! 与本仓的许可一致，整个仓库统一按 LGPL-2.1-or-later 使用。
+//! 详见 README 的「许可证」一节。
 //!
 //! 换一个数据源（规范附录、或别的宽松许可实现）即可整体替换 —— 生成器已就位，
 //! 且表本身与实现无关。
+//!
+//! 这些表是 **MP43 自用**的：宏块类型表 `MB_INTRA` / `MB_NON_INTRA`、
+//! 三套 escape 的 RL 表、以及 WMV1 的 DC 缩放表。**MPEG-4 Part 2 不能用**，
+//! 那边见 `crates/mp4v/src/tables.rs`。
 
 #![allow(dead_code, clippy::all)]
 

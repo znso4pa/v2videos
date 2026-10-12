@@ -25,7 +25,7 @@
 //! ffmpeg 只当**交叉验证的 oracle**（测试里解同一条流、逐像素对账），不进产物。
 
 mod bitreader;
-mod bitwriter;
+pub mod bitwriter;
 mod block;
 mod encode;
 mod error;
@@ -41,6 +41,7 @@ pub mod tables;
 mod vlc;
 
 pub use bitreader::BitReader;
+pub use bitwriter::BitWriter;
 pub use error::{Error, Result};
 pub use header::{decode012, parse_frame_header, FrameHeader, PictureType};
 pub use block::RlTable;

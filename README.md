@@ -26,6 +26,8 @@ crates/
   avi      AVI（RIFF）解封装
   msmpeg4  MS-MPEG-4 v3（MP43）解码（I / P）+ 编码（I / P，含运动估计与帧内/帧间判决）
   wma      WMA v1/v2 音频解码（帧头 / LSP 指数 / 系数 / IMDCT）
+  mp4v     MPEG-4 Part 2（mp4v）**编码** —— 目前全 I 帧
+  mp4      MP4 / ISOBMFF **封装**（ftyp / mdat / moov，视频 + PCM 音频）
   cli      `v2v` 命令行：**批量转码**（解封装 → 解码 → 编码 → 封装）
 tools/
   gen_tables.py   生成 VLC / 反量化表（附自检：前缀无关、Kraft 和、逐码往返）
@@ -55,23 +57,44 @@ V2V_ASF_SAMPLE=/path/to/sample.wmv cargo test --release -- --ignored
 
 | 链路分段    | 做到了什么                                                   | 怎么算验证过                               |
 | ------- | ------------------------------------------------------- | ------------------------------------ |
-| **解封装** | ASF / WMV（`v2v-asf`）                                    | 与 `ffprobe` 逐字段对：轨道、尺寸、包数、关键帧数       |
+| **解封装** | ASF / WMV（`v2v-asf`）、AVI（`v2v-avi`）                      | 与 `ffprobe` 逐字段对：轨道、尺寸、包数、关键帧数       |
 | **解码**  | MS-MPEG-4 v3（MP43）：I 帧 + P 帧（skip、MV 中值预测、半像素运动补偿、帧间残差） | 与 `ffmpeg` **逐像素**对：整段样本**每一帧最大差 0** |
 | **编码**  | MP43 **I 帧 + P 帧**：正向 DCT + 量化 + DC / RL 熵编码、运动估计（整像素粗搜 + 半像素细化）、skip 宏块 | 编出来的 I+P 序列交给 `ffmpeg` 解，与自己的解码器**逐像素一致** |
-
+| **编码**  | MPEG-4 Part 2（`v2v-mp4v`）**全 I 帧**：DC 预测 / AC 预测（逐宏块比位数择优）/ H.263 量化 | 编出来的流交给 `ffmpeg` 解，真样本 **44.5 dB**（同 qscale 下 ffmpeg 自己的 mpeg4 是 43.6 dB） |
 | **音频直通** | 转换时原样搬音频轨（ASF 多流复用） | 真样本整文件（208 秒音乐）：输出音频与源**逐样本 0 差异**（36,700,160 字节完全一致） |
-| **音频解码** | WMA v2（`v2v-wma`） | 真样本整轨 **494 帧 / 505,856 样本**，与 ffmpeg 的 PCM **最大差 3**（s16 满量程 32768），峰值 17567.5 vs 17568 |
+| **音频解码** | WMA v1/v2（`v2v-wma`）→ PCM | 真样本整轨与 ffmpeg 的 PCM **最大差 2**（s16 满量程 32768）；转进 MP4 后**对齐偏移 0 采样点** |
 | **封装**  | ASF 写（`.wmv`，单视频流） | `ffprobe` 认；自己解封装字节一致；ffmpeg 解出来的像素与我们的解码器**逐位一致** |
+| **封装**  | MP4 / ISOBMFF 写（`v2v-mp4`，`mp4v` + `sowt` PCM） | 真样本 mp4v 轨的 `stsz`/`stts`/`stss`/`stco` 与 ffmpeg **逐项相同**、逐帧 MD5 一致；PCM 轨原样往返 |
 
-**还没做**：音频**编码**（WMA 只能解；转换时音频走直通）、Simple Index、其他容器与编解码器。
+**两条输出路**（`v2v convert`，默认 `.wmv`）：
+
+```bash
+# .wmv：视频重编码成 MP43，音频**直通**（零损失），会做 PSNR 校验
+v2v convert in.wmv -o out/
+
+# .mp4：视频重编码成 MPEG-4 Part 2，音频解成 PCM
+v2v convert --mp4 in.wmv -o out/
+```
+
+**为什么 `.mp4` 必须重编码**：MP4 / 3GP 容器**不收 MP43**（`mp4`/`3gp`/`3g2` 三个 muxer 都报
+`codec not currently supported in container`），`mov` 收但是单向街 —— 写出来的东西 ffmpeg
+自己读不回来。WMA 同理。所以 `.wmv → .mp4` 这条路上视频必须过一遍 MPEG-4 Part 2 编码器，
+音频必须解成 PCM（`sowt`）。
+
+**还没做**：MPEG-4 Part 2 的 **P 帧 / B 帧**（现在全 I 帧，所以 `.mp4` 比 ffmpeg 编的大 3 倍左右）、
+音频**编码**（WMA 只能解；`.wmv` 走直通、`.mp4` 走 PCM）、Simple Index、其他容器与编解码器。
 
 ## 命令行
 
 ```bash
 cargo run --release -p v2v-cli -- convert <输入.wmv>... -o <输出目录> [-q 6] [-g 250] [-n 100]
+cargo run --release -p v2v-cli -- convert --mp4 <输入.wmv>... -o <输出目录> [-q 6] [--fps 25]
 ```
 
-批量：一个输入失败不影响其他；默认转完会把输出**解码回来**与源帧比 PSNR。
+批量：一个输入失败不影响其他。默认（`.wmv`）转完会把输出**解码回来**与源帧比 PSNR；
+`--mp4` 不做这个校验 —— 我们只有 `mp4v` 编码器、没有解码器（那条路的正确性由
+`crates/mp4v/tests/ffmpeg_roundtrip.rs` 钉着）。
+
 输入容器按**魔数**自动认（`ASF` / `AVI`，不看扩展名），视频轨目前只支持 **MP43**；
 别的容器 / codec 会明确报「不支持」，不静默跳过。
 
@@ -79,9 +102,10 @@ cargo run --release -p v2v-cli -- convert <输入.wmv>... -o <输出目录> [-q 
 
 **LGPL-2.1-or-later**，见 [LICENSE](LICENSE)。
 
-选 LGPL 的**原因很直接：MP43 解码需要的 VLC / 反量化表（`crates/msmpeg4/src/tables.rs`）**
-是从 FFmpeg 的数据文件读出来的（同为 LGPL-2.1-or-later）。表本身是 H.263 /
-MPEG-4 Part 2 的格式定义、与实现无关，也可以换数据源重新生成；但与其搞「单文件例外」
+选 LGPL 的**原因很直接：MP43 与 MPEG-4 Part 2 编解码需要的 VLC / 反量化表**
+（`crates/msmpeg4/src/tables.rs`、`crates/mp4v/src/tables.rs`）是从 FFmpeg 的数据文件读出来的
+（同为 LGPL-2.1-or-later）。表本身是 H.263 / MPEG-4 Part 2 的格式定义、与实现无关，
+也可以换数据源重新生成（`tools/gen_tables.py` 就是为此留的）；但与其搞「单文件例外」
 这种容易说错的安排，不如整个仓库统一按 LGPL 走。
 
 **代价**：GPL 侧的编码器（x264/x265）链不了，编码只能走宽松许可的实现或硬件

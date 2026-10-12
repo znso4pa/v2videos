@@ -51,7 +51,13 @@ fn moving_sequence(w: u32, h: u32, n: usize) -> Vec<Frame> {
                 v[r * cw + c] = (128 - (r / 8) as i32 * 4 + i as i32 * 2).clamp(16, 240) as u8;
             }
         }
-        out.push(Frame { width: w, height: h, y, u, v });
+        out.push(Frame {
+            width: w,
+            height: h,
+            y,
+            u,
+            v,
+        });
     }
     out
 }
@@ -90,6 +96,7 @@ fn converts_and_output_is_readable() {
         verify: true,
         max_frames: None,
         copy_audio: true,
+        ..Default::default()
     };
     let rep = convert_file(&input, &output, &opts).expect("转换");
 
@@ -269,6 +276,7 @@ fn converts_real_sample_and_ffmpeg_agrees() {
         verify: true,
         max_frames: Some(n),
         copy_audio: true,
+        ..Default::default()
     };
     let rep = convert_file(&input, &output, &opts).expect("转真样本");
     eprintln!("真样本：{rep:?}");
@@ -400,7 +408,10 @@ fn wrap_avi(frames: &[&[u8]], w: u32, h: u32, key_first: bool) -> Vec<u8> {
         u32le(&mut strf, 0);
     }
 
-    let strl = list(b"strl", &[chunk(b"strh", &strh), chunk(b"strf", &strf)].concat());
+    let strl = list(
+        b"strl",
+        &[chunk(b"strh", &strh), chunk(b"strf", &strf)].concat(),
+    );
     let hdrl = list(b"hdrl", &[chunk(b"avih", &avih), strl].concat());
 
     let mut movi_body = Vec::new();
@@ -465,6 +476,7 @@ fn converts_avi_input() {
         verify: true,
         max_frames: None,
         copy_audio: true,
+        ..Default::default()
     };
     let rep = convert_file(&input, &output, &opts).expect("转 AVI");
     eprintln!("AVI → WMV：{rep:?}");
@@ -509,6 +521,7 @@ fn audio_is_passed_through_bit_exactly() {
         verify: false,
         max_frames: Some(60),
         copy_audio: true,
+        ..Default::default()
     };
     let rep = convert_file(&input, &output, &opts).expect("转换");
     eprintln!("报告：{rep:?}");
@@ -568,5 +581,510 @@ fn audio_is_passed_through_bit_exactly() {
         );
     }
     eprintln!("前 {n} 个音频载荷逐字节一致 ✓");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ==================== `.mp4`（MPEG-4 Part 2）那条路 ====================
+
+/// 一个够用的只读 ISOBMFF 遍历器（只在测试里用）。
+///
+/// 刻意不复用 `crates/mp4` 的写侧代码 —— 那边是**写**、这边是**读**，
+/// 共用会让「两边一起错」变得难以察觉。
+mod isobmff {
+    pub fn be32(d: &[u8]) -> u32 {
+        u32::from_be_bytes(d[0..4].try_into().unwrap())
+    }
+
+    /// `[start, end)` 里的所有 box：`(类型, body 起点, body 终点)`。
+    pub fn boxes(d: &[u8], start: usize, end: usize) -> Vec<([u8; 4], usize, usize)> {
+        let mut v = Vec::new();
+        let mut p = start;
+        while p + 8 <= end {
+            let sz = be32(&d[p..]) as usize;
+            let mut ty = [0u8; 4];
+            ty.copy_from_slice(&d[p + 4..p + 8]);
+            if sz < 8 || p + sz > end {
+                break;
+            }
+            v.push((ty, p + 8, p + sz));
+            p += sz;
+        }
+        v
+    }
+
+    /// 按路径逐层往下找，返回最后一层的 body `(起点, 终点)`。
+    pub fn find(d: &[u8], start: usize, end: usize, path: &[&[u8; 4]]) -> Option<(usize, usize)> {
+        let mut cur = (start, end);
+        for want in path {
+            let hit = boxes(d, cur.0, cur.1)
+                .into_iter()
+                .find(|(t, _, _)| t == *want)?;
+            cur = (hit.1, hit.2);
+        }
+        Some(cur)
+    }
+
+    /// 所有 box 类型（整棵树的深度优先展平），给「结构看起来对不对」用。
+    pub fn all_types(d: &[u8], start: usize, end: usize, out: &mut Vec<[u8; 4]>) {
+        for (t, b, e) in boxes(d, start, end) {
+            out.push(t);
+            // 只有容器 box 才往下钻。
+            if matches!(
+                &t,
+                b"moov" | b"trak" | b"mdia" | b"minf" | b"stbl" | b"udta"
+            ) {
+                all_types(d, b, e, out);
+            }
+        }
+    }
+}
+
+fn has_ffmpeg() -> bool {
+    Command::new("ffmpeg")
+        .arg("-version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn psnr(a: &[u8], b: &[u8]) -> f64 {
+    assert_eq!(a.len(), b.len(), "两边字节数不同");
+    let se: f64 = a
+        .iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| {
+            let d = f64::from(x) - f64::from(y);
+            d * d
+        })
+        .sum();
+    let mse = se / a.len() as f64;
+    if mse == 0.0 {
+        f64::INFINITY
+    } else {
+        10.0 * (255.0 * 255.0 / mse).log10()
+    }
+}
+
+/// 输出 `.mp4` 的结构：**不依赖 ffmpeg**，我们自己拆 box 看。
+///
+/// 判据是「换容器不换内容」之外还多一条 —— MP4 的 `esds` 里那 40 多字节
+/// `DecoderSpecificInfo` 必须是**完整**的 VOS + 视觉对象 + VOL，
+/// 少了 VOS 那两级 `ffprobe` 就报不出 `profile` / `level`。
+#[test]
+fn mp4_output_has_a_valid_isobmff_structure() {
+    let dir = temp_dir("mp4_struct");
+    let (w, h) = (64u32, 48u32);
+    let frames = moving_sequence(w, h, 5);
+    let input = dir.join("in.wmv");
+    let output = dir.join("out.mp4");
+    make_wmv(&input, &frames, MP43, 4);
+
+    let opts = ConvertOptions {
+        qscale: 6,
+        format: v2v_cli::OutputFormat::Mp4,
+        verify: true,
+        max_frames: None,
+        copy_audio: true,
+        ..Default::default()
+    };
+    let rep = convert_file(&input, &output, &opts).expect("转 MP4");
+    eprintln!("报告：{rep:?}");
+    assert_eq!(rep.frames, 5);
+    assert_eq!(rep.key_frames, 5, "全 I 帧 → 每帧都是关键帧");
+    assert!(rep.psnr_db.is_none(), "`.mp4` 这条路没有解码器可比");
+    assert!(rep.audio_payloads == 0, "合成样本没有音频轨");
+
+    let d = std::fs::read(&output).expect("读输出");
+    assert_eq!(&d[4..8], b"ftyp", "开头必须是 ftyp");
+    assert_eq!(&d[8..12], b"isom", "品牌必须是 isom（不是 qt）");
+
+    let mut types = Vec::new();
+    isobmff::all_types(&d, 0, d.len(), &mut types);
+    for need in [
+        &b"ftyp"[..],
+        b"moov",
+        b"mdat",
+        b"trak",
+        b"mdia",
+        b"minf",
+        b"stbl",
+        b"stsd",
+        b"stts",
+        b"stsc",
+        b"stsz",
+        b"stco",
+    ] {
+        assert!(
+            types.iter().any(|t| t == need),
+            "少了 box {:?}",
+            String::from_utf8_lossy(need)
+        );
+    }
+    // 全 I 帧 → `stss` 应当被整个省掉（见 `crates/mp4` 的模块文档）。
+    assert!(!types.iter().any(|t| t == b"stss"), "全 I 帧不该写 stss");
+
+    // ---- stsd 里的编码器标识与 DSI ----
+    let stsd = isobmff::find(
+        &d,
+        0,
+        d.len(),
+        &[b"moov", b"trak", b"mdia", b"minf", b"stbl", b"stsd"],
+    )
+    .expect("stsd");
+    // stsd: ver/flags(4) count(4) 之后是 sample entry
+    let ent = stsd.0 + 8;
+    assert_eq!(&d[ent + 4..ent + 8], b"mp4v", "sample entry 必须是 mp4v");
+
+    let esds = isobmff::find(
+        &d,
+        ent + 86,
+        ent + isobmff::be32(&d[ent..]) as usize,
+        &[b"esds"],
+    )
+    .expect("esds");
+    // esds 的 body：ver/flags(4) → ES_Descriptor → DecoderConfigDescriptor → DSI。
+    //
+    // ⚠️ 描述符长度是**变宽**的（7 位/字节，最高位是续接标志），所以必须用
+    // `descr_len` 走，不能假设 4 字节。`descr_len` 返回 `(长度值, 长度字段之后的偏移)` ——
+    // 拿后者再加长度值才是 body 的末尾。
+    let mut q = esds.0 + 4 + 1; // 跳过 ver/flags 和 ES_Descriptor 的 tag
+    let (_, e) = descr_len(&d, q);
+    q = e + 3; // es_id(2) + flags(1)；flags == 0 所以没有 dependsOn/URL/OCR
+    assert_eq!(d[q], 0x04, "接着应当是 DecoderConfigDescriptor（tag 4）");
+    let (_, e) = descr_len(&d, q + 1);
+    q = e + 13; // oti(1) + streamType(1) + bufferSizeDB(3) + maxBitrate(4) + avgBitrate(4)
+    assert_eq!(d[q], 0x05, "接着应当是 DecoderSpecificInfo（tag 5）");
+    let (ln, q2) = descr_len(&d, q + 1);
+    let dsi = &d[q2..q2 + ln];
+    eprintln!("DSI（{ln} 字节）：{}", hex(dsi));
+    assert_eq!(
+        &dsi[..4],
+        &[0x00, 0x00, 0x01, 0xB0],
+        "DSI 必须以 VOS 起始码开头"
+    );
+    assert!(
+        dsi.windows(4).any(|x| x == [0x00, 0x00, 0x01, 0xB5]),
+        "DSI 里要有视觉对象起始码"
+    );
+    assert!(
+        dsi.windows(4).any(|x| x == [0x00, 0x00, 0x01, 0x20]),
+        "DSI 里要有 VOL 起始码"
+    );
+
+    // ---- stsz 的样本数 = 帧数；mdat 的字节数 = 各样本之和 ----
+    let stsz = isobmff::find(
+        &d,
+        0,
+        d.len(),
+        &[b"moov", b"trak", b"mdia", b"minf", b"stbl", b"stsz"],
+    )
+    .expect("stsz");
+    let count = isobmff::be32(&d[stsz.0 + 8..]);
+    assert_eq!(count as usize, rep.frames, "stsz 的样本数应等于帧数");
+
+    let mdat = isobmff::find(&d, 0, d.len(), &[b"mdat"]).expect("mdat");
+    assert!(
+        mdat.1 - mdat.0 > 0 && (mdat.1 - mdat.0) < d.len(),
+        "mdat 大小不合理"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn descr_len(d: &[u8], mut o: usize) -> (usize, usize) {
+    let mut n = 0usize;
+    for _ in 0..4 {
+        let c = d[o];
+        o += 1;
+        n = (n << 7) | (c & 0x7F) as usize;
+        if c & 0x80 == 0 {
+            break;
+        }
+    }
+    (n, o)
+}
+
+fn hex(d: &[u8]) -> String {
+    d.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// `.mp4` 的输出交给 ffmpeg 解，与「输入解码后的画面」比 PSNR。
+///
+/// 比的是**输入解码后的画面**（编码器看到的东西），不是原始合成帧 ——
+/// 这样量到的就只是 MPEG-4 这一趟的损失，不掺 MP43 那一趟。
+#[test]
+fn mp4_output_decodes_with_ffmpeg() {
+    if !has_ffmpeg() {
+        eprintln!("SKIP: PATH 上没有 ffmpeg");
+        return;
+    }
+    let dir = temp_dir("mp4_ffmpeg");
+    let (w, h) = (320u32, 240u32);
+    let n = 6usize;
+    let frames = moving_sequence(w, h, n);
+    let input = dir.join("in.wmv");
+    let output = dir.join("out.mp4");
+    make_wmv(&input, &frames, MP43, 4);
+
+    // 编码器看到的画面（= 我们解输入得到的东西）
+    let mut src = Vec::new();
+    {
+        let mut d = AsfDemuxer::new(std::fs::File::open(&input).expect("开输入")).expect("解封装");
+        let (vnum, ww, hh) = {
+            let v = d
+                .streams()
+                .iter()
+                .find(|s| s.kind == StreamKind::Video)
+                .expect("视频轨");
+            let vf = v.video.as_ref().expect("视频格式");
+            (v.number, vf.width, vf.height)
+        };
+        let mut dec = Decoder::new();
+        while let Some(s) = d.next_sample().expect("读") {
+            if s.stream == vnum {
+                src.push(dec.decode(&s.data, ww, hh).expect("解输入"));
+            }
+        }
+    }
+    assert_eq!(src.len(), n);
+
+    let opts = ConvertOptions {
+        qscale: 6,
+        format: v2v_cli::OutputFormat::Mp4,
+        verify: false,
+        max_frames: None,
+        copy_audio: true,
+        ..Default::default()
+    };
+    let rep = convert_file(&input, &output, &opts).expect("转 MP4");
+    assert_eq!(rep.frames, n);
+
+    // ffmpeg 解我们的 MP4
+    let got = Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-i",
+            output.to_str().unwrap(),
+            // 见 `mp4_from_real_sample_keeps_audio_in_sync` 里对 `-fps_mode` 的说明。
+            "-fps_mode",
+            "passthrough",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "yuv420p",
+            "-",
+        ])
+        .output()
+        .expect("跑 ffmpeg");
+    assert!(
+        got.status.success(),
+        "ffmpeg 解不开：{}",
+        String::from_utf8_lossy(&got.stderr)
+    );
+    let log = String::from_utf8_lossy(&got.stderr).to_lowercase();
+    for bad in ["error", "corrupt", "invalid", "damaged"] {
+        assert!(!log.contains(bad), "ffmpeg 报了「{bad}」：{log}");
+    }
+
+    let mut want = Vec::new();
+    for f in &src {
+        want.extend_from_slice(&f.y);
+        want.extend_from_slice(&f.u);
+        want.extend_from_slice(&f.v);
+    }
+    let p = psnr(&want, &got.stdout);
+    eprintln!("`.mp4` 端到端 PSNR = {p:.2} dB（qscale {}）", opts.qscale);
+    assert!(p > 35.0, "画质太差（{p:.2} dB）—— 位流能解开但内容不对");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **真样本端到端**（默认 `#[ignore]`）：真 `.wmv` 转 `.mp4`，
+/// 交 ffmpeg 解，视频比 PSNR、**音频查对齐偏移**。
+///
+/// ```text
+/// V2V_ASF_SAMPLE=<样本> cargo test --release -p v2v-cli -- --ignored --nocapture
+/// ```
+///
+/// 音频那条判据是这套里最有价值的一条：WMA 有**两帧编码器延迟**，
+/// 不跳掉它，音频会整体晚约 90 ms 与视频错位 —— 而画质、帧数、
+/// 能不能解开这些判据**全都不会报警**。
+#[test]
+#[ignore = "需要真样本（带 WMA 音轨 + MP43 视频）与 ffmpeg"]
+fn mp4_from_real_sample_keeps_audio_in_sync() {
+    let src_path = match std::env::var("V2V_ASF_SAMPLE") {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!("SKIP: V2V_ASF_SAMPLE 未设置");
+            return;
+        }
+    };
+    if !Path::new(&src_path).is_file() {
+        eprintln!("SKIP: 样本不存在");
+        return;
+    }
+    if !has_ffmpeg() {
+        eprintln!("SKIP: PATH 上没有 ffmpeg");
+        return;
+    }
+    let dir = temp_dir("mp4_real");
+    let input = dir.join("in.wmv");
+    std::fs::copy(&src_path, &input).expect("拷样本");
+    let output = dir.join("out.mp4");
+
+    let n = 30usize;
+    let opts = ConvertOptions {
+        qscale: 6,
+        format: v2v_cli::OutputFormat::Mp4,
+        verify: false,
+        max_frames: Some(n),
+        copy_audio: true,
+        ..Default::default()
+    };
+    let rep = convert_file(&input, &output, &opts).expect("转真样本");
+    eprintln!("真样本 → MP4：{rep:?}");
+    assert_eq!(rep.frames, n);
+    assert!(rep.audio_payloads > 0, "一个音频采样点都没写");
+
+    let run = |args: &[&str]| -> Vec<u8> {
+        let o = Command::new("ffmpeg")
+            .args(args)
+            .output()
+            .expect("跑 ffmpeg");
+        assert!(
+            o.status.success(),
+            "ffmpeg 失败：{}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        o.stdout
+    };
+    let out_s = output.to_str().unwrap();
+    let in_s = input.to_str().unwrap();
+
+    // ---- 视频：与「源解码后的画面」比 ----
+    let mut d = AsfDemuxer::new(std::fs::File::open(&input).expect("开输入")).expect("解封装");
+    let (vnum, w, h) = {
+        let v = d
+            .streams()
+            .iter()
+            .find(|s| s.kind == StreamKind::Video)
+            .expect("视频轨");
+        let vf = v.video.as_ref().expect("视频格式");
+        (v.number, vf.width, vf.height)
+    };
+    let mut dec = Decoder::new();
+    let mut src = Vec::new();
+    while let Some(s) = d.next_sample().expect("读") {
+        if s.stream == vnum {
+            src.push(dec.decode(&s.data, w, h).expect("解源"));
+            if src.len() == n {
+                break;
+            }
+        }
+    }
+    assert_eq!(src.len(), n);
+    let mut want = Vec::new();
+    for f in &src {
+        want.extend_from_slice(&f.y);
+        want.extend_from_slice(&f.u);
+        want.extend_from_slice(&f.v);
+    }
+    // `-fps_mode passthrough` = 一个解码帧出一个输出帧。不加的话 ffmpeg 会按它
+    // **自己估的**帧率（`r_frame_rate`）复制/丢帧去凑恒定输出帧率 —— 那样比出来的
+    // 帧数对不上，还会把「容器时间戳不规整」这种真问题掩盖成「帧数不对」。
+    let got = run(&[
+        "-v",
+        "error",
+        "-i",
+        out_s,
+        "-map",
+        "0:v",
+        "-fps_mode",
+        "passthrough",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "yuv420p",
+        "-",
+    ]);
+    let p = psnr(&want, &got);
+    eprintln!("视频 PSNR = {p:.2} dB");
+    assert!(p > 30.0, "真内容画质太差（{p:.2} dB）");
+
+    // ---- 音频：找最佳对齐偏移，必须落在 0 ----
+    //
+    // ⚠️ 采样率与声道数**必须照源的来**（`elephant.asf` 是 8 kHz 单声道）。
+    // 写死 `-ac 2 -ar 44100` 会引入重采样器自己的群延迟，量出来是个假偏移 ——
+    // 而且两边的 MSE 都是 0（内容逐位相同），只有偏移这一项能看出问题。
+    let (ch, rate) = {
+        let a = d
+            .streams()
+            .iter()
+            .find(|s| s.kind == StreamKind::Audio)
+            .expect("音频轨");
+        let af = a.audio.as_ref().expect("音频格式");
+        (af.channels.to_string(), af.sample_rate.to_string())
+    };
+    let ours = run(&[
+        "-v", "error", "-i", out_s, "-map", "0:a", "-f", "s16le", "-",
+    ]);
+    let theirs = run(&[
+        "-v", "error", "-i", in_s, "-map", "0:a", "-f", "s16le", "-ac", &ch, "-ar", &rate, "-",
+    ]);
+    let a: Vec<i16> = ours
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    let b: Vec<i16> = theirs
+        .chunks_exact(2)
+        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    assert!(!a.is_empty() && b.len() > a.len(), "音频长度不合理");
+
+    // ⚠️ 从**参考里第一个有声音的样本**开始比。很多素材开头是一段静音
+    // （`elephant.asf` 开头 4 万多个样本全是 0），静音段里任何偏移的 MSE 都是 0，
+    // 那样这个判据就完全失效了 —— 实测踩过：它报了个 -8 的假偏移。
+    let loud = |v: &i16| v.unsigned_abs() > 200;
+    let Some(start) = (0..a.len()).find(|&i| loud(&b[i])) else {
+        eprintln!("SKIP: 我们覆盖的这段音频里没有有声样本，比不出对齐");
+        return;
+    };
+
+    let mut best: Option<(f64, i64)> = None;
+    for sh in -8i64..=8 {
+        let (mut se, mut cnt) = (0f64, 0usize);
+        for i in (start..a.len() - 16).step_by(11) {
+            let j = i as i64 + sh;
+            if j < 0 || j as usize >= b.len() {
+                continue;
+            }
+            let d = f64::from(a[i]) - f64::from(b[j as usize]);
+            se += d * d;
+            cnt += 1;
+        }
+        if cnt < 1000 {
+            continue;
+        }
+        let mse = se / cnt as f64;
+        // 并列时取**绝对值更小**的偏移 —— 否则全零段会让搜索停在 -8 上。
+        let better = match best {
+            None => true,
+            Some((bm, bs)) => mse < bm - 1e-9 || ((mse - bm).abs() <= 1e-9 && sh.abs() < bs.abs()),
+        };
+        if better {
+            best = Some((mse, sh));
+        }
+    }
+    let (mse, sh) = best.expect("一个偏移都没算出来");
+    eprintln!("音频最佳对齐偏移 = {sh} 采样点（MSE {mse:.2}）");
+    assert_eq!(
+        sh, 0,
+        "音频偏移了 {sh} 个采样点 —— WMA 的编码器延迟没跳干净？"
+    );
+    assert!(mse < 1000.0, "音频内容对不上（MSE {mse:.2}）");
+
     let _ = std::fs::remove_dir_all(&dir);
 }
