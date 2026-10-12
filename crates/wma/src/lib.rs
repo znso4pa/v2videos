@@ -24,11 +24,13 @@
 //!   （起始位置在缓冲区内、帧数在合理区间），精确帧数等帧解码器落地后再验。
 
 mod bitreader;
+mod decoder;
 mod params;
 mod superframe;
 pub mod tables;
 
 pub use bitreader::BitReader;
+pub use decoder::WmaDecoder;
 pub use params::WmaParams;
 pub use superframe::{SuperframeHeader, SuperframeState};
 

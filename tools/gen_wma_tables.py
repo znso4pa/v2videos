@@ -81,6 +81,40 @@ def grab_floats(src: str, name: str) -> list[float]:
     return [float(x) for x in re.findall(r"-?\d+\.\d+(?:[eE][-+]?\d+)?", body)]
 
 
+def grab_int_rows(src: str, name: str) -> list[list[int]]:
+    """抓一个二维整数数组的**每一行**（行内项数可以不满 —— C 会补 0）。"""
+    m = re.search(rf"\b{name}\s*(\[[^=]*?)?=\s*\{{", src)
+    if not m:
+        raise SystemExit(f"找不到数组 {name}")
+    i = m.end() - 1
+    depth = 0
+    end = None
+    for j in range(i, len(src)):
+        if src[j] == "{":
+            depth += 1
+        elif src[j] == "}":
+            depth -= 1
+            if depth == 0:
+                end = j
+                break
+    body = src[i + 1 : end]
+    rows = []
+    depth = 0
+    start = None
+    for j, ch in enumerate(body):
+        if ch == "{":
+            if depth == 0:
+                start = j + 1
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                rows.append(
+                    [int(x, 0) for x in re.findall(r"0[xX][0-9a-fA-F]+|-?\d+", body[start:j])]
+                )
+    return rows
+
+
 def grab_float_rows(src: str, name: str) -> list[list[float]]:
     """抓一个二维浮点数组的**每一行**（行内项数可以不满 —— C 会补 0）。"""
     m = re.search(rf"\b{name}\s*(\[[^=]*?)?=\s*\{{", src)
@@ -204,6 +238,27 @@ def main() -> int:
     out.append("// （`ff_aac_scalefactor_code` / `_bits`），还没抽。本样本 `use_exp_vlc = 0`，")
     out.append("// 走 LSP 路径，所以先不做；要用的时候在生成器里加一段。")
     out.append("")
+
+    # ---- 指数频带表（v2 的捷径，a < 3 时用）----
+    for tag, name in [
+        ("44100", "exponent_band_44100"),
+        ("32000", "exponent_band_32000"),
+        ("22050", "exponent_band_22050"),
+    ]:
+        # ⚠️ 又是「短行」：每行**首元素是数量**（代码里 `n = *table++`），后面才是频带，
+        # 剩下的位置 C 补 0。所以要按行抽、补到 25 列。
+        rows = grab_int_rows(wmadata, name)
+        assert len(rows) == 3, f"{name} 行数 {len(rows)}"
+        out.append(f"/// `{name}[3][25]`：v2 在 `frame_len_bits - 7 - k < 3` 时用的指数频带表。")
+        out.append("///")
+        out.append("/// **每行第 0 个元素是频带个数**（ffmpeg 里 `n = *table++`），后面才是频带宽度。")
+        out.append(f"pub static EXPONENT_BAND_{tag}: [[u8; 25]; 3] = [")
+        for row in rows:
+            assert len(row) <= 25, f"{name} 某行有 {len(row)} 个值"
+            padded = row + [0] * (25 - len(row))
+            out.append("    [" + ", ".join(str(v) for v in padded) + "],")
+        out.append("];")
+        out.append("")
 
     # ---- critical freqs ----
     crit = grab_array(wma_freqs, "ff_wma_critical_freqs")
