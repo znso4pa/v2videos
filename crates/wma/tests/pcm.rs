@@ -124,14 +124,54 @@ fn first_frames_match_ffmpeg_pcm() {
     };
     eprintln!("ffmpeg 解出 {} 个样本（交错）", pcm.len());
 
-    // 逐样本比（s16 量化后）
+    // ---- 先定「帧级偏移」----
+    //
+    // ⚠️ ffmpeg 的 WMA 解码器会**整帧跳过**编码器延迟（`skip_samples`，
+    // 日志里会打 `skip whole frame`），所以它的 PCM 比码流本身的帧少几帧。
+    // 实测这个样本少 3 帧（3072 个样本）—— 对账前必须先把这个偏移找出来，
+    // 否则会把「少了几帧」误判成「波形不对」。
+    let fl0 = params.frame_len;
+    let nf_ours = n / fl0;
+    let nf_ref = pcm.len() / channels / fl0;
+    let mut shift_frames = 0i64;
+    {
+        let mut best = (f64::MAX, 0i64);
+        for s in -8i64..=8 {
+            let mut sum = 0f64;
+            let mut cnt = 0usize;
+            for f in 8..nf_ours.min(40) as i64 {
+                let g = f - s;
+                if g < 0 || g >= nf_ref as i64 {
+                    continue;
+                }
+                for i in (0..fl0).step_by(7) {
+                    let a = got[0][(f as usize) * fl0 + i];
+                    let b = pcm[((g as usize) * fl0 + i) * channels] as f32;
+                    sum += ((a - b) * (a - b)) as f64;
+                    cnt += 1;
+                }
+            }
+            if cnt > 100 {
+                let mse = sum / cnt as f64;
+                if mse < best.0 {
+                    best = (mse, s);
+                }
+            }
+        }
+        shift_frames = best.1;
+        eprintln!("帧级偏移：我们的帧 = ffmpeg 的帧 + {shift_frames}（MSE {:8.0}）", best.0);
+    }
+    let shift = (shift_frames * fl0 as i64).max(0) as usize;
+
+    // 逐样本比（s16 量化后，按上面的偏移对齐）
     let mut worst = 0i32;
     let mut worst_at = 0usize;
     let mut sum = 0f64;
     let mut count = 0usize;
-    for i in 0..n {
+    let cmp_n = n.saturating_sub(shift);
+    for i in 0..cmp_n {
         for ch in 0..channels {
-            let ours = (got[ch][i].clamp(-32768.0, 32767.0)) as i32;
+            let ours = (got[ch][i + shift].clamp(-32768.0, 32767.0)) as i32;
             let idx = i * channels + ch;
             if idx >= pcm.len() {
                 break;
@@ -155,8 +195,8 @@ fn first_frames_match_ffmpeg_pcm() {
 
     // ⚠️ 先确认**两边都不是静音** —— 否则「静音 vs 静音」会假绿。
     // （第一版就踩了：我们解出 4096 个零、ffmpeg 前 4096 个也是零，测试居然过了。）
-    let ours_peak = got[0][..n].iter().fold(0f32, |m, &v| m.max(v.abs()));
-    let ref_peak = pcm[..(n * channels).min(pcm.len())]
+    let ours_peak = got[0][shift..n].iter().fold(0f32, |m, &v| m.max(v.abs()));
+    let ref_peak = pcm[..(cmp_n * channels).min(pcm.len())]
         .iter()
         .fold(0i16, |m, &v| m.max(v.abs()));
     eprintln!("峰值：我们 {ours_peak:.1} / ffmpeg {ref_peak}");
@@ -164,6 +204,47 @@ fn first_frames_match_ffmpeg_pcm() {
         ours_peak > 1.0 && ref_peak > 1,
         "两边都是静音（我们峰值 {ours_peak:.1}，ffmpeg {ref_peak}）—— 这个对账没有意义"
     );
+    // ---- 帧映射：我们的每一帧，最像 ffmpeg 的哪一帧 ----
+    {
+        let fl = params.frame_len;
+        let nf_ours = n / fl;
+        let nf_ref = pcm.len() / channels / fl;
+        for f in 10..nf_ours.min(24) {
+            let mut best = (f64::MAX, 0usize);
+            for g in 0..nf_ref.min(40) {
+                let mut sum = 0f64;
+                for i in 0..256 {
+                    let a = got[0][f * fl + i];
+                    let b = pcm[(g * fl + i) * channels] as f32;
+                    sum += ((a - b) * (a - b)) as f64;
+                }
+                let mse = sum / 256.0;
+                if mse < best.0 {
+                    best = (mse, g);
+                }
+            }
+            eprintln!("我们帧 {f:2} ↔ ffmpeg 帧 {:2}（MSE {:8.0}）", best.1, best.0);
+        }
+    }
+
+    // ---- 逐帧看：错的是所有有声音的帧，还是只有某些帧 ----
+    let fl = params.frame_len;
+    for f in 0..(n / fl).min(20) {
+        let mut worst = 0i32;
+        for i in 0..fl {
+            let idx = (f * fl + i) * channels;
+            if idx >= pcm.len() {
+                break;
+            }
+            let d = (got[0][f * fl + i] as i32 - pcm[idx] as i32).abs();
+            worst = worst.max(d);
+        }
+        let peak = (0..fl)
+            .map(|i| got[0][f * fl + i].abs())
+            .fold(0f32, f32::max);
+        eprintln!("帧 {f:2}: 最大差 {worst:6} 我们峰值 {peak:8.1}");
+    }
+
     // ---- 对齐诊断：波形是不是整体错位（错位的话峰值会对、逐样本差会很大）----
     // 找一个**有声音**的窗口（静音段对齐没有意义：零对零总是相等）
     let mut anchor = 0usize;

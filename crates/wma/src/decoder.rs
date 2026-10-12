@@ -152,6 +152,10 @@ pub struct WmaDecoder {
     last_bitoffset: usize,
     /// superframe 序号（4 位、16 回绕），用来校验包序。
     pub superframe_index: u32,
+    /// 每声道上一块解出多少个系数（调试用）。
+    pub last_coef_count: [usize; 2],
+    /// 上一帧的 `total_gain`（调试用）。
+    pub last_total_gain: i32,
 }
 
 impl WmaDecoder {
@@ -331,6 +335,8 @@ impl WmaDecoder {
             last_superframe: Vec::new(),
             last_bitoffset: 0,
             superframe_index: 0,
+            last_coef_count: [0; 2],
+            last_total_gain: 0,
         })
     }
 
@@ -367,17 +373,22 @@ impl WmaDecoder {
             return Err(Error::Bad("bit_offset 超出包长"));
         }
 
-        // 有残留：把本包开头 `bit_offset` 位接到残留后面，解出那一帧
+        // 有残留：把本包开头 `bit_offset` 位接到残留后面，解出那一帧。
+        //
+        // ⚠️ 这 `bit_offset` 位是**从头之后接着读**的（ffmpeg 就在头解析完的位置上
+        // `get_bits` 继续），**不是**从包的第 0 位读！第一版从第 0 位读，
+        // 结果「残留帧」全错 —— 而帧号看着还对（帧数没少），只是那些帧的内容是错的，
+        // 表现为「有的帧几乎正确、有的帧几乎静音」交替出现。
         if !self.last_superframe.is_empty() {
             let mut acc = std::mem::take(&mut self.last_superframe);
             let mut bitpos = acc.len() * 8;
-            for i in 0..bit_offset {
-                let bit = (payload[i >> 3] >> (7 - (i & 7))) & 1;
+            for _ in 0..bit_offset {
+                let bit = r.bit()?;
                 if bitpos % 8 == 0 {
                     acc.push(0);
                 }
                 let last = acc.len() - 1;
-                acc[last] |= bit << (7 - (bitpos % 8));
+                acc[last] |= (bit as u8) << (7 - (bitpos % 8));
                 bitpos += 1;
             }
             let mut rr = BitReader::new(&acc);
@@ -410,12 +421,23 @@ impl WmaDecoder {
 
     /// 解一帧：返回**每个声道** `frame_len` 个样本。
     pub fn decode_frame(&mut self, r: &mut BitReader) -> Result<Vec<Vec<f32>>> {
+        let start_bit = r.bit_pos();
         self.block_pos = 0;
         loop {
             let last = self.decode_block(r)?;
             if last {
                 break;
             }
+        }
+        if std::env::var("V2V_WMA_FRAME_DBG").is_ok() {
+            eprintln!(
+                "[frame] bit {}→{} (吃 {} 位) total_gain={} coef_cnt={:?}",
+                start_bit,
+                r.bit_pos(),
+                r.bit_pos() - start_bit,
+                self.last_total_gain,
+                &self.last_coef_count[..self.params.channels]
+            );
         }
         let fl = self.params.frame_len;
         let mut out = Vec::with_capacity(self.params.channels);
@@ -501,6 +523,7 @@ impl WmaDecoder {
             }
         }
         let coef_nb_bits = total_gain_to_bits(total_gain);
+        self.last_total_gain = total_gain;
 
         let n = self.coefs_end[bsize] - self.params.coefs_start;
         let mut nb_coefs = [n; 2];
@@ -919,6 +942,7 @@ impl WmaDecoder {
             }
             offset += 1;
         }
+        self.last_coef_count[ch] = offset;
         if offset > num_coefs {
             if std::env::var("V2V_WMA_DEBUG").is_ok() {
                 eprintln!("[dbg] 越界：offset={offset} num_coefs={num_coefs} bit_pos={}", r.bit_pos());
