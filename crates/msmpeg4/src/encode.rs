@@ -1,18 +1,27 @@
 //! MS-MPEG-4 v3（MP43）**编码器**。
 //!
-//! 目前只做 **I 帧**（帧内）—— 那是「能出一条 ffmpeg 解得开的流」的最小完整切片。
-//! P 帧（运动估计 + 帧间残差）还没做。
+//! I 帧（帧内）+ P 帧（运动估计 + 帧间残差）。P 帧逐宏块做**帧内/帧间判决**：
+//! 运动估计 + 残差与「直接帧内编码」都算一遍位数，取小的 —— 画面切换时残差
+//! 会大到帧间不划算，判决自动退回帧内，画质不崩。
 //!
-//! 位流按 MS-MPEG-4 v3 的语法写：帧头 + 帧内宏块类型 + DC 一趟 + AC 的 RL 编码。
+//! 位流按 MS-MPEG-4 v3 的语法写：帧头 + 宏块类型 + 系数编码。
 //! **熵编码必须严格按语法**（差一位 ffmpeg 就解不开 —— 这也是最硬的验证），
 //! 但**量化器不必**：码流只需要「合法且质量好」，不必和别的编码器编出的字节相同。
 //!
-//! ## 两个「必须知道」的点
+//! ## 几个「必须知道」的点
 //!
-//! - **DC 走单独一趟**：`level = round(F(0,0) / dc_scale)`，且要减去邻居预测
-//!   （`dc_predict`，和我们解码端同一个函数）。AC 则走 RL 表。
+//! - **DC 走单独一趟**（帧内）：`level = round(F(0,0) / dc_scale)`，且要减去邻居预测
+//!   （`dc_predict`，和解码端同一个函数）。AC 走 RL 表。**帧间没有 DC 一趟**，
+//!   DC 是普通系数混在 RL 里。
+//! - **P 帧里的帧内宏块语法和 I 帧不一样**（对照 `msmpeg4enc.c` 的
+//!   `ff_msmpeg4_encode_mb` 与 `msmpeg4dec.c` 的 `msmpeg4v34_decode_mb`）：
+//!   MB 类型用**同一张** `MB_NON_INTRA` 表 —— 符号下标 `bit6=0` 是帧内（下标 = cbp，
+//!   **不做 CBP 预测**），`bit6=1` 是帧间（下标 = cbp + 64）；后面照读 1 位 `ac_pred`；
+//!   色度 RL 表 = `rl_table_index`（P 帧头只写这一个下标，解码端
+//!   `rl_chroma_table_index = rl_table_index`）。帧内宏块**不写 MV、不动 MV 网格**
+//!   （解码端留着初值 (0,0)，后面的中值预测按这个来）。
 //! - **level 的 8 位上限**：第三 escape 用 8 位有符号写 level，所以 |level| ≤ 127。
-//!   `qscale` 会自动抬高来保证这一点（见 `pick_qscale`）。
+//!   I 帧 `qscale` 会自动抬高来保证这一点（见 `pick_qscale`）。
 
 use crate::bitwriter::BitWriter;
 use crate::block::RlTable;
@@ -81,6 +90,9 @@ pub struct Encoder {
     ref_planes: Option<Planes>,
     /// 上一帧实际用的 qscale（`pick_qscale` 抬高过的话会不一样）。
     pub last_qscale: u8,
+    /// **上一帧里走了帧内路径的宏块数**（P 帧判决的结果；I 帧恒为全部）。
+    /// 测试与调用方用它确认「画面切换时帧内真的接管了」。
+    pub intra_mbs_last: usize,
 }
 
 impl Encoder {
@@ -94,6 +106,7 @@ impl Encoder {
             mv_grid: Grid::new(1, 1),
             ref_planes: None,
             last_qscale: cfg.qscale,
+            intra_mbs_last: 0,
         }
     }
 
@@ -218,52 +231,31 @@ impl Encoder {
                 wtr.put(code, len);
                 wtr.put(0, 1); // ac_pred = 0（我们不做 AC 预测）
 
-                // ---- 6 个块 ----
+                // ---- 6 个块：DC 一趟 + 帧内 AC（与 P 帧里的帧内宏块共用一个函数）----
+                write_intra_blocks(
+                    &mut wtr,
+                    &mut self.dc_luma,
+                    &mut self.dc_cb,
+                    &mut self.dc_cr,
+                    &dc_vlc,
+                    &dc_vlc_c,
+                    &rl_luma,
+                    &rl_chroma,
+                    &qb,
+                    mbx,
+                    mby,
+                    first_slice_line,
+                    y_dc_scale,
+                    c_dc_scale,
+                )?;
+
+                // ---- 重建（P 帧的参考）----
+                // 帧内反量化：DC 乘 dc_scale，AC 是 level*qmul ± qadd，然后 idct_put。
                 for n in 0..6usize {
-                    let luma = n < 4;
-                    let scale = if luma { y_dc_scale } else { c_dc_scale };
-                    let (dc_grid, dcv) = if luma {
-                        (&mut self.dc_luma, &dc_vlc)
-                    } else if n == 4 {
-                        (&mut self.dc_cb, &dc_vlc_c)
-                    } else {
-                        (&mut self.dc_cr, &dc_vlc_c)
-                    };
-                    let (gx, gy) = if luma {
-                        (2 * mbx + (n & 1), 2 * mby + (n >> 1))
-                    } else {
-                        (mbx, mby)
-                    };
-                    let xy = dc_grid.idx(gx, gy);
-
-                    // DC 预测（与解码端同一个 dc_predict）
-                    let mut a = dc_grid.data[xy - 1] as i32;
-                    let mut b = dc_grid.data[xy - 1 - dc_grid.w] as i32;
-                    let mut c = dc_grid.data[xy - dc_grid.w] as i32;
-                    if first_slice_line && (n & 2) == 0 {
-                        b = 1024;
-                        c = 1024;
-                    }
-                    // ⚠️ 这里必须用**截断**除法（Rust 的 `/`），和解码端
-                    // `(a + scale/2) / scale` 逐位一致；四舍五入会让预测值偏掉。
-                    a = (a + scale / 2) / scale;
-                    b = (b + scale / 2) / scale;
-                    c = (c + scale / 2) / scale;
-                    let (pred, _dir) = dc_predict(a, b, c);
-
-                    let total = qb[n][0];
-                    dc_grid.data[xy] = (total * scale) as i16;
-                    write_dc(&mut wtr, dcv, total - pred);
-
-                    // AC
-                    let rl = if luma { &rl_luma } else { &rl_chroma };
-                    write_ac(&mut wtr, rl, &qb[n], true, 0);
-
-                    // ---- 重建（P 帧的参考）----
-                    // 帧内反量化：DC 乘 dc_scale，AC 是 level*qmul ± qadd，然后 idct_put。
+                    let scale = if n < 4 { y_dc_scale } else { c_dc_scale };
                     let (plane, stride, _px, _py) = recon_at(&mut cur, n, mbx, mby);
                     let mut rb = [0i16; 64];
-                    rb[0] = (total * scale) as i16;
+                    rb[0] = (qb[n][0] * scale) as i16;
                     for k in 1..64 {
                         rb[k] = dequant(qb[n][k], qmul, qadd);
                     }
@@ -289,8 +281,13 @@ impl Encoder {
 
     /// 编一帧 **P 帧**（帧间）。必须先编过一帧 I。
     ///
-    /// 帧间宏块一律按 inter 编（不做「这个宏块改用帧内」的判决）；
-    /// 残差为零且运动矢量为零时退化成 skip。
+    /// 每个宏块做**帧内/帧间判决**：运动估计 + 帧间残差与「直接帧内编码」
+    /// 都算一遍位数，取小的 —— 画面切换时残差大到帧间不划算，自动退回帧内。
+    /// 残差为零且运动矢量为零时退化成 skip（1 位，永远最便宜）。
+    ///
+    /// 帧内宏块在 P 帧里的语法与 I 帧不同（见模块注释）：`MB_NON_INTRA[cbp]`
+    /// （不加 64、不做 CBP 预测）+ 1 位 `ac_pred` + 帧内块语法；**不写 MV、
+    /// 不动 MV 网格** —— 解码端留着初值 (0,0)，后面的中值预测按这个来。
     ///
     /// ⚠️ 半像素取整：P 帧用不用带舍入的插值由 `flipflop_rounding` 决定，而它只从
     /// I 帧尾部的 ext header 读。我们（与 ffmpeg 的编码器一样）**不写** ext header，
@@ -315,9 +312,18 @@ impl Encoder {
         let q = self.cfg.qscale as i32;
         let qmul = q << 1;
         let qadd = (q - 1) | 1;
+        // P 帧里帧内宏块的 DC 缩放（与 I 帧/解码端同表：亮度用 OLD 表）。
+        let y_dc_scale = tables::OLD_Y_DC_SCALE[self.cfg.qscale as usize] as i32;
+        let c_dc_scale = tables::C_DC_SCALE[self.cfg.qscale as usize] as i32;
 
         let rl_inter = rl_table(3 + self.cfg.rl_table_index as usize)?;
+        // P 帧里的帧内宏块：亮度用帧内表（下标即 `rl_table_index`），色度用
+        // `3 + rl_table_index`（P 帧头只写一个下标，解码端 `rl_chroma_table_index`
+        // 直接抄它 —— 见 `msmpeg4dec.c` 的 P 分支）。
+        let rl_intra_luma = rl_table(self.cfg.rl_table_index as usize)?;
         let mb_non_intra_vlc = Vlc::new(&tables::MB_NON_INTRA);
+        let dc_vlc = Vlc::new(&tables::DC[self.cfg.dc_table_index as usize][0]);
+        let dc_vlc_c = Vlc::new(&tables::DC[self.cfg.dc_table_index as usize][1]);
         let mv_tab = MvIndex::new(self.cfg.mv_table_index as usize);
 
         // P 帧恒用带舍入的插值，理由见上面的函数注释。
@@ -325,6 +331,19 @@ impl Encoder {
 
         let mut cur = Planes::new(pw, ph);
         self.mv_grid = Grid::new(mb_w, mb_h);
+        // **DC 网格每帧重置 1024**（与解码端同款：P 帧里帧内宏块的 DC 预测
+        // 从这张网格读 —— 不重置会把上一帧的 DC 带进来，预测全偏）。
+        self.dc_luma = Grid::with_init(2 * mb_w, 2 * mb_h, 1024);
+        self.dc_cb = Grid::with_init(mb_w, mb_h, 1024);
+        self.dc_cr = Grid::with_init(mb_w, mb_h, 1024);
+
+        // 帧内路径的**位数下限**：MB 类型（cbp=0 的码）+ 1 位 ac_pred + 6 个全 0 的
+        // DC 码。帧间路径比这还便宜时，帧内不可能赢，直接跳过评估。
+        let (_, mb0_len) = mb_non_intra_vlc
+            .code_len(0)
+            .ok_or(Error::Bad("MB_NON_INTRA[0] 越界"))?;
+        let dc0_len = dc_vlc.code_len(0).map(|(_, l)| l).unwrap_or(0);
+        let intra_floor = mb0_len as usize + 1 + 6 * dc0_len as usize;
 
         let mut wtr = BitWriter::new();
         wtr.put(1, 2); // pict_type - 1 = 1 → P
@@ -334,6 +353,7 @@ impl Encoder {
         wtr.put(self.cfg.dc_table_index as u32, 1);
         wtr.put(self.cfg.mv_table_index as u32, 1);
 
+        let mut intra_count = 0usize;
         for mby in 0..mb_h {
             let first_slice_line = mby == 0;
             for mbx in 0..mb_w {
@@ -348,7 +368,7 @@ impl Encoder {
                 mc_chroma8(&mut predu, 8, 0, 0, refp, 0, &p, no_rounding);
                 mc_chroma8(&mut predv, 8, 0, 0, refp, 1, &p, no_rounding);
 
-                // ---- 残差 → 正向 DCT → 量化 → cbp ----
+                // ---- 帧间路径：残差 → 正向 DCT → 量化 → cbp ----
                 let mut qb = [[0i32; 64]; 6];
                 let mut cbp = 0u32;
                 for n in 0..6usize {
@@ -392,7 +412,7 @@ impl Encoder {
                     }
                 }
 
-                // ---- skip：没有残差且不动 ----
+                // ---- skip：没有残差且不动（1 位，两条路径都赢不了它）----
                 if self.cfg.use_skip_mb_code && cbp == 0 && mv == (0, 0) {
                     wtr.put(1, 1);
                     let g = self.mv_grid.idx(mbx, mby);
@@ -401,40 +421,228 @@ impl Encoder {
                     continue;
                 }
 
-                // ---- MB 类型 + 运动矢量 ----
-                if self.cfg.use_skip_mb_code {
-                    wtr.put(0, 1); // mb coded
-                }
+                // ---- 帧间路径的位流（临时写入器，赢了才接进正式位流）----
+                let mut w_p = BitWriter::new();
                 let (code, len) = mb_non_intra_vlc
                     .code_len((cbp + 64) as usize)
                     .ok_or(Error::Bad("CBP 超出帧间 MB 类型表"))?;
-                wtr.put(code, len);
-
-                let g = self.mv_grid.idx(mbx, mby);
-                self.mv_grid.data[g] = mv;
-                mv_tab.write(&mut wtr, mv.0 - pred.0, mv.1 - pred.1)?;
-
-                // ---- 6 个块（帧间：DC 也是普通系数，run 从 0 起）----
+                w_p.put(code, len);
+                mv_tab.write(&mut w_p, mv.0 - pred.0, mv.1 - pred.1)?;
                 for n in 0..6usize {
-                    write_ac(&mut wtr, &rl_inter, &qb[n], false, 1);
+                    write_ac(&mut w_p, &rl_inter, &qb[n], false, 1);
                 }
 
-                // ---- 重建：先 MC 铺底，再叠回反量化后的残差 ----
-                mc_mb(&mut cur, refp, mbx, mby, mv, no_rounding);
-                for n in 0..6usize {
-                    let (plane, stride, _px, _py) = recon_at(&mut cur, n, mbx, mby);
-                    let mut rb = [0i16; 64];
-                    for k in 0..64usize {
-                        rb[k] = dequant(qb[n][k], qmul, qadd);
+                // ---- 帧内路径：原始像素（不是残差）→ fdct → 量化 ----
+                let mut use_intra = false;
+                let mut w_i = BitWriter::new();
+                let mut qb_intra = [[0i32; 64]; 6];
+                if w_p.bit_pos() > intra_floor {
+                    let mut cbp_intra = 0u32;
+                    for n in 0..6usize {
+                        let luma = n < 4;
+                        let scale = if luma { y_dc_scale } else { c_dc_scale };
+                        let (plane, stride, px, py) = block_at(&y, &u, &v, pw, mbx, mby, n);
+                        let mut coef = [0i32; 64];
+                        fdct(&plane[py * stride + px..], stride, &mut coef);
+                        let mut blk = [0i32; 64];
+                        blk[0] = div_round(coef[0], scale);
+                        let mut has_ac = false;
+                        for k in 1..64usize {
+                            let l = quantize(coef[k], qmul, qadd)
+                                .clamp(-MAX_ESCAPE_LEVEL, MAX_ESCAPE_LEVEL);
+                            blk[k] = l;
+                            if l != 0 {
+                                has_ac = true;
+                            }
+                        }
+                        qb_intra[n] = blk;
+                        // 帧内的 cbp bit 只表示「有 AC」（DC 无论如何都要传）
+                        if has_ac {
+                            cbp_intra |= 1 << (5 - n);
+                        }
                     }
-                    idct_add(&mut rb, plane, stride);
+
+                    // scratch 写一遍：DC 网格会被写，先拍快照，输了再还原。
+                    let snap = DcSnap::take(
+                        &self.dc_luma,
+                        &self.dc_cb,
+                        &self.dc_cr,
+                        mbx,
+                        mby,
+                    );
+                    let (code, len) = mb_non_intra_vlc
+                        .code_len(cbp_intra as usize)
+                        .ok_or(Error::Bad("CBP 超出 MB 类型表（帧内）"))?;
+                    w_i.put(code, len);
+                    w_i.put(0, 1); // ac_pred = 0（我们不做 AC 预测）
+                    write_intra_blocks(
+                        &mut w_i,
+                        &mut self.dc_luma,
+                        &mut self.dc_cb,
+                        &mut self.dc_cr,
+                        &dc_vlc,
+                        &dc_vlc_c,
+                        &rl_intra_luma,
+                        &rl_inter,
+                        &qb_intra,
+                        mbx,
+                        mby,
+                        first_slice_line,
+                        y_dc_scale,
+                        c_dc_scale,
+                    )?;
+                    use_intra = w_i.bit_pos() < w_p.bit_pos();
+                    if !use_intra {
+                        snap.restore(
+                            &mut self.dc_luma,
+                            &mut self.dc_cb,
+                            &mut self.dc_cr,
+                        );
+                    }
+                }
+
+                // ---- 写正式位流：skip 位两条路径一样，后面整段接赢的那条 ----
+                if self.cfg.use_skip_mb_code {
+                    wtr.put(0, 1); // mb coded
+                }
+                if use_intra {
+                    // DC 网格的更新在 scratch 里已经发生 —— 帧内赢了，保留它。
+                    intra_count += 1;
+                    wtr.append(&w_i);
+                    // 重建：帧内 = 反量化后 idct_put **覆盖**
+                    for n in 0..6usize {
+                        let (plane, stride, _px, _py) = recon_at(&mut cur, n, mbx, mby);
+                        let mut rb = [0i16; 64];
+                        let scale = if n < 4 { y_dc_scale } else { c_dc_scale };
+                        rb[0] = (qb_intra[n][0] * scale) as i16;
+                        for k in 1..64usize {
+                            rb[k] = dequant(qb_intra[n][k], qmul, qadd);
+                        }
+                        idct_put(&mut rb, plane, stride);
+                    }
+                } else {
+                    wtr.append(&w_p);
+                    // 帧间才写 MV 网格；帧内宏块留着 (0,0)（与解码端一致）。
+                    let g = self.mv_grid.idx(mbx, mby);
+                    self.mv_grid.data[g] = mv;
+                    // 重建：先 MC 铺底，再叠回反量化后的残差
+                    mc_mb(&mut cur, refp, mbx, mby, mv, no_rounding);
+                    for n in 0..6usize {
+                        let (plane, stride, _px, _py) = recon_at(&mut cur, n, mbx, mby);
+                        let mut rb = [0i16; 64];
+                        for k in 0..64usize {
+                            rb[k] = dequant(qb[n][k], qmul, qadd);
+                        }
+                        idct_add(&mut rb, plane, stride);
+                    }
                 }
             }
         }
 
+        self.intra_mbs_last = intra_count;
         self.ref_planes = Some(cur);
         Ok(wtr.finish())
     }
+}
+
+/// 帧内/帧间判决用的 DC 网格快照：帧内路径先写进临时位流，网格也被顺手更新；
+/// 输了就靠它还原。只拍**当前宏块会写的那 6 个槽**（亮度 4 + 色度 2）。
+struct DcSnap {
+    luma: [(usize, i16); 4],
+    cb: (usize, i16),
+    cr: (usize, i16),
+}
+
+impl DcSnap {
+    fn take(
+        dc_luma: &Grid<i16>,
+        dc_cb: &Grid<i16>,
+        dc_cr: &Grid<i16>,
+        mbx: usize,
+        mby: usize,
+    ) -> Self {
+        let mut luma = [(0usize, 0i16); 4];
+        for (i, slot) in luma.iter_mut().enumerate() {
+            let gx = 2 * mbx + (i & 1);
+            let gy = 2 * mby + (i >> 1);
+            let xy = dc_luma.idx(gx, gy);
+            *slot = (xy, dc_luma.data[xy]);
+        }
+        let xy = dc_cb.idx(mbx, mby);
+        let cb = (xy, dc_cb.data[xy]);
+        let xy = dc_cr.idx(mbx, mby);
+        let cr = (xy, dc_cr.data[xy]);
+        Self { luma, cb, cr }
+    }
+
+    fn restore(&self, dc_luma: &mut Grid<i16>, dc_cb: &mut Grid<i16>, dc_cr: &mut Grid<i16>) {
+        for (xy, v) in &self.luma {
+            dc_luma.data[*xy] = *v;
+        }
+        dc_cb.data[self.cb.0] = self.cb.1;
+        dc_cr.data[self.cr.0] = self.cr.1;
+    }
+}
+
+/// 帧内 6 块的位流：逐块 DC 一趟（读网格做预测、写回 `total * scale`）+ 帧内 AC。
+///
+/// I 帧与 P 帧里的帧内宏块**共用这一个函数** —— DC 预测是跨宏块的有状态逻辑，
+/// 写两份一定会漂。与 `frame.rs` 解码端的帧内块语法逐位对称：
+/// 预测比较用 `<=`、缩放用**截断**除法、片首行且 `n` 的 bit1 为 0 时上/右上取 1024。
+#[allow(clippy::too_many_arguments)]
+fn write_intra_blocks(
+    w: &mut BitWriter,
+    dc_luma: &mut Grid<i16>,
+    dc_cb: &mut Grid<i16>,
+    dc_cr: &mut Grid<i16>,
+    dc_vlc: &Vlc,
+    dc_vlc_c: &Vlc,
+    rl_luma: &RlTable,
+    rl_chroma: &RlTable,
+    qb: &[[i32; 64]; 6],
+    mbx: usize,
+    mby: usize,
+    first_slice_line: bool,
+    y_dc_scale: i32,
+    c_dc_scale: i32,
+) -> Result<()> {
+    for n in 0..6usize {
+        let luma = n < 4;
+        let scale = if luma { y_dc_scale } else { c_dc_scale };
+        let (dc_grid, dcv, rl) = if luma {
+            (&mut *dc_luma, dc_vlc, rl_luma)
+        } else if n == 4 {
+            (&mut *dc_cb, dc_vlc_c, rl_chroma)
+        } else {
+            (&mut *dc_cr, dc_vlc_c, rl_chroma)
+        };
+        let (gx, gy) = if luma {
+            (2 * mbx + (n & 1), 2 * mby + (n >> 1))
+        } else {
+            (mbx, mby)
+        };
+        let xy = dc_grid.idx(gx, gy);
+
+        let mut a = dc_grid.data[xy - 1] as i32;
+        let mut b = dc_grid.data[xy - 1 - dc_grid.w] as i32;
+        let mut c = dc_grid.data[xy - dc_grid.w] as i32;
+        if first_slice_line && (n & 2) == 0 {
+            b = 1024;
+            c = 1024;
+        }
+        // ⚠️ 截断除法（Rust 的 `/`），与解码端 `(a + scale/2) / scale` 逐位一致；
+        // 四舍五入会让预测值偏掉。
+        a = (a + scale / 2) / scale;
+        b = (b + scale / 2) / scale;
+        c = (c + scale / 2) / scale;
+        let (pred, _dir) = dc_predict(a, b, c);
+
+        let total = qb[n][0];
+        dc_grid.data[xy] = (total * scale) as i16;
+        write_dc(w, dcv, total - pred);
+        write_ac(w, rl, &qb[n], true, 0);
+    }
+    Ok(())
 }
 
 /// 当前帧**重建**平面上第 `n` 个块的 `(平面切片, 行距, x, y)`。

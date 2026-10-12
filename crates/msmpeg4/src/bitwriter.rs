@@ -57,6 +57,19 @@ impl BitWriter {
         self.bytes.len() * 8 + self.nbits as usize
     }
 
+    /// 把另一个写入器写出的位（含未满一字节的尾位）原样接到自己后面。
+    ///
+    /// P 帧的帧内/帧间判决用：两条路径先各自写进临时写入器比大小，赢的那条
+    /// 整段接进正式位流 —— 保证「比较时的位数」和「实际写出的位数」是同一个数。
+    pub fn append(&mut self, other: &BitWriter) {
+        for &b in &other.bytes {
+            self.put(b as u32, 8);
+        }
+        if other.nbits > 0 {
+            self.put(other.cur as u32, other.nbits as u32);
+        }
+    }
+
     /// 补齐到字节边界（MP43 每帧从字节边界开始）。
     pub fn align(&mut self) {
         if self.nbits > 0 {

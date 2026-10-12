@@ -249,3 +249,114 @@ fn static_scene_collapses_to_skips() {
     assert_eq!(w0, 0);
     assert_eq!(w1, 0, "静止 P 帧：ffmpeg 与我们不一致（最大差 {w1}）");
 }
+
+/// **画面切换**：P 帧遇到完全不同的画面，帧间残差会大到不划算 ——
+/// 帧内/帧间判决应该让帧内宏块接管，画质不崩、ffmpeg 仍然解得开。
+#[test]
+fn scene_cut_falls_back_to_intra_macroblocks() {
+    let (w, h) = (320u32, 240u32);
+
+    // 0: 移动序列的 I 帧；1: 正常预测帧；2: **完全不同的画面**（切换）；
+    // 3: 新画面的移动版（预测恢复正常）。
+    let mut frames = moving_sequence(w, h, 2);
+    frames.push(different_scene(w, h, 0));
+    frames.push(different_scene(w, h, 1));
+
+    let res = match encode_sequence_and_cross_check(&frames, 8) {
+        Ok(v) => v,
+        Err(e) => panic!("编/解失败：{e}"),
+    };
+
+    // ① 合法性：整段（含切换帧）两个解码器逐位一致
+    for (i, (worst, _, _)) in res.iter().enumerate() {
+        assert_eq!(*worst, 0, "帧 {i}：ffmpeg 与我们的解码不一致");
+    }
+
+    // ② 切换帧（帧 2）的画质：帧内接管后不应崩。
+    //    没有判决时这里全是强行帧间的垃圾残差，PSNR 会掉到十几 dB。
+    let (_, cut_psnr, _) = res[2];
+    eprintln!(
+        "各帧 PSNR：{:.2} / {:.2} / {:.2} / {:.2}，各帧字节：{:?}",
+        res[0].1, res[1].1, res[2].1, res[3].1,
+        res.iter().map(|(_, _, s)| *s).collect::<Vec<_>>()
+    );
+    assert!(
+        cut_psnr > 28.0,
+        "切换帧画质崩了（PSNR {cut_psnr:.2} dB）—— 帧内判决可能没接管"
+    );
+
+    // ③ 切换帧的码流明显大于正常预测帧（帧内码字贵得多）—— 证明它真用了帧内
+    let normal_p = res[1].2;
+    let cut = res[2].2;
+    assert!(
+        cut > normal_p * 4,
+        "切换帧没比正常预测帧贵多少（{cut} vs {normal_p}）—— 帧内可能没被用上"
+    );
+
+    // ④ 直接证据：判决计数 —— 正常预测帧 0 个帧内宏块，切换帧占大多数
+    let mut enc = Encoder::new(EncoderConfig {
+        qscale: 8,
+        ..Default::default()
+    });
+    let intra: Vec<usize> = frames
+        .iter()
+        .map(|f| {
+            enc.encode_frame(f).expect("编码");
+            enc.intra_mbs_last
+        })
+        .collect();
+    eprintln!("各帧帧内宏块数：{intra:?}");
+    // 正常预测帧允许**少量**帧内宏块（方块边缘的新内容局部更便宜 —— 这是判决
+    // 在正确工作），但只该是个位数；切换帧应该占大多数。
+    let total_mbs = (w * h / 256) as usize;
+    assert!(
+        intra[1] * 20 < total_mbs,
+        "正常预测帧的帧内宏块太多（{}）—— 判决可能过于激进",
+        intra[1]
+    );
+    assert!(
+        intra[3] * 20 < total_mbs,
+        "新画面的移动帧帧内宏块太多（{}）",
+        intra[3]
+    );
+    assert!(
+        intra[2] > total_mbs / 2,
+        "切换帧只有 {} 个帧内宏块 —— 判决没接管",
+        intra[2]
+    );
+}
+
+/// 与 `moving_sequence` 完全不同的画面：高频棋盘底 + 一块随 `i` 平移的亮斑。
+/// 底是**固定**的 —— 切换帧（i 起步）必然全帧内；下一帧（i+1）只有亮斑移动，
+/// 帧间应该预测得很好。
+fn different_scene(w: u32, h: u32, i: usize) -> Frame {
+    let (wu, hu) = (w as usize, h as usize);
+    let mut y = vec![0u8; wu * hu];
+    for r in 0..hu {
+        for c in 0..wu {
+            y[r * wu + c] = if (r / 6 + c / 6) % 2 == 0 { 235 } else { 20 };
+        }
+    }
+    // 移动的亮斑（帧 2 → 3 之间可被运动补偿追上）
+    let ox = 40 + i * 6;
+    let oy = 30 + i * 3;
+    for r in 0..30usize {
+        for c in 0..30usize {
+            let yy = oy + r;
+            let xx = ox + c;
+            if yy < hu && xx < wu {
+                y[yy * wu + xx] = 128;
+            }
+        }
+    }
+    let (cw, ch) = (wu / 2, hu / 2);
+    let mut u = vec![0u8; cw * ch];
+    let mut v = vec![0u8; cw * ch];
+    for r in 0..ch {
+        for c in 0..cw {
+            u[r * cw + c] = if (r / 4) % 2 == 0 { 220 } else { 40 };
+            v[r * cw + c] = if (c / 4) % 2 == 0 { 60 } else { 200 };
+        }
+    }
+    Frame { width: w, height: h, y, u, v }
+}
