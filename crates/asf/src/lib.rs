@@ -157,7 +157,10 @@ impl<R: Read> AsfDemuxer<R> {
         }
         let mut buf = vec![0u8; self.packet_size];
         let filled = self.reader.read_full(&mut buf)?;
-        if filled < self.packet_size {
+        // 尾部不完整的包：**按文件结束处理，不报错**。真实世界里截断/残缺的文件很常见，
+        // ffmpeg 也是容忍的；把它当致命错误会让「文件差最后几字节」整个读不出来。
+        let truncated = filled < self.packet_size;
+        if truncated {
             self.done = true;
             if filled == 0 {
                 return Ok(());
@@ -165,7 +168,12 @@ impl<R: Read> AsfDemuxer<R> {
             buf.truncate(filled);
         }
         self.packets_read += 1;
-        self.process_packet(&buf)
+        let r = self.process_packet(&buf);
+        if truncated {
+            // 残缺的尾巴解到一半失败是预期的：已经拿到的东西都留下了。
+            return Ok(());
+        }
+        r
     }
 
     fn process_packet(&mut self, buf: &[u8]) -> Result<()> {
@@ -376,7 +384,17 @@ impl<R: Read> AsfDemuxer<R> {
                     st.key_frame = cur_key;
                 }
                 if frag_offset >= st.buf.len() || frag_size > st.buf.len() - frag_offset {
-                    // 片段位置非法：丢弃这一段，别污染缓冲。
+                    // 片段位置非法（真样本里会遇到：载荷声明的对象长为 0，ffmpeg 也为此
+                    // 打 `packet fragment position invalid` 的日志）。
+                    //
+                    // ⚠️ 这里**必须把这个片段的数据吃掉**再继续：载荷长度是已知的，
+                    // 跳过它才能保住后面的载荷头对齐。第一版直接 `None` 走人、
+                    // 一个字节都不消费 —— 下一个载荷头就会从数据中间开始读，
+                    // 位流错位到包尾之外（实测：一个 22 kbps 的 WMA 样本读到第 393
+                    // 个样本就 `unexpected end of data`）。
+                    let n = frag_size.min(c.remaining());
+                    c.skip(n)?;
+                    size_left -= n as i64;
                     None
                 } else {
                     let data = c.take(frag_size)?;

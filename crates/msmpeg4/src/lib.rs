@@ -1,4 +1,8 @@
-//! 纯 Rust 的 Microsoft MPEG-4（MP41/MP42/MP43、WMV1/WMV2）视频解码。
+//! 纯 Rust 的 Microsoft MPEG-4 视频解码 —— **目前只做 MP43（v3）**。
+//!
+//! ⚠️ 文档以前写成「MP41/MP42/MP43、WMV1/WMV2 都支持」，那是**夸大**：
+//! WMV1/WMV2（v1/v2）的帧头与宏块语法不同，还没实现（实测一个 WMV1 样本会解不动，
+//! 对账测试里显式 SKIP 掉了）。见 TODO。
 //!
 //! 目标：把 ASF 解封装吐出的裸视频帧解成 YUV420P。无 C、无 FFI、零依赖。
 //!

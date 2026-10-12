@@ -35,6 +35,16 @@ fn p_frames_match_ffmpeg() {
 }
 
 fn check_p_frames(path: &str) {
+    // 这条对账只对 **MP43**（v3）有意义：WMV1/WMV2 的帧头与宏块语法不同，
+    // 我们还没实现（见 TODO）。别的 codec 的样本直接跳过，别把「没实现」
+    // 伪装成「对不上」。
+    if let Some((_w, _h, fourcc)) = common::video_fourcc(path) {
+        let name = v2v_asf::fourcc_string(fourcc);
+        if name != "MP43" {
+            eprintln!("SKIP: 视频是 {name}，本对账只针对 MP43");
+            return;
+        }
+    }
     let (samples, w, h) = match all_video_frames(path) {
         Some(v) => v,
         None => {

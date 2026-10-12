@@ -182,6 +182,14 @@ pub fn yuv420p_frame_len(w: u32, h: u32) -> usize {
 }
 
 
+/// 视频流的 `(宽, 高, fourcc)`（拿不到就 `None`）。
+pub fn video_fourcc(path: &str) -> Option<(u32, u32, u32)> {
+    let d = AsfDemuxer::new(BufReader::new(File::open(path).ok()?)).ok()?;
+    let v = d.streams().iter().find(|s| s.kind == StreamKind::Video)?;
+    let vf = v.video.as_ref()?;
+    Some((vf.width, vf.height, vf.fourcc))
+}
+
 /// 按**解码顺序**取出全部视频帧（不过滤关键帧），连同视频尺寸。
 pub fn all_video_frames(path: &str) -> Option<(Vec<Vec<u8>>, u32, u32)> {
     first_video_frames(path, usize::MAX)
