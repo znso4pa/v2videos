@@ -6,6 +6,8 @@
 //! ```text
 //!   .wmv/.wma ──► [本 crate] ──► Sample { stream, key_frame, timestamp_ms, data }
 //!                  解封装
+//!
+//! 反方向（封装）也有：`AsfMuxer` 把裸样本写回 `.wmv`（目前单视频流）。
 //! ```
 //!
 //! 无 C、无 FFI、零依赖。数据包布局按 ASF 规范实现；行为与 `ffprobe` 交叉验证
@@ -30,9 +32,11 @@ mod cursor;
 mod error;
 mod guid;
 mod header;
+mod mux;
 mod types;
 
 pub use error::{Error, Result};
+pub use mux::{AsfMuxer, VideoStreamInfo};
 pub use types::{
     fourcc_string, AudioFormat, FileInfo, Sample, Stream, StreamKind, VideoFormat,
 };
