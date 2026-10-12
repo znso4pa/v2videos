@@ -1,4 +1,4 @@
-# v2video
+# v2videos
 
 用 **Rust** 研究「视频之间的编码格式转换」—— 也就是把一种视频（**容器 + 视频编码 + 音频编码**）
 转成另一种，整条链路的每一段都拿出来看看：在纯 Rust 里能做到什么、边界在哪、代价是什么。
@@ -17,16 +17,33 @@
 
 中间那层「像素域 / 采样域」是关键的解耦点：两端互相不认识，只认中间那份裸数据。
 
-## 关注的问题
+## 目录
 
-- **容器**：解封装与封装。ASF/WMV、AVI、FLV、MPEG-PS/TS、MP4、MKV/WebM……
-- **视频编码**：解码与编码。MPEG-4 Part 2、MSMPEG4 / WMV1–3、H.263、MJPEG、H.264、
-  VP8/VP9、AV1……哪些编解码器真的**有编码器**（很多只有解码器，比如 VC-1）。
-- **音频编码**：AAC、MP3、Vorbis、WMA、PCM……
-- **纯 Rust 生态的现状**：哪些 crate 能用、成熟度与下载量、许可证是否干净、
-  什么时候只能靠 FFI（ffmpeg 等）、体积代价多大。
-- **硬件的取舍**：什么时候值得走 Android MediaCodec / VA-API / VideoToolbox，
-  什么时候纯软件更好。
+```text
+crates/
+  asf      ASF（.wmv / .wma）解封装 —— 纯 std、零依赖
+  msmpeg4  MS-MPEG-4 v3（MP43）解码（I / P）+ I 帧编码
+tools/
+  gen_tables.py   生成 VLC / 反量化表（附自检：前缀无关、Kraft 和、逐码往返）
+```
+
+## 构建与测试
+
+```bash
+cargo build
+cargo test        # 单元测试 + 不依赖样本的集成测试
+```
+
+**与 `ffmpeg` / `ffprobe` 的交叉验证**是本仓的判据：解码结果逐像素对、封装字段逐字段对、
+编码出来的流交回 ffmpeg 解。这些测试需要一个真样本，用环境变量指路；**缺样本时打
+`SKIP` 并通过**，所以新 clone 下来 `cargo test` 直接就能跑：
+
+```bash
+V2V_ASF_SAMPLE=/path/to/sample.wmv cargo test
+
+# 整段样本逐帧对账（最重的一条，默认标了 #[ignore]）：
+V2V_ASF_SAMPLE=/path/to/sample.wmv cargo test --release -- --ignored
+```
 
 ## 状态
 
@@ -37,9 +54,6 @@
 | **解封装** | ASF / WMV（`v2v-asf`） | 与 `ffprobe` 逐字段对：轨道、尺寸、包数、关键帧数 |
 | **解码** | MS-MPEG-4 v3（MP43）：I 帧 + P 帧（skip、MV 中值预测、半像素运动补偿、帧间残差） | 与 `ffmpeg` **逐像素**对：整段样本**每一帧最大差 0** |
 | **编码** | MP43 **I 帧**：正向 DCT + 量化 + DC / RL 熵编码 | 编出来的流交给 `ffmpeg` 解，与自己的解码器**逐像素一致** |
-
-`cargo test` 默认全绿；对真样本的重活（整段逐帧对账）标了 `#[ignore]`，
-要显式跑：`cargo test --release -- --ignored`。
 
 **还没做**：P 帧编码（运动估计）、ASF 写、音频（WMA）、其他容器与编解码器。
 
