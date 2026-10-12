@@ -8,7 +8,9 @@
 //! - ✅ **位读取器**（MSB 优先 —— 实测确认，见下）
 //! - ✅ **参数推导**（`ff_wma_init` / `ff_wma_get_frame_len_bits` 逐条对着写）
 //! - ✅ **superframe 头解析**（帧数 / `bit_offset` / 跨包残留的搬运规则）
-//! - ⏳ 帧头 → 指数解码（LSP / VLC）→ 位分配 → 系数（16 张 RL 表）→ IMDCT
+//! - ✅ **码表**（`tables.rs`，由 `tools/gen_wma_tables.py` 从 ffmpeg 的数据文件生成，
+//!   带 Kraft 和自检）
+//! - ⏳ 帧头 → 指数解码（LSP / VLC）→ 位分配 → 系数（6 张 RL 表）→ IMDCT
 //!
 //! ## 两个「实测才知道」的点
 //!
@@ -24,6 +26,7 @@
 mod bitreader;
 mod params;
 mod superframe;
+pub mod tables;
 
 pub use bitreader::BitReader;
 pub use params::WmaParams;
