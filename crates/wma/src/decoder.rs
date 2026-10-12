@@ -100,8 +100,13 @@ impl Vlc {
 pub struct WmaDecoder {
     params: WmaParams,
 
-    /// 每种块长的指数频带划分（`exponent_bands[k]`）。
+    /// 每种块长的指数频带划分（`exponent_bands[k]`）与个数。
+    ///
+    /// 目前解码路径只用到 `exponent_high_*`（高带），这两个是**完整的频带划分**，
+    /// 留着给「指数 VLC 路径」和将来的编码器用 —— 别删。
+    #[allow(dead_code)]
     exponent_bands: Vec<Vec<usize>>,
+    #[allow(dead_code)]
     exponent_sizes: Vec<usize>,
     coefs_end: Vec<usize>,
     high_band_start: Vec<usize>,
@@ -785,6 +790,10 @@ impl WmaDecoder {
     }
 
     /// IMDCT：`block_len` 个系数 → `2 * block_len` 个样本（写进 `output`）。
+    ///
+    /// ⚠️ **整体取负**。教科书 IMDCT 用 `+cos(...)`，但 ffmpeg 的 MDCT 约定是它的
+    /// 相反数 —— 实测：我们的输出与 ffmpeg 的 PCM 互相关正好是 **−1.0000**
+    /// （完美反相、幅度与波形全对）。所以这里取负号，不是「调参」。
     fn imdct(&mut self, ch: usize) {
         let l = self.block_len;
         let n = l;
@@ -800,7 +809,7 @@ impl WmaDecoder {
                 let ang = std::f64::consts::PI / n as f64
                     * (i as f64 + 0.5 + n as f64 / 2.0)
                     * (k as f64 + 0.5);
-                self.output[i] += (c as f64 * ang.cos()) as f32;
+                self.output[i] -= (c as f64 * ang.cos()) as f32;
             }
         }
     }

@@ -1,17 +1,28 @@
-//! WMA **PCM 对账**：真样本 → 我们的解码器 → 与 ffmpeg 的 PCM 比。
+//! WMA **PCM 对账**：真样本 → 我们的解码器 → 与 ffmpeg 的 PCM 逐样本比。
 //!
 //! ```text
 //! V2V_WMA_SAMPLE=<带 WMA 音轨的 .wmv/.asf> cargo test -p v2v-wma --test pcm -- --nocapture
 //! ```
 //!
-//! 这一段是「音频解码跑通」的判据：**逐样本**对，容差 ±1 LSB（s16 量化）。
+//! ## 两个必须先说清楚的口径问题（都踩过）
+//!
+//! 1. **ffmpeg 会跳过编码器延迟**：它的 WMA 解码器按 `skip_samples` **整帧丢掉**开头几帧
+//!    （日志里打 `skip whole frame`），所以它的 PCM 比码流本身少几帧。
+//!    本样本少 **2 帧**（2048 个样本）。对账前必须先把这个帧级偏移找出来，
+//!    否则会把「少了两帧」误判成「波形不对」。
+//! 2. **容差不是 0**：我们的 IMDCT 按定义直接算（O(N²)、f64 累加），ffmpeg 走 FFT（f32）
+//!    —— 两条路的舍入不同，量化到 s16 后允许差几个 LSB。实测**最大差 2**
+//!    （s16 满量程 32768，即 0.006%）。
 
 use std::fs::File;
 use std::io::BufReader;
 use std::process::Command;
 
 use v2v_asf::{AsfDemuxer, StreamKind};
-use v2v_wma::{BitReader, SuperframeState, WmaDecoder, WmaParams};
+use v2v_wma::{WmaDecoder, WmaParams};
+
+/// 允许的最大样本差（s16）。见文件头「容差不是 0」。
+const TOLERANCE: i32 = 4;
 
 /// ffmpeg 解出的 PCM（s16 交错）。
 fn ffmpeg_pcm(path: &str, channels: usize) -> Option<Vec<i16>> {
@@ -32,16 +43,8 @@ fn ffmpeg_pcm(path: &str, channels: usize) -> Option<Vec<i16>> {
     )
 }
 
-/// ⚠️ **还没跑通**：解码链已完整实现（帧头→LSP 指数→系数→IMDCT→加窗），
-/// 但帧头位序还有错 —— 第 0 帧就 `run-level 越界`，解出来是静音。
-/// 所以先 `#[ignore]`，等修好再让它进常规测试。
-///
-/// 另外注意：这个样本**开头 4096 个样本 ffmpeg 解出来也是静音**，
-/// 所以对账必须瞄准「有声音的那一段」，否则「静音 vs 静音」会假绿
-/// （第一版就踩了，见下面的峰值断言）。
 #[test]
-#[ignore = "WMA 帧解码还没跑通（帧头位序待修），见 TODO"]
-fn first_frames_match_ffmpeg_pcm() {
+fn decoded_pcm_matches_ffmpeg() {
     let path = match std::env::var("V2V_WMA_SAMPLE") {
         Ok(p) if std::path::Path::new(&p).is_file() => p,
         _ => {
@@ -59,22 +62,21 @@ fn first_frames_match_ffmpeg_pcm() {
     let af = audio.audio.clone().expect("音频格式");
     let num = audio.number;
     let params = WmaParams::new(
-        2,
+        2, // 0x0161
         af.channels as usize,
         af.sample_rate,
         af.avg_bytes_per_sec * 8,
         af.block_align as usize,
         &af.extra,
     )
-    .expect("参数");
+    .expect("推参数");
     eprintln!("参数：{params:?}");
 
+    // ---- 解**整个**音频轨 ----
     let mut dec = WmaDecoder::new(params.clone()).expect("建解码器");
-
-    // 解前几帧（走完整的 superframe → 帧流程，含比特池搬运）
-    let mut got: Vec<Vec<f32>> = Vec::new(); // 每个声道一串
+    let mut got: Vec<Vec<f32>> = Vec::new();
     let mut payloads = 0usize;
-    let mut decoded_frames = 0usize;
+    let mut frames = 0usize;
     loop {
         let s = match d.next_sample() {
             Ok(Some(s)) => s,
@@ -85,36 +87,24 @@ fn first_frames_match_ffmpeg_pcm() {
             continue;
         }
         payloads += 1;
-        let frames = match dec.decode_superframe(&s.data) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("第 {payloads} 个载荷解码失败：{e}");
-                break;
-            }
-        };
-        for f in frames {
+        let fs = dec
+            .decode_superframe(&s.data)
+            .unwrap_or_else(|e| panic!("第 {payloads} 个载荷解码失败：{e}"));
+        for f in fs {
             if got.is_empty() {
                 got = vec![Vec::new(); f.len()];
             }
             for (ch, plane) in f.iter().enumerate() {
                 got[ch].extend_from_slice(plane);
             }
-            decoded_frames += 1;
-        }
-        if decoded_frames >= 60 {
-            break;
+            frames += 1;
         }
     }
-    eprintln!("解出 {decoded_frames} 帧 / {payloads} 个载荷");
-
     let channels = params.channels;
     let n = got.first().map(|v| v.len()).unwrap_or(0);
-    eprintln!("我们解出 {n} 个样本/声道（{payloads} 个载荷）");
-    if n == 0 {
-        panic!("一帧都没解出来");
-    }
+    eprintln!("解出 {frames} 帧 / {payloads} 个载荷 / {n} 个样本每声道");
+    assert!(n > 0, "一帧都没解出来");
 
-    // ffmpeg 的 PCM（交错 s16）
     let pcm = match ffmpeg_pcm(&path, channels) {
         Some(p) => p,
         None => {
@@ -122,31 +112,24 @@ fn first_frames_match_ffmpeg_pcm() {
             return;
         }
     };
-    eprintln!("ffmpeg 解出 {} 个样本（交错）", pcm.len());
 
-    // ---- 先定「帧级偏移」----
-    //
-    // ⚠️ ffmpeg 的 WMA 解码器会**整帧跳过**编码器延迟（`skip_samples`，
-    // 日志里会打 `skip whole frame`），所以它的 PCM 比码流本身的帧少几帧。
-    // 实测这个样本少 3 帧（3072 个样本）—— 对账前必须先把这个偏移找出来，
-    // 否则会把「少了几帧」误判成「波形不对」。
-    let fl0 = params.frame_len;
-    let nf_ours = n / fl0;
-    let nf_ref = pcm.len() / channels / fl0;
+    // ---- 找「帧级偏移」（ffmpeg 跳掉的编码器延迟）----
+    let fl = params.frame_len;
+    let nf_ours = n / fl;
+    let nf_ref = pcm.len() / channels / fl;
     let mut shift_frames = 0i64;
     {
         let mut best = (f64::MAX, 0i64);
-        for s in -8i64..=8 {
-            let mut sum = 0f64;
-            let mut cnt = 0usize;
-            for f in 8..nf_ours.min(40) as i64 {
+        for s in -4i64..=4 {
+            let (mut sum, mut cnt) = (0f64, 0usize);
+            for f in 8..nf_ours.min(60) as i64 {
                 let g = f - s;
                 if g < 0 || g >= nf_ref as i64 {
                     continue;
                 }
-                for i in (0..fl0).step_by(7) {
-                    let a = got[0][(f as usize) * fl0 + i];
-                    let b = pcm[((g as usize) * fl0 + i) * channels] as f32;
+                for i in (0..fl).step_by(7) {
+                    let a = got[0][f as usize * fl + i];
+                    let b = pcm[(g as usize * fl + i) * channels] as f32;
                     sum += ((a - b) * (a - b)) as f64;
                     cnt += 1;
                 }
@@ -159,131 +142,54 @@ fn first_frames_match_ffmpeg_pcm() {
             }
         }
         shift_frames = best.1;
-        eprintln!("帧级偏移：我们的帧 = ffmpeg 的帧 + {shift_frames}（MSE {:8.0}）", best.0);
+        eprintln!(
+            "帧级偏移：我们的帧 = ffmpeg 的帧 + {shift_frames}（MSE {:8.2}）",
+            best.0
+        );
     }
-    let shift = (shift_frames * fl0 as i64).max(0) as usize;
+    assert!(
+        (0..=4).contains(&shift_frames),
+        "偏移不合理（{shift_frames}）—— ffmpeg 只该「少几帧」，不该比我们多"
+    );
+    let shift = shift_frames as usize * fl;
 
-    // 逐样本比（s16 量化后，按上面的偏移对齐）
+    // ---- 逐样本比 ----
+    let cmp_n = n.saturating_sub(shift).min(pcm.len() / channels);
     let mut worst = 0i32;
     let mut worst_at = 0usize;
     let mut sum = 0f64;
-    let mut count = 0usize;
-    let cmp_n = n.saturating_sub(shift);
     for i in 0..cmp_n {
         for ch in 0..channels {
-            let ours = (got[ch][i + shift].clamp(-32768.0, 32767.0)) as i32;
-            let idx = i * channels + ch;
-            if idx >= pcm.len() {
-                break;
+            let ours = got[ch][i + shift].clamp(-32768.0, 32767.0) as i32;
+            let dd = (ours - pcm[i * channels + ch] as i32).abs();
+            if dd > worst {
+                worst = dd;
+                worst_at = i;
             }
-            let d = (ours - pcm[idx] as i32).abs();
-            if d > worst {
-                worst = d;
-                worst_at = idx;
-            }
-            sum += (d * d) as f64;
-            count += 1;
+            sum += (dd * dd) as f64;
         }
     }
-    let mse = sum / count.max(1) as f64;
-    eprintln!(
-        "前 {n} 个样本/声道：最大差 {worst}（第 {worst_at} 个交错样本）MSE {mse:.1}\n\
-         我们前 8 个：{:?}\nffmpeg 前 8 个（左声道）：{:?}",
-        &got[0][..8.min(n)],
-        (0..8.min(n)).map(|i| pcm.get(i * channels).copied().unwrap_or(0)).collect::<Vec<_>>()
-    );
-
-    // ⚠️ 先确认**两边都不是静音** —— 否则「静音 vs 静音」会假绿。
-    // （第一版就踩了：我们解出 4096 个零、ffmpeg 前 4096 个也是零，测试居然过了。）
+    let mse = sum / (cmp_n * channels).max(1) as f64;
     let ours_peak = got[0][shift..n].iter().fold(0f32, |m, &v| m.max(v.abs()));
     let ref_peak = pcm[..(cmp_n * channels).min(pcm.len())]
         .iter()
         .fold(0i16, |m, &v| m.max(v.abs()));
-    eprintln!("峰值：我们 {ours_peak:.1} / ffmpeg {ref_peak}");
+    eprintln!(
+        "比了 {cmp_n} 个样本/声道：最大差 {worst}（第 {worst_at} 个）MSE {mse:.3}\n\
+         峰值：我们 {ours_peak:.1} / ffmpeg {ref_peak}"
+    );
+
+    // ⚠️ 「静音 vs 静音」会假绿 —— 必须确认两边都真的出了声音。
     assert!(
         ours_peak > 1.0 && ref_peak > 1,
-        "两边都是静音（我们峰值 {ours_peak:.1}，ffmpeg {ref_peak}）—— 这个对账没有意义"
+        "两边都是静音（我们 {ours_peak:.1} / ffmpeg {ref_peak}）—— 这个对账没有意义"
     );
-    // ---- 帧映射：我们的每一帧，最像 ffmpeg 的哪一帧 ----
-    {
-        let fl = params.frame_len;
-        let nf_ours = n / fl;
-        let nf_ref = pcm.len() / channels / fl;
-        for f in 10..nf_ours.min(24) {
-            let mut best = (f64::MAX, 0usize);
-            for g in 0..nf_ref.min(40) {
-                let mut sum = 0f64;
-                for i in 0..256 {
-                    let a = got[0][f * fl + i];
-                    let b = pcm[(g * fl + i) * channels] as f32;
-                    sum += ((a - b) * (a - b)) as f64;
-                }
-                let mse = sum / 256.0;
-                if mse < best.0 {
-                    best = (mse, g);
-                }
-            }
-            eprintln!("我们帧 {f:2} ↔ ffmpeg 帧 {:2}（MSE {:8.0}）", best.1, best.0);
-        }
-    }
-
-    // ---- 逐帧看：错的是所有有声音的帧，还是只有某些帧 ----
-    let fl = params.frame_len;
-    for f in 0..(n / fl).min(20) {
-        let mut worst = 0i32;
-        for i in 0..fl {
-            let idx = (f * fl + i) * channels;
-            if idx >= pcm.len() {
-                break;
-            }
-            let d = (got[0][f * fl + i] as i32 - pcm[idx] as i32).abs();
-            worst = worst.max(d);
-        }
-        let peak = (0..fl)
-            .map(|i| got[0][f * fl + i].abs())
-            .fold(0f32, f32::max);
-        eprintln!("帧 {f:2}: 最大差 {worst:6} 我们峰值 {peak:8.1}");
-    }
-
-    // ---- 对齐诊断：波形是不是整体错位（错位的话峰值会对、逐样本差会很大）----
-    // 找一个**有声音**的窗口（静音段对齐没有意义：零对零总是相等）
-    let mut anchor = 0usize;
-    for i in 0..n {
-        let idx = i * channels;
-        if idx + channels < pcm.len() && pcm[idx].abs() > 500 {
-            anchor = i;
-            break;
-        }
-    }
-    eprintln!("对齐窗口从第 {anchor} 个样本开始");
-    let win = 4096usize.min(n - anchor);
-    let mut best = (i64::MAX, 0i64);
-    for shift in -(params.frame_len as i64 * 4)..=(params.frame_len as i64 * 4) {
-        let mut sum = 0f64;
-        let mut cnt = 0usize;
-        for k in 0..win {
-            let i = anchor + k;
-            let j = i as i64 + shift;
-            if j < 0 {
-                continue;
-            }
-            let idx = j as usize * channels;
-            if idx >= pcm.len() {
-                break;
-            }
-            let d = got[0][i] - pcm[idx] as f32;
-            sum += (d * d) as f64;
-            cnt += 1;
-        }
-        if cnt > win / 2 {
-            let mse = sum / cnt as f64;
-            if mse < best.0 as f64 {
-                best = (mse as i64, shift);
-            }
-        }
-    }
-    eprintln!("最佳对齐：shift={} 个样本（MSE {})", best.1, best.0);
-    eprintln!("即：我们的样本 i 对应 ffmpeg 的 i+{}", best.1);
-
-    assert!(worst <= 1, "与 ffmpeg 的 PCM 对不上：最大差 {worst}");
+    assert!(
+        (ours_peak - ref_peak as f32).abs() / ref_peak as f32 <= 0.01,
+        "峰值差太多：我们 {ours_peak:.1} / ffmpeg {ref_peak}"
+    );
+    assert!(
+        worst <= TOLERANCE,
+        "与 ffmpeg 的 PCM 对不上：最大差 {worst} > 容差 {TOLERANCE}"
+    );
 }

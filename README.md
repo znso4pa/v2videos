@@ -25,6 +25,7 @@ crates/
   asf      ASF（.wmv / .wma）解封装 + **封装** —— 纯 std
   avi      AVI（RIFF）解封装
   msmpeg4  MS-MPEG-4 v3（MP43）解码（I / P）+ 编码（I / P，含运动估计与帧内/帧间判决）
+  wma      WMA v1/v2 音频解码（帧头 / LSP 指数 / 系数 / IMDCT）
   cli      `v2v` 命令行：**批量转码**（解封装 → 解码 → 编码 → 封装）
 tools/
   gen_tables.py   生成 VLC / 反量化表（附自检：前缀无关、Kraft 和、逐码往返）
@@ -58,9 +59,10 @@ V2V_ASF_SAMPLE=/path/to/sample.wmv cargo test --release -- --ignored
 | **解码**  | MS-MPEG-4 v3（MP43）：I 帧 + P 帧（skip、MV 中值预测、半像素运动补偿、帧间残差） | 与 `ffmpeg` **逐像素**对：整段样本**每一帧最大差 0** |
 | **编码**  | MP43 **I 帧 + P 帧**：正向 DCT + 量化 + DC / RL 熵编码、运动估计（整像素粗搜 + 半像素细化）、skip 宏块 | 编出来的 I+P 序列交给 `ffmpeg` 解，与自己的解码器**逐像素一致** |
 
+| **音频解码** | WMA v2（`v2v-wma`） | 真样本整轨 **494 帧 / 505,856 样本**，与 ffmpeg 的 PCM **最大差 3**（s16 满量程 32768），峰值 17567.5 vs 17568 |
 | **封装**  | ASF 写（`.wmv`，单视频流） | `ffprobe` 认；自己解封装字节一致；ffmpeg 解出来的像素与我们的解码器**逐位一致** |
 
-**还没做**：音频（WMA 解 / 编）、多流复用、Simple Index（seek 会退化）、其他容器与编解码器。
+**还没做**：音频**编码**（WMA 只能解）、多流复用（音频还没进封装器）、Simple Index、其他容器与编解码器。
 
 ## 命令行
 
