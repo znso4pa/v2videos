@@ -292,7 +292,28 @@ impl Encoder {
     /// ⚠️ 半像素取整：P 帧用不用带舍入的插值由 `flipflop_rounding` 决定，而它只从
     /// I 帧尾部的 ext header 读。我们（与 ffmpeg 的编码器一样）**不写** ext header，
     /// 所以解码端恒得 `flipflop_rounding = 0` → P 帧恒用**带舍入**的插值。
+    ///
+    /// **qscale 自动抬高**（与 I 帧的 `pick_qscale` 同一个目标）：量化后的 |level|
+    /// 超出 8 位 escape 会被截断 —— 截断是**一致**的质量损失（编解码两边用同一个
+    /// 截断值，不会错位），但既然能避免就避免。P 帧的 max 系数要等整帧运动估计
+    /// 完才知道，所以用「先编一遍、发现截断就按 `pick_qscale` 的公式抬高重编」
+    /// —— ME 与 qscale 无关，截断也罕见，实践里最多重编一两次。
     pub fn encode_p_frame(&mut self, frame: &Frame) -> Result<Vec<u8>> {
+        let mut q = self.cfg.qscale;
+        loop {
+            let (stream, clamped, max_coef) = self.encode_p_frame_at(frame, q)?;
+            if !clamped || q >= 31 {
+                self.last_qscale = q;
+                return Ok(stream);
+            }
+            let need = ((max_coef as f64) / (2.0 * MAX_ESCAPE_LEVEL as f64)).ceil() as i64;
+            q = q.max(need.clamp(1, 31) as u8);
+        }
+    }
+
+    /// 在**指定 qscale** 下编一帧 P。
+    /// 返回 `(位流, 是否发生 level 截断, 走量化器的系数里的最大幅值)`。
+    fn encode_p_frame_at(&mut self, frame: &Frame, q_target: u8) -> Result<(Vec<u8>, bool, i32)> {
         let w = frame.width as usize;
         let h = frame.height as usize;
         let mb_w = w.div_ceil(16);
@@ -309,12 +330,12 @@ impl Encoder {
 
         let (y, u, v) = pad_planes(frame, pw, ph);
 
-        let q = self.cfg.qscale as i32;
+        let q = q_target as i32;
         let qmul = q << 1;
         let qadd = (q - 1) | 1;
         // P 帧里帧内宏块的 DC 缩放（与 I 帧/解码端同表：亮度用 OLD 表）。
-        let y_dc_scale = tables::OLD_Y_DC_SCALE[self.cfg.qscale as usize] as i32;
-        let c_dc_scale = tables::C_DC_SCALE[self.cfg.qscale as usize] as i32;
+        let y_dc_scale = tables::OLD_Y_DC_SCALE[q_target as usize] as i32;
+        let c_dc_scale = tables::C_DC_SCALE[q_target as usize] as i32;
 
         let rl_inter = rl_table(3 + self.cfg.rl_table_index as usize)?;
         // P 帧里的帧内宏块：亮度用帧内表（下标即 `rl_table_index`），色度用
@@ -347,13 +368,18 @@ impl Encoder {
 
         let mut wtr = BitWriter::new();
         wtr.put(1, 2); // pict_type - 1 = 1 → P
-        wtr.put(self.cfg.qscale as u32, 5);
+        wtr.put(q_target as u32, 5);
         wtr.put(u32::from(self.cfg.use_skip_mb_code), 1);
         code012(&mut wtr, self.cfg.rl_table_index);
         wtr.put(self.cfg.dc_table_index as u32, 1);
         wtr.put(self.cfg.mv_table_index as u32, 1);
 
         let mut intra_count = 0usize;
+        // level 截断追踪：`clamped` = 本次尝试里任何量化后的 level 被夹到 ±127；
+        // `max_coef` = 走量化器的系数最大幅值 —— 重编时按 `pick_qscale` 的公式
+        // 用它直接跳到够用的 qscale。
+        let mut clamped = false;
+        let mut max_coef = 0i32;
         for mby in 0..mb_h {
             let first_slice_line = mby == 0;
             for mbx in 0..mb_w {
@@ -398,8 +424,14 @@ impl Encoder {
                     let mut blk = [0i32; 64];
                     let mut has = false;
                     for k in 0..64usize {
-                        let l = quantize(coef[k], qmul, qadd)
-                            .clamp(-MAX_ESCAPE_LEVEL, MAX_ESCAPE_LEVEL);
+                        let l_raw = quantize(coef[k], qmul, qadd);
+                        let l = l_raw.clamp(-MAX_ESCAPE_LEVEL, MAX_ESCAPE_LEVEL);
+                        if l != l_raw {
+                            clamped = true;
+                        }
+                        if coef[k].abs() > max_coef {
+                            max_coef = coef[k].abs();
+                        }
                         blk[k] = l;
                         if l != 0 {
                             has = true;
@@ -448,8 +480,14 @@ impl Encoder {
                         blk[0] = div_round(coef[0], scale);
                         let mut has_ac = false;
                         for k in 1..64usize {
-                            let l = quantize(coef[k], qmul, qadd)
-                                .clamp(-MAX_ESCAPE_LEVEL, MAX_ESCAPE_LEVEL);
+                            let l_raw = quantize(coef[k], qmul, qadd);
+                            let l = l_raw.clamp(-MAX_ESCAPE_LEVEL, MAX_ESCAPE_LEVEL);
+                            if l != l_raw {
+                                clamped = true;
+                            }
+                            if coef[k].abs() > max_coef {
+                                max_coef = coef[k].abs();
+                            }
                             blk[k] = l;
                             if l != 0 {
                                 has_ac = true;
@@ -541,7 +579,7 @@ impl Encoder {
 
         self.intra_mbs_last = intra_count;
         self.ref_planes = Some(cur);
-        Ok(wtr.finish())
+        Ok((wtr.finish(), clamped, max_coef))
     }
 }
 

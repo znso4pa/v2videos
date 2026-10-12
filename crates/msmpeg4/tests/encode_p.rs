@@ -360,3 +360,91 @@ fn different_scene(w: u32, h: u32, i: usize) -> Frame {
     }
     Frame { width: w, height: h, y, u, v }
 }
+
+// ---------- qscale 自动抬高 ----------
+
+/// 平滑对角渐变（低频，qscale=1 就装得下）。
+fn smooth_frame(w: u32, h: u32) -> Frame {
+    let (wu, hu) = (w as usize, h as usize);
+    let mut y = vec![0u8; wu * hu];
+    for r in 0..hu {
+        for c in 0..wu {
+            y[r * wu + c] = (60 + (r + c) * 100 / (wu + hu)) as u8;
+        }
+    }
+    let (cw, ch) = (wu / 2, hu / 2);
+    let mut u = vec![128u8; cw * ch];
+    let mut v = vec![128u8; cw * ch];
+    Frame { width: w, height: h, y, u, v }
+}
+
+/// 确定性伪随机噪声（LCG，不用引依赖）—— 对运动补偿是「什么都不像」的极限。
+fn noise_frame(w: u32, h: u32, seed: u32) -> Frame {
+    let (wu, hu) = (w as usize, h as usize);
+    let mut s = seed;
+    let mut next = |s: &mut u32, a: u32, c: u32| {
+        *s = s.wrapping_mul(a).wrapping_add(c);
+        (*s >> 24) as u8
+    };
+    let mut y = Vec::with_capacity(wu * hu);
+    for _ in 0..wu * hu {
+        y.push(next(&mut s, 1_664_525, 1_013_904_223));
+    }
+    let (cw, ch) = (wu / 2, hu / 2);
+    let mut u = Vec::with_capacity(cw * ch);
+    for _ in 0..cw * ch {
+        u.push(next(&mut s, 2_269_547, 7));
+    }
+    let mut v = Vec::with_capacity(cw * ch);
+    for _ in 0..cw * ch {
+        v.push(next(&mut s, 1_103_515, 12_345));
+    }
+    Frame { width: w, height: h, y, u, v }
+}
+
+/// **P 帧的 qscale 自动抬高**：量化后的 |level| 超出 8 位 escape 会被截断
+/// （一致、但没必要）。噪声 P 帧的系数幅值远超范围 —— 编码器应该像 I 帧的
+/// `pick_qscale` 那样自动抬高，且抬高后的流仍然两个解码器逐位一致。
+#[test]
+fn p_frame_qscale_auto_raises_when_levels_would_clamp() {
+    let (w, h) = (128u32, 96u32);
+    let frames = vec![smooth_frame(w, h), noise_frame(w, h, 42)];
+
+    let mut enc = Encoder::new(EncoderConfig {
+        qscale: 1,
+        ..Default::default()
+    });
+    let s0 = enc.encode_frame(&frames[0]).expect("编 I");
+    assert_eq!(enc.last_qscale, 1, "平滑 I 帧不该抬高 qscale");
+    let s1 = enc.encode_frame(&frames[1]).expect("编 P");
+    eprintln!(
+        "噪声 P 帧：qscale {} → {}（流 {} 字节）",
+        1, enc.last_qscale, s1.len()
+    );
+    assert!(
+        enc.last_qscale > 1,
+        "噪声 P 帧没有抬高 qscale —— 截断可能还在静默发生"
+    );
+
+    // 合法性：两条流交 ffmpeg 解，与我们的解码器逐位一致
+    let mut dec = Decoder::new();
+    let ours0 = dec.decode(&s0, w, h).expect("解 I");
+    let ours1 = dec.decode(&s1, w, h).expect("解 P");
+    let refs = vec![&s0[..], &s1[..]];
+    let avi = wrap_avi(&refs, w, h);
+    let tmp = unique_temp("v2v_qraise_probe", "avi");
+    std::fs::write(&tmp, &avi).expect("写 AVI");
+    let ff = ffmpeg_frames(tmp.to_str().unwrap(), 2, w, h);
+    let _ = std::fs::remove_file(&tmp);
+    let ff = match ff {
+        Some(v) if v.len() == 2 => v,
+        _ => {
+            eprintln!("SKIP: ffmpeg 解不了");
+            return;
+        }
+    };
+    let (w0, _, _, _) = compare(&ours0.y, &ours0.u, &ours0.v, &ff[0], w, h);
+    let (w1, _, _, _) = compare(&ours1.y, &ours1.u, &ours1.v, &ff[1], w, h);
+    assert_eq!(w0, 0);
+    assert_eq!(w1, 0, "抬高 qscale 后的 P 帧：ffmpeg 与我们不一致（最大差 {w1}）");
+}
