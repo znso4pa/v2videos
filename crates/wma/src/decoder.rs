@@ -36,6 +36,7 @@ struct Vlc {
 
 impl Vlc {
     fn from_codes(codes: &[(u32, u8)]) -> Self {
+        // 注：码字**不需要**按位反转（试过，反转后「VLC 里没有这个码」——MSB 优先是对的）。
         let mut entries: Vec<(u8, u32, u32)> = codes
             .iter()
             .enumerate()
@@ -46,25 +47,34 @@ impl Vlc {
         Self { entries, max_len }
     }
 
-    /// 由**码长**推规范 Huffman 码字（ffmpeg 的 `ff_vlc_init_from_lengths` 就是这个规则：
-    /// 按长度从小到大、同长度按数组顺序依次发码）。
+    /// 由**码长**推规范 Huffman 码字 —— 严格照 ffmpeg 的 `ff_vlc_init_from_lengths`：
+    ///
+    /// ```c
+    ///     j = code = 0;
+    ///     for (i = 0; i < nb_codes; i++) {
+    ///         len = *lens;
+    ///         buf[j].code = code;          // 32 位定点：码字占高 len 位
+    ///         code += 1U << (32 - len);
+    ///     }
+    /// ```
+    ///
+    /// ⚠️ **两个「不能想当然」的地方**（第一版两个都错了，位流直接错位）：
+    /// 1. 是**按数组顺序**发码，**不是**「先按长度排序再发」——
+    ///    `ff_wma_hgain_hufftab` 的长度列是无序的（10,10,10,10,9,9,8,8,…），
+    ///    排序发码会给出完全不同的码字。
+    /// 2. 累加器是 **32 位定点**（`1 << (32-len)`），不是「读一位加一位」的整数递增。
     fn from_lengths(lens: &[(i16, u8)]) -> Self {
-        let max_len = lens.iter().map(|&(_, l)| l).max().unwrap_or(0);
-        let mut code = 0u32;
-        let mut prev_len = 0u8;
+        let mut code: u64 = 0;
         let mut entries: Vec<(u8, u32, u32)> = Vec::with_capacity(lens.len());
-        // 先按长度分组（同长度保持数组顺序）
-        let mut order: Vec<usize> = (0..lens.len()).collect();
-        order.sort_by_key(|&i| lens[i].1);
-        for i in order {
-            let len = lens[i].1;
+        let mut max_len = 0u8;
+        for &(sym, len) in lens {
             if len == 0 {
                 continue;
             }
-            code <<= len - prev_len;
-            prev_len = len;
-            entries.push((len, code, lens[i].0 as u32));
-            code += 1;
+            let c = (code >> (32 - len as u32)) as u32;
+            entries.push((len, c, sym as u32));
+            max_len = max_len.max(len);
+            code += 1u64 << (32 - len as u32);
         }
         Self { entries, max_len }
     }
@@ -134,6 +144,14 @@ pub struct WmaDecoder {
     coefs: [Vec<f32>; 2],
     output: Vec<f32>,
     frame_out: [Vec<f32>; 2],
+
+    // ---- 比特池（superframe 跨包搬运）----
+    /// 上一包没用完、留给下一包接着解的那半帧的字节。
+    last_superframe: Vec<u8>,
+    /// `last_superframe` 开头要跳过的位数。
+    last_bitoffset: usize,
+    /// superframe 序号（4 位、16 回绕），用来校验包序。
+    pub superframe_index: u32,
 }
 
 impl WmaDecoder {
@@ -310,7 +328,84 @@ impl WmaDecoder {
             coefs: [vec![0.0; BLOCK_MAX_SIZE], vec![0.0; BLOCK_MAX_SIZE]],
             output: vec![0.0; BLOCK_MAX_SIZE * 2],
             frame_out: [vec![0.0; BLOCK_MAX_SIZE * 2], vec![0.0; BLOCK_MAX_SIZE * 2]],
+            last_superframe: Vec::new(),
+            last_bitoffset: 0,
+            superframe_index: 0,
         })
+    }
+
+    /// 解**一个 ASF 音频载荷**（= 一个 superframe），返回它解出的若干帧。
+    ///
+    /// 逐行对着 `wma_decode_superframe`：比特池的搬运、残留半帧的接续、
+    /// `reset_block_lengths` 的时机，一个都不能少。
+    pub fn decode_superframe(&mut self, payload: &[u8]) -> Result<Vec<Vec<Vec<f32>>>> {
+        let p = self.params.clone();
+        let mut frames: Vec<Vec<Vec<f32>>> = Vec::new();
+
+        // 不用比特池：整包就是一个帧。
+        if !p.use_bit_reservoir {
+            let mut r = BitReader::new(payload);
+            frames.push(self.decode_frame(&mut r)?);
+            return Ok(frames);
+        }
+
+        let mut r = BitReader::new(payload);
+        let index = r.get(4)?;
+        let raw = r.get(4)?;
+        self.superframe_index = index;
+        // 上一包没有残留时，本包的总产出要减 1（那一帧本来该由上一包留下）
+        let mut nb_frames = raw as i32 - i32::from(self.last_superframe.is_empty());
+        if nb_frames <= 0 {
+            // 攒位：把 `buf_size - 1` 字节接进残留缓冲（ffmpeg 就是从第 1 个字节起接）
+            self.last_superframe.extend_from_slice(&payload[1..]);
+            return Ok(frames);
+        }
+
+        let bit_offset = r.get(p.byte_offset_bits + 3)? as usize;
+        let start = bit_offset + 4 + 4 + p.byte_offset_bits as usize + 3;
+        if start > payload.len() * 8 {
+            return Err(Error::Bad("bit_offset 超出包长"));
+        }
+
+        // 有残留：把本包开头 `bit_offset` 位接到残留后面，解出那一帧
+        if !self.last_superframe.is_empty() {
+            let mut acc = std::mem::take(&mut self.last_superframe);
+            let mut bitpos = acc.len() * 8;
+            for i in 0..bit_offset {
+                let bit = (payload[i >> 3] >> (7 - (i & 7))) & 1;
+                if bitpos % 8 == 0 {
+                    acc.push(0);
+                }
+                let last = acc.len() - 1;
+                acc[last] |= bit << (7 - (bitpos % 8));
+                bitpos += 1;
+            }
+            let mut rr = BitReader::new(&acc);
+            rr.skip(self.last_bitoffset)?;
+            frames.push(self.decode_frame(&mut rr)?);
+            nb_frames -= 1;
+        }
+
+        // 本包新起的帧：从 `start` 位开始
+        let mut rr = BitReader::new(&payload[start >> 3..]);
+        rr.skip(start & 7)?;
+        // ⚠️ `reset_block_lengths` 是**每个 superframe 重置一次**（ffmpeg 在
+        // 解新帧之前置 1）—— 只在构造时置一次会让第二帧起少读一个字段，位流全错。
+        self.reset_block_lengths = true;
+        for _ in 0..nb_frames {
+            frames.push(self.decode_frame(&mut rr)?);
+        }
+
+        // 存残留：这一包解完之后剩下的位
+        let consumed = rr.bit_pos() + ((bit_offset + 4 + 4 + p.byte_offset_bits as usize + 3) & !7);
+        self.last_bitoffset = consumed & 7;
+        let byte = consumed >> 3;
+        self.last_superframe = if byte <= payload.len() {
+            payload[byte..].to_vec()
+        } else {
+            Vec::new()
+        };
+        Ok(frames)
     }
 
     /// 解一帧：返回**每个声道** `frame_len` 个样本。
@@ -409,6 +504,15 @@ impl WmaDecoder {
 
         let n = self.coefs_end[bsize] - self.params.coefs_start;
         let mut nb_coefs = [n; 2];
+        if std::env::var("V2V_WMA_DEBUG").is_ok() {
+            eprintln!(
+                "[dbg] block_len_bits={} prev={} next={} ms_stereo={} coded={:?} total_gain={} \
+                 bit_pos={} bsize={} nb_coefs={} high_sizes={}",
+                self.block_len_bits, self.prev_block_len_bits, self.next_block_len_bits,
+                self.ms_stereo, &self.channel_coded[..channels], total_gain,
+                r.bit_pos(), bsize, n, self.exponent_high_sizes[bsize]
+            );
+        }
 
         // ---- 噪声编码：高带编码标志 + 增益 ----
         let mut high_band_coded = [[false; HIGH_BAND_MAX_SIZE]; 2];
@@ -444,6 +548,15 @@ impl WmaDecoder {
             }
         }
 
+        if std::env::var("V2V_WMA_DEBUG").is_ok() {
+            eprintln!(
+                "[dbg] 噪声段后 bit_pos={} high_coded={:?} high_vals={:?}",
+                r.bit_pos(),
+                &high_band_coded[0][..self.exponent_high_sizes[bsize]],
+                &high_band_values[0][..self.exponent_high_sizes[bsize]]
+            );
+        }
+
         // ---- 指数 ----
         if self.block_len_bits == frame_len_bits || r.bit()? != 0 {
             for ch in 0..channels {
@@ -463,6 +576,15 @@ impl WmaDecoder {
             if self.channel_coded[ch] && !self.exponents_initialized[ch] {
                 return Err(Error::Bad("指数没初始化"));
             }
+        }
+
+        if std::env::var("V2V_WMA_DEBUG").is_ok() {
+            eprintln!(
+                "[dbg] 指数后 bit_pos={} max_exp={:?} exp[0][..4]={:?}",
+                r.bit_pos(),
+                &self.max_exponent[..channels],
+                &self.exponents[0][..4]
+            );
         }
 
         // ---- 系数（run-level）----
@@ -765,8 +887,19 @@ impl WmaDecoder {
     ) -> Result<()> {
         let frame_len_bits = self.params.frame_len_bits;
         let coef_mask = self.block_len - 1;
+        let dbg = std::env::var("V2V_WMA_DEBUG").is_ok() && ch == 0;
+        let mut seen = 0usize;
         while offset < num_coefs {
             let code = self.coef_vlc[tindex].decode(r)? as usize;
+            if dbg && seen < 12 {
+                eprintln!(
+                    "[dbg] 系数码 #{seen}: code={code} run={:?} level={:?} bit_pos={}",
+                    self.run_table[tindex].get(code),
+                    self.level_table[tindex].get(code),
+                    r.bit_pos()
+                );
+                seen += 1;
+            }
             if code > 1 {
                 offset += self.run_table[tindex][code] as usize;
                 let sign = r.bit()? as i32 - 1;
@@ -787,6 +920,9 @@ impl WmaDecoder {
             offset += 1;
         }
         if offset > num_coefs {
+            if std::env::var("V2V_WMA_DEBUG").is_ok() {
+                eprintln!("[dbg] 越界：offset={offset} num_coefs={num_coefs} bit_pos={}", r.bit_pos());
+            }
             return Err(Error::Bad("run-level 越界"));
         }
         Ok(())

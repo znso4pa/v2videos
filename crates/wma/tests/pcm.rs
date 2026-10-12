@@ -70,11 +70,11 @@ fn first_frames_match_ffmpeg_pcm() {
     eprintln!("参数：{params:?}");
 
     let mut dec = WmaDecoder::new(params.clone()).expect("建解码器");
-    let mut st = SuperframeState::default();
 
-    // 解前几帧
+    // 解前几帧（走完整的 superframe → 帧流程，含比特池搬运）
     let mut got: Vec<Vec<f32>> = Vec::new(); // 每个声道一串
     let mut payloads = 0usize;
+    let mut decoded_frames = 0usize;
     loop {
         let s = match d.next_sample() {
             Ok(Some(s)) => s,
@@ -85,39 +85,30 @@ fn first_frames_match_ffmpeg_pcm() {
             continue;
         }
         payloads += 1;
-        let h = match st.parse(&params, &s.data) {
-            Ok(Some(h)) => h,
-            Ok(None) => continue,
-            Err(e) => panic!("第 {payloads} 个载荷 superframe 头失败：{e}"),
-        };
-        let start = h.frames_start_bit;
-        let mut r = BitReader::new(&s.data[start >> 3..]);
-        r.skip(start & 7).expect("对齐");
-        for i in 0..h.nb_frames.max(0) {
-            let frames = match dec.decode_frame(&mut r) {
-                Ok(f) => f,
-                Err(e) => {
-                    eprintln!("第 {payloads} 个载荷第 {i} 帧解码失败：{e}");
-                    break;
-                }
-            };
-            if got.is_empty() {
-                got = vec![Vec::new(); frames.len()];
-            }
-            for (ch, f) in frames.iter().enumerate() {
-                got[ch].extend_from_slice(f);
-            }
-            if got[0].len() >= params.frame_len * 4 {
+        let frames = match dec.decode_superframe(&s.data) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("第 {payloads} 个载荷解码失败：{e}");
                 break;
             }
+        };
+        for f in frames {
+            if got.is_empty() {
+                got = vec![Vec::new(); f.len()];
+            }
+            for (ch, plane) in f.iter().enumerate() {
+                got[ch].extend_from_slice(plane);
+            }
+            decoded_frames += 1;
         }
-        if got.first().map(|v| v.len()).unwrap_or(0) >= params.frame_len * 4 {
+        if decoded_frames >= 60 {
             break;
         }
     }
+    eprintln!("解出 {decoded_frames} 帧 / {payloads} 个载荷");
 
     let channels = params.channels;
-    let n = got.first().map(|v| v.len()).unwrap_or(0).min(params.frame_len * 4);
+    let n = got.first().map(|v| v.len()).unwrap_or(0);
     eprintln!("我们解出 {n} 个样本/声道（{payloads} 个载荷）");
     if n == 0 {
         panic!("一帧都没解出来");
@@ -173,5 +164,45 @@ fn first_frames_match_ffmpeg_pcm() {
         ours_peak > 1.0 && ref_peak > 1,
         "两边都是静音（我们峰值 {ours_peak:.1}，ffmpeg {ref_peak}）—— 这个对账没有意义"
     );
+    // ---- 对齐诊断：波形是不是整体错位（错位的话峰值会对、逐样本差会很大）----
+    // 找一个**有声音**的窗口（静音段对齐没有意义：零对零总是相等）
+    let mut anchor = 0usize;
+    for i in 0..n {
+        let idx = i * channels;
+        if idx + channels < pcm.len() && pcm[idx].abs() > 500 {
+            anchor = i;
+            break;
+        }
+    }
+    eprintln!("对齐窗口从第 {anchor} 个样本开始");
+    let win = 4096usize.min(n - anchor);
+    let mut best = (i64::MAX, 0i64);
+    for shift in -(params.frame_len as i64 * 4)..=(params.frame_len as i64 * 4) {
+        let mut sum = 0f64;
+        let mut cnt = 0usize;
+        for k in 0..win {
+            let i = anchor + k;
+            let j = i as i64 + shift;
+            if j < 0 {
+                continue;
+            }
+            let idx = j as usize * channels;
+            if idx >= pcm.len() {
+                break;
+            }
+            let d = got[0][i] - pcm[idx] as f32;
+            sum += (d * d) as f64;
+            cnt += 1;
+        }
+        if cnt > win / 2 {
+            let mse = sum / cnt as f64;
+            if mse < best.0 as f64 {
+                best = (mse as i64, shift);
+            }
+        }
+    }
+    eprintln!("最佳对齐：shift={} 个样本（MSE {})", best.1, best.0);
+    eprintln!("即：我们的样本 i 对应 ffmpeg 的 i+{}", best.1);
+
     assert!(worst <= 1, "与 ffmpeg 的 PCM 对不上：最大差 {worst}");
 }
