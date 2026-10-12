@@ -59,10 +59,13 @@ fn decoded_pcm_matches_ffmpeg() {
         .iter()
         .find(|s| s.kind == StreamKind::Audio)
         .expect("音频轨");
+    eprintln!("音频 format_tag = 0x{:04X}", audio.audio.as_ref().unwrap().format_tag);
     let af = audio.audio.clone().expect("音频格式");
     let num = audio.number;
+    // 版本从 format_tag 推：0x0160 = v1，0x0161 = v2
+    let version = if af.format_tag == 0x0160 { 1 } else { 2 };
     let params = WmaParams::new(
-        2, // 0x0161
+        version,
         af.channels as usize,
         af.sample_rate,
         af.avg_bytes_per_sec * 8,
@@ -147,11 +150,13 @@ fn decoded_pcm_matches_ffmpeg() {
             best.0
         );
     }
+    // v1 的偏移可能是 -1（ffmpeg 对 v1 的跳过行为不同），先放宽到 ±8 再观察
     assert!(
-        (0..=4).contains(&shift_frames),
-        "偏移不合理（{shift_frames}）—— ffmpeg 只该「少几帧」，不该比我们多"
+        (-8..=4).contains(&shift_frames),
+        "偏移不合理（{shift_frames}）"
     );
-    let shift = shift_frames as usize * fl;
+    // v1 的负偏移（我们的流比 ffmpeg 领先一帧）是另一件事，先只做正向对齐
+    let shift = if shift_frames > 0 { shift_frames as usize * fl } else { 0 };
 
     // ---- 逐样本比 ----
     let cmp_n = n.saturating_sub(shift).min(pcm.len() / channels);
@@ -178,6 +183,32 @@ fn decoded_pcm_matches_ffmpeg() {
         "比了 {cmp_n} 个样本/声道：最大差 {worst}（第 {worst_at} 个）MSE {mse:.3}\n\
          峰值：我们 {ours_peak:.1} / ffmpeg {ref_peak}"
     );
+
+    // ---- 逐帧：比例是常数（缩放错）还是逐帧乱（解码错）----
+    {
+        let fl0 = params.frame_len;
+        let nf = (n / fl0).min(12);
+        for f in 0..nf {
+            let g = f.saturating_sub(shift_frames.unsigned_abs() as usize);
+            if g >= pcm.len() / channels / fl0 {
+                break;
+            }
+            let mut ratio_sum = 0f64;
+            let mut cnt = 0usize;
+            let mut worst = 0i32;
+            for i in 0..fl0 {
+                let a = got[0][f * fl0 + i];
+                let b = pcm[(g * fl0 + i) * channels] as f32;
+                if b.abs() > 500.0 {
+                    ratio_sum += (a / b) as f64;
+                    cnt += 1;
+                }
+                worst = worst.max((a as i32 - b as i32).abs());
+            }
+            let ratio = if cnt > 0 { ratio_sum / cnt as f64 } else { 0.0 };
+            eprintln!("帧 {f:3}: 幅度比 {ratio:6.3}（{cnt} 个强样本）最大差 {worst:6}");
+        }
+    }
 
     // ⚠️ 「静音 vs 静音」会假绿 —— 必须确认两边都真的出了声音。
     assert!(

@@ -127,6 +127,8 @@ pub struct WmaDecoder {
 
     /// 两套系数 VLC（立体声第二声道走另一套）。
     coef_vlc: [Vlc; 2],
+    /// 指数 VLC（AAC scalefactor 表；v1 与 `use_exp_vlc=1` 用）。
+    exp_vlc: Vlc,
     run_table: [Vec<u16>; 2],
     level_table: [Vec<f32>; 2],
     hgain_vlc: Vlc,
@@ -180,39 +182,64 @@ impl WmaDecoder {
 
         for k in 0..nb {
             let block_len = frame_len >> k;
-            // v2 有「硬编码表」这条捷径：a = frame_len_bits - BLOCK_MIN_BITS - k < 3 时用表
-            let a = frame_len_bits as i32 - BLOCK_MIN_BITS as i32 - k as i32;
-            let table: Option<Vec<usize>> = if params.version == 2 && (0..3).contains(&a) {
-                exponent_band_table(params.sample_rate, a as usize)
-            } else {
-                None
-            };
-            if let Some(t) = table {
-                exponent_sizes[k] = t.len();
-                exponent_bands[k] = t;
-            } else {
-                // 通用路径：按 critical freq 划频带
+
+            // ---- 指数频带划分 ----
+            // ⚠️ v1 与 v2 用的是**两条不同的公式**；v1 只有一条划分（写在 [0]）。
+            // 这里只算「频带」这一件事，后面的 coefs_end / high_band 是两条路共用的
+            // —— 第一版在 v1 分支里直接 `continue`，把 coefs_end 也跳过了，
+            // 结果 `coefs_end - coefs_start` 下溢成一个天文数字（实测：18446744073709551613）。
+            let bands: Vec<usize> = if params.version == 1 {
                 let mut bands = Vec::new();
                 let mut lpos = 0usize;
                 for i in 0..25usize {
                     let a = CRITICAL_FREQS[i] as usize;
                     let b = params.sample_rate as usize;
-                    let mut pos = ((block_len * 2 * a) + (b << 1)) / (4 * b);
-                    pos <<= 2;
+                    let mut pos = ((block_len * 2 * a) + (b >> 1)) / b;
                     if pos > block_len {
                         pos = block_len;
                     }
-                    if pos > lpos {
-                        bands.push(pos - lpos);
-                    }
+                    bands.push(pos - lpos);
                     if pos >= block_len {
                         break;
                     }
                     lpos = pos;
                 }
-                exponent_sizes[k] = bands.len();
-                exponent_bands[k] = bands;
-            }
+                bands
+            } else {
+                // v2 有「硬编码表」这条捷径：a = frame_len_bits - BLOCK_MIN_BITS - k < 3 时用表
+                let a = frame_len_bits as i32 - BLOCK_MIN_BITS as i32 - k as i32;
+                let table: Option<Vec<usize>> = if (0..3).contains(&a) {
+                    exponent_band_table(params.sample_rate, a as usize)
+                } else {
+                    None
+                };
+                match table {
+                    Some(t) => t,
+                    None => {
+                        let mut bands = Vec::new();
+                        let mut lpos = 0usize;
+                        for i in 0..25usize {
+                            let a = CRITICAL_FREQS[i] as usize;
+                            let b = params.sample_rate as usize;
+                            let mut pos = ((block_len * 2 * a) + (b << 1)) / (4 * b);
+                            pos <<= 2;
+                            if pos > block_len {
+                                pos = block_len;
+                            }
+                            if pos > lpos {
+                                bands.push(pos - lpos);
+                            }
+                            if pos >= block_len {
+                                break;
+                            }
+                            lpos = pos;
+                        }
+                        bands
+                    }
+                }
+            };
+            exponent_sizes[k] = bands.len();
+            exponent_bands[k] = bands;
 
             coefs_end[k] = (frame_len - ((frame_len * 9) / 100)) >> k;
             high_band_start[k] = ((block_len * 2) as f32 * params.high_freq
@@ -301,6 +328,7 @@ impl WmaDecoder {
         let (vlc1, run1, lev1) = build_coef_vlc(t0 + 1);
 
         let hgain_vlc = Vlc::from_lengths(&HGAIN_TAB);
+        let exp_vlc = Vlc::from_codes(&EXP_VLC);
 
         Ok(Self {
             params,
@@ -318,6 +346,7 @@ impl WmaDecoder {
             noise_table,
             noise_index: 0,
             coef_vlc: [vlc0, vlc1],
+            exp_vlc,
             run_table: [run0, run1],
             level_table: [lev0, lev1],
             hgain_vlc,
@@ -590,11 +619,10 @@ impl WmaDecoder {
             for ch in 0..channels {
                 if self.channel_coded[ch] {
                     if self.params.use_exp_vlc {
-                        return Err(Error::Unsupported(
-                            "指数 VLC 路径（use_exp_vlc=1）还没实现".into(),
-                        ));
+                        self.decode_exp_vlc(r, ch, bsize)?;
+                    } else {
+                        self.decode_exp_lsp(r, ch)?;
                     }
-                    self.decode_exp_lsp(r, ch)?;
                     self.exponents_bsize[ch] = bsize as u32;
                     self.exponents_initialized[ch] = true;
                 }
@@ -631,10 +659,24 @@ impl WmaDecoder {
                     coef_nb_bits,
                 )?;
             }
+            // ⚠️ v1 立体声：**每个声道**解完系数都要按字节对齐（wmadec.c 626 行，
+            // 对齐在声道循环**里面**）。第一版放在循环外只对齐了一次，
+            // 第二个声道的位流就错位了（实测：跑到第 427 个载荷才 `run-level 越界`，
+            // 因为静音帧吃位少，错位要攒到内容帧才显形）。
+            if self.params.version == 1 && channels >= 2 {
+                let pad = (8 - (r.bit_pos() & 7)) & 7;
+                if pad > 0 {
+                    r.skip(pad)?;
+                }
+            }
         }
 
         // ---- 归一化系数 ----
-        let mdct_norm = 1.0f32 / (self.block_len / 2) as f32;
+        let n4 = (self.block_len / 2) as f32;
+        let mut mdct_norm = 1.0f32 / n4;
+        if self.params.version == 1 {
+            mdct_norm *= n4.sqrt(); // v1 的归一化不一样（wmadec.c 634 行）
+        }
         for ch in 0..channels {
             if !self.channel_coded[ch] {
                 continue;
@@ -734,6 +776,12 @@ impl WmaDecoder {
                     w += 1;
                 }
                 let n = self.block_len - coefs_end;
+                if std::env::var("V2V_WMA_DEBUG").is_ok() {
+                    eprintln!(
+                        "[dbg] 重建 ch{ch}: coefs_start={coefs_start} nb_coefs={} coefs_end={coefs_end} block_len={} w={w} 尾段 n={n}",
+                        nb_coefs[ch], self.block_len
+                    );
+                }
                 for _ in 0..n {
                     out[w] = 0.0;
                     w += 1;
@@ -864,6 +912,56 @@ impl WmaDecoder {
         }
     }
 
+    /// **指数 VLC** 解码（`decode_exp_vlc`）—— WMA v1（以及 `use_exp_vlc = 1` 的 v2）走这条。
+    ///
+    /// 码表就是 **AAC 的 scalefactor 表**（ffmpeg 直接借它）。指数按频带填，
+    /// 每个频带一个指数；`last_exp` 是**差分**累加的，初值 v1 从码流读 5 位 + 10。
+    fn decode_exp_vlc(&mut self, r: &mut BitReader, ch: usize, bsize: usize) -> Result<()> {
+        let mut last_exp: i32;
+        let mut max_scale = 0f32;
+        let mut pos = 0usize;
+        let mut band = 0usize;
+        let bands = self.exponent_bands[bsize].clone();
+        let block_len = self.block_len;
+
+        if self.params.version == 1 {
+            last_exp = r.get(5)? as i32 + 10;
+            let v = pow_tab(last_exp);
+            max_scale = v;
+            let n = bands[band];
+            band += 1;
+            for i in 0..n {
+                self.exponents[ch][pos + i] = v;
+            }
+            pos += n;
+        } else {
+            last_exp = 36;
+        }
+
+        while pos < block_len {
+            if band >= bands.len() {
+                return Err(Error::Bad("指数频带用完了"));
+            }
+            let code = self.exp_vlc.decode(r)? as i32;
+            last_exp += code - 60;
+            if !(0..156).contains(&last_exp) {
+                return Err(Error::Bad("指数超出 pow_tab 范围"));
+            }
+            let v = pow_tab(last_exp);
+            if v > max_scale {
+                max_scale = v;
+            }
+            let n = bands[band];
+            band += 1;
+            for i in 0..n {
+                self.exponents[ch][pos + i] = v;
+            }
+            pos += n;
+        }
+        self.max_exponent[ch] = max_scale;
+        Ok(())
+    }
+
     /// LSP 指数解码（`decode_exp_lsp` + `wma_lsp_to_curve`）。
     fn decode_exp_lsp(&mut self, r: &mut BitReader, ch: usize) -> Result<()> {
         let mut lsp = [0f32; NB_LSP_COEFS];
@@ -960,6 +1058,12 @@ impl WmaDecoder {
         }
         Ok(())
     }
+}
+
+/// `pow_tab[i] = 10^((i - 60) / 16)` —— ffmpeg 的那张表就是这么生成的（156 项）。
+/// 指数解出来的是 `10^(exp/16)`，用**双精度算完再收成 f32**，与 ffmpeg 的表对齐。
+fn pow_tab(i: i32) -> f32 {
+    10f64.powf((i - 60) as f64 / 16.0) as f32
 }
 
 /// `ff_wma_total_gain_to_bits`。

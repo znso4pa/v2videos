@@ -159,10 +159,17 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", default="/tmp/ffsize/ffmpeg-7.1/libavcodec", help="ffmpeg libavcodec 目录")
     ap.add_argument("--out", default="crates/wma/src/tables.rs")
+    ap.add_argument(
+        "--aactab",
+        default="",
+        help="ffmpeg 的 aactab.c（指数 VLC 用的是 AAC 的 scalefactor 表）",
+    )
     args = ap.parse_args()
 
     src_dir = Path(args.src)
     wmadata = strip_comments((src_dir / "wmadata.h").read_text())
+    aactab_path = Path(args.aactab) if args.aactab else src_dir / "aactab.c"
+    aactab = strip_comments(aactab_path.read_text()) if aactab_path.is_file() else ""
     wma_freqs = strip_comments((src_dir / "wma_freqs.c").read_text())
 
     out = []
@@ -259,6 +266,25 @@ def main() -> int:
             out.append("    [" + ", ".join(str(v) for v in padded) + "],")
         out.append("];")
         out.append("")
+
+    # ---- 指数 VLC（AAC 的 scalefactor 表，ffmpeg 的 WMA 解码器直接借它）----
+    if aactab:
+        codes = grab_array(aactab, "ff_aac_scalefactor_code")
+        bits = grab_array(aactab, "ff_aac_scalefactor_bits")
+        assert len(codes) == 121 and len(bits) == 121, f"AAC 表项数 {len(codes)}/{len(bits)}"
+        ks = kraft_sum(bits)
+        if abs(ks - 1.0) > 1e-9:
+            raise SystemExit(f"AAC scalefactor 的 Kraft 和 = {ks}（应为 1）—— 抽错了")
+        out.append("/// AAC 的 scalefactor 码表（`ff_aac_scalefactor_code` / `_bits`，121 项）。")
+        out.append("///")
+        out.append("/// WMA **v1**（以及 `use_exp_vlc = 1` 的 v2）的指数就用它。Kraft 和 = 1。")
+        out.append(f"pub static EXP_VLC: [(u32, u8); {len(bits)}] = [")
+        for c, b in zip(codes, bits):
+            out.append(f"    ({c}, {b}),")
+        out.append("];")
+        out.append("")
+    else:
+        print("  （没找到 aactab.c —— 指数 VLC 表没生成）", file=sys.stderr)
 
     # ---- critical freqs ----
     crit = grab_array(wma_freqs, "ff_wma_critical_freqs")
