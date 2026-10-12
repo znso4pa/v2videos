@@ -60,6 +60,11 @@ pub struct EncoderConfig {
     pub mv_table_index: u8,
     /// P 帧要不要写「skip 宏块」标志位（ffmpeg 的编码器恒写 1）。
     pub use_skip_mb_code: bool,
+    /// **周期 I 帧间隔**（帧数）。`0` = 只首帧是 I（默认，与之前行为一致）。
+    ///
+    /// 长序列必须开：P 帧只参考前一帧，误差会累积（漂移）；周期 I 帧还能让
+    /// 播放器 seek。转换工具按秒数换算后传进来。
+    pub keyframe_interval: usize,
 }
 
 impl Default for EncoderConfig {
@@ -71,6 +76,7 @@ impl Default for EncoderConfig {
             dc_table_index: 0,
             mv_table_index: 1,
             use_skip_mb_code: true,
+            keyframe_interval: 0,
         }
     }
 }
@@ -93,6 +99,10 @@ pub struct Encoder {
     /// **上一帧里走了帧内路径的宏块数**（P 帧判决的结果；I 帧恒为全部）。
     /// 测试与调用方用它确认「画面切换时帧内真的接管了」。
     pub intra_mbs_last: usize,
+    /// **上一帧是不是关键帧（I 帧）** —— 封装器写载荷的关键帧位要用。
+    pub last_key_frame: bool,
+    /// 距上一个 I 帧编了多少帧（周期 I 帧用）。
+    frames_since_i: usize,
 }
 
 impl Encoder {
@@ -107,6 +117,8 @@ impl Encoder {
             ref_planes: None,
             last_qscale: cfg.qscale,
             intra_mbs_last: 0,
+            last_key_frame: false,
+            frames_since_i: 0,
         }
     }
 
@@ -270,13 +282,27 @@ impl Encoder {
 
     // ==================== P 帧 ====================
 
-    /// 编一帧：第一帧是 I，之后都是 P。
+    /// 编一帧：第一帧是 I；之后按 `keyframe_interval` 周期性插 I，其余是 P。
+    ///
+    /// 编完看 `last_key_frame` —— 封装器要用它写载荷的关键帧位。
     pub fn encode_frame(&mut self, frame: &Frame) -> Result<Vec<u8>> {
-        if self.ref_planes.is_none() {
+        // 先把**当前帧**记进「距上个 I 帧多远」—— 否则间隔会整整多一帧。
+        if self.ref_planes.is_some() {
+            self.frames_since_i += 1;
+        }
+        let force_i = self.ref_planes.is_none()
+            || (self.cfg.keyframe_interval > 0
+                && self.frames_since_i >= self.cfg.keyframe_interval);
+        let out = if force_i {
             self.encode_i_frame(frame)
         } else {
             self.encode_p_frame(frame)
+        };
+        self.last_key_frame = force_i;
+        if force_i {
+            self.frames_since_i = 0;
         }
+        out
     }
 
     /// 编一帧 **P 帧**（帧间）。必须先编过一帧 I。

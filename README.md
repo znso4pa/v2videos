@@ -21,8 +21,9 @@
 
 ```text
 crates/
-  asf      ASF（.wmv / .wma）解封装 —— 纯 std、零依赖
-  msmpeg4  MS-MPEG-4 v3（MP43）解码（I / P）+ 编码（I / P，含运动估计）
+  asf      ASF（.wmv / .wma）解封装 + **封装** —— 纯 std、零依赖
+  msmpeg4  MS-MPEG-4 v3（MP43）解码（I / P）+ 编码（I / P，含运动估计与帧内/帧间判决）
+  cli      `v2v` 命令行：**批量转码**（解封装 → 解码 → 编码 → 封装）
 tools/
   gen_tables.py   生成 VLC / 反量化表（附自检：前缀无关、Kraft 和、逐码往返）
 ```
@@ -55,7 +56,18 @@ V2V_ASF_SAMPLE=/path/to/sample.wmv cargo test --release -- --ignored
 | **解码**  | MS-MPEG-4 v3（MP43）：I 帧 + P 帧（skip、MV 中值预测、半像素运动补偿、帧间残差） | 与 `ffmpeg` **逐像素**对：整段样本**每一帧最大差 0** |
 | **编码**  | MP43 **I 帧 + P 帧**：正向 DCT + 量化 + DC / RL 熵编码、运动估计（整像素粗搜 + 半像素细化）、skip 宏块 | 编出来的 I+P 序列交给 `ffmpeg` 解，与自己的解码器**逐像素一致** |
 
-**还没做**：ASF 写（现在只能包成 AVI 验证）、音频（WMA）、其他容器与编解码器。
+| **封装**  | ASF 写（`.wmv`，单视频流） | `ffprobe` 认；自己解封装字节一致；ffmpeg 解出来的像素与我们的解码器**逐位一致** |
+
+**还没做**：音频（WMA 解 / 编）、多流复用、Simple Index（seek 会退化）、其他容器与编解码器。
+
+## 命令行
+
+```bash
+cargo run --release -p v2v-cli -- convert <输入.wmv>... -o <输出目录> [-q 6] [-g 250] [-n 100]
+```
+
+批量：一个输入失败不影响其他；默认转完会把输出**解码回来**与源帧比 PSNR。
+输入目前只支持 ASF 里的 MP43 视频轨（别的 codec 会明确报「不支持」，不静默跳过）。
 
 ## 许可证
 

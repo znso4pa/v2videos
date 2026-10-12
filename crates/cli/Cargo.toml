@@ -1,0 +1,14 @@
+[package]
+name = "v2v-cli"
+description = "v2video 的命令行工具：WMV/ASF 批量转码（解封装 → 解码 → 编码 → 封装）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "v2v"
+path = "src/main.rs"
+
+[dependencies]
+v2v-asf = { path = "../asf" }
+v2v-msmpeg4 = { path = "../msmpeg4" }
