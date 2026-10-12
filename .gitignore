@@ -1,0 +1,27 @@
+# Rust
+/target
+**/*.rs.bk
+*.pdb
+Cargo.lock
+
+# 构建产物 / 缓存
+*.o
+*.a
+*.so
+*.dylib
+
+# 编辑器 / 系统
+.DS_Store
+.idea/
+.vscode/
+
+# 真样本 / 测试夹具 —— 故意不入库（版权 + 体积）。测试运行时按环境变量路径读、
+# 缺样本打 `SKIP …` 并通过；`include_bytes!` 一个仓库里没有的文件会让新 clone 的
+# `cargo test` 直接崩。见 AGENTS.md。
+crates/*/testdata/*
+
+# 变更日志 + 路线图是**本地文件**（唯一真源，但不入库）—— 见 AGENTS.md
+TODO.md
+
+# 会话记忆 / 工作数据（本地，含夹具出处等不入库的信息）
+.workbuddy-ai/
