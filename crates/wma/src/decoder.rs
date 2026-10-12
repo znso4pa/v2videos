@@ -278,8 +278,12 @@ impl WmaDecoder {
 
         // ---- LSP 表 ----
         let wdel = std::f32::consts::PI / frame_len as f32;
-        let lsp_cos: Vec<f32> = (0..frame_len).map(|i| 2.0 * (wdel * i as f32).cos()).collect();
-        let lsp_pow_e: Vec<f32> = (0..256).map(|i| ((i as i32 - 126) as f32 * -0.25).exp2()).collect();
+        let lsp_cos: Vec<f32> = (0..frame_len)
+            .map(|i| 2.0 * (wdel * i as f32).cos())
+            .collect();
+        let lsp_pow_e: Vec<f32> = (0..256)
+            .map(|i| ((i as i32 - 126) as f32 * -0.25).exp2())
+            .collect();
         let mut lsp_pow_m1 = vec![0f32; 1 << LSP_POW_BITS];
         let mut lsp_pow_m2 = vec![0f32; 1 << LSP_POW_BITS];
         {
@@ -487,23 +491,12 @@ impl WmaDecoder {
 
     /// 解一帧：返回**每个声道** `frame_len` 个样本。
     pub fn decode_frame(&mut self, r: &mut BitReader) -> Result<Vec<Vec<f32>>> {
-        let start_bit = r.bit_pos();
         self.block_pos = 0;
         loop {
             let last = self.decode_block(r)?;
             if last {
                 break;
             }
-        }
-        if std::env::var("V2V_WMA_FRAME_DBG").is_ok() {
-            eprintln!(
-                "[frame] bit {}→{} (吃 {} 位) total_gain={} coef_cnt={:?}",
-                start_bit,
-                r.bit_pos(),
-                r.bit_pos() - start_bit,
-                self.last_total_gain,
-                &self.last_coef_count[..self.params.channels]
-            );
         }
         let fl = self.params.frame_len;
         let mut out = Vec::with_capacity(self.params.channels);
@@ -593,15 +586,6 @@ impl WmaDecoder {
 
         let n = self.coefs_end[bsize] - self.params.coefs_start;
         let mut nb_coefs = [n; 2];
-        if std::env::var("V2V_WMA_DEBUG").is_ok() {
-            eprintln!(
-                "[dbg] block_len_bits={} prev={} next={} ms_stereo={} coded={:?} total_gain={} \
-                 bit_pos={} bsize={} nb_coefs={} high_sizes={}",
-                self.block_len_bits, self.prev_block_len_bits, self.next_block_len_bits,
-                self.ms_stereo, &self.channel_coded[..channels], total_gain,
-                r.bit_pos(), bsize, n, self.exponent_high_sizes[bsize]
-            );
-        }
 
         // ---- 噪声编码：高带编码标志 + 增益 ----
         let mut high_band_coded = [[false; HIGH_BAND_MAX_SIZE]; 2];
@@ -637,15 +621,6 @@ impl WmaDecoder {
             }
         }
 
-        if std::env::var("V2V_WMA_DEBUG").is_ok() {
-            eprintln!(
-                "[dbg] 噪声段后 bit_pos={} high_coded={:?} high_vals={:?}",
-                r.bit_pos(),
-                &high_band_coded[0][..self.exponent_high_sizes[bsize]],
-                &high_band_values[0][..self.exponent_high_sizes[bsize]]
-            );
-        }
-
         // ---- 指数 ----
         if self.block_len_bits == frame_len_bits || r.bit()? != 0 {
             for ch in 0..channels {
@@ -665,26 +640,6 @@ impl WmaDecoder {
                 return Err(Error::Bad("指数没初始化"));
             }
         }
-        // A/B 实验（V2V_WMA_FLAT_EXP=1）：把指数曲线换成平谱。
-        // 若平谱比真曲线更接近 ffmpeg，说明曲线本身错了（频带映射 / 差分累加）。
-        if std::env::var("V2V_WMA_FLAT_EXP").is_ok() {
-            for ch in 0..channels {
-                for v in self.exponents[ch][..self.block_len].iter_mut() {
-                    *v = 1.0;
-                }
-                self.max_exponent[ch] = 1.0;
-            }
-        }
-
-        if std::env::var("V2V_WMA_DEBUG").is_ok() {
-            eprintln!(
-                "[dbg] 指数后 bit_pos={} max_exp={:?} exp[0][..4]={:?}",
-                r.bit_pos(),
-                &self.max_exponent[..channels],
-                &self.exponents[0][..4]
-            );
-        }
-
         // ---- 系数（run-level）----
         for ch in 0..channels {
             if self.channel_coded[ch] {
@@ -692,14 +647,7 @@ impl WmaDecoder {
                 for v in self.coefs1[ch][..self.block_len].iter_mut() {
                     *v = 0.0;
                 }
-                self.run_level_decode(
-                    r,
-                    tindex,
-                    ch,
-                    0,
-                    nb_coefs[ch],
-                    coef_nb_bits,
-                )?;
+                self.run_level_decode(r, tindex, ch, 0, nb_coefs[ch], coef_nb_bits)?;
             }
             // ⚠️ v1 立体声：**每个声道**解完系数都要按字节对齐（wmadec.c 626 行，
             // 对齐在声道循环**里面**）。第一版放在循环外只对齐了一次，
@@ -818,12 +766,6 @@ impl WmaDecoder {
                     w += 1;
                 }
                 let n = self.block_len - coefs_end;
-                if std::env::var("V2V_WMA_DEBUG").is_ok() {
-                    eprintln!(
-                        "[dbg] 重建 ch{ch}: coefs_start={coefs_start} nb_coefs={} coefs_end={coefs_end} block_len={} w={w} 尾段 n={n}",
-                        nb_coefs[ch], self.block_len
-                    );
-                }
                 for _ in 0..n {
                     out[w] = 0.0;
                     w += 1;
@@ -1059,19 +1001,8 @@ impl WmaDecoder {
     ) -> Result<()> {
         let frame_len_bits = self.params.frame_len_bits;
         let coef_mask = self.block_len - 1;
-        let dbg = std::env::var("V2V_WMA_DEBUG").is_ok() && ch == 0;
-        let mut seen = 0usize;
         while offset < num_coefs {
             let code = self.coef_vlc[tindex].decode(r)? as usize;
-            if dbg && seen < 12 {
-                eprintln!(
-                    "[dbg] 系数码 #{seen}: code={code} run={:?} level={:?} bit_pos={}",
-                    self.run_table[tindex].get(code),
-                    self.level_table[tindex].get(code),
-                    r.bit_pos()
-                );
-                seen += 1;
-            }
             if code > 1 {
                 offset += self.run_table[tindex][code] as usize;
                 let sign = r.bit()? as i32 - 1;
@@ -1093,9 +1024,6 @@ impl WmaDecoder {
         }
         self.last_coef_count[ch] = offset;
         if offset > num_coefs {
-            if std::env::var("V2V_WMA_DEBUG").is_ok() {
-                eprintln!("[dbg] 越界：offset={offset} num_coefs={num_coefs} bit_pos={}", r.bit_pos());
-            }
             return Err(Error::Bad("run-level 越界"));
         }
         Ok(())

@@ -74,9 +74,18 @@ fn decode_aac(frames: &[Vec<u8>], channels: u8) -> Vec<Vec<f32>> {
     let path = std::env::temp_dir().join("v2v_aac_ours.aac");
     std::fs::write(&path, &adts).expect("写 ADTS");
 
-    // ⚠️ 解到**文件**：`-f f32le -`（stdout）会被 ffmpeg 9 拒掉，
-    // 报 `Output file does not contain any stream` —— 那是 CLI 的脾气，不是位流的问题。
-    let raw_path = std::env::temp_dir().join("v2v_aac_ours.f32");
+    // ⚠️ 两点：
+    //
+    // 1. **解到文件**：`-f f32le -`（stdout）会被 ffmpeg 9 拒掉，
+    //    报 `Output file does not contain any stream` —— 那是 CLI 的脾气。
+    // 2. **用 `s16le` 而不是 `f32le`**：`f32le` 是 ±1 归一化的，而本测试的输入是
+    //    int16 量级（`AMP = 12000`）。口径不同会让「幅度比」算出 0.000，
+    //    看起来像位流全错、其实是**单位没对齐**。用 `s16le` 就和输入同量级了。
+    let raw_path = std::env::temp_dir().join("v2v_aac_ours.pcm");
+    // ⚠️ 先删残留 —— 不然 ffmpeg 失败时会把**上一次运行**的输出读回来，
+    // 量出来的样本数/能量对不上，而且看起来像编码器的错。实测踩过：
+    // 同一个文件名在两个测试间复用，读到了上一轮的长度。
+    let _ = std::fs::remove_file(&raw_path);
     let out = Command::new("ffmpeg")
         .args([
             "-v",
@@ -84,7 +93,7 @@ fn decode_aac(frames: &[Vec<u8>], channels: u8) -> Vec<Vec<f32>> {
             "-i",
             path.to_str().unwrap(),
             "-f",
-            "f32le",
+            "s16le",
             "-ac",
             &channels.to_string(),
             "-y",
@@ -104,17 +113,17 @@ fn decode_aac(frames: &[Vec<u8>], channels: u8) -> Vec<Vec<f32>> {
 
     let raw = std::fs::read(&raw_path).expect("读 ffmpeg 的输出");
     let ch = channels as usize;
-    let n = raw.len() / 4 / ch;
+    // ⚠️ 上面 `-f s16le` 是**每样本 2 字节**。这里必须按 2 字节读 ——
+    // 按 4 字节读会让样本数正好少一半、而且数据整体错位（能量量出来 0），
+    // 症状和「位流写坏了」一模一样。实测踩过。
+    let n = raw.len() / 2 / ch;
     let mut planes = vec![Vec::with_capacity(n); ch];
     for i in 0..n {
         for (c, p) in planes.iter_mut().enumerate() {
-            let o = (i * ch + c) * 4;
-            p.push(f32::from_le_bytes([
-                raw[o],
-                raw[o + 1],
-                raw[o + 2],
-                raw[o + 3],
-            ]));
+            let o = (i * ch + c) * 2;
+            // 换成 f32 但**保持 int16 量级**（不做 /32768 归一化）——
+            // 这样与输入（`AMP = 12000`）是同一个口径，可以直接比幅度。
+            p.push(f32::from(i16::from_le_bytes([raw[o], raw[o + 1]])));
         }
     }
     planes
@@ -165,29 +174,21 @@ fn goertzel(x: &[f32], freq: f64, sr: f64) -> f64 {
     (s1 * s1 + s2 * s2 - coeff * s1 * s2).max(0.0).sqrt() / x.len() as f64
 }
 
-/// ⚠️ **这条现在不通过** —— 但它记录的是**当前真实进度**，所以留着不删。
+/// 编一段 440 Hz 正弦 → ffmpeg 解 → 频谱与电平都对得上。
 ///
-/// 已经**成立**的部分（靠它自己就能看出来）：
-///
-/// - `ffmpeg` 能**完整解开**我们编的码流，不报任何错；
-/// - 解出来的样本数与输入**精确相等**（4096 → 4096）；
-/// - 体积压到未压缩 PCM 的 **14.5%**。
-///
-/// **还没成立**的：解出来的**幅度**不对（能量比期望低 4 个数量级左右）。
-/// 也就是说「语法全对、定标还差一档」—— 差在哪已经缩到
-/// 「写进 `scalefactor_data` 的 sf」与「解码端解出来的 `sfo`」对不上，
-/// 但还没定位到具体是哪一步（见 TODO.md 的「AAC 卡在哪」）。
-///
-/// 所以标了 `#[ignore]`，免得让工作区一直红着；修好后去掉这个标记即可。
+/// 三条判据：主频还是 440 Hz、幅度在 ±2 倍内、体积真的压下来了。
 #[test]
-#[ignore = "幅度定标还差一档 —— 语法已经全对，详见本函数的文档注释与 TODO.md"]
 fn ffmpeg_decodes_our_aac_and_it_is_still_a_sine() {
     if !has_ffmpeg() {
         eprintln!("SKIP: PATH 上没有 ffmpeg");
         return;
     }
     let channels = 1u8;
-    let total = 4096usize;
+    // ⚠️ **要够长**。AAC 是 2048 点的窗 + 50% 重叠，编出来的头一两帧是
+    // 「窗还没升满」的渐变段；只给 4096 个样本的话整段都在渐变里，
+    // 量出来的能量接近于 0（实测踩过：能量 0.1，看着像位流全错，
+    // 其实是测试太短）。给 16 帧以上，让测量落在平稳段。
+    let total = 16384usize;
     let samples = sine(total, channels as usize);
 
     let mut e = Encoder::new(EncoderConfig {
@@ -221,12 +222,16 @@ fn ffmpeg_decodes_our_aac_and_it_is_still_a_sine() {
     println!("ffmpeg 解出 {} 个样本（输入 {}）", got[0].len(), total);
 
     // ---- 判据 1：解出来的还是 440 Hz ----
-    // ⚠️ 跳过开头的编码器延迟（AAC 有 1024 个样本的窗重叠延迟）。
+    //
+    // ⚠️ 跳过开头的**编码器延迟**。AAC 长窗是 2N = 2048 个样本的窗、
+    // 50% 重叠，所以解码器的输出比输入**晚一个 1024 点的块**才开始有内容。
+    // 只看前 2048 个点会量到静音（实测就是：能量 0.0）。
+    // 所以跳过一个整块（1024）再往后取。
     let skip = 2048usize.min(got[0].len() / 3);
     let seg = &got[0][skip..];
     let e440 = goertzel(seg, 440.0, SR as f64);
     let e1000 = goertzel(seg, 1000.0, SR as f64);
-    println!("440 Hz 能量 {e440:.1}，1000 Hz 能量 {e1000:.1}");
+    println!("跳过 {skip} 个样本后量；440 Hz 能量 {e440:.1}，1000 Hz 能量 {e1000:.1}");
     assert!(
         e440 > 10.0 * e1000.max(1e-6),
         "440 Hz 不是主频（{e440:.1} vs {e1000:.1}）—— 谱系数写错了"

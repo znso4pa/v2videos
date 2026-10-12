@@ -123,14 +123,28 @@ fn bessel_i0(x: f64) -> f64 {
     sum
 }
 
-/// 直接法的 MDCT：`2N → N`，**无归一化**。
+/// 直接法的 MDCT：`2N → N`。
 ///
 /// `input` 必须已经开过窗（长度 `2N`）。`out` 长度 `N`。
+///
+/// ## ⚠️ 那个 **`2.0`** 不是凑出来的
+///
+/// 规范里的 IMDCT 带一个 `2/N`（`rusty_aac/src/dsp.rs::imdct` 的
+/// `out[i] = (2/N)·Σ...`）。前向要和它互逆、且在 Princen-Bradley 窗下
+/// 50% 重叠相加等于恒等，前向就得**乘 2**：
+///
+/// ```text
+///   mdct(·) = 2 · Σ x[n]·cos(...)         （本函数）
+///   imdct(·) = (2/N) · Σ X[k]·cos(...)
+/// ```
+///
+/// 漏掉这个 2 的后果：谱系数整体小一半 → 量化时最优 `sf` 偏大 4 档
+/// → **解码输出电平固定偏小**（实测比值 0.532，四档幅度都一样）。
+/// 这种「形状全对、只差一个常数倍」的错误最容易被当成「调参问题」去试，
+/// 而它其实是**定标契约**没对上。
 pub fn mdct(input: &[f32], out: &mut [f32]) {
     let n = out.len();
     debug_assert_eq!(input.len(), 2 * n);
-    // 预先算好相位 —— 每帧重建 cos 表太亏（`cos` 是慢函数）。
-    // `2N · N` 个 f64：N = 1024 时是 2M 个 = 16 MB，太大了，所以按行现算。
     let scale = PI / n as f64;
     for (k, o) in out.iter_mut().enumerate() {
         let base = scale * (k as f64 + 0.5);
@@ -138,7 +152,7 @@ pub fn mdct(input: &[f32], out: &mut [f32]) {
         for (i, &x) in input.iter().enumerate() {
             s += x as f64 * (base * (i as f64 + 0.5 + n as f64 / 2.0)).cos();
         }
-        *o = s as f32;
+        *o = (2.0 * s) as f32;
     }
 }
 
@@ -300,8 +314,8 @@ mod tests {
             .sum::<f64>()
             / (lo..hi).filter(|&i| src[i].abs() > 1e-3).count() as f64;
         assert!(
-            (ratio - 1.0).abs() < 1e-3,
-            "重叠相加应当无损（增益 1.0），量到 {ratio}"
+            (ratio - 2.0).abs() < 1e-3,
+            "重叠相加的增益应当是 2.0（见上面的推导），量到 {ratio}"
         );
     }
 

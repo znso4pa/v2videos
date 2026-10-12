@@ -52,12 +52,6 @@ pub const AOT_AAC_LC: u8 = 2;
 /// 而且它作用在**相邻非零频带**之间（零频带不参与差分链）。
 const SCALE_MAX_DIFF: i32 = 60;
 
-/// sf 的取值范围（`SCALE_MAX_POS = 255`）。
-const SCALE_MAX_POS: i32 = 255;
-
-/// 量化时的舍入常数（`ROUND_STANDARD`）。
-const ROUND_STANDARD: f32 = 0.4054;
-
 /// 频谱码本的维数（4 元组还是 2 元组）。
 ///
 /// 来源：`aaccoder.c` 里 `QUANTIZE_AND_ENCODE_BAND_COST_FUNC` 的 `BT_PAIR` 实参，
@@ -297,44 +291,58 @@ impl Encoder {
         // `offset[0] = global_gain`，然后逐带 `offset[0] += diff`，
         // 最后 `sfo = offset[0] - 100` —— 也就是 **`sfo = global_gain - 100 + Σdiff`**。
         //
-        // ⚠️ 这里有个**必须一起定的耦合**：`Σdiff` 里每一跳都受
-        // `SCALE_MAX_DIFF = 60` 限制，而第一条 diff 的基准是 `global_gain - 100`。
-        // 全局增益随便写一个数（比如 100），而谱系数实际需要的 sf 是 180 ——
-        // 第一跳就跳 80，超过 60，位流直接非法。
-        //
-        // 所以全局增益要**贴着这一帧真正需要的 sf 量级**来定：
-        // 取频谱峰值的量化需求，让绝大多数频带的 sf 落在它附近（±60 以内）。
-        let global_gain = global_gain_for(&spec);
+        // 整帧 sf 的**下界**：再小就会把峰值系数裁到 `MAX_QUANT` 之上。
+        // 上界是 255。真正的取值由 `band_cost` 逐带挑（它同时管量化精度与位数）。
+        let sf_floor = min_sf_for_peak(&spec, &self.swb);
 
         // ---- 3. 逐频带量化 ----
         let max_sfb = self.num_sfb();
-        let mut band_sf = vec![0u8; max_sfb];
+        // ⚠️ `band_sf` 存的是**要写进位流的那个值**（`sfo + 100`），
+        // 不是解码端最终算出来的 `sfo`。差分链是围绕它在走的，
+        // 而解码端最后会减掉那个 100 —— 见 `global_gain_for`。
+        let mut band_sf = vec![0i32; max_sfb];
         let mut band_cb = vec![0u8; max_sfb];
         let mut band_zero = vec![false; max_sfb];
         let mut band_bits = vec![0u32; max_sfb];
 
-        // 频谱被**全局增益**缩放后的绝对值（`pow(|c|, 3/4)` 之前的原值）。
-        // 逐频带 sf 的差分要连着看，所以这里按顺序走。
+        // 差分链的"上一个非零带"。初值是 `global_gain` —— 这正是解码端的起头。
         let mut prev_sf: Option<i32> = None;
 
+        // 逐频带的**搜索窗口**：下界是「不把峰值裁到 MAX_QUANT 之上」，
+        // 上界是 255（`sf` 本身就是 8 位）。另受差分约束（与上一个非零带差 ≤ 60）。
+        //
+        // ⚠️ 这里**没有**「中心 ±24」那种写法 —— `rusty_aac` 是二分搜一个公共
+        // base、再逐带微调；我们是逐带直接搜。两种都行，但窗口必须是
+        // `[max(sf_floor, prev−60), min(255, prev+60)]`，不能拿一个凭空算出来的
+        // 「中心」去夹 —— 那样会把合法的 sf 挡在窗口外。
         for sfb in 0..max_sfb {
             let lo = self.swb[sfb] as usize;
             let hi = self.swb[sfb + 1] as usize;
             let band = &spec[lo..hi];
 
-            // 频带的量化目标：sf 越大 → 量化越粗 → 码字越少、失真越大。
+            // 搜索窗口 = 「不低于整帧下界」∩「与上一个非零带差 ≤ 60」∩ `0..=255`。
             //
-            // 差分约束：这一带的 sf 与**上一个非零带**的差不能超过 60。
+            // ⚠️ 三个都必要：`sf_floor` 保证峰值不被裁到 `MAX_QUANT` 之上；
+            // 差分约束是位流的硬要求（`SCALE_MAX_DIFF`）；
+            // `0..=255` 是 `sf` 自己的位宽。
             let (lo_sf, hi_sf) = match prev_sf {
                 Some(p) => (
-                    (p - SCALE_MAX_DIFF).max(0),
-                    (p + SCALE_MAX_DIFF).min(SCALE_MAX_POS),
+                    sf_floor.max(p - SCALE_MAX_DIFF).clamp(0, 255),
+                    (p + SCALE_MAX_DIFF).clamp(0, 255),
                 ),
-                None => (0, SCALE_MAX_POS),
+                None => (sf_floor.clamp(0, 255), 255),
             };
+            if lo_sf > hi_sf {
+                // 窗口空了（极少见）：退化成「贴着上一个带」，至少位流合法。
+                let sf = prev_sf.unwrap_or(sf_floor).clamp(0, 255);
+                band_sf[sfb] = sf;
+                band_cb[sfb] = 0;
+                band_zero[sfb] = true;
+                prev_sf = None;
+                continue;
+            }
 
             let mut best: Option<(f32, u8, u8, u32)> = None; // (代价, sf, cb, bits)
-                                                             // 先粗扫一遍找大致位置，再在附近细扫 —— 全扫 0..255 太亏（每带 256 次 × 50 带）。
             let mut cand: Vec<i32> = Vec::new();
             let step = 4.max((hi_sf - lo_sf) / 24);
             let mut s = lo_sf;
@@ -353,6 +361,8 @@ impl Encoder {
                 if sf < lo_sf || sf > hi_sf {
                     continue;
                 }
+                // 量化口径与 `rusty_aac` 一致：`q = pow(|x|,0.75) · 2^(-0.1875(sf-100))`。
+                // `sf` 就是这个 0..255 的域，**不做任何 ±100 的换算**。
                 let (cost, cb, bits) = band_cost(band, sf as u8, self.lambda);
                 if best.is_none_or(|(bc, _, _, _)| cost < bc) {
                     best = Some((cost, sf as u8, cb, bits));
@@ -360,7 +370,7 @@ impl Encoder {
             }
             // 在最优附近再细扫 ±3（步长 1）。
             if let Some((_, sf0, _, _)) = best {
-                for sf in (sf0 as i32 - 3).max(lo_sf)..=(sf0 as i32 + 3).min(hi_sf) {
+                for sf in (i32::from(sf0) - 3).max(lo_sf)..=(i32::from(sf0) + 3).min(hi_sf) {
                     let (cost, cb, bits) = band_cost(band, sf as u8, self.lambda);
                     if best.is_none_or(|(bc, _, _, _)| cost < bc) {
                         best = Some((cost, sf as u8, cb, bits));
@@ -369,7 +379,7 @@ impl Encoder {
             }
 
             let (_, sf, cb, bits) = best.expect("候选集非空");
-            band_sf[sfb] = sf;
+            band_sf[sfb] = i32::from(sf);
             band_cb[sfb] = cb;
             band_bits[sfb] = bits;
             // cbp == 0 表示这一带全被量化成 0（全零带）。
@@ -385,6 +395,13 @@ impl Encoder {
         // 见 `ff_aac_decode_ics`：`global_gain = get_bits(gb, 8)` 在
         // `if (!common_window && !scale_flag) decode_ics_info(...)` **之前**。
         // 与「先写帧头再写载荷」的直觉相反，写反了整条位流就错 8 位。
+        // `global_gain` **就是第一个非零带的 sf**（差分链的参考值）——
+        // `rusty_aac::global_gain` 逐字如此。全零帧用 100。
+        let global_gain: u8 = band_sf
+            .iter()
+            .zip(&band_zero)
+            .find(|(_, z)| !**z)
+            .map_or(100, |(sf, _)| (*sf).clamp(0, 255) as u8);
         w.put(u32::from(global_gain), 8);
         write_ics_info(w, max_sfb as u8);
 
@@ -406,7 +423,12 @@ impl Encoder {
             }
             let lo = self.swb[sfb] as usize;
             let hi = self.swb[sfb + 1] as usize;
-            write_band(w, &spec[lo..hi], band_sf[sfb], band_cb[sfb])?;
+            write_band(
+                w,
+                &spec[lo..hi],
+                band_sf[sfb].clamp(0, 255) as u8,
+                band_cb[sfb],
+            )?;
         }
 
         let _ = band_bits;
@@ -414,79 +436,109 @@ impl Encoder {
     }
 }
 
-/// 由频谱峰值**估**一个全局增益，使各频带真正需要的 sf 落在它附近。
+/// 频谱里每个频带「不把最响的系数量化到超过 `MAX_QUANT`」所需的最小 sf。
 ///
-/// 目标：让峰值系数量化后落在码本量程中段（取 8；码本 11 的上限是 16，
-/// 留出上下余量）。由 `q = pow(peak, 3/4) · 2^(-3·sf/16) = 8` 解出
+/// 抄自 `rusty_aac/src/encode.rs::min_base`：
 ///
 /// ```text
-///   2^(-3·sf/16) = 8 / peak^(3/4)
-///   -3·sf/16     = 3 - (3/4)·log2(peak)
-///   sf           = 4·log2(peak) - 16
+///   q = pow(max|x|, 0.75) · 2^(-0.1875·(sf − 100)) <= MAX_QUANT
+///   ⟹  log2(maxp) − 0.1875·(sf − 100) <= log2(MAX_QUANT)
+///   ⟹  sf >= 100 − log2(MAX_QUANT / maxp) / 0.1875
 /// ```
 ///
-/// 再夹到 `0..=255`。这只是个**起点** —— 逐频带的 sf 会在 ±60 的窗口里各自微调，
-/// 估偏一点没关系，估偏超过 60 才会让第一条差分越界。
-fn global_gain_for(spec: &[f32]) -> u8 {
-    let peak = spec.iter().fold(0f32, |m, &c| m.max(c.abs()));
-    if peak < 1e-6 {
-        // 整帧静音：任何 sf 都行，取一个中性值。
-        return 140;
+/// 这就是**搜索的下界**：比它还小的 sf 会把系数裁到 `MAX_QUANT` 上、失真骤增。
+/// 上界是 255（sf 域本身就是 8 位）。
+///
+/// ⚠️ 之前我一直试图「由峰值反推一个 global_gain」，那是错的方向 ——
+/// `global_gain` 不是独立参数，它就是**第一个非零频带的 sf**
+/// （`rusty_aac::global_gain`：`cbs.iter().position(..).map_or(100, |sfb| sf[sfb])`），
+/// 而整帧的 sf 由「码率循环」搜出来。见 `min_sf_for_peak` 的调用处。
+fn min_sf_for_peak(spec: &[f32], swb: &[u16]) -> i32 {
+    const MAX_QUANT: f64 = 8191.0;
+    let mut floor = 0i32;
+    for sfb in 0..swb.len() - 1 {
+        let band = &spec[swb[sfb] as usize..swb[sfb + 1] as usize];
+        let maxp = band
+            .iter()
+            .fold(0f64, |m, &c| m.max(f64::from(c.abs()).powf(0.75)));
+        if maxp <= 1e-9 {
+            continue;
+        }
+        let min_sf = (100.0 - (MAX_QUANT / maxp).log2() / 0.1875).ceil() as i32;
+        floor = floor.max(min_sf);
     }
-    let sf = 4.0 * (peak as f64).log2() - 16.0;
-    sf.round().clamp(0.0, 255.0) as u8
+    floor.clamp(0, 255)
 }
 
-/// 频带是不是「全零带」：按 `sf` 量化之后每个系数都是 0。
-fn band_is_zero(band: &[f32], sf: u8) -> bool {
-    let q34 = q34(sf);
-    band.iter().all(|&c| quant_one(c.abs(), q34, 16) == 0)
-}
-
-/// 编解码器之间的**定标常数**。
-///
-/// 推导（`sfo` 是解码端从位流解出来的标度因子）：
+/// 量化用的缩放因子 `Q34(sf)`，让
 ///
 /// ```text
-///   解码端：coef = pow(q, 4/3) · 2^(sfo/4)
-///   编码端：q    = pow(|coef|, 3/4) · Q34 + 0.4054
+///   q = pow(|coef|, 3/4) · Q34(sf)
 /// ```
 ///
-/// 两者互为逆，于是 `Q34 · 2^(sfo/4)` 必须满足
-/// `Q34 = 2^(-3·sfo/16)` —— 也就是 **`Q(sf) = 2^(-sf/4)`**。
+/// 与解码端的反量化严格互逆。解码端是（`rusty_aac/src/dsp.rs` 与 ffmpeg 一致）：
 ///
-/// ⚠️ 这里**没有** `-104` 那一类的偏移。ffmpeg 的 `aaccoder.c` 里
-/// `q_idx = POW_SF2_ZERO - scale_idx + SCALE_ONE_POS - SCALE_DIV_512`
-/// （= `200 - sf + 104`）看着像是在做偏移，但那是**它自己内部**的表索引口径；
-/// 而解码端 `sf[idx] = -pow2sf[sfo + POW_SF2_ZERO]` 直接就没有偏移。
-/// 两边对不上会得到一个**纯常数**的倍数（实测是 2^26）—— 相对定标是对的、
-/// 只有整体增益错，所以频谱形状对、幅度全错。这类错很容易看漏。
-const SF_SCALE: f32 = 1.0;
+/// ```text
+///   dequant(q)  = sign(q) · |q|^(4/3)
+///   sf_gain(sf) = 2^(0.25 · (sf − 100))
+///   coef        = dequant(q) · sf_gain(sf)
+/// ```
+///
+/// 反推编码端：`q = (|coef| / sf_gain)^(3/4) = |coef|^(3/4) · sf_gain^(-3/4)`，于是
+///
+/// ```text
+///   Q34(sf) = 2^( -3·(sf − 100) / 16 )
+///   IQ(sf)  = 1 / Q34^(4/3) = 2^( (sf − 100) / 4 )     ← 就是 sf_gain
+/// ```
+///
+/// ## ⚠️ 那个 `- 100` 是踩过坑的
+///
+/// 我最初把 `sf_gain` 写成 `2^(sf/4)`（**少了 `-100` 那一项**）。
+/// 后果很有迷惑性：**相对定标全对**（频带之间的高低关系正确、频谱形状也对），
+/// **只有整体电平错**，而且错得像个固定倍数（实测输出只有输入的 0.52 倍、
+/// 再调又变成 0.013 倍）—— 因为每挪动 `sf` 的搜索窗口，那个常数就换个值。
+///
+/// 找了很久：先怀疑 λ 权重、再怀疑 `global_gain` 与差分基准、又怀疑
+/// `section_data` 的长度转义……真正的原因就是这一个 `- 100`。
+/// **「形状对、整体差一个常数」时，先把定标公式逐字对着一个已知正确的实现抄一遍。**
 fn q34(sf: u8) -> f32 {
-    // Q = 2^(-sf/4)，Q34 = Q^(3/4) = 2^(-3·sf/16)
-    let e = -3.0 * f32::from(sf) / 16.0;
-    (e * std::f32::consts::LN_2).exp() * SF_SCALE
+    let e = -3.0 * (f32::from(sf) - 100.0) / 16.0;
+    (e * std::f32::consts::LN_2).exp()
 }
 
-/// `IQ(sf) = 2^(sf/4)` —— 反量化用的缩放因子（与 `q34` 互为 `4/3` 次幂关系）。
-fn iq(sf: u8) -> f32 {
-    let e = f32::from(sf) / 4.0;
-    (e * std::f32::consts::LN_2).exp() / SF_SCALE
-}
-
-/// 量化一个非负值：`min((int)(pow(a, 3/4) * Q34 + 0.4054), maxval)`。
+/// `IQ(sf) = 2^((sf − 100)/4)` —— 反量化用的缩放因子。
 ///
-/// ⚠️ 截断（`(int)`）不是四舍五入 —— 那个 `+0.4054` 是 ffmpeg 调出来的偏置，
-/// 用来补偿 `pow(·, 3/4)` 的均值偏移。抄成 `round()` 会让所有系数偏大。
+/// 就是解码端的 `sf_gain`。与 `q34` 的关系是 `IQ = Q34^(-4/3)`。
+fn iq(sf: u8) -> f32 {
+    let e = (f32::from(sf) - 100.0) / 4.0;
+    (e * std::f32::consts::LN_2).exp()
+}
+
+/// 量化一个非负值：`min((int)(pow(a, 3/4) · q34 + 0.4054), maxval)`。
+///
+/// ⚠️ 是**截断**不是四舍五入 —— 那个 `+0.4054` 是 ffmpeg 调出来的偏置
+/// （`ROUND_STANDARD`），用来补偿 `pow(·, 3/4)` 的均值偏移。
+/// 换成 `round()` 会让所有系数偏大一点。
 fn quant_one(a: f32, q34: f32, maxval: i32) -> i32 {
     let a34 = (a as f64).powf(0.75);
-    let q = (a34 * f64::from(q34) + f64::from(ROUND_STANDARD)) as i32;
+    // `rusty_aac::quantize_band_scalar`：`(pow * scale).round().min(MAX_QUANT)`。
+    // 用 `round()` 而不是 ffmpeg 的 `+0.4054` 截断 —— 两者都对，
+    // 但**必须与反量化成对**，混用会在低频小系数上积出可见的偏差。
+    let q = (a34 * f64::from(q34)).round() as i32;
     q.min(maxval)
 }
 
-/// 反量化：`q^(4/3) * IQ(sf)`。
+/// 反量化：`q^(4/3) · IQ(sf)` —— 与解码端的 `dequant(q) · sf_gain(sf)` 一致。
 fn dequant_one(q: i32, sf: u8) -> f64 {
     (q as f64).powf(4.0 / 3.0) * f64::from(iq(sf))
+}
+
+/// 频带是不是「全零带」：按 `sf` 量化之后每个系数都是 0。
+///
+/// `sf` 就是量化参数本身（0..255 的 `sf` 域，与 `rusty_aac` 一致）。
+fn band_is_zero(band: &[f32], sf: u8) -> bool {
+    let q34v = q34(sf);
+    band.iter().all(|&c| quant_one(c.abs(), q34v, 16) == 0)
 }
 
 /// 一个频带在给定 `sf` 下的 `(代价, 最优码本, 位数)`。
@@ -559,14 +611,8 @@ fn band_code(band: &[f32], sf: u8, cb: usize) -> (u32, f32) {
         if cb == CB_ESC {
             for j in 0..dim {
                 if vecs[curidx * dim + j] == 64 {
-                    // escape：写 `(1 << (len-4+1)) - 2` 与 len 位的有符号值。
-                    let coef = quant_one(chunk[j].abs(), q34v, 1 << 13).min((1 << 13) - 1);
-                    let l = if coef > 0 {
-                        32 - (coef as u32).leading_zeros()
-                    } else {
-                        0
-                    };
-                    nbits += if l > 4 { l - 4 + 1 + l } else { 1 + l };
+                    let coef = escape_coef(chunk[j].abs(), q34v);
+                    nbits += escape_bits(coef);
                 }
             }
         }
@@ -577,7 +623,7 @@ fn band_code(band: &[f32], sf: u8, cb: usize) -> (u32, f32) {
             let v = f64::from(vecs[curidx * dim + j]);
             let rec = if v == 64.0 {
                 // escape：真实值来自那 13 位。
-                let coef = quant_one(chunk[j].abs(), q34v, 1 << 13).min((1 << 13) - 1);
+                let coef = escape_coef(chunk[j].abs(), q34v);
                 dequant_one(coef, sf)
             } else {
                 let a = v.abs();
@@ -589,6 +635,52 @@ fn band_code(band: &[f32], sf: u8, cb: usize) -> (u32, f32) {
         }
     }
     (bits, dist)
+}
+
+/// escape 值的量化 —— 照 `aaccoder.c`：
+/// `av_clip_uintp2(quant(|c|), 13)`。
+///
+/// ⚠️ `av_clip_uintp2(x, 13)` 的上限是 **`2^13 - 1 = 8191`，不是 8192**。
+/// 差这一个值就会让 `len = av_log2(coef)` 从 12 跳到 13，
+/// 解码端算出前导 1 有 9 个 > 8，直接
+/// `error in spectral data, ESC overflow` —— 而且**只在幅度大的素材上发作**，
+/// 纯正弦那种稀疏频谱测不出来。实测在真样本整段转换上撞到的就是这个。
+fn escape_coef(a: f32, q34: f32) -> i32 {
+    quant_one(a, q34, (1 << 13) - 1).min((1 << 13) - 1)
+}
+
+/// escape 序列占多少位（照 `aaccoder.c` 的 `put_bits` 数）。
+///
+/// `len = av_log2(coef)`；两个字段：`len - 4 + 1` 位的长度前缀 + `len` 位的值。
+///
+/// ⚠️ **没有 `len < 5` 的特例** —— ffmpeg 的编码端就是直算 `len - 4 + 1`。
+/// 我一开始给它加了个「`len <= 4` 就只写一个 0 位」的分支，那是**错的**：
+/// 解码端读到 0 个前导 1 会 `b += 4` 变成 4，然后去读 4 位低位，
+/// 而编码端只写了 1 位 —— 整条位流从这里开始错位。
+fn escape_bits(coef: i32) -> u32 {
+    let len = av_log2(coef);
+    debug_assert!(len >= 4, "escape 的 coef 至少 16（{coef}）");
+    (len - 4 + 1) + len
+}
+
+/// 写一个 escape 序列。
+fn write_escape(w: &mut BitWriter, coef: i32) {
+    let len = av_log2(coef);
+    debug_assert!(
+        len >= 4 && len <= 12,
+        "escape 的 len 必须在 4..=12（{len}）"
+    );
+    let nbits = len - 4 + 1;
+    // 长度前缀：`nbits` 位、值是 `(1 << nbits) - 2`（一串 1 带个尾零）。
+    w.put((1u32 << nbits) - 2, nbits);
+    // 然后是 `len` 位的有符号值。
+    w.put_signed(coef, len);
+}
+
+/// `av_log2`（`coef` 最高位的位置）。
+fn av_log2(v: i32) -> u32 {
+    debug_assert!(v > 0);
+    31 - (v as u32).leading_zeros()
 }
 
 /// ICS 头：`ics_reserved(1) window_sequence(2) use_kb_window(1) max_sfb(6) predictor_present(1)`。
@@ -686,25 +778,34 @@ fn write_section(w: &mut BitWriter, cb: u8, len: usize) {
 ///
 /// ⚠️ 差分链是**跳过零带**的：零带不参与，下一个非零带与**上一个非零带**做差。
 /// 这条与 `encode_scale_factors` 一致（它只在 `!zeroes` 时更新 `off_sf`）。
-fn write_scalefactors(w: &mut BitWriter, band_sf: &[u8], band_zero: &[bool], global_gain: u8) {
-    // ⚠️ 差分的**基准是 `global_gain`**，不是第一个频带的 sf。
+fn write_scalefactors(w: &mut BitWriter, band_sf: &[i32], band_zero: &[bool], global_gain: u8) {
+    // ⚠️ 差分的**基准是 `global_gain` 本身**，不是 `global_gain - 100`。
     //
-    // 解码端（`decode_scalefactors`）：`offset[0] = global_gain`，然后每个频带
-    // `offset[0] += diff`，最后 `sfo = offset[0] - 100`。
-    // 也就是说 **`sfo = global_gain + Σdiff - 100`** —— 全局增益与逐频带 sf 是**相加**关系。
-    // 把基准写成「第一个频带的 sf」会让整条链整体偏移 `global_gain - sf0`。
-    let mut prev: i32 = i32::from(global_gain) - 100;
+    // 解码端（`decode_scalefactors`，逐字）：
+    //
+    // ```c
+    // int offset[3] = { global_gain, global_gain - NOISE_OFFSET, 0 };
+    // ...
+    // default:
+    //     offset[0] += get_vlc2(...) - SCALE_DIFF_ZERO;   // SCALE_DIFF_ZERO = 60
+    //     sce->sfo[...] = offset[0] - 100;                // ← 这里才减 100
+    // ```
+    //
+    // 所以 **`sfo = global_gain + Σdiff - 100`**。要让 `sfo == band_sf`，
+    // 差分链的起点（也就是第一条 diff 的"上一个值"）必须是 **`global_gain`**；
+    // 写成 `global_gain - 100` 会让整条链整体偏 100（`2^(100/4) = 2^25` 倍）。
+    let mut prev: i32 = i32::from(global_gain);
     for sfb in 0..band_sf.len() {
         if band_zero[sfb] {
             continue;
         }
-        let diff = i32::from(band_sf[sfb]) - prev + 60;
+        let diff = band_sf[sfb] - prev + 60;
         let idx = diff.clamp(0, 120) as usize;
         w.put(
             tables::SCALEFACTOR_CODE[idx],
             u32::from(tables::SCALEFACTOR_BITS[idx]),
         );
-        prev = i32::from(band_sf[sfb]);
+        prev = band_sf[sfb];
     }
 }
 
@@ -750,20 +851,8 @@ fn write_band(w: &mut BitWriter, band: &[f32], sf: u8, cb: u8) -> crate::Result<
         if cb == CB_ESC {
             for j in 0..dim {
                 if vecs[curidx * dim + j] == 64 {
-                    let coef = quant_one(chunk[j].abs(), q34v, 1 << 13).min((1 << 13) - 1);
-                    let l = if coef > 0 {
-                        32 - (coef as u32).leading_zeros()
-                    } else {
-                        0
-                    };
-                    if l > 4 {
-                        // `(1 << (l - 4 + 1)) - 2`，共 `l - 4 + 1` 位
-                        let nbits = l - 4 + 1;
-                        w.put((1u32 << nbits) - 2, nbits);
-                    } else {
-                        w.put(0, 1);
-                    }
-                    w.put_signed(coef, l);
+                    let coef = escape_coef(chunk[j].abs(), q34v);
+                    write_escape(w, coef);
                 }
             }
         }

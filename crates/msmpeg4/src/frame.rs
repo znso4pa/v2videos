@@ -46,9 +46,9 @@ use crate::vlc::Vlc;
 /// MPEG-4 的标准 zig-zag 扫描顺序（`ff_zigzag_direct`）。
 /// 帧内（无 ac_pred）与**所有帧间块**都用它（`inter_scantable` 也是 zig-zag）。
 pub const ZIGZAG: [u8; 64] = [
-    0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27,
-    20, 13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58,
-    59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
+    0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27, 20,
+    13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58, 59,
+    52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
 ];
 
 /// `DC_MAX`：DC VLC 里那个 escape 符号（解到它就用 8 位明文补 level）。
@@ -208,7 +208,7 @@ impl Decoder {
         let mb_h = height.div_ceil(16) as usize;
         let (header, used_bits) = parse_frame_header(data, mb_w as u32, mb_h as u32)?;
         let is_p = header.picture_type == PictureType::P;
-        let frame_no = self.frames;
+
         self.frames += 1;
         self.ac_pred_reads.clear();
 
@@ -251,13 +251,6 @@ impl Decoder {
         // 帧内只作用在 `1..=nCoeffs`（DC 另乘 dc_scale），帧间是 `0..=nCoeffs`（含 DC）。
         let qmul = (q as i32) << 1;
         let qadd = ((q as i32) - 1) | 1;
-
-        let dump_mb: Option<(usize, usize)> = std::env::var("V2V_DUMP_MB").ok().and_then(|s| {
-            let (a, b) = s.split_once(',')?;
-            Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
-        });
-        let debug_mb = std::env::var("V2V_DEBUG_MB").is_ok();
-        let dump_mv = std::env::var("V2V_DUMP_MV").is_ok();
 
         // 系数表：帧内用 `rl_table_index`（亮度）/ `3 + rl_chroma_table_index`（色度）；
         // 帧间一律 `3 + rl_table_index`。
@@ -347,9 +340,6 @@ impl Decoder {
                     if header.use_skip_mb_code && r.bit()? != 0 {
                         let g = mv_grid.idx(mbx, mby);
                         mv_grid.data[g] = (0, 0);
-                        if dump_mv && mbx < 8 && mby < 4 {
-                            eprintln!("帧{frame_no} P MB({mbx},{mby}) SKIP mv=(0,0) q={q} nr={no_rounding}");
-                        }
                         let _ = mc_mb(
                             &mut out,
                             self.prev.as_ref().unwrap(),
@@ -377,13 +367,6 @@ impl Decoder {
                     if !mb_intra {
                         let pred = pred_motion(&mv_grid, mbx, mby, first_slice_line);
                         mv = decode_motion(&mut r, &mv_vlc, mv_x, mv_y, pred)?;
-                        if dump_mv && mbx < 8 && mby < 4 {
-                            let sx = (mbx as i32) * 16 + (mv.0 >> 1);
-                            let sy = (mby as i32) * 16 + (mv.1 >> 1);
-                            eprintln!(
-                                "帧{frame_no} P MB({mbx},{mby}) pred={pred:?} mv={mv:?} src=({sx},{sy}) intra=0 skip=0 q={q} nr={no_rounding}"
-                            );
-                        }
                     } else {
                         let bit_pos = r.bit_pos();
                         ac_pred = r.bit()? != 0;
@@ -430,13 +413,6 @@ impl Decoder {
                             coded: cbp != 0,
                         });
                     }
-                }
-
-                if debug_mb && mbx == 0 && mby == 0 {
-                    eprintln!(
-                        "MB(0,0) intra={mb_intra} cbp={cbp:#06b} ac_pred={ac_pred} mv={mv:?} bits={}",
-                        r.bit_pos()
-                    );
                 }
 
                 // ---- 帧间：先做运动补偿铺底，残差随后叠加 ----
@@ -490,9 +466,6 @@ impl Decoder {
                         let dc_v = if luma { &dc_vlc } else { &dc_vlc_c };
                         let dc_sym = dc_v.decode(&mut r)?;
                         let mut level = dc_sym as i32;
-                        if debug_mb && mbx == 0 && mby == 0 {
-                            eprintln!("    blk{n} DC sym={dc_sym} esc={}", dc_sym == DC_MAX);
-                        }
                         if level == DC_MAX as i32 {
                             level = r.u(8)? as i32;
                             if r.bit()? != 0 {
@@ -521,9 +494,6 @@ impl Decoder {
                         // 帧内的 DC 要乘 dc_scale（亮度用 `y_dc_scale`、色度用 `c_dc_scale`）——
                         // 漏了这一步会让整帧偏暗一档（输出成了 level/8 而不是 level）。
                         block[0] = (level * scale) as i16;
-                        if debug_mb && mbx == 0 && mby == 0 {
-                            eprintln!("  blk{n} coded={coded_flag} level={level} pred={pred} dir={dir} scale={scale} bits={}", r.bit_pos());
-                        }
                         if coded_flag {
                             if ac_pred {
                                 self.stats.blocks_ac_pred += 1;
@@ -577,34 +547,11 @@ impl Decoder {
                         // 帧间的反量化**只做一次**，而且在 RL 表里就做完了（表按 qscale 分档）。
                         // 所以 `decode_ac(qmul, qadd, …)` 出来的就是**最终系数**，直接进 idct_add。
                         // 再加一趟会让残差整整放大 qmul 倍（qscale = 2 时 4 倍）—— 实测踩过。
-                        if dump_mb == Some((mbx, mby)) {
-                            let mut line = String::new();
-                            for j in 0..64 {
-                                line.push_str(&format!("{:6}", block[j]));
-                            }
-                            eprintln!("帧{frame_no} MB({mbx},{mby}) blk{n} inter {line}");
-                        }
                     }
 
                     // 调试：帧内块的**自然序**系数（对照 ffmpeg `-debug 64`）。
                     // ⚠️ ffmpeg 的打印发生在**反量化之前**，所以打印出来的 `block[0]` 是未乘
                     // `dc_scale` 的 level、AC 也是未反量化的原始 level —— 我们这里是**反量化之后**的，
-                    // 对账时要先 `block[0] /= scale`、再把 AC 逆回 `(v ∓ qadd) / qmul`。
-                    if mb_intra && dump_mb == Some((mbx, mby)) {
-                        let mut line = String::new();
-                        for j in 0..64 {
-                            let v = if j == 0 {
-                                block[0] / scale as i16
-                            } else {
-                                block[j]
-                            };
-                            line.push_str(&format!("{v:6}"));
-                        }
-                        eprintln!(
-                            "帧{frame_no} MB({mbx},{mby}) blk{n} scan={} {line}",
-                            if ac_pred { "H/V" } else { "zz" }
-                        );
-                    }
 
                     // ---- IDCT → 像素 ----
                     let (plane, stride, px, py) = if luma {

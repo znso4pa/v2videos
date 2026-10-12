@@ -95,6 +95,31 @@ pub struct ConvertOptions {
     /// `.mp4` 的帧率分子（写进 VOL 的 `vop_time_increment_resolution`）。
     /// `None` = 从视频样本的时间戳推。
     pub fps: Option<u32>,
+    /// `.mp4` 的音频轨怎么走。
+    ///
+    /// 只对 `.mp4` 有效 —— `.wmv` 那条路的音频是**直通**（ASF 载荷原样搬）。
+    pub audio: Mp4Audio,
+    /// `.mp4` 走 AAC 时的目标码率（bit/s）。
+    ///
+    /// 这是**目标**不是保证：编码器不做码率控制，实际码率在它附近浮动。
+    pub aac_bitrate: u32,
+}
+
+/// `.mp4` 的音频轨编码方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mp4Audio {
+    /// **AAC-LC 编码**（默认）。体积能压到 PCM 的 1/10 上下。
+    Aac,
+    /// **未压缩 PCM**（`sowt`）。文件大，但一定能放、而且零编解码延迟。
+    Pcm,
+}
+
+impl Default for Mp4Audio {
+    fn default() -> Self {
+        // 默认走 AAC —— 真样本里 PCM 占了整个 `.mp4` 的 3/4，
+        // 而 AAC 解码器在哪儿都有（浏览器、手机、ffmpeg）。
+        Self::Aac
+    }
 }
 
 impl Default for ConvertOptions {
@@ -107,6 +132,8 @@ impl Default for ConvertOptions {
             max_frames: None,
             copy_audio: true,
             fps: None,
+            audio: Mp4Audio::default(),
+            aac_bitrate: 128_000,
         }
     }
 }
@@ -607,23 +634,55 @@ fn convert_to_mp4(
         decoder_specific_info: enc.decoder_specific_info(),
         avg_bitrate: 0,
     };
-    let mut mux = match (audio.as_ref(), src_audio.as_ref()) {
-        (Some(_), Some(af)) => {
+    // ---- 音频编码器（只在 `.mp4` + `Mp4Audio::Aac` 时建）----
+    //
+    // ⚠️ AAC 的**每一帧必须是 1024 个采样点**（长窗），而 WMA 解码器吐出来的
+    // 是一段一段不等长的 PCM。所以中间要有个「攒够 1024 再编」的缓冲 ——
+    // 见下面的 `aac_pending`。
+    let mut aac = match (&audio, &src_audio, opts.audio) {
+        (Some(_), Some(af), Mp4Audio::Aac) => {
+            Some(v2v_aac::Encoder::new(v2v_aac::EncoderConfig {
+                channels: af.channels as u8,
+                sample_rate: af.sample_rate,
+                bitrate: opts.aac_bitrate,
+                kb_window: false,
+            })?)
+        }
+        _ => None,
+    };
+
+    let mut mux = match (src_audio.as_ref(), aac.as_ref()) {
+        (Some(af), Some(a)) => {
             v2v_mp4::Mp4Muxer::with_audio(
                 vtrack,
                 v2v_mp4::AudioTrack {
                     channels: af.channels,
                     sample_rate: af.sample_rate,
-                    // `sowt` 的时间基就是采样率（一个采样点 = 一个 tick）。
+                    // AAC 的时间基取采样率：一帧 1024 个样本，`stts` 里写 1024。
+                    // 这样「样本时长 × 时间基」正好落在秒上，不用管帧率。
                     timescale: af.sample_rate,
-                    avg_bitrate: af.sample_rate * af.channels as u32 * 16,
-                    codec: v2v_mp4::AudioCodec::Pcm {
-                        bits: 16,
-                        big_endian: false,
+                    avg_bitrate: opts.aac_bitrate,
+                    codec: v2v_mp4::AudioCodec::Es {
+                        object_type: 0x40, // MPEG-4 Audio
+                        decoder_specific_info: a.audio_specific_config().to_bytes(),
                     },
                 },
             )
         }
+        (Some(af), None) => v2v_mp4::Mp4Muxer::with_audio(
+            vtrack,
+            v2v_mp4::AudioTrack {
+                channels: af.channels,
+                sample_rate: af.sample_rate,
+                // `sowt` 的时间基就是采样率（一个采样点 = 一个 tick）。
+                timescale: af.sample_rate,
+                avg_bitrate: af.sample_rate * af.channels as u32 * 16,
+                codec: v2v_mp4::AudioCodec::Pcm {
+                    bits: 16,
+                    big_endian: false,
+                },
+            },
+        ),
         _ => v2v_mp4::Mp4Muxer::new(vtrack),
     };
 
@@ -638,6 +697,8 @@ fn convert_to_mp4(
         Some(a) => (a.decoder.take(), a.skip),
         None => (None, 0),
     };
+    // AAC 的待编样本缓冲（每声道一条，f32）。攒够 1024 个就编一帧。
+    let mut aac_pending: Vec<Vec<f32>> = Vec::new();
     // 上一帧的视频时间戳（毫秒）—— `stts` 写的是**真实间隔**。
     let mut prev_vts: Option<i64> = None;
     let mut last_dur = (VTS as f64 / fps as f64).round().max(1.0) as u32;
@@ -662,6 +723,26 @@ fn convert_to_mp4(
                 let drop = (skip_left * plan.point).min(pcm.len());
                 pcm.drain(..drop);
                 skip_left -= drop / plan.point;
+            }
+            if let Some(enc) = aac.as_mut() {
+                // ---- AAC：攒够 1024 个采样点再编一帧 ----
+                //
+                // 源 PCM 是「交织的小端 16 位」，AAC 编码器要的是
+                // 「每声道一条、f32、范围 ±32768」——所以要先拆开、归一。
+                push_aac_pcm(
+                    &mut aac_pending,
+                    &pcm,
+                    plan.point,
+                    src_audio.as_ref().expect("有 plan 就一定有源格式").channels as usize,
+                );
+                drain_aac_frames(
+                    enc,
+                    &mut aac_pending,
+                    &mut mux,
+                    &mut audio_points,
+                    plan.point,
+                )?;
+                continue;
             }
             for c in pcm.chunks_exact(plan.point) {
                 mux.write_audio(c, 1)?;
@@ -710,6 +791,11 @@ fn convert_to_mp4(
         }
     }
 
+    // ---- 收尾：把 AAC 的尾巴（不足 1024 个采样点）补零编出去 ----
+    if let Some(enc) = aac.as_mut() {
+        flush_aac(enc, &mut aac_pending, &mut mux, &mut audio_points)?;
+    }
+
     let mp4 = mux.finish();
     write_out(output, &mp4)?;
 
@@ -724,6 +810,90 @@ fn convert_to_mp4(
         psnr_db: None,
     })
 }
+
+/// 把一段「交织的小端 16 位 PCM」拆进 AAC 的待编缓冲。
+///
+/// ⚠️ 两个口径都要转：
+///
+/// 1. **交织 → 分声道**：源是 `L R L R ...`，AAC 编码器要 `[L...], [R...]`；
+/// 2. **int16 → f32**：`crates/wma` 解出来的是 int16 量级，而 `v2v-aac` 要的是
+///    同量级的 f32（**不归一化到 ±1**，因为 AAC 的 sf 定标本来就吸收整帧幅度）。
+///
+/// 尾部不足一个采样点的字节直接丢掉 —— `plan.point` 是「一个采样点的字节数」，
+/// 只可能是 2 或 4，不会有半个点的残渣。
+fn push_aac_pcm(pending: &mut Vec<Vec<f32>>, pcm: &[u8], point: usize, channels: usize) {
+    if pending.is_empty() {
+        pending.resize(channels, Vec::new());
+    }
+    for c in pcm.chunks_exact(point) {
+        for (ch, p) in pending.iter_mut().enumerate() {
+            let o = ch * 2;
+            let v = i16::from_le_bytes([c[o], c[o + 1]]);
+            p.push(f32::from(v));
+        }
+    }
+}
+
+/// 从待编缓冲里尽量多地编出 AAC 帧（每帧 1024 个采样点）并写进封装器。
+///
+/// ⚠️ **不足 1024 的部分要留着**，不能提前编 —— 提前编会补零，
+/// 而补进去的零会在输出里变成一小段可听的静音（每 1024 个点补一次就够听出来）。
+/// 剩下的尾巴由 `flush_aac` 在收尾时补零编出去。
+fn drain_aac_frames(
+    enc: &mut v2v_aac::Encoder,
+    pending: &mut Vec<Vec<f32>>,
+    mux: &mut v2v_mp4::Mp4Muxer,
+    audio_samples: &mut usize,
+    _point: usize,
+) -> Result<(), Error> {
+    loop {
+        let have = pending.first().map_or(0, |p| p.len());
+        if have < AAC_FRAME_SAMPLES {
+            return Ok(());
+        }
+        let planes: Vec<Vec<f32>> = pending
+            .iter_mut()
+            .map(|p| p.drain(..AAC_FRAME_SAMPLES).collect())
+            .collect();
+        let frame = enc.encode_frame(&v2v_aac::Frame { planes })?;
+        // AAC 一帧就是 1024 个采样点，时间基是采样率 —— 所以时长写 1024。
+        mux.write_audio(&frame, AAC_FRAME_SAMPLES as u32)?;
+        // 计数用**输出侧的采样点数**（与 PCM 那条路同单位，报告里好对比）。
+        *audio_samples += AAC_FRAME_SAMPLES;
+    }
+}
+
+/// 收尾：把不足一帧的尾巴补零编出去。
+///
+/// 不丢尾巴的话，输出的音频会比源短最多 1023 个采样点（约 23 ms）——
+/// 听感上就是最后那一点点被切掉了。
+fn flush_aac(
+    enc: &mut v2v_aac::Encoder,
+    pending: &mut Vec<Vec<f32>>,
+    mux: &mut v2v_mp4::Mp4Muxer,
+    audio_samples: &mut usize,
+) -> Result<(), Error> {
+    let have = pending.first().map_or(0, |p| p.len());
+    if have == 0 {
+        return Ok(());
+    }
+    // 补零到 1024（残留的尾巴本来就没有真实样本，补零是唯一合法的编法）。
+    let planes: Vec<Vec<f32>> = pending
+        .iter_mut()
+        .map(|p| {
+            let mut v = std::mem::take(p);
+            v.resize(AAC_FRAME_SAMPLES, 0.0);
+            v
+        })
+        .collect();
+    let frame = enc.encode_frame(&v2v_aac::Frame { planes })?;
+    mux.write_audio(&frame, AAC_FRAME_SAMPLES as u32)?;
+    *audio_samples += AAC_FRAME_SAMPLES;
+    Ok(())
+}
+
+/// AAC 长窗一帧的采样点数。
+const AAC_FRAME_SAMPLES: usize = 1024;
 
 /// 默认帧率 —— 推不出来时用（WMV 绝大多数是 25 或 30）。
 const DEFAULT_FPS: u32 = 25;

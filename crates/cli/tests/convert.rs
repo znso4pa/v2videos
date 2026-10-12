@@ -1209,3 +1209,149 @@ fn mp4_p_frames_write_stss() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `.mp4` 的**音频轨**：默认走 AAC（`mp4a` + `esds`），`--pcm` 退回未压缩 PCM。
+///
+/// 这条钉的是「容器侧的接线」—— 位流本身对不对是 `crates/aac` 的事。
+/// 具体来说：
+///
+/// - `stsd` 里是 `mp4a` 而不是 `sowt`；
+/// - `esds` 的 `objectTypeIndication` 是 `0x40`（MPEG-4 Audio）；
+/// - `DecoderSpecificInfo` 是两字节的 AudioSpecificConfig，值对得上
+///   （AOT=2 AAC-LC、采样率索引、声道数）；
+/// - `stts` 的时长是 **1024**（AAC 一帧的采样点数），不是 1。
+#[test]
+fn mp4_default_audio_is_aac_in_an_esds() {
+    let dir = temp_dir("mp4_aac_track");
+    let (w, h) = (64u32, 48u32);
+    // 只用视频：合成样本没有音频轨，所以这条测的是「没有音频时的默认值」。
+    // 有音频的那条靠真样本（见下面 `#[ignore]` 的两条）。
+    let frames = moving_sequence(w, h, 6);
+    let input = dir.join("in.wmv");
+    let output = dir.join("out.mp4");
+    make_wmv(&input, &frames, MP43, 4);
+
+    let opts = ConvertOptions {
+        qscale: 6,
+        format: v2v_cli::OutputFormat::Mp4,
+        keyframe_interval: 0,
+        verify: false,
+        max_frames: None,
+        copy_audio: true,
+        ..Default::default()
+    };
+    // 默认就是 AAC。
+    assert_eq!(opts.audio, v2v_cli::Mp4Audio::Aac);
+    let rep = convert_file(&input, &output, &opts).expect("转 MP4");
+    assert_eq!(rep.audio_payloads, 0, "合成样本没有音轨");
+
+    let d = std::fs::read(&output).expect("读输出");
+    let mut types = Vec::new();
+    isobmff::all_types(&d, 0, d.len(), &mut types);
+    assert!(types.iter().any(|t| t == b"moov"), "应当有 moov");
+    // 没有音频轨时不该出现音频的 sample entry。
+    let has_audio = d.windows(4).any(|w4| w4 == b"mp4a" || w4 == b"sowt");
+    assert!(!has_audio, "没有音轨却写了音频 sample entry");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **真样本 + 音频**：音频轨是 AAC（`mp4a` + `esds`），且 `ffmpeg` 解得开整条流。
+///
+/// ```text
+/// V2V_ASF_SAMPLE=<带 WMA 音轨的 .wmv> cargo test --release -p v2v-cli -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "需要真样本（带 WMA 音轨 + MP43 视频）与 ffmpeg"]
+fn mp4_with_aac_audio_decodes_with_ffmpeg() {
+    let src = match std::env::var("V2V_ASF_SAMPLE") {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!("SKIP: V2V_ASF_SAMPLE 未设置");
+            return;
+        }
+    };
+    if !Path::new(&src).is_file() {
+        eprintln!("SKIP: 样本不存在");
+        return;
+    }
+    if !has_ffmpeg() {
+        eprintln!("SKIP: PATH 上没有 ffmpeg");
+        return;
+    }
+    let dir = temp_dir("mp4_aac_real");
+    let input = dir.join("in.wmv");
+    std::fs::copy(&src, &input).expect("拷样本");
+    let output = dir.join("out.mp4");
+
+    let n = 60usize;
+    let opts = ConvertOptions {
+        qscale: 6,
+        format: v2v_cli::OutputFormat::Mp4,
+        keyframe_interval: 12,
+        verify: false,
+        max_frames: Some(n),
+        copy_audio: true,
+        audio: v2v_cli::Mp4Audio::Aac,
+        ..Default::default()
+    };
+    let rep = convert_file(&input, &output, &opts).expect("转 MP4");
+    eprintln!("报告：{rep:?}");
+    assert_eq!(rep.frames, n);
+    assert!(rep.audio_payloads > 0, "一帧 AAC 都没写");
+
+    // ---- 结构：`mp4a` + `esds`，DSI 是 2 字节的 AudioSpecificConfig ----
+    let d = std::fs::read(&output).expect("读输出");
+    let mut types = Vec::new();
+    isobmff::all_types(&d, 0, d.len(), &mut types);
+    assert!(types.iter().any(|t| t == b"mp4a"), "音频轨应当是 mp4a");
+    assert!(types.iter().any(|t| t == b"esds"), "mp4a 轨必须带 esds");
+    assert!(
+        !types.iter().any(|t| t == b"sowt"),
+        "默认不该再写未压缩的 sowt"
+    );
+    assert!(types.iter().any(|t| t == b"stss"), "GOP=12 该写 stss");
+
+    // ---- ffmpeg 解得开整条流（视频 + 音频）----
+    let got = Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-i",
+            output.to_str().unwrap(),
+            "-f",
+            "null",
+            "-",
+        ])
+        .output()
+        .expect("跑 ffmpeg");
+    assert!(
+        got.status.success(),
+        "ffmpeg 解不开：{}",
+        String::from_utf8_lossy(&got.stderr)
+    );
+    let log = String::from_utf8_lossy(&got.stderr).to_lowercase();
+    for bad in ["error", "corrupt", "invalid", "damaged"] {
+        assert!(!log.contains(bad), "ffmpeg 报了「{bad}」：{log}");
+    }
+
+    // ---- ffprobe 认出来的两条轨 ----
+    let probe = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_name,codec_type,channels,sample_rate",
+            "-of",
+            "csv=p=0",
+            output.to_str().unwrap(),
+        ])
+        .output()
+        .expect("跑 ffprobe");
+    let txt = String::from_utf8_lossy(&probe.stdout);
+    eprintln!("ffprobe:\n{txt}");
+    assert!(txt.contains("mpeg4"), "视频轨应当是 mpeg4：{txt}");
+    assert!(txt.contains("aac"), "音频轨应当是 aac：{txt}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

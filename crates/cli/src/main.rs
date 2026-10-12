@@ -20,7 +20,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use v2v_cli::{convert_batch, ConvertOptions, OutputFormat};
+use v2v_cli::{convert_batch, ConvertOptions, Mp4Audio, OutputFormat};
 
 const USAGE: &str = "\
 v2v —— WMV/ASF 批量转码（纯 Rust：解封装 → 解码 → 编码 → 封装）
@@ -31,7 +31,9 @@ v2v —— WMV/ASF 批量转码（纯 Rust：解封装 → 解码 → 编码 →
 选项：
   -o, --out-dir <DIR>   输出目录（默认：与输入同目录）
   -q, --qscale <1..31>  量化尺度（默认 6；越大文件越小、越糊）
-      --mp4             输出 .mp4（MPEG-4 Part 2 + PCM），默认输出 .wmv（MP43 in ASF）
+      --mp4             输出 .mp4（MPEG-4 Part 2 + AAC），默认输出 .wmv（MP43 in ASF）
+      --pcm             .mp4 的音频用未压缩 PCM（sowt）而不是 AAC
+      --aac-bitrate N   .mp4 走 AAC 时的目标码率（默认 128000 bit/s）
       --fps <N>         --mp4 专用：VOL 里声明的帧率（默认从样本时间戳推）
   -g, --gop <N>         周期 I 帧间隔（默认 250；0 = 只首帧是 I）
                         对 .mp4 也有效 —— 传 0 就是全 I 帧（大但每帧独立可解）
@@ -44,7 +46,8 @@ v2v —— WMV/ASF 批量转码（纯 Rust：解封装 → 解码 → 编码 →
 
 两条输出路：
   .wmv  视频重编码成 MP43，音频**直通**（零损失）。会做 PSNR 校验。
-  .mp4  视频重编码成 MPEG-4 Part 2（I+P，GOP 由 -g 控制），音频解成 PCM。
+  .mp4  视频重编码成 MPEG-4 Part 2（I+P，GOP 由 -g 控制），
+        音频 WMA → PCM → **AAC-LC**（默认；`--pcm` 可退回未压缩 PCM）。
         MP43 / WMA 都进不了 MP4 容器，所以这条路**必须**重编码；
         我们只有 mp4v 编码器没有解码器，所以这条路**不做** PSNR 校验。
         -g 0 会编成全 I 帧（文件大得多，但每帧独立可解、适合剪辑）。
@@ -92,6 +95,14 @@ fn run(args: &[String]) -> Result<bool, String> {
                 opts.qscale = v;
             }
             "--mp4" => opts.format = OutputFormat::Mp4,
+            "--pcm" => opts.audio = Mp4Audio::Pcm,
+            "--aac-bitrate" => {
+                opts.aac_bitrate = it
+                    .next()
+                    .ok_or("--aac-bitrate 后面要跟数字")?
+                    .parse()
+                    .map_err(|_| "--aac-bitrate 要正整数（bit/s）".to_string())?;
+            }
             "--fps" => {
                 let v: u32 = it
                     .next()
@@ -162,8 +173,11 @@ fn run(args: &[String]) -> Result<bool, String> {
         inputs.len(),
         out_dir.display(),
         match opts.format {
-            OutputFormat::Asf => ".wmv / MP43",
-            OutputFormat::Mp4 => ".mp4 / MPEG-4 Part 2",
+            OutputFormat::Asf => ".wmv / MP43 + 音频直通".to_string(),
+            OutputFormat::Mp4 => match opts.audio {
+                Mp4Audio::Aac => format!(".mp4 / MPEG-4 Part 2 + AAC {}", opts.aac_bitrate),
+                Mp4Audio::Pcm => ".mp4 / MPEG-4 Part 2 + PCM".to_string(),
+            },
         },
         opts.qscale,
         if opts.keyframe_interval == 0 {
