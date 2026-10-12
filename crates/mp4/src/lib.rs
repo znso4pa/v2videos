@@ -14,26 +14,35 @@
 //! ```
 //!
 //! MP43（MS-MPEG-4 v3）**不是** MP4 认的编码 —— 视频必须重编码。
-//! 而音频那边 WMA 同样进不了 MP4。所以 `.wmv → .mp4` 是「解码 → 重编码 → 重新封装」，
-//! 三段都省不掉。
+//! 而音频那边 WMA 同样进不了 MP4：
+//!
+//! ```text
+//! $ ffmpeg -i in.asf -map 0:a -c copy -f mp4 out.mp4
+//! [mp4 @ ...] Could not find tag for codec wmav1 in stream #0,
+//!             codec not currently supported in container
+//! ```
+//!
+//! 所以 `.wmv → .mp4` 是「解码 → 重编码 → 重新封装」，三段都省不掉。
 //!
 //! ## 现在支持什么
 //!
 //! - **`mp4v`**（MPEG-4 Part 2）视频轨 —— 对应的编码器是下一步。
-//! - **`mp4a`**（AAC）音频轨。
+//! - **`mp4a`**（AAC / MP3…，走 `esds`）音频轨。
+//! - **`sowt` / `twos`**（未压缩 PCM）音频轨 —— **不需要音频编码器**。
+//!   这是眼下最省事的一条路：WMA 解出来就是 PCM，直接装。
 //! - 非分片 MP4（`ftyp` / `mdat` / `moov`），`moov` 在尾部。
 //!
 //! 零依赖、纯 std、无 FFI。
 //!
 //! ## 还没做
 //!
-//! 编辑列表（`edts` / `elst`，音频延迟补偿）、分片 MP4、`co64`（> 4 GiB）、
-//! H.265 / AV1 之类的 sample entry、`udta` 标记。
+//! 编辑列表（`edts` / `elst`，解码器延迟补偿）、分片 MP4、`co64`（> 4 GiB）、
+//! H.265 / AV1 之类的 sample entry、`pasp`、`udta` 标记。
 
 mod mux;
 mod writer;
 
-pub use mux::{AudioTrack, Mp4Muxer, VideoTrack};
+pub use mux::{AudioCodec, AudioTrack, Mp4Muxer, VideoTrack};
 
 /// MP4 封装里的错误。
 #[derive(Debug)]

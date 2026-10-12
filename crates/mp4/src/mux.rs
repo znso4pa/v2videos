@@ -14,20 +14,31 @@
 //! `moov` 在尾部是因为 `stbl` 里的表（`stsz` / `stco` / `stts`…）要等所有样本写
 //! 完才能定。整个文件在内存里拼完再吐出来 —— 与 `AsfMuxer` 的做法一致。
 //!
-//! ## 表怎么填（v1 的取舍）
+//! ## 表怎么填
 //!
-//! - **一个样本一个 chunk**：`stsc` 恒为 `(first_chunk=1, samples_per_chunk=1, 1)`，
-//!   `stco` 每个样本一项。表最简单，且**不依赖调用者的交错策略** —— 代价是
-//!   `stco` 每样本 4 字节（2000 帧 = 8 KB，可接受）。ffmpeg 会把同一轨的连续样本
-//!   合并成 chunk，但那样得先知道交错顺序。
+//! - **chunk = 一段连续的字节**：按「本样本的偏移是否紧接上一个样本的末尾」
+//!   切 chunk，`stsc` 对「每 chunk 样本数」再做游程压缩。
+//!   这样**不依赖调用者的交错策略** —— 全视频再全音频就是各 1 个 chunk，
+//!   逐帧交错就自动切成很多小 chunk，两种都能被正确读回。
 //! - **`stts` 做游程压缩**：等时长的帧只占一项（75 帧 25fps → 1 项）。
+//! - **`stsz` 等长时用 `default_sample_size`**：PCM 轨全靠这条，
+//!   否则 13 万个样本的表就是 512 KB。
 //! - **全是关键帧时不写 `stss`**（规范：缺席 = 所有样本都是同步点）。
+//! - **描述符长度用最简形式**（`put_descr_len`）。ffmpeg 恒写 4 字节，
+//!   我们按规范写最简 —— 已实测 ffmpeg 能正常读（见 `tests/real_sample.rs`）。
+//!
+//! ## 音频：`mp4a` 还是 PCM
+//!
+//! MP4 **不接受 WMA**（`Could not find tag for codec wmav1`），所以 WMV→MP4
+//! 要么上 AAC 编码器，要么走未压缩 PCM。`sowt`（PCM S16LE）这条路已实测
+//! 可用：把 ffmpeg 产的 MOV 的 `ftyp` 主品牌从 `qt  ` 改成 `isom` 之后，
+//! ffprobe 照样认 `codec_name=pcm_s16le`，`ffmpeg -f s16le` 也能原样解出来。
 //!
 //! ## 还没做
 //!
-//! - `edts` / `elst`（编辑列表）—— 音频编码器延迟的补偿就靠它。现在不写，
-//!   A/V 可能有几十毫秒的偏移。
-//! - `udta` / `meta`（写我们的编码器标记）。
+//! - `edts` / `elst`（编辑列表）—— 解码器延迟的补偿就靠它。
+//!   ffmpeg 给 WMV2 的 MP4 就写了 `elst`（空编辑 40 ms + 正片）。
+//! - `pasp`（像素宽高比）、`udta` / `meta`（编码器标记）。
 //! - 分片 MP4（`moof`）、`co64`（> 4 GiB）。
 
 use crate::writer::{put_descr_len, BoxBuilder};
@@ -49,15 +60,33 @@ pub struct VideoTrack {
     pub avg_bitrate: u32,
 }
 
-/// 音频轨参数 —— 目前只支持 `mp4a`（AAC）。
+/// 音频轨的编解码类型 —— 决定 `stsd` 里写哪种 sample entry。
+#[derive(Debug, Clone)]
+pub enum AudioCodec {
+    /// `mp4a` + `esds`：ES 型编码（AAC / MP3…）。
+    Es {
+        /// `objectTypeIndication`：AAC = `0x40`，MP3 = `0x6B`。
+        object_type: u8,
+        /// `DecoderSpecificInfo`（AAC 是 AudioSpecificConfig）。
+        decoder_specific_info: Vec<u8>,
+    },
+    /// `sowt`（小端）/ `twos`（大端）：**未压缩 PCM**，样本就是裸采样字节。
+    ///
+    /// **一个样本 = 一个采样点**（`stsz` 的 default size = 声道数 × 字节数），
+    /// 时间基就等于采样率，每个样本时长 1。ffmpeg 的 `sowt` 轨就是这么填的
+    /// （实测：`stsz` default 4、count 131072、`stts` 一项 `(131072, 1)`）。
+    Pcm { bits: u16, big_endian: bool },
+}
+
+/// 音频轨参数。
 #[derive(Debug, Clone)]
 pub struct AudioTrack {
     pub channels: u16,
     pub sample_rate: u32,
-    /// 时间基（每秒多少 tick）。AAC 一般就等于采样率。
+    /// 时间基（每秒多少 tick）。PCM 就等于采样率；AAC 一般也是。
     pub timescale: u32,
-    /// `esds` 里的 DecoderSpecificInfo：**AudioSpecificConfig**（AAC 是 2 字节起）。
-    pub decoder_specific_info: Vec<u8>,
+    pub codec: AudioCodec,
+    /// 平均码率（bit/s）。只写进 `esds` 与 `btrt`；PCM 用不上。
     pub avg_bitrate: u32,
 }
 
@@ -346,8 +375,7 @@ fn minf_audio(a: &AudioTrack, samples: &[SampleRec]) -> BoxBuilder {
     let mut minf = BoxBuilder::new(b"minf");
     minf.child(smhd);
     minf.child(dinf());
-    // 音频不写 `stss` —— 每个样本都是同步点。
-    minf.child(stbl(&mp4a_entry(a), samples, false));
+    minf.child(stbl(&audio_entry(a), samples, false));
     minf
 }
 
@@ -365,17 +393,51 @@ fn dinf() -> BoxBuilder {
     dinf
 }
 
+/// 把样本按「在文件里是否首尾相接」切成 chunk。
+///
+/// 这是 `stsc` / `stco` 的本意：**一个 chunk 是一段连续的字节**。
+///
+/// v1 曾用一个样本一个 chunk —— 对视频勉强能用，对 PCM 会直接爆：
+/// 3 秒 44.1 kHz 立体声 = 13 万个样本 → 13 万条 `stco`（512 KB），
+/// 而整条轨在文件里本来就是连续的一段，本该只有 1 条。
+///
+/// 按「是否连续」切还有个好处：**不依赖调用者的交错策略**。
+/// 全视频再全音频 → 两条轨各 1 个 chunk；逐帧交错 → 自动切成很多小 chunk。
+/// 两种都能被解码器正确读回。
+fn chunk_runs(samples: &[SampleRec]) -> Vec<usize> {
+    let mut runs: Vec<usize> = Vec::new();
+    let mut cur = 0usize;
+    for (i, s) in samples.iter().enumerate() {
+        if i > 0 {
+            let prev = samples[i - 1];
+            let contiguous = prev.offset as u64 + prev.size as u64 == s.offset as u64;
+            if !contiguous {
+                runs.push(cur);
+                cur = 0;
+            }
+        }
+        cur += 1;
+    }
+    if cur > 0 {
+        runs.push(cur);
+    }
+    runs
+}
+
 fn stbl(sample_entry: &[u8], samples: &[SampleRec], with_stss: bool) -> BoxBuilder {
+    let runs = chunk_runs(samples);
     let mut b = BoxBuilder::new(b"stbl");
     b.child(stsd(sample_entry));
     b.child(stts(samples));
-    let ss = if with_stss { stss(samples) } else { None };
-    if let Some(ss) = ss {
-        b.child(ss);
+    // 音频不写 `stss` —— 每个样本都是同步点。
+    if with_stss {
+        if let Some(ss) = stss(samples) {
+            b.child(ss);
+        }
     }
-    b.child(stsc(samples));
+    b.child(stsc(&runs));
     b.child(stsz(samples));
-    b.child(stco(samples));
+    b.child(stco(samples, &runs));
     b
 }
 
@@ -426,38 +488,58 @@ fn stss(samples: &[SampleRec]) -> Option<BoxBuilder> {
     Some(b)
 }
 
-/// `stsc` —— 一个样本一个 chunk，所以恒为一项。
-fn stsc(samples: &[SampleRec]) -> BoxBuilder {
+/// `stsc` —— 「每 chunk 样本数」做**游程压缩**。
+fn stsc(runs: &[usize]) -> BoxBuilder {
+    let mut rle: Vec<(u32, u32)> = Vec::new(); // (chunk 数, 每 chunk 样本数)
+    for &n in runs {
+        match rle.last_mut() {
+            Some(last) if last.1 == n as u32 => last.0 += 1,
+            _ => rle.push((1, n as u32)),
+        }
+    }
+
     let mut b = BoxBuilder::new(b"stsc");
     b.full(0, 0);
-    if samples.is_empty() {
-        b.u32(0);
-    } else {
-        b.u32(1);
-        b.u32(1); // first_chunk
-        b.u32(1); // samples_per_chunk
+    b.u32(rle.len() as u32);
+    let mut first_chunk = 1u32;
+    for (count, per_chunk) in rle {
+        b.u32(first_chunk);
+        b.u32(per_chunk);
         b.u32(1); // sample_description_index
+        first_chunk += count;
     }
     b
 }
 
 fn stsz(samples: &[SampleRec]) -> BoxBuilder {
+    // 全部等长 → 用 default_sample_size，省掉整张表。
+    // PCM 轨全靠这条：13 万个样本 × 4 字节的表就是 512 KB。
+    let uniform = samples
+        .first()
+        .map(|s| s.size)
+        .filter(|n| samples.iter().all(|s| s.size == *n));
+
     let mut b = BoxBuilder::new(b"stsz");
     b.full(0, 0);
-    b.u32(0); // sample_size = 0 → 逐样本给大小
+    b.u32(uniform.unwrap_or(0)); // 0 = 逐样本给大小
     b.u32(samples.len() as u32);
-    for s in samples {
-        b.u32(s.size);
+    if uniform.is_none() {
+        for s in samples {
+            b.u32(s.size);
+        }
     }
     b
 }
 
-fn stco(samples: &[SampleRec]) -> BoxBuilder {
+/// `stco` —— 每个 chunk 的**首样本**偏移。
+fn stco(samples: &[SampleRec], runs: &[usize]) -> BoxBuilder {
     let mut b = BoxBuilder::new(b"stco");
     b.full(0, 0);
-    b.u32(samples.len() as u32);
-    for s in samples {
-        b.u32(s.offset);
+    b.u32(runs.len() as u32);
+    let mut i = 0usize;
+    for &n in runs {
+        b.u32(samples[i].offset);
+        i += n;
     }
     b
 }
@@ -494,19 +576,34 @@ fn mp4v_entry(v: &VideoTrack) -> Vec<u8> {
     b.finish()
 }
 
-fn mp4a_entry(a: &AudioTrack) -> Vec<u8> {
-    let mut b = BoxBuilder::new(b"mp4a");
+/// `AudioSampleEntry` 的固定 28 字节头（`mp4a` / `sowt` / `twos` 共用）。
+fn audio_sample_entry(b: &mut BoxBuilder, a: &AudioTrack, bits: u16) {
     b.zeros(6); // reserved
     b.u16(1); // data_reference_index
-    b.zeros(8); // reserved（version / revision / vendor）
+    b.zeros(8); // version / revision / vendor
     b.u16(a.channels);
-    b.u16(16); // samplesize
+    b.u16(bits); // samplesize
     b.u16(0); // pre_defined
     b.u16(0); // reserved
     b.u32(a.sample_rate << 16); // 16.16
-    b.child(esds(2, 0x40, 0x05, a.avg_bitrate, &a.decoder_specific_info));
-    b.child(btrt(a.avg_bitrate));
-    b.finish()
+}
+
+fn audio_entry(a: &AudioTrack) -> Vec<u8> {
+    match &a.codec {
+        AudioCodec::Es { object_type, decoder_specific_info } => {
+            let mut b = BoxBuilder::new(b"mp4a");
+            audio_sample_entry(&mut b, a, 16);
+            b.child(esds(2, *object_type, 0x05, a.avg_bitrate, decoder_specific_info));
+            b.child(btrt(a.avg_bitrate));
+            b.finish()
+        }
+        AudioCodec::Pcm { bits, big_endian } => {
+            // 未压缩：没有 `esds`，也没有 `btrt` —— 只有固定头。
+            let mut b = BoxBuilder::new(if *big_endian { b"twos" } else { b"sowt" });
+            audio_sample_entry(&mut b, a, *bits);
+            b.finish()
+        }
+    }
 }
 
 /// `btrt`（MPEG-4 系统）：缓冲提示。三个值都填同一个码率。
@@ -616,15 +713,99 @@ mod tests {
         let f = m.finish();
         let mdat_size = u32::from_be_bytes(f[28..32].try_into().unwrap()) as usize;
         assert_eq!(mdat_size, 8 + 10 + 20, "mdat = 头 + 两个样本");
-        // stco 的第一个偏移应当是 ftyp(28) + mdat 头(8)
         // stco 的搜索命中的是 type 字段：size(4) type(4) ver/flags(4) count(4) 之后才是条目
         let stco = f.windows(4).position(|w| w == b"stco").expect("有 stco");
         let count = u32::from_be_bytes(f[stco + 8..stco + 12].try_into().unwrap());
-        assert_eq!(count, 2, "两个样本 → 两条 stco（一 chunk 一样本）");
+        assert_eq!(count, 1, "两个样本在文件里首尾相接 → 只该有 1 个 chunk");
         let first_off = u32::from_be_bytes(f[stco + 12..stco + 16].try_into().unwrap());
         assert_eq!(first_off as usize, 28 + 8, "ftyp(28) + mdat 头(8)");
-        let second_off = u32::from_be_bytes(f[stco + 16..stco + 20].try_into().unwrap());
-        assert_eq!(second_off as usize, 28 + 8 + 10, "第二个样本紧接在第一个之后");
+    }
+
+    #[test]
+    fn contiguous_samples_merge_into_one_chunk_but_a_gap_splits_it() {
+        let mk = |off, size| SampleRec { offset: off, size, duration: 1, key: true };
+        // 0..10 连着，然后跳到 100（中间有别轨的样本）
+        let s = vec![mk(0, 10), mk(10, 20), mk(100, 5)];
+        assert_eq!(chunk_runs(&s), vec![2, 1], "前两个一块，第三个自己一块");
+
+        // 全部连续
+        assert_eq!(chunk_runs(&[mk(0, 4), mk(4, 4), mk(8, 4)]), vec![3]);
+
+        // 交错：每两个之间都跳
+        assert_eq!(chunk_runs(&[mk(0, 1), mk(9, 1), mk(18, 1)]), vec![1, 1, 1]);
+
+        // 空
+        assert!(chunk_runs(&[]).is_empty());
+    }
+
+    #[test]
+    fn stsz_falls_back_to_default_size_when_every_sample_is_equal() {
+        let s: Vec<SampleRec> = (0..1000)
+            .map(|i| SampleRec { offset: i * 4, size: 4, duration: 1, key: true })
+            .collect();
+        let b = stsz(&s).finish();
+        assert_eq!(u32::from_be_bytes(b[12..16].try_into().unwrap()), 4, "default size");
+        assert_eq!(u32::from_be_bytes(b[16..20].try_into().unwrap()), 1000);
+        assert_eq!(b.len(), 20, "省掉了整张表");
+
+        // 不等长时必须逐项写
+        let s = vec![
+            SampleRec { offset: 0, size: 4, duration: 1, key: true },
+            SampleRec { offset: 4, size: 8, duration: 1, key: true },
+        ];
+        let b = stsz(&s).finish();
+        assert_eq!(u32::from_be_bytes(b[12..16].try_into().unwrap()), 0);
+        assert_eq!(b.len(), 20 + 8);
+    }
+
+    #[test]
+    fn stsc_run_length_compresses_the_chunking_pattern() {
+        // chunk 大小：1,1,1,2,2,2 → 两项
+        let b = stsc(&[1, 1, 1, 2, 2, 2]).finish();
+        assert_eq!(u32::from_be_bytes(b[12..16].try_into().unwrap()), 2, "两项");
+        assert_eq!(u32::from_be_bytes(b[16..20].try_into().unwrap()), 1, "first_chunk");
+        assert_eq!(u32::from_be_bytes(b[20..24].try_into().unwrap()), 1, "每 chunk 1 个");
+        assert_eq!(u32::from_be_bytes(b[28..32].try_into().unwrap()), 4, "从第 4 个 chunk 起");
+        assert_eq!(u32::from_be_bytes(b[32..36].try_into().unwrap()), 2, "每 chunk 2 个");
+    }
+
+    #[test]
+    fn pcm_audio_uses_sowt_without_esds() {
+        let mut m = Mp4Muxer::with_audio(
+            video(),
+            AudioTrack {
+                channels: 2,
+                sample_rate: 44100,
+                timescale: 44100,
+                codec: AudioCodec::Pcm { bits: 16, big_endian: false },
+                avg_bitrate: 0,
+            },
+        );
+        m.write_video(&[1, 2, 3], true, 512).unwrap();
+        // 一个样本 = 一个采样点 = 2ch × 2B
+        for _ in 0..500 {
+            m.write_audio(&[0u8; 4], 1).unwrap();
+        }
+        let f = m.finish();
+        assert!(f.windows(4).any(|w| w == b"sowt"), "有 sowt sample entry");
+        assert_eq!(
+            f.windows(4).filter(|w| *w == b"esds").count(),
+            1,
+            "只有视频轨写 esds；PCM 不写"
+        );
+
+        let stsz = f.windows(4).position(|w| w == b"stsz").expect("有 stsz");
+        // 命中点是 type 串：ver/flags(+4) default_size(+8) count(+12)
+        let audio_stsz = f[stsz + 4..].windows(4).position(|w| w == b"stsz").unwrap() + stsz + 4;
+        assert_eq!(
+            u32::from_be_bytes(f[audio_stsz + 8..audio_stsz + 12].try_into().unwrap()),
+            4,
+            "PCM 的 default_sample_size = 声道数 × 字节数"
+        );
+        assert_eq!(
+            u32::from_be_bytes(f[audio_stsz + 12..audio_stsz + 16].try_into().unwrap()),
+            500
+        );
     }
 
     #[test]
