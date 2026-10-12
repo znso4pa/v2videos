@@ -1,0 +1,12 @@
+[package]
+name = "v2v-msmpeg4"
+description = "纯 Rust 的 Microsoft MPEG-4（MP41/MP42/MP43 / WMV1-2）视频解码 —— 无 C、无 FFI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+# 只给 example / 集成测试用：从 ASF 里取视频样本做验证。
+v2v-asf = { path = "../asf" }
