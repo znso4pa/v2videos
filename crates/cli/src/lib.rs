@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 pub use v2v_asf::{AsfDemuxer, AsfMuxer, StreamKind, VideoStreamInfo};
 pub use v2v_avi::AviDemuxer;
-pub use v2v_container::Sample;
+pub use v2v_container::{AudioFormat, Sample};
 pub use v2v_msmpeg4::{Decoder, Encoder, EncoderConfig, Frame};
 
 /// MP43 的 FourCC（本工具唯一的输出编码）。
@@ -33,6 +33,11 @@ pub struct ConvertOptions {
     /// 最多转多少帧（`None` = 全部）。做局部转换/预览用 —— 也让真样本的
     /// 端到端验证能在几秒内跑完。
     pub max_frames: Option<usize>,
+    /// **音频直通**（默认开）：把源的音频载荷**原样**搬进输出，不重编码。
+    ///
+    /// 为什么是直通：我们还没有 WMA **编码器**，重编码做不到；而直通不但零损失，
+    /// 还顺带证明了「封装器能复用多流」。代价是输入输出必须是同一个音频编码。
+    pub copy_audio: bool,
 }
 
 impl Default for ConvertOptions {
@@ -42,6 +47,7 @@ impl Default for ConvertOptions {
             keyframe_interval: 250,
             verify: true,
             max_frames: None,
+            copy_audio: true,
         }
     }
 }
@@ -52,7 +58,9 @@ pub struct ConvertReport {
     pub frames: usize,
     /// 关键帧数（含首帧）。
     pub key_frames: usize,
-    /// 跳过的音频样本数（音频还没做）。
+    /// **直通**的音频载荷数。
+    pub audio_payloads: usize,
+    /// 没搬的音频载荷数（音频编码还没做时会有；见 `ConvertOptions::copy_audio`）。
     pub skipped_audio: usize,
     pub bytes_in: u64,
     pub bytes_out: u64,
@@ -112,6 +120,8 @@ impl From<v2v_avi::Error> for Error {
 trait VideoSource {
     /// `(流号, 宽, 高, fourcc)`；没有视频轨就 `None`。
     fn video_stream(&self) -> Option<(u8, u32, u32, u32)>;
+    /// `(流号, WAVEFORMATEX)`；没有音频轨就 `None`。
+    fn audio_stream(&self) -> Option<(u8, AudioFormat)>;
     fn next(&mut self) -> Result<Option<Sample>, Error>;
 }
 
@@ -122,6 +132,10 @@ impl VideoSource for AsfSource {
         let v = self.0.streams().iter().find(|s| s.kind == StreamKind::Video)?;
         let vf = v.video.as_ref()?;
         Some((v.number, vf.width, vf.height, vf.fourcc))
+    }
+    fn audio_stream(&self) -> Option<(u8, AudioFormat)> {
+        let a = self.0.streams().iter().find(|s| s.kind == StreamKind::Audio)?;
+        Some((a.number, a.audio.clone()?))
     }
     fn next(&mut self) -> Result<Option<Sample>, Error> {
         Ok(self.0.next_sample()?)
@@ -135,6 +149,10 @@ impl VideoSource for AviSource {
         let v = self.0.streams().iter().find(|s| s.kind == StreamKind::Video)?;
         let vf = v.video.as_ref()?;
         Some((v.number, vf.width, vf.height, vf.fourcc))
+    }
+    fn audio_stream(&self) -> Option<(u8, AudioFormat)> {
+        let a = self.0.streams().iter().find(|s| s.kind == StreamKind::Audio)?;
+        Some((a.number, a.audio.clone()?))
     }
     fn next(&mut self) -> Result<Option<Sample>, Error> {
         Ok(self.0.next_sample()?)
@@ -194,23 +212,57 @@ pub fn convert_file(
         keyframe_interval: opts.keyframe_interval,
         ..Default::default()
     });
-    let mut mux = AsfMuxer::new(VideoStreamInfo {
-        width: w,
-        height: h,
-        fourcc: MP43,
-    });
+    // 音频：直通（只支持 WMA，因为输出要写同样的 WAVEFORMATEX）
+    let audio = if opts.copy_audio {
+        match demux.audio_stream() {
+            Some((_, af))
+                if af.format_tag == 0x0160 || af.format_tag == 0x0161 =>
+            {
+                Some(af)
+            }
+            Some((_, af)) => {
+                return Err(Error::Unsupported(format!(
+                    "音频是 0x{:04X}，直通只支持 WMA（0x0160/0x0161）",
+                    af.format_tag
+                )))
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+    let audio_num = demux.audio_stream().map(|(n, _)| n);
+    let mut mux = AsfMuxer::with_audio(
+        VideoStreamInfo {
+            width: w,
+            height: h,
+            fourcc: MP43,
+        },
+        audio,
+    );
     // 校验用的第二个解码器（与解码源帧的那个分开 —— 状态独立）。
     let mut vdec = if opts.verify { Some(Decoder::new()) } else { None };
 
     let mut frames = 0usize;
     let mut key_frames = 0usize;
+    let mut audio_payloads = 0usize;
     let mut skipped_audio = 0usize;
     let mut sq_err = 0f64;
     let mut n_px = 0u64;
 
     while let Some(s) = demux.next()? {
+        // 音频：直通（原样写载荷，时间戳照搬）
+        if Some(s.stream) == audio_num {
+            if opts.copy_audio {
+                let pts = u32::try_from(s.timestamp_ms.max(0)).unwrap_or(0);
+                mux.write_audio(&s.data, pts)?;
+                audio_payloads += 1;
+            } else {
+                skipped_audio += 1;
+            }
+            continue;
+        }
         if s.stream != vnum {
-            skipped_audio += 1;
             continue;
         }
         let pts = u32::try_from(s.timestamp_ms.max(0)).map_err(|_| {
@@ -265,6 +317,7 @@ pub fn convert_file(
     Ok(ConvertReport {
         frames,
         key_frames,
+        audio_payloads,
         skipped_audio,
         bytes_in,
         bytes_out: wmv.len() as u64,

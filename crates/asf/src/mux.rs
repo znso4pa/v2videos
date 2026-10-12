@@ -25,8 +25,9 @@
 //!   的体积没影响（WMV 本来就要整个头部已知包数才能填），只影响内存峰值。
 //! - 不写 Simple Index：播放器 seek 会退化到逐包扫。待做。
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::guid::{self, Guid};
+use crate::types::AudioFormat;
 
 /// 数据包大小。ffmpeg 的 muxer 默认 3200。
 const PACKET_SIZE: usize = 3200;
@@ -54,22 +55,80 @@ pub struct VideoStreamInfo {
 pub struct AsfMuxer {
     file_id: Guid,
     video: VideoStreamInfo,
-    /// 媒体对象号（1 起，每帧 +1）。
+    /// 音频流（有就一起复用；目前只做**直通**，不重编码）。
+    audio: Option<AudioFormat>,
+    /// 视频的媒体对象号（1 起，每帧 +1）。
     seq: u8,
+    /// 音频的媒体对象号（独立计数）。
+    seq_audio: u8,
     packets: Vec<Vec<u8>>,
     /// 已见到的最大显示时间（毫秒，不含 preroll）。
     max_pts_ms: u32,
 }
 
 impl AsfMuxer {
+    /// 只复用视频。
     pub fn new(video: VideoStreamInfo) -> Self {
+        Self::with_audio(video, None)
+    }
+
+    /// 复用视频 + 音频。`audio` 是源文件的 WAVEFORMATEX（**原样**写进流属性，
+    /// 所以音频必须是**直通**：写进去的载荷要和它匹配）。
+    pub fn with_audio(video: VideoStreamInfo, audio: Option<AudioFormat>) -> Self {
         Self {
             file_id: [0u8; 16],
             video,
+            audio,
             seq: 1,
+            seq_audio: 1,
             packets: Vec::new(),
             max_pts_ms: 0,
         }
+    }
+
+    /// 写一个音频载荷（**直通**：调用方给的就是源的载荷字节）。
+    ///
+    /// 音频流的号是 2（视频是 1）。音频载荷一般不大，整块塞进一个包；
+    /// 超过单包容量的会自动分片（与视频同一条路径）。
+    pub fn write_audio(&mut self, data: &[u8], pts_ms: u32) -> Result<()> {
+        if self.audio.is_none() {
+            return Err(Error::Bad("没声明音频流，却要写音频载荷"));
+        }
+        if data.is_empty() {
+            return Ok(());
+        }
+        self.max_pts_ms = self.max_pts_ms.max(pts_ms);
+        let mut offset = 0usize;
+        while offset < data.len() {
+            let mut chunk = (data.len() - offset).min(PAYLOAD_CAPACITY);
+            if chunk == PAYLOAD_CAPACITY - 1 {
+                chunk -= 1;
+            }
+            let pad = PACKET_SIZE - PACKET_HEADER_MIN_SIZE - PAYLOAD_HEADER_SIZE - chunk;
+            let mut p = Vec::with_capacity(PACKET_SIZE);
+            p.push(0x82);
+            p.push(0);
+            p.push(0);
+            match pad {
+                0 => p.push(0x00),
+                1..=255 => p.push(0x08),
+                _ => p.push(0x10),
+            }
+            p.push(0x5D);
+            match pad {
+                1..=255 => p.push((pad - 1) as u8),
+                _ if pad >= 256 => p.extend_from_slice(&((pad - 2) as u16).to_le_bytes()),
+                _ => {}
+            }
+            p.extend_from_slice(&pts_ms.to_le_bytes());
+            p.extend_from_slice(&0u16.to_le_bytes());
+            self.payload(&mut p, data, offset, chunk, false, pts_ms, 2, self.seq_audio)?;
+            p.resize(PACKET_SIZE, 0);
+            self.packets.push(p);
+            offset += chunk;
+        }
+        self.seq_audio = self.seq_audio.wrapping_add(1);
+        Ok(())
     }
 
     /// 写一帧视频。`pts_ms` 是显示时间（毫秒，**不含** preroll —— 封装时统一加）。
@@ -110,7 +169,7 @@ impl AsfMuxer {
             p.extend_from_slice(&0u16.to_le_bytes()); // 时长：单载荷恒 0
 
             // ---- 载荷 ----
-            self.payload(&mut p, data, offset, chunk, key_frame, pts_ms)?;
+            self.payload(&mut p, data, offset, chunk, key_frame, pts_ms, 1, self.seq)?;
             debug_assert!(p.len() <= PACKET_SIZE);
             p.resize(PACKET_SIZE, 0); // padding 补齐
             self.packets.push(p);
@@ -131,9 +190,11 @@ impl AsfMuxer {
         chunk: usize,
         key_frame: bool,
         pts_ms: u32,
+        stream: u8,
+        seq: u8,
     ) -> Result<()> {
-        p.push((if key_frame { 0x80 } else { 0x00 }) | 1); // 流号 1
-        p.push(self.seq);
+        p.push((if key_frame { 0x80 } else { 0x00 }) | stream);
+        p.push(seq);
         p.extend_from_slice(&(offset as u32).to_le_bytes());
         p.push(0x08); // replicated data 长度（恒 8：对象总长 + 显示时间）
         p.extend_from_slice(&(data.len() as u32).to_le_bytes());
@@ -206,16 +267,50 @@ impl AsfMuxer {
             b
         };
 
+        // ---- Stream Properties（音频，可选）----
+        // 子对象数要用到它，所以先算。
+        let sp_audio: Option<Vec<u8>> = self.audio.as_ref().map(|a| {
+            let mut wfx = Vec::with_capacity(18 + a.extra.len());
+            wfx.extend_from_slice(&a.format_tag.to_le_bytes());
+            wfx.extend_from_slice(&a.channels.to_le_bytes());
+            wfx.extend_from_slice(&a.sample_rate.to_le_bytes());
+            wfx.extend_from_slice(&a.avg_bytes_per_sec.to_le_bytes());
+            wfx.extend_from_slice(&a.block_align.to_le_bytes());
+            wfx.extend_from_slice(&a.bits_per_sample.to_le_bytes());
+            wfx.extend_from_slice(&(a.extra.len() as u16).to_le_bytes());
+            wfx.extend_from_slice(&a.extra);
+
+            let mut b = Vec::with_capacity(64 + wfx.len());
+            b.extend_from_slice(&audio_media());
+            b.extend_from_slice(&audio_conceal_spread());
+            b.extend_from_slice(&0u64.to_le_bytes()); // 时间偏移
+            b.extend_from_slice(&(wfx.len() as u32).to_le_bytes());
+            b.extend_from_slice(&8u32.to_le_bytes()); // 纠错数据长度
+            b.extend_from_slice(&2u16.to_le_bytes()); // 流号 2
+            b.extend_from_slice(&0u32.to_le_bytes());
+            b.extend_from_slice(&wfx);
+            // 纠错数据（与 ffmpeg 的写法一致：0x01 + block_align×2 + 0x01 + 0x00）
+            b.push(0x01);
+            b.extend_from_slice(&a.block_align.to_le_bytes());
+            b.extend_from_slice(&a.block_align.to_le_bytes());
+            b.extend_from_slice(&1u16.to_le_bytes());
+            b.push(0x00);
+            b
+        });
+
         let mut out = Vec::with_capacity(200 + data_size as usize);
         out.extend_from_slice(&guid::HEADER);
         let header_size_pos = out.len();
         out.extend_from_slice(&0u64.to_le_bytes()); // 头长度，下面回填
-        out.extend_from_slice(&3u32.to_le_bytes()); // 子对象数
+        out.extend_from_slice(&(3u32 + u32::from(sp_audio.is_some())).to_le_bytes()); // 子对象数
         out.push(1);
         out.push(2);
         let header_body_start = out.len();
         out.extend_from_slice(&object(guid::FILE_PROPERTIES, &fp_body));
         out.extend_from_slice(&object(guid::STREAM_PROPERTIES, &sp_body));
+        if let Some(a) = &sp_audio {
+            out.extend_from_slice(&object(guid::STREAM_PROPERTIES, a));
+        }
         out.extend_from_slice(&object(guid::HEADER_EXTENSION, &he_body));
         let header_size = (out.len() - header_body_start + 30) as u64;
         out[header_size_pos..header_size_pos + 8]
@@ -257,6 +352,22 @@ fn video_conceal_none() -> Guid {
     [
         0x00, 0x57, 0xFB, 0x20, 0x55, 0x5B, 0xCF, 0x11, 0xA8, 0xFD, 0x00, 0x80, 0x5F, 0x5C, 0x44,
         0x2B,
+    ]
+}
+
+/// `ff_asf_audio_media`（音频流的类型 GUID）。
+fn audio_media() -> Guid {
+    [
+        0x40, 0x9E, 0x69, 0xF8, 0x4D, 0x5B, 0xCF, 0x11, 0xA8, 0xFD, 0x00, 0x80, 0x5F, 0x5C, 0x44,
+        0x2B,
+    ]
+}
+
+/// `ff_asf_audio_conceal_spread`（音频流的纠错类型 GUID）。
+fn audio_conceal_spread() -> Guid {
+    [
+        0x50, 0xCD, 0xC3, 0xBF, 0x8F, 0x61, 0xCF, 0x11, 0x8B, 0xB2, 0x00, 0xAA, 0x00, 0xB4, 0xE2,
+        0x20,
     ]
 }
 

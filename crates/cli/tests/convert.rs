@@ -89,6 +89,7 @@ fn converts_and_output_is_readable() {
         keyframe_interval: 4, // 8 帧 → 关键帧在 0 与 4
         verify: true,
         max_frames: None,
+        copy_audio: true,
     };
     let rep = convert_file(&input, &output, &opts).expect("转换");
 
@@ -267,6 +268,7 @@ fn converts_real_sample_and_ffmpeg_agrees() {
         keyframe_interval: 0,
         verify: true,
         max_frames: Some(n),
+        copy_audio: true,
     };
     let rep = convert_file(&input, &output, &opts).expect("转真样本");
     eprintln!("真样本：{rep:?}");
@@ -462,6 +464,7 @@ fn converts_avi_input() {
         keyframe_interval: 0,
         verify: true,
         max_frames: None,
+        copy_audio: true,
     };
     let rep = convert_file(&input, &output, &opts).expect("转 AVI");
     eprintln!("AVI → WMV：{rep:?}");
@@ -476,5 +479,94 @@ fn converts_avi_input() {
         n += 1;
     }
     assert_eq!(n, 5);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **音频直通**（真样本，`#[ignore]`）：转出来的文件要带音频，且音频载荷**逐字节**等于源的。
+///
+/// ```text
+/// V2V_AUDIO_SAMPLE=<带 WMA 音频 + MP43 视频的 .wmv/.asf> cargo test --release -p v2v-cli -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "需要真样本（带 WMA 音轨 + MP43 视频）"]
+fn audio_is_passed_through_bit_exactly() {
+    let src = match std::env::var("V2V_AUDIO_SAMPLE") {
+        Ok(p) if Path::new(&p).is_file() => p,
+        _ => {
+            eprintln!("SKIP: V2V_AUDIO_SAMPLE 未设置或文件不存在");
+            return;
+        }
+    };
+    let dir = temp_dir("audio");
+    let input = dir.join("in.wmv");
+    std::fs::copy(&src, &input).expect("拷样本");
+    let output = dir.join("out.wmv");
+
+    // 只转 60 帧（够验证直通，且省时间）
+    let opts = ConvertOptions {
+        qscale: 6,
+        keyframe_interval: 0,
+        verify: false,
+        max_frames: Some(60),
+        copy_audio: true,
+    };
+    let rep = convert_file(&input, &output, &opts).expect("转换");
+    eprintln!("报告：{rep:?}");
+    assert_eq!(rep.frames, 60);
+    assert!(rep.audio_payloads > 0, "一个音频载荷都没搬");
+
+    // ---- 输出里得有两条流，音频格式与源一致 ----
+    let mut d = AsfDemuxer::new(std::fs::File::open(&output).expect("开")).expect("解输出");
+    let out_audio = d
+        .streams()
+        .iter()
+        .find(|s| s.kind == StreamKind::Audio)
+        .expect("输出没有音频轨");
+    let out_af = out_audio.audio.clone().expect("音频格式");
+    let out_num = out_audio.number;
+
+    let mut src_d = AsfDemuxer::new(std::fs::File::open(&input).expect("开")).expect("解源");
+    let src_audio = src_d
+        .streams()
+        .iter()
+        .find(|s| s.kind == StreamKind::Audio)
+        .expect("源没有音频轨");
+    let src_af = src_audio.audio.clone().expect("源音频格式");
+    let src_num = src_audio.number;
+    assert_eq!(out_af.format_tag, src_af.format_tag);
+    assert_eq!(out_af.sample_rate, src_af.sample_rate);
+    assert_eq!(out_af.channels, src_af.channels);
+    assert_eq!(out_af.block_align, src_af.block_align);
+
+    // ---- 音频载荷逐字节比（重叠的那一段）----
+    let mut out_payloads = Vec::new();
+    while let Some(s) = d.next_sample().expect("读输出") {
+        if s.stream == out_num {
+            out_payloads.push(s.data);
+        }
+    }
+    let mut src_payloads = Vec::new();
+    while let Some(s) = src_d.next_sample().expect("读源") {
+        if s.stream == src_num {
+            src_payloads.push(s.data);
+        }
+    }
+    eprintln!(
+        "音频载荷：输出 {} 个 / 源 {} 个",
+        out_payloads.len(),
+        src_payloads.len()
+    );
+    assert!(
+        out_payloads.len() <= src_payloads.len(),
+        "输出的音频载荷比源还多？"
+    );
+    let n = out_payloads.len().saturating_sub(1); // 最后一个可能被截断
+    for i in 0..n {
+        assert_eq!(
+            out_payloads[i], src_payloads[i],
+            "第 {i} 个音频载荷不一致 —— 直通没做到逐字节相同"
+        );
+    }
+    eprintln!("前 {n} 个音频载荷逐字节一致 ✓");
     let _ = std::fs::remove_dir_all(&dir);
 }

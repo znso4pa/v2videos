@@ -8,6 +8,7 @@
 //!   -q, --qscale <1..31>  量化尺度（默认 6；越大越小越糊）
 //!   -g, --gop <N>         周期 I 帧间隔，0=只首帧（默认 250）
 //!   -n, --max-frames <N>  最多转多少帧（默认全部；预览/局部转换用）
+//!       --no-audio        不搬音频（默认**直通**搬过去，零损失）
 //!       --no-verify       不校验输出（默认会解码回来比 PSNR）
 //!   -h, --help            帮助
 //! ```
@@ -30,10 +31,11 @@ v2v —— WMV/ASF 批量转码（纯 Rust：解封装 → 解码 → 编码 →
   -q, --qscale <1..31>  量化尺度（默认 6；越大文件越小、越糊）
   -g, --gop <N>         周期 I 帧间隔（默认 250；0 = 只首帧是 I）
   -n, --max-frames <N>  最多转多少帧（默认全部）
+      --no-audio        不搬音频（默认直通搬过去）
       --no-verify       跳过输出校验（默认解码回来与源比 PSNR）
   -h, --help            显示本帮助
 
-输入支持：ASF（.wmv）里的 MP43 视频轨。音频轨暂不搬。
+输入支持：ASF（.wmv）/ AVI 里的 MP43 视频轨 + WMA 音频轨（音频**直通**，零损失）。
 ";
 
 fn main() -> ExitCode {
@@ -94,6 +96,7 @@ fn run(args: &[String]) -> Result<bool, String> {
                     .map_err(|_| "--max-frames 要非负整数".to_string())?;
                 opts.max_frames = if v == 0 { None } else { Some(v) };
             }
+            "--no-audio" => opts.copy_audio = false,
             "--no-verify" => opts.verify = false,
             "-h" | "--help" => {
                 print!("{USAGE}");
@@ -150,17 +153,18 @@ fn run(args: &[String]) -> Result<bool, String> {
                     None => "未校验".into(),
                 };
                 eprintln!(
-                    "  ✓ {} → {}：{} 帧（{} 关键帧），{} → {} 字节，PSNR {}",
+                    "  ✓ {} → {}：{} 帧（{} 关键帧）+ {} 个音频载荷，{} → {} 字节，PSNR {}",
                     input.display(),
                     out.display(),
                     rep.frames,
                     rep.key_frames,
+                    rep.audio_payloads,
                     rep.bytes_in,
                     rep.bytes_out,
                     psnr
                 );
                 if rep.skipped_audio > 0 {
-                    eprintln!("      （跳过 {} 个音频样本：音频轨暂不搬）", rep.skipped_audio);
+                    eprintln!("      （跳过 {} 个音频样本：--no-audio）", rep.skipped_audio);
                 }
             }
             Err(e) => {
