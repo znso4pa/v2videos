@@ -1,0 +1,9 @@
+[package]
+name = "v2v-mp4"
+description = "纯 Rust MP4 / ISOBMFF 封装 —— 无 C、无 FFI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# 无。纯 std。
