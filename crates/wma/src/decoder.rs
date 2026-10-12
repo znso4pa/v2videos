@@ -374,18 +374,50 @@ impl WmaDecoder {
         })
     }
 
-    /// 解**一个 ASF 音频载荷**（= 一个 superframe），返回它解出的若干帧。
+    /// 解**一个 ASF 音频载荷**，返回它解出的若干帧。
     ///
-    /// 逐行对着 `wma_decode_superframe`：比特池的搬运、残留半帧的接续、
+    /// 开了比特池时，一个载荷 = 一个 superframe（可能含多帧，靠残留半帧跨包接续）；
+    /// 没开时，一个载荷 = `len / block_align` 个**各自独立**的帧。
+    ///
+    /// 两条路都逐行对着 `wma_decode_superframe`：比特池的搬运、残留半帧的接续、
     /// `reset_block_lengths` 的时机，一个都不能少。
     pub fn decode_superframe(&mut self, payload: &[u8]) -> Result<Vec<Vec<Vec<f32>>>> {
         let p = self.params.clone();
         let mut frames: Vec<Vec<Vec<f32>>> = Vec::new();
 
-        // 不用比特池：整包就是一个帧。
+        // 不用比特池：**每个 `block_align` 字节块解一帧**，不是整包一帧。
+        //
+        // ⚠️ 这是踩了很久的坑。`wma_decode_superframe` 里有这么两句：
+        //
+        // ```c
+        // if (avctx->block_align) buf_size = avctx->block_align;   // 1116 → 372
+        // ...
+        // return buf_size;                                         // 返回 372
+        // ```
+        //
+        // 而通用解码层（`decode.c` 的 `decode_simple_internal`）认这个返回值：
+        //
+        // ```c
+        // pkt->data += consumed;   // 剩下 744 字节留在 avci->in_pkt 里
+        // pkt->size -= consumed;
+        // ```
+        //
+        // 于是同一个 ASF 载荷会被**连着喂进解码器 3 次**，每次 372 字节、各出一帧。
+        // 本样本 1116 = 3 × 372，一个载荷出 3 帧。
+        //
+        // 曾经把载荷首字节 `0xE3` 读成「superframe 序号 14、帧数 3」，纯属巧合的
+        // 误判 —— `flags2 = 0x0001` 的 bit1 是 0，比特池根本没开，那个字节就是
+        // 普通帧数据的开头。判定实验：同一批字节灌进 WAV，`block_align=372`
+        // 出 2174 帧、`block_align=1116` 出 724 帧，且前者与 ASF 的 PCM **MD5 相同**。
         if !p.use_bit_reservoir {
-            let mut r = BitReader::new(payload);
-            frames.push(self.decode_frame(&mut r)?);
+            let ba = p.block_align;
+            let mut off = 0;
+            while payload.len() - off >= ba {
+                let mut r = BitReader::new(&payload[off..off + ba]);
+                frames.push(self.decode_frame(&mut r)?);
+                off += ba;
+            }
+            // 末尾不足一块的余数：ffmpeg 会打 "Input packet size too small" 并丢掉。
             return Ok(frames);
         }
 

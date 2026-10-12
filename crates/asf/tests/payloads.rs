@@ -113,7 +113,6 @@ fn mixed_payload_asf() -> Vec<u8> {
     sp_video.extend_from_slice(&video_type);
 
     // ---- 数据包 ----
-    let audio_data = [0xAAu8, 0xBB, 0xCC, 0xDD];
     let video_data = [0x11u8, 0x22, 0x33, 0x44];
     let mut pkt = Vec::new();
     pkt.extend_from_slice(&[0x82, 0x00, 0x00]); // EC：标准 3 字节

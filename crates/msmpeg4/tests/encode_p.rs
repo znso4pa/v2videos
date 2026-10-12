@@ -373,8 +373,8 @@ fn smooth_frame(w: u32, h: u32) -> Frame {
         }
     }
     let (cw, ch) = (wu / 2, hu / 2);
-    let mut u = vec![128u8; cw * ch];
-    let mut v = vec![128u8; cw * ch];
+    let u = vec![128u8; cw * ch];
+    let v = vec![128u8; cw * ch];
     Frame { width: w, height: h, y, u, v }
 }
 
@@ -382,7 +382,7 @@ fn smooth_frame(w: u32, h: u32) -> Frame {
 fn noise_frame(w: u32, h: u32, seed: u32) -> Frame {
     let (wu, hu) = (w as usize, h as usize);
     let mut s = seed;
-    let mut next = |s: &mut u32, a: u32, c: u32| {
+    let next = |s: &mut u32, a: u32, c: u32| {
         *s = s.wrapping_mul(a).wrapping_add(c);
         (*s >> 24) as u8
     };

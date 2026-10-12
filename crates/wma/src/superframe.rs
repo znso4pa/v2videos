@@ -3,7 +3,7 @@
 //! ## 结构（一包 = 一个 ASF 音频载荷）
 //!
 //! ```text
-//! 不用比特池：整包就是一个帧。
+//! 不用比特池：载荷里排着 `len / block_align` 个**各自独立**的帧，没有头。
 //! 用比特池：
 //!   4 位  superframe 序号（每个包 +1，8 回绕）
 //!   4 位  本包的帧数（还要减去「上一包有没有残留」那一位，见下）
@@ -57,14 +57,17 @@ pub struct SuperframeState {
 impl SuperframeState {
     /// 解一包的头。
     ///
-    /// `data` 是一个 ASF 音频载荷（长度应为 `block_align`）。
+    /// `data` 是一个 ASF 音频载荷。开了比特池时它整包就是一个 superframe；
+    /// 没开时它是 `len / block_align` 个独立帧的拼接。
     /// 返回 `None` = 这一包只是「往残留缓冲里攒位」，不产帧。
     pub fn parse(&mut self, params: &WmaParams, data: &[u8]) -> Result<Option<SuperframeHeader>> {
         if !params.use_bit_reservoir {
-            // 不用比特池：整包一个帧，没有头。
+            // 不用比特池：没有头，载荷里就是 `len / block_align` 个**各自独立**
+            // 的帧（ffmpeg 把 `buf_size` 截到 `avctx->block_align`，通用解码层
+            // 按已消费字节数循环，等价于逐块解）。本样本 1116 / 372 = 3 帧。
             return Ok(Some(SuperframeHeader {
                 index: 0,
-                nb_frames: 1,
+                nb_frames: (data.len() / params.block_align) as i32,
                 bit_offset: 0,
                 frames_start_bit: 0,
             }));
@@ -142,5 +145,18 @@ mod tests {
         let mut st = SuperframeState::default();
         assert!(st.parse(&params(), &data).unwrap().is_none());
         assert!(st.accumulated_bits > 0);
+    }
+
+    #[test]
+    fn no_reservoir_payload_holds_len_over_block_align_frames() {
+        // v1 44100 立体声，私有数据 `00 08 01 00` → flags2 = 0x0001 → 比特池**关**
+        let p = WmaParams::new(1, 2, 44100, 64080, 372, &[0x00, 0x08, 0x01, 0x00]).unwrap();
+        assert!(!p.use_bit_reservoir);
+        // 真样本的载荷是 1116 字节 = 3 × 372
+        let data = vec![0u8; 1116];
+        let mut st = SuperframeState::default();
+        let h = st.parse(&p, &data).unwrap().expect("有帧");
+        assert_eq!(h.nb_frames, 3, "1116 / 372 = 3 个独立帧");
+        assert_eq!(h.frames_start_bit, 0, "没有头，直接从第 0 位起");
     }
 }

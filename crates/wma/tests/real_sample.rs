@@ -1,18 +1,27 @@
-//! WMA **真样本**对账：拿 ASF 里那条音频轨的每个载荷，跑 superframe 头解析。
+//! WMA **真样本**对账：拿 ASF 里那条音频轨的每个载荷，跑参数推导 + 帧结构校验。
 //!
 //! ```text
 //! V2V_WMA_SAMPLE=<带 WMA 音轨的 .wmv/.asf> cargo test -p v2v-wma -- --nocapture
 //! ```
 //!
+//! ## 两条路径的载荷结构**不一样**
+//!
+//! - **开了比特池**（v2，本仓库的 `raam28mb.wmv`）：一个载荷 = 一个 superframe，
+//!   载荷长度 == `block_align`，开头是 4+4+(byte_offset_bits+3) 位的头。
+//! - **没开比特池**（v1，`wma1.asf`）：没有头，载荷里排着 `len / block_align` 个
+//!   **各自独立**的帧 —— 本样本 1116 / 372 = 3 帧。
+//!
 //! ## 这一段能验什么、不能验什么
 //!
 //! **能验**：参数推导（帧长 / `byte_offset_bits` / 噪声编码开关）、superframe 头的
-//! 位序与字段位置、序号是否逐包递增、`bit_offset` 是否落在包内。
+//! 位序与字段位置、序号是否逐包递增、`bit_offset` 是否落在包内、载荷长度是否
+//! 是 `block_align` 的整数倍。
 //! 还能验一条**跨层一致性**：推出来的帧数 × 帧长 ÷ 采样率 ≈ 音频时长
 //! （由「文件里音频字节数 ÷ 码率」算出）—— 两边独立算出来的秒数必须接近。
 //!
-//! **不能验**：精确帧数。superframe 末尾会把「没用完的位」留给下一包接着解，
-//! 残留长度取决于帧内实际消耗了多少位 —— 那要等帧解码器。
+//! **不能验**：开了比特池时的精确帧数。superframe 末尾会把「没用完的位」留给
+//! 下一包接着解，残留长度取决于帧内实际消耗了多少位 —— 那要等帧解码器
+//! （见 `pcm.rs`）。没开比特池时帧数是可以直接算出来的，这里会硬校验。
 
 use std::fs::File;
 use std::io::BufReader;
@@ -39,10 +48,12 @@ fn parses_every_audio_payload_of_the_real_sample() {
     let af = audio.audio.as_ref().expect("音频格式");
     let num = audio.number;
 
+    // 版本从 format_tag 推：0x0160 = v1，0x0161 = v2
+    let version = if af.format_tag == 0x0160 { 1 } else { 2 };
     // 码率：WAVEFORMATEX 里没有 bit_rate 字段，用 avg_bytes_per_sec × 8（与 ffprobe 同口径）
     let bit_rate = af.avg_bytes_per_sec * 8;
     let params = WmaParams::new(
-        2, // 0x0161
+        version,
         af.channels as usize,
         af.sample_rate,
         bit_rate,
@@ -71,26 +82,38 @@ fn parses_every_audio_payload_of_the_real_sample() {
         payloads += 1;
         bytes += s.data.len();
         assert_eq!(
+            s.data.len() % params.block_align,
+            0,
+            "载荷长度应是 block_align 的整数倍（{} / {}）",
             s.data.len(),
-            params.block_align,
-            "载荷长度应等于 block_align"
+            params.block_align
         );
 
         let h = st.parse(&params, &s.data).expect("superframe 头").expect("有帧");
-        // 序号逐包 +1（4 位字段，16 回绕 —— 实测不是 8 回绕）
-        if let Some(prev) = last_index {
-            assert_eq!(h.index, (prev + 1) % 16, "superframe 序号不连续");
+        if params.use_bit_reservoir {
+            // 序号逐包 +1（4 位字段，16 回绕 —— 实测不是 8 回绕）
+            if let Some(prev) = last_index {
+                assert_eq!(h.index, (prev + 1) % 16, "superframe 序号不连续");
+            }
+            last_index = Some(h.index);
+            // bit_offset 必须落在包内，且第一个完整帧的起点不能越界
+            assert!(
+                h.frames_start_bit <= s.data.len() * 8,
+                "bit_offset 越界：{} > {}",
+                h.frames_start_bit,
+                s.data.len() * 8
+            );
+            max_bit_offset = max_bit_offset.max(h.bit_offset);
+            assert!((1..=15).contains(&h.nb_frames), "帧数离谱：{}", h.nb_frames);
+        } else {
+            // 没有头：帧数直接由长度决定
+            assert_eq!(
+                h.nb_frames as usize,
+                s.data.len() / params.block_align,
+                "载荷里的帧数应等于 len / block_align"
+            );
+            assert_eq!(h.frames_start_bit, 0, "没有头，应从第 0 位起");
         }
-        last_index = Some(h.index);
-        // bit_offset 必须落在包内，且第一个完整帧的起点不能越界
-        assert!(
-            h.frames_start_bit <= s.data.len() * 8,
-            "bit_offset 越界：{} > {}",
-            h.frames_start_bit,
-            s.data.len() * 8
-        );
-        max_bit_offset = max_bit_offset.max(h.bit_offset);
-        assert!((1..=15).contains(&h.nb_frames), "帧数离谱：{}", h.nb_frames);
         frames += h.nb_frames as i64;
     }
 
@@ -105,9 +128,10 @@ fn parses_every_audio_payload_of_the_real_sample() {
 
     assert!(payloads > 0, "一个音频载荷都没读到");
     assert!(frames > 0, "推出 0 帧");
-    // 两条独立路径算出来的时长必须接近（允许 5%：帧的边界会切在包中间）。
-    // 实测这个样本：494 帧 → 22.94 s vs 23.40 s（比值 0.98），
+    // 两条独立路径算出来的时长必须接近（允许 5%：开了比特池时帧的边界会切在包中间）。
+    // 实测 v2 样本（`raam28mb.wmv`）：494 帧 → 22.94 s vs 23.40 s（比值 0.98），
     // 而 ffmpeg 解出来的 PCM 正好是 493 帧 —— 三个独立数字互相印证。
+    // 实测 v1 样本（`wma1.asf`）：725 载荷 × 3 帧 = 2175 帧 → 101.01 s vs 101.01 s（比值 1.00）。
     let ratio = seconds_by_frames / seconds_by_bytes;
     assert!(
         (0.95..1.05).contains(&ratio),

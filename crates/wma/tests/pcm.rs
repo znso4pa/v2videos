@@ -6,13 +6,19 @@
 //!
 //! ## 两个必须先说清楚的口径问题（都踩过）
 //!
-//! 1. **ffmpeg 会跳过编码器延迟**：它的 WMA 解码器按 `skip_samples` **整帧丢掉**开头几帧
-//!    （日志里打 `skip whole frame`），所以它的 PCM 比码流本身少几帧。
-//!    本样本少 **2 帧**（2048 个样本）。对账前必须先把这个帧级偏移找出来，
+//! 1. **ffmpeg 会跳过编码器延迟**：它的 WMA 解码器按 `skip_samples = frame_len * 2`
+//!    **整帧丢掉**开头几帧，所以它的 PCM 比码流本身少几帧。
+//!    两个样本都少 **2 帧**（4096 个样本）。对账前必须先把这个帧级偏移找出来，
 //!    否则会把「少了两帧」误判成「波形不对」。
 //! 2. **容差不是 0**：我们的 IMDCT 按定义直接算（O(N²)、f64 累加），ffmpeg 走 FFT（f32）
 //!    —— 两条路的舍入不同，量化到 s16 后允许差几个 LSB。实测**最大差 2**
 //!    （s16 满量程 32768，即 0.006%）。
+//!
+//! ## 两个样本的「载荷 → 帧」结构不一样（都验过了）
+//!
+//! - **v2**（`raam28mb.wmv`）：开了比特池，一个载荷 = 一个 superframe，载荷长度 == `block_align`。
+//! - **v1**（`wma1.asf`）：比特池关，一个载荷里排着 `len / block_align` 个**各自独立**的帧
+//!   —— 1116 / 372 = 3 帧。这一条曾经理解错，见 `decoder.rs::decode_superframe` 的注释。
 
 use std::fs::File;
 use std::io::BufReader;
@@ -117,11 +123,11 @@ fn decoded_pcm_matches_ffmpeg() {
     };
 
     // ---- 找「帧级偏移」（ffmpeg 跳掉的编码器延迟）----
+    // 口径：`got[f] ≈ pcm[f - shift_frames]`
     let fl = params.frame_len;
     let nf_ours = n / fl;
     let nf_ref = pcm.len() / channels / fl;
-    let mut shift_frames = 0i64;
-    {
+    let shift_frames: i64 = {
         let mut best = (f64::MAX, 0i64);
         for s in -4i64..=4 {
             let (mut sum, mut cnt) = (0f64, 0usize);
@@ -144,19 +150,16 @@ fn decoded_pcm_matches_ffmpeg() {
                 }
             }
         }
-        shift_frames = best.1;
         eprintln!(
-            "帧级偏移：我们的帧 = ffmpeg 的帧 + {shift_frames}（MSE {:8.2}）",
-            best.0
+            "帧级偏移：我们的帧 = ffmpeg 的帧 + {}（MSE {:8.2}）",
+            best.1, best.0
         );
-    }
-    // v1 的偏移可能是 -1（ffmpeg 对 v1 的跳过行为不同），先放宽到 ±8 再观察
-    assert!(
-        (-8..=4).contains(&shift_frames),
-        "偏移不合理（{shift_frames}）"
-    );
-    // v1 的负偏移（我们的流比 ffmpeg 领先一帧）是另一件事，先只做正向对齐
-    let shift = if shift_frames > 0 { shift_frames as usize * fl } else { 0 };
+        best.1
+    };
+    // ffmpeg 的 `skip_samples = s->frame_len * 2`（整整两帧，见 `flush()`），v1/v2 一样 ——
+    // 实测偏移就是 +2。这里只是合理性守卫，真正的判据是下面的逐样本容差。
+    assert!((1..=4).contains(&shift_frames), "偏移不合理（{shift_frames}）");
+    let shift = shift_frames as usize * fl;
 
     // ---- 逐样本比 ----
     let cmp_n = n.saturating_sub(shift).min(pcm.len() / channels);
@@ -189,7 +192,11 @@ fn decoded_pcm_matches_ffmpeg() {
         let fl0 = params.frame_len;
         let nf = (n / fl0).min(12);
         for f in 0..nf {
-            let g = f.saturating_sub(shift_frames.unsigned_abs() as usize);
+            let g = f as i64 - shift_frames;
+            if g < 0 {
+                continue; // 落在 ffmpeg 跳掉的那两帧里，没有可比对象
+            }
+            let g = g as usize;
             if g >= pcm.len() / channels / fl0 {
                 break;
             }
@@ -210,8 +217,7 @@ fn decoded_pcm_matches_ffmpeg() {
         }
     }
 
-    // ---- 帧级互相关（v1 定位用）----
-    // ---- 帧级互相关（v1 定位用）：我们的内容帧最像 ffmpeg 的哪一帧、相关多少 ----
+    // ---- 帧级互相关：我们的内容帧最像 ffmpeg 的哪一帧、相关多少 ----
     {
         let fl0 = params.frame_len;
         for f in 18..(n / fl0).min(48) {
@@ -219,7 +225,7 @@ fn decoded_pcm_matches_ffmpeg() {
                 break;
             }
             let mut best = (0f64, 0i64, 1i64);
-            for g in (f as i64 + shift_frames - 2)..=(f as i64 + shift_frames + 2) {
+            for g in (f as i64 - shift_frames - 2)..=(f as i64 - shift_frames + 2) {
                 for sgn in [1i64, -1] {
                     let mut ab = 0f64;
                     let mut aa = 0f64;
