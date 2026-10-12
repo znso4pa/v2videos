@@ -19,8 +19,11 @@
 //! ffmpeg 只当**交叉验证的 oracle**（测试里解同一条流、逐像素对账），不进产物。
 
 mod bitreader;
+mod bitwriter;
 mod block;
+mod encode;
 mod error;
+mod fdct;
 mod frame;
 mod grid;
 mod header;
@@ -35,6 +38,8 @@ pub use bitreader::BitReader;
 pub use error::{Error, Result};
 pub use header::{decode012, parse_frame_header, FrameHeader, PictureType};
 pub use block::RlTable;
+pub use encode::{Encoder, EncoderConfig};
+pub use fdct::fdct;
 pub use frame::{decode_i_frame, AcPredRead, Decoder, Frame, Stats, ZIGZAG};
 pub use idct::{idct_add, idct_put};
 pub use predict::{ac_predict, coded_block_predict, dc_predict, AcVal};
