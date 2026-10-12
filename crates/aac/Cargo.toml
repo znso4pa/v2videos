@@ -1,0 +1,15 @@
+[package]
+name = "v2v-aac"
+description = "纯 Rust 的 AAC-LC 音频编码 —— 无 C、无 FFI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# MDCT / 窗函数 / 位写入器这几件与具体编码格式无关的东西，复用 msmpeg4 那边已经
+# 验证过的实现（`BitWriter` 的 MSB 优先语义正好与 AAC 一致）。
+v2v-msmpeg4 = { path = "../msmpeg4" }
+
+[dev-dependencies]
+# 测试里手工拼 ADTS 头要用位写入器。
+v2v-msmpeg4 = { path = "../msmpeg4" }
