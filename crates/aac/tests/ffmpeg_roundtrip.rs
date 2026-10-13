@@ -448,6 +448,25 @@ fn bitrate_is_controlled_to_the_target() {
 /// **结论要如实写**：心理声学模型带来了**小幅但真实**的效率提升
 /// （不只是 SNR 数字游戏），但**我们仍落后 ffmpeg 约 30%**，
 /// 不能说成「反超」。
+///
+/// ## ⚠️⚠️⚠️ 上面这段结论**已被推翻**（2026-10-13）
+///
+/// 那个「+8% 效率」不是模型省下的位，而是它**整条扔掉频带**换来的：
+/// 代价 `dist / th²` 在安静带上**溢出 f32 变成 `inf`**，于是 `band_cost`
+/// 落到兜底分支、把该带判成「全零带」（机制与三方对照见 `band_cost` 的注释）。
+///
+/// 后果在真音乐上非常明显（音乐的低音比中高频高 40+ dB，中频带正好中招）：
+///
+/// ```text
+///   12 秒真音乐（单声道 64k）   阈值 + f32 代价  5.47 dB
+///                              阈值 + f64 代价 11.88 dB
+///                              只比平方误差    11.85 dB  ← 现在
+///                              ffmpeg 同码率   11.91 dB
+/// ```
+///
+/// 粉噪声频谱平坦，扔掉几条带听不出来，所以这两条测试当初没抓到。
+/// 现在由 `wide_dynamic_range_signal_keeps_its_midrange` 专门看着
+/// （大动态范围信号：修复版 30.7 dB / 有害版 8.3 dB）。
 #[test]
 fn quality_is_within_2db_of_ffmpeg() {
     if !has_ffmpeg() {
@@ -807,5 +826,112 @@ fn short_window_frames_are_valid_and_actually_used() {
         got[0].len() <= total + 4096,
         "解出来的样本数 {} 远超输入 {total} —— 帧边界写错了",
         got[0].len()
+    );
+}
+
+/// **频谱动态范围大的信号上，中频带不能被量化掉** —— 这条是回归测试。
+///
+/// ## 为什么必须单独有这一条
+///
+/// 现有两条质量测试都用**粉噪声**当基准，而粉噪声频谱平坦（各带能量差不多），
+/// 抓不到下面这个真实的回归：
+///
+/// 代价函数曾经是 `dist / th²`（`th` = 掩蔽阈值）。安静带的 `th` 小，
+/// `(1/th)²` 能到 1e24，而 `dist` 是 1e9~1e11 量级 —— 乘积**溢出 f32 变成 `inf`**，
+/// 于是 `band_cost` 的比较全部失效、落到兜底分支，**把那条带判成「全零带」**。
+/// 音乐里比低音低十几 dB 的中频带正好中招，整段被抹掉。
+///
+/// | 12 秒真音乐（单声道 64k） | 总 SNR |
+/// |---|---|
+/// | 阈值 + f32 代价（原实现） | 5.47 dB |
+/// | 阈值 + f64 代价 | 11.88 dB |
+/// | 只比平方误差（现在） | **11.85 dB** |
+/// | ffmpeg 同码率 | 11.91 dB |
+///
+/// 这里的合成信号复现那个形状：**强低音 + 几个中频乐音**（可编码的乐音，
+/// 不是白噪声 —— 白噪声在低码率下本来就编不好，用它当判据会冤枉编码器）。
+/// 中频带被抹掉时全局 SNR 会塌下来。
+#[test]
+fn wide_dynamic_range_signal_keeps_its_midrange() {
+    if !has_ffmpeg() {
+        eprintln!("SKIP: PATH 上没有 ffmpeg");
+        return;
+    }
+    const SECS: usize = 4;
+    let n = SR as usize * SECS;
+    const MID: [f64; 4] = [700.0, 1500.0, 3000.0, 6000.0];
+
+    // 强低音（80 Hz，12000）+ 四个中频乐音（各 2500）+ 一点底噪。
+    let mut state = 12345u32;
+    let src: Vec<f32> = (0..n)
+        .map(|i| {
+            let t = i as f64 / f64::from(SR);
+            let mut v = 12000.0 * (2.0 * std::f64::consts::PI * 80.0 * t).sin();
+            for f in MID {
+                v += 2500.0 * (2.0 * std::f64::consts::PI * f * t).sin();
+            }
+            state = state.wrapping_mul(1103515245).wrapping_add(12345);
+            v += ((state >> 16) as f64 / 32768.0 - 1.0) * 150.0;
+            v as f32
+        })
+        .collect();
+
+    let mut e = Encoder::new(EncoderConfig {
+        channels: 1,
+        sample_rate: SR,
+        bitrate: 96_000,
+        kb_window: false,
+    })
+    .expect("建编码器");
+    let mut frames = Vec::new();
+    for chunk in src.chunks(1024) {
+        let mut p = chunk.to_vec();
+        p.resize(1024, 0.0);
+        frames.push(e.encode_frame(&Frame { planes: vec![p] }).expect("编一帧"));
+    }
+    let dec = decode_aac(&frames, 1);
+
+    // ⚠️ **必须先对齐**：AAC 解码出来的样本比源**晚约 1024 个**（编码器的
+    // 延迟 + 首帧的 priming），而 `decode_aac` 不做补偿。直接逐样本比会
+    // 把「对不齐」量成 SNR —— 周期性信号上尤其惨（差一个采样点就全错）。
+    // 所以这里先粗搜、再逐样本细化。
+    let got = &dec[0];
+    let m = got.len().min(src.len());
+    let mse_at = |sh: usize| -> f64 {
+        let mut s = 0f64;
+        let mut c = 0u32;
+        for i in (20000..m - 20000).step_by(7) {
+            let d = f64::from(got[i + sh]) - f64::from(src[i]);
+            s += d * d;
+            c += 1;
+        }
+        s / f64::from(c.max(1))
+    };
+    let mut best = (f64::MAX, 0usize);
+    for sh in (0..4096).step_by(32) {
+        let v = mse_at(sh);
+        if v < best.0 {
+            best = (v, sh);
+        }
+    }
+    let lo = best.1.saturating_sub(32);
+    for sh in lo..(best.1 + 32).min(4096) {
+        let v = mse_at(sh);
+        if v < best.0 {
+            best = (v, sh);
+        }
+    }
+    let sh = best.1;
+    let (mut se, mut sp) = (0f64, 0f64);
+    for i in 20000..m - 20000 {
+        let d = f64::from(got[i + sh]) - f64::from(src[i]);
+        se += d * d;
+        sp += f64::from(src[i]) * f64::from(src[i]);
+    }
+    let snr = 10.0 * (sp / se.max(1e-9)).log10();
+    println!("大动态范围信号（96k 单声道）：SNR {snr:.2} dB（对齐 {sh}）");
+    assert!(
+        snr > 12.0,
+        "SNR 只有 {snr:.2} dB —— 中频带被量化掉了（代价函数是不是又在拿掩蔽阈值当权重了？）"
     );
 }
