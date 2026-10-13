@@ -1276,7 +1276,12 @@ fn min_sf_for_peak(spec: &[f32], swb: &[u16]) -> i32 {
         let band = &spec[swb[sfb] as usize..swb[sfb + 1] as usize];
         let maxp = band
             .iter()
-            .fold(0f64, |m, &c| m.max(f64::from(c.abs()).powf(0.75)));
+            .fold(0f64, |m, &c| {
+                // 同 `quant_one`：`x^0.75 = √x·√√x`，别调 `powf`。
+                let x = f64::from(c.abs());
+                let r = x.sqrt();
+                m.max(r * r.sqrt())
+            });
         if maxp <= 1e-9 {
             continue;
         }
@@ -1318,16 +1323,33 @@ fn min_sf_for_peak(spec: &[f32], swb: &[u16]) -> i32 {
 /// `section_data` 的长度转义……真正的原因就是这一个 `- 100`。
 /// **「形状对、整体差一个常数」时，先把定标公式逐字对着一个已知正确的实现抄一遍。**
 fn q34(sf: u8) -> f32 {
-    let e = -3.0 * (f32::from(sf) - 100.0) / 16.0;
-    (e * std::f32::consts::LN_2).exp()
+    // ⚠️ **查表**，别每次算 `exp()`：这个函数在 `band_code` 里是**逐 (带, sf, 码本)**
+    // 调的（一帧 ~5 万次），而 sf 只有 256 个可能值。表算一次，值完全相同。
+    static T: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let mut t = [0f32; 256];
+        for (sf, v) in t.iter_mut().enumerate() {
+            let e = -3.0 * (sf as f32 - 100.0) / 16.0;
+            *v = (e * std::f32::consts::LN_2).exp();
+        }
+        t
+    })[sf as usize]
 }
 
 /// `IQ(sf) = 2^((sf − 100)/4)` —— 反量化用的缩放因子。
 ///
 /// 就是解码端的 `sf_gain`。与 `q34` 的关系是 `IQ = Q34^(-4/3)`。
 fn iq(sf: u8) -> f32 {
-    let e = (f32::from(sf) - 100.0) / 4.0;
-    (e * std::f32::consts::LN_2).exp()
+    // 同上：查表（`IQ = 2^((sf−100)/4)`）。
+    static T: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let mut t = [0f32; 256];
+        for (sf, v) in t.iter_mut().enumerate() {
+            let e = (sf as f32 - 100.0) / 4.0;
+            *v = (e * std::f32::consts::LN_2).exp();
+        }
+        t
+    })[sf as usize]
 }
 
 /// 量化一个非负值：`min((int)(pow(a, 3/4) · q34 + 0.4054), maxval)`。
@@ -1336,11 +1358,15 @@ fn iq(sf: u8) -> f32 {
 /// （`ROUND_STANDARD`），用来补偿 `pow(·, 3/4)` 的均值偏移。
 /// 换成 `round()` 会让所有系数偏大一点。
 fn quant_one(a: f32, q34: f32, maxval: i32) -> i32 {
-    let a34 = (a as f64).powf(0.75);
     // `rusty_aac::quantize_band_scalar`：`(pow * scale).round().min(MAX_QUANT)`。
     // 用 `round()` 而不是 ffmpeg 的 `+0.4054` 截断 —— 两者都对，
     // 但**必须与反量化成对**，混用会在低频小系数上积出可见的偏差。
-    let q = (a34 * f64::from(q34)).round() as i32;
+    // ⚠️ 用 `x^0.75 = √x · √√x`（两次硬件开方），**不要** `powf(0.75)`：
+    // 后者是 libm 超越函数（几十到上百纳秒），而这里是**逐系数**调的最内层。
+    // 也试过 ffmpeg 那种 **pow34 查表 + 插值**：既没更快（硬件开方本来就快），
+    // 还把质量打掉 **0.78 dB**（相对误差 6e-6 对量化器的舍入边界来说太大）→ 撤。
+    let r = f64::from(a).sqrt();
+    let q = (r * r.sqrt() * f64::from(q34)).round() as i32;
     q.min(maxval)
 }
 
@@ -1587,6 +1613,10 @@ fn band_code(band: &[f32], sf: u8, cb: usize) -> (u32, f32) {
         bits += nbits;
 
         // 失真：用码本矢量反量化后的值与原值比。
+        //
+        // ⚠️ `iq(sf)` **提到循环外**：它只跟 `sf` 有关（是个 `exp()`），
+        // 原来写在逐系数的循环里 —— 那是每个系数一次超越函数。
+        let iq_sf = f64::from(iq(sf));
         for j in 0..dim {
             let v = f64::from(vecs[curidx * dim + j]);
             let rec = if v == 64.0 {
@@ -1596,7 +1626,7 @@ fn band_code(band: &[f32], sf: u8, cb: usize) -> (u32, f32) {
             } else {
                 let a = v.abs();
                 let sign = if chunk[j] < 0.0 { -1.0 } else { 1.0 };
-                a * sign * f64::from(iq(sf))
+                a * sign * iq_sf
             };
             let d = f64::from(chunk[j]) - rec;
             dist += (d * d) as f32;
