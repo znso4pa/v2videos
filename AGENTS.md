@@ -8,8 +8,23 @@
 
 ## 现状
 
-**刚初始化，还没有任何代码。** 下面「命令」「架构不变量」两节是**占位**，等第一段代码落地再填。
-但**约定**（下一节）从现在起就生效 —— 它们是从隔壁 UsefulUnpack 的实战里换来的，越早遵守越省事。
+**链路已经打通到 `.wmv → .mp4`**：9 个 crate、约 3 万行 Rust，**零第三方依赖**
+（`Cargo.lock` 里只有本仓的包）。
+
+```text
+container  解封装共用的数据模型（Stream / Sample / AudioFormat / VideoFormat）—— 零依赖
+asf        ASF（.wmv / .wma）解封装 **+ 封装**（多载荷打包 + Simple Index）
+avi        AVI（RIFF）解封装
+msmpeg4    MP43 解码（I / P）**+ 编码**（I / P，含运动估计）；兼**共享数值内核**（见下）
+wma        WMA v1 / v2 解码（**只有解码器**）
+mp4v       MPEG-4 Part 2 编码（I / P + 码率控制）
+aac        AAC-LC 编码（MDCT / 短窗 / TNS / Huffman / 码率控制）
+mp4        MP4 / ISOBMFF 封装（mp4v + mp4a(AAC) 或 sowt PCM）
+cli        `v2v convert`：ASF / AVI → `.wmv`（MP43 + 音频直通）或 `.mp4`（mp4v + AAC）
+```
+
+下面的**约定**与**架构不变量**是硬约束（从隔壁 UsefulUnpack 的实战里换来的，不是摆设）——
+动手前先读完；**进度、判据、下一步**在 `TODO.md`（本地、不入库、唯一真源），面向人的状态表在 README。
 
 ## 约定（现在起生效）
 
@@ -53,12 +68,33 @@
   它和它编码的假设会一起错。对着 `ffmpeg`/`ffprobe` 逐样本比（解码结果、帧数、时间戳），
   并且优先「**字节相同**」而不是「没报错」。
 
-## 命令（占位 —— 等第一段代码）
+## 命令
 
 ```bash
-cargo build
-cargo test
+cargo test --workspace -j 4     # 单元 + 不依赖样本的集成测试（缺样本的会打 `SKIP` 并通过）
+cargo build -j 4                # 并发**限 4** —— 见下一节「构建资源纪律」
+
+cargo run -p v2v-cli -- convert in.wmv -o out/              # .wmv：MP43 + 音频直通
+cargo run -p v2v-cli -- convert --mp4 -g 12 in.wmv -o out/  # .mp4：mp4v + AAC
 ```
+
+**带真样本的对账测试**按**环境变量**找样本（样本一律 `.gitignore`，缺了就 `SKIP`）：
+
+| 变量                       | 用途                                              |
+| ------------------------ | ----------------------------------------------- |
+| `V2V_ASF_SAMPLE`         | 视频逐帧对 `ffmpeg`（msmpeg4 / avi / cli；多个样本用 `:` 分隔） |
+| `V2V_WMA_SAMPLE`         | WMA 解码出的 PCM 对 `ffmpeg`（wma）                    |
+| `V2V_AUDIO_SAMPLE`       | 音频直通整文件对账（cli，标了 `#[ignore]`）                    |
+| `V2V_MP4_REF` / `V2V_MP4_PCM` | MP4 封装逐 box 对 `ffmpeg` 产的参考件（mp4）              |
+| `V2V_MAX_FRAMES` / `V2V_PFRAME_MAP` | 限量跑 / 逐帧定位（msmpeg4 调试用）                        |
+
+```bash
+# 例：带样本跑全套；最重的是 #[ignore] 那一层
+V2V_ASF_SAMPLE='/path/a.wmv:/path/b.asf' cargo test --workspace -j 4 -- --ignored
+```
+
+⚠️ **「`cargo test` 全绿」≠「对账过了」** —— 没设环境变量时那些对账测试只是 **SKIP 了**。
+动了编解码 / 容器，必须自己带上样本再跑一遍（见「完成任务前」）。
 
 ## 🖥️ 构建资源纪律（**动手前先看表** —— 这台机器很吃紧）
 
@@ -90,9 +126,28 @@ df -h /System/Volumes/Data  # 磁盘 <10% 可用会让 macOS 整体变卡（换�
   别硬撑着跑完。
 - 报进度时**带上 load / 磁盘数字**，用户才知道还要不要继续等。
 
-## 架构不变量（占位 —— 等第一段代码）
+## 架构不变量
 
-（还没有。第一段代码落地时，把「什么绝对不能变」写在这里。）
+**这几条是「每段可查、可单独替换」得以成立的前提 —— 动它们要当心。**
+
+1. **容器解封装只经 `v2v-container` 的类型对外**（`Stream` / `Sample` / `AudioFormat` /
+   `VideoFormat`）。上层（解码器、`v2v convert`）**不认识容器** —— 加一种容器 = 加一个
+   「字节 → Stream / Sample」的实现，上层不动。
+2. **零第三方依赖。** 所有 crate 只依赖本仓内部包。要引 crates.io 上的东西，先过许可证
+   （LGPL 兼容：Apache-2.0 / MIT / BSD；MPL 这类 copyleft 一律不引），并说清现有代码
+   为什么做不到。
+3. **`v2v-msmpeg4` 兼共享数值内核**：`BitReader` / `BitWriter`（MSB 优先）/ FDCT / IDCT /
+   VLC 表被 `v2v-mp4v` 与 `v2v-aac` 复用。**不要复刻第二份** —— 会漂的就是第二份。
+   改这些共享件要**同时**跑 mp4v 与 aac 的对账测试。
+4. **码表只有一份真源**：`crates/*/src/tables.rs` 是唯一落点，生成与自检脚本在
+   `tools/`（`gen_tables.py` / `gen_aac_tables.py` / `gen_wma_tables.py` / `check_tables.py`）。
+   加格式只改那一处，别的地方转发。
+5. **样本与「夹具出处」永不入库。** 真样本走环境变量 + 缺样本 `SKIP`；**提交信息、源码
+   注释、测试名**里不许点名来源产品、不许写样本文件名。**某个样本的规模**（帧数 / 分辨率 /
+   单帧字节数）**别写进代码或断言** —— 换个样本就失效，而且它本身就是出处（v0.1.1 清过一批）。
+   质量 / 体积指标（PSNR、码率、压缩比）写 README / TODO 没问题，那是测量结果不是出处。
+6. **正确性由「真样本 + 外部 oracle」钉住**：解码逐像素对 `ffmpeg`、封装逐 box 对
+   `ffprobe`、编出来的流交回 `ffmpeg` 解。自造往返**必要但不充分**，不能单独当判据。
 
 ## 已经踩过的坑（从 UsefulUnpack 的视频链路带过来，直接相关）
 
@@ -123,6 +178,10 @@ df -h /System/Volumes/Data  # 磁盘 <10% 可用会让 macOS 整体变卡（换�
 
 ## 完成任务前
 
-1. `cargo test` 绿（如果动了 Rust）。
-2. 动了编解码/容器：对着**真样本 + `ffmpeg`/`ffprobe`** 比一遍 —— 合成往返**不算数**。
-3. 如果改了 ffmpeg 构建配置：`verify_components` 式的注册表核对通过，并且**重新量最终 `.so`**。
+1. `cargo test --workspace -j 4` 绿，**并且**编译**无警告**（本仓现在是零警告）。
+2. 动了编解码 / 容器：对着**真样本 + `ffmpeg` / `ffprobe`** 比一遍 —— 合成往返**不算数**，
+   而且**没设环境变量时的「全绿」也不算**（那些测试跳过了）。优先「字节 / 像素相同」
+   而不是「没报错」。
+3. 清调试残留：`grep -rn 'V2V_' crates/*/src` 只应剩下测试里的样本变量；排查期随手写的
+   example / 脚本 / 写死路径已经删掉（AGENTS.md「本地调试残留」那条）。
+4. 判据、量出来的数字、试过又撤掉的候选 —— 写 `TODO.md`，**不进提交信息**。
