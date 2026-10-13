@@ -229,6 +229,7 @@ fn ffmpeg_decodes_our_aac_and_it_is_still_a_sine() {
         channels,
         sample_rate: SR,
         bitrate: 128_000,
+        threads: 1,
         kb_window: false,
     })
     .expect("建编码器");
@@ -350,6 +351,7 @@ fn bitrate_is_controlled_to_the_target() {
         channels,
         sample_rate: SR,
         bitrate: target,
+        threads: 1,
         kb_window: false,
     })
     .expect("建编码器");
@@ -507,6 +509,7 @@ fn quality_is_within_2db_of_ffmpeg() {
         channels: 1,
         sample_rate: SR,
         bitrate: 128_000,
+        threads: 1,
         kb_window: false,
     })
     .expect("建编码器");
@@ -637,6 +640,7 @@ fn quality_per_bit_is_within_55pct_of_ffmpeg() {
         channels: 1,
         sample_rate: SR,
         bitrate: 128_000,
+        threads: 1,
         kb_window: false,
     })
     .expect("建编码器");
@@ -781,6 +785,7 @@ fn short_window_frames_are_valid_and_actually_used() {
         channels,
         sample_rate: SR,
         bitrate: 128_000,
+        threads: 1,
         kb_window: false,
     })
     .expect("建编码器");
@@ -880,6 +885,7 @@ fn wide_dynamic_range_signal_keeps_its_midrange() {
         channels: 1,
         sample_rate: SR,
         bitrate: 96_000,
+        threads: 1,
         kb_window: false,
     })
     .expect("建编码器");

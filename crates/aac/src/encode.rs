@@ -129,6 +129,27 @@ pub struct EncoderConfig {
     pub bitrate: u32,
     /// 用 KBD 窗而不是正弦窗。默认正弦（不需要 Bessel 函数，AAC 里也常用）。
     pub kb_window: bool,
+    /// **编码时用几个线程**（默认 **1** = 不并行）。
+    ///
+    /// ## 为什么由调用者给、而不是库自己探测
+    ///
+    /// 只有调用者知道这台机器 / 这个 App **还有多少算力可用**：
+    /// `std::thread::available_parallelism()` 报的是**整机核数**，它不知道调用者
+    /// 是不是已经在并行转几个文件、也不知道这是不是 Android 上被系统限流的后台任务。
+    /// 库自己起线程 = 把「什么时候发热、什么时候抢 CPU」的决定权从调用方拿走了。
+    ///
+    /// ## 当前只有「声道并行」
+    ///
+    /// 双声道时两个声道各占一个线程：**总工作量不变**（只是让两个核同时干），
+    /// 而且**输出逐字节相同**。所以它不是「拿算力换延迟」，是可以放心开的那一类。
+    /// 线程数会被**封顶到声道数** —— 单声道时给多少都是 1。
+    ///
+    /// ## ⚠️ 调用方要自己保证不在主线程上等
+    ///
+    /// 这个 API 是**同步**的：`encode_frame` 会一直占到这一帧编完。
+    /// Android 上要在工作线程 / 协程里调，别在 UI 线程调（那是 ANR 的来源，
+    /// 跟这里开几个线程无关）。
+    pub threads: usize,
 }
 
 impl Default for EncoderConfig {
@@ -138,6 +159,7 @@ impl Default for EncoderConfig {
             sample_rate: 44100,
             bitrate: 128_000,
             kb_window: false,
+            threads: 1,
         }
     }
 }
@@ -181,10 +203,36 @@ impl AudioSpecificConfig {
 }
 
 /// AAC-LC 编码器。有状态：要跨帧维护 50% 重叠的那半块样本。
+/// **一个声道自己的状态** —— 编码时唯一可变的东西。
+///
+/// 抽出来是为了能**两个声道并行**：`encode_channel` 除了这个结构之外只读
+/// `Encoder` 的其余部分，所以两个声道之间没有共享的可变状态。
+/// 谁起线程由调用者定（`EncoderConfig::threads`），库不自己探测核数。
+struct ChannelState {
+    /// 上一帧的后半段（`N` 个样本），与这一帧拼成 `2N`（AAC 是 50% 重叠）。
+    overlap: Vec<f32>,
+    /// 「上一帧的攻击落在哪个子块」（`None` = 没有攻击）。
+    ///
+    /// 短窗的覆盖区是 `buf[448..1600]`（见 `encode_channel`），换算到**本帧样本**
+    /// 就是 `[-576, +576)`：所以一帧里的攻击落在**前 ~576 个样本**（子块 0..=4）
+    /// 时本帧要用短窗；落在**后 448 个样本**（子块 5..=7）时，攻击其实落在
+    /// **下一帧**的窗口覆盖区里 —— 于是本帧发 `LONG_START`、下一帧发短窗。
+    ///
+    /// ⚠️ 这个「前/后」的划分是**不需要前瞻**就能决定 `LONG_START` 的关键：
+    /// 「下一帧会不会是短窗」由**本帧自己的后段攻击**决定，而它是本帧已知的。
+    attack_prev: Option<usize>,
+    /// **上一帧选中的 `sf_offset`** —— 下一帧搜偏移时的**种子**。
+    ///
+    /// 相邻帧的谱形状是连续的，所以上一帧的答案是很好的出发点：从它出发做
+    /// 指数搜索，绝大多数帧 2–4 趟就收敛（固定区间二分恒 7 趟）。
+    /// **找的还是同一个答案**（最小的可行偏移），所以输出逐字节不变。
+    sf_offset_prev: i32,
+}
+
 pub struct Encoder {
     cfg: EncoderConfig,
-    /// 上一帧的后半段（`N` 个样本），与这一帧拼成 `2N`。
-    overlap: Vec<Vec<f32>>,
+    /// 每声道一份可变状态。`threads >= 2` 时两个声道各在一个线程里动自己那份。
+    chans: Vec<ChannelState>,
     /// 长窗的开窗表（`2N` 长）。
     window: Vec<f32>,
     /// 采样率索引（TNS 的几张表按它索引）。
@@ -198,17 +246,6 @@ pub struct Encoder {
     /// 短窗一帧 = 8 个 128 点的 MDCT；频带划分用 `SWB_OFFSET_128`。
     swb_short: Vec<u16>,
     window_short: Vec<f32>,
-    /// 每声道「上一帧的攻击落在哪个子块」（`None` = 没有攻击）。
-    ///
-    /// 短窗的覆盖区是 `buf[448..1600]`（见 `encode_channel`），换算到**本帧样本**
-    /// 就是 `[-576, +576)`：所以一帧里的攻击落在**前 ~576 个样本**（子块 0..=4）
-    /// 时本帧要用短窗；落在**后 448 个样本**（子块 5..=7）时，攻击其实落在
-    /// **下一帧**的窗口覆盖区里 —— 于是本帧发 `LONG_START`、下一帧发短窗。
-    ///
-    /// ⚠️ 这个「前/后」的划分是**不需要前瞻**就能决定 `LONG_START` 的关键：
-    /// 「下一帧会不会是短窗」由**本帧自己的后段攻击**决定，而它是本帧已知的。
-    attack_prev: Vec<Option<usize>>,
-
     /// 每帧的**位数预算**（`bitrate / 帧率 / 声道数`）。
     ///
     /// ⚠️ 用「预算 + 二分搜偏移」而不是「λ 权重」——
@@ -222,13 +259,6 @@ pub struct Encoder {
     /// 光看「ffmpeg 解得开」证明不了它真的被走过（长窗也解得开）。
     /// 测试用它断言「这段瞬态素材确实进了短窗那条路」。
     short_frames: u64,
-
-    /// 每声道**上一帧选中的 `sf_offset`** —— 下一帧搜偏移时的**种子**。
-    ///
-    /// 相邻帧的谱形状是连续的，所以上一帧的答案是很好的出发点：从它出发做
-    /// 指数搜索，绝大多数帧 2–4 趟就收敛（固定区间二分恒 7 趟）。
-    /// **找的还是同一个答案**（最小的可行偏移），所以输出逐字节不变。
-    sf_offset_prev: Vec<i32>,
 }
 
 impl Encoder {
@@ -264,17 +294,21 @@ impl Encoder {
             (f64::from(cfg.bitrate) / frames_per_sec / f64::from(cfg.channels)).max(1.0);
 
         Ok(Self {
-            overlap: vec![vec![0f32; LONG_LEN]; cfg.channels as usize],
+            chans: (0..cfg.channels)
+                .map(|_| ChannelState {
+                    overlap: vec![0f32; LONG_LEN],
+                    attack_prev: None,
+                    sf_offset_prev: SF_OFFSET_SEED_INIT,
+                })
+                .collect(),
             window,
             sr_idx: sr_idx as usize,
             frame_index: 0,
             swb,
             swb_short,
             window_short,
-            attack_prev: vec![None; cfg.channels as usize],
             bits_per_frame: bits_per_frame as u32,
             short_frames: 0,
-            sf_offset_prev: vec![SF_OFFSET_SEED_INIT; cfg.channels as usize],
             cfg,
         })
     }
@@ -335,10 +369,20 @@ impl Encoder {
             w.put(0, 1);
         }
 
-        for ch in 0..self.cfg.channels as usize {
-            if self.encode_channel(&mut w, ch, &frame.planes[ch])? {
-                any_short = true;
-            }
+        // ---- 声道元素体：串行，或（调用者要求时）两个声道并行 ----
+        //
+        // 位流里两个声道是**前后相接**的两段，各自独立 —— 所以并行只影响
+        // 「谁在什么时候算」，不影响写出来的字节。这也是本仓唯一一种
+        // 「不拿算力换延迟」的并行：总工作量不变，只是让两个核同时干。
+        //
+        // ⚠️ 线程数由**调用者**给（`EncoderConfig::threads`），库不自己探测核数：
+        // 只有调用者知道这台机器 / 这个 App 还有多少算力可用（Android 上尤其如此）。
+        let mut chans = std::mem::take(&mut self.chans);
+        let bodies = self.encode_channel_bodies(&mut chans, frame);
+        self.chans = chans;
+        for (body, short) in bodies? {
+            w.append(&body);
+            any_short |= short;
         }
         if any_short {
             self.short_frames += 1;
@@ -358,6 +402,53 @@ impl Encoder {
 
         self.frame_index += 1;
         Ok(w.finish())
+    }
+
+    /// 编出**所有声道**的元素体（不含元素头），每个声道一段。
+    ///
+    /// `threads >= 2` 且是双声道时，两个声道各在一个线程里编 —— 位流里它们本来
+    /// 就是前后相接的两段、互不影响，所以**输出逐字节相同**。
+    ///
+    /// 线程数**封顶到声道数**：单声道没有可并行的东西，给 8 也是白给。
+    fn encode_channel_bodies(
+        &self,
+        chans: &mut [ChannelState],
+        frame: &Frame,
+    ) -> crate::Result<Vec<(BitWriter, bool)>> {
+        let n = self.cfg.channels as usize;
+        let threads = self.cfg.threads.min(n).max(1);
+        if threads < 2 || n < 2 {
+            let mut out = Vec::with_capacity(n);
+            for ch in 0..n {
+                let mut w = BitWriter::new();
+                let short = self.encode_channel(&mut chans[ch], &mut w, &frame.planes[ch])?;
+                out.push((w, short));
+            }
+            return Ok(out);
+        }
+
+        // 双声道并行：每个线程只碰**自己那份** `ChannelState`（`split_at_mut` 保证
+        // 不重叠），`self` 全程只读 —— 所以两个声道之间没有共享的可变状态。
+        let (a, b) = chans.split_at_mut(1);
+        let (p0, p1) = (&frame.planes[0], &frame.planes[1]);
+        // ⚠️ 闭包里不能用 `?`（它的返回类型是那个元组），所以两边都先把 `Result`
+        // 带出来，到外面再展开。
+        let (r0, r1) = std::thread::scope(|scope| {
+            let h = scope.spawn(|| {
+                let mut w = BitWriter::new();
+                let short = self.encode_channel(&mut a[0], &mut w, p0)?;
+                Ok::<_, Error>((w, short))
+            });
+            let mut w1 = BitWriter::new();
+            let r1 = self
+                .encode_channel(&mut b[0], &mut w1, p1)
+                .map(|short| (w1, short));
+            (h.join(), r1)
+        });
+        // 线程里的 panic 要转成自己的错误类型再往上抛（`JoinError` 不是 `Error`）。
+        let r0 = r0.map_err(|_| Error::Bad("声道编码线程 panic".into()))??;
+        let r1 = r1?;
+        Ok(vec![r0, r1])
     }
 
     /// 给**一个窗口组**选逐带的 sf 与码本（**不写位流**）。
@@ -573,21 +664,21 @@ impl Encoder {
     /// 这个分界是刻意的：元素头（`ID_SCE` + 标签）跟 `sf_offset` 无关，
     /// 让每趟都带一遍只是白算计数的次数。
     fn encode_channel(
-        &mut self,
+        &self,
+        st: &mut ChannelState,
         w: &mut BitWriter,
-        ch: usize,
         samples: &[f32],
     ) -> crate::Result<bool> {
         // ---- 1. 攒 2N 个样本 → 开窗 → MDCT ----
         let mut buf = vec![0f32; 2 * LONG_LEN];
         // 左半 = 上一帧的后半（AAC 是 50% 重叠）
-        buf[..LONG_LEN].copy_from_slice(&self.overlap[ch]);
+        buf[..LONG_LEN].copy_from_slice(&st.overlap);
         // 右半 = 这一帧（不足补 0）
         let n = samples.len().min(LONG_LEN);
         buf[LONG_LEN..LONG_LEN + n].copy_from_slice(&samples[..n]);
         // 存下这一帧，作为下一帧的左半
-        self.overlap[ch][..n].copy_from_slice(&samples[..n]);
-        for v in &mut self.overlap[ch][n..] {
+        st.overlap[..n].copy_from_slice(&samples[..n]);
+        for v in &mut st.overlap[n..] {
             *v = 0.0;
         }
 
@@ -597,9 +688,9 @@ impl Encoder {
         // 50% 重叠区里会跨进下一帧的前半 —— 长窗会把攻击「摊平」成一帧的
         // pre-echo，这正是短窗要解决的东西）。
         let attack = detect_attack(samples);
-        let prev_attack = self.attack_prev[ch];
+        let prev_attack = st.attack_prev;
         let short = attack.is_some() || prev_attack.is_some();
-        self.attack_prev[ch] = attack;
+        st.attack_prev = attack;
         let seq = if short {
             WindowSequence::EightShort
         } else {
@@ -740,7 +831,7 @@ impl Encoder {
         // 括号约定：`lo` = 已知**不可行**的最大偏移（`-1` = 还不知道），
         // `hi` = 已知**可行**的最小偏移（`MAX_SF_OFFSET + 1` = 还不知道）。
         let budget = self.bits_per_frame;
-        let seed = self.sf_offset_prev[ch].clamp(0, MAX_SF_OFFSET);
+        let seed = st.sf_offset_prev.clamp(0, MAX_SF_OFFSET);
         let mut chosen: Option<BitWriter> = None;
         let mut lo: i32 = -1;
         let mut hi: i32 = MAX_SF_OFFSET + 1;
@@ -796,7 +887,7 @@ impl Encoder {
             }
         }
         // 记住这一帧的答案，给下一帧当种子（`hi` 超界 = 这一帧没有任何可行偏移）。
-        self.sf_offset_prev[ch] = if hi <= MAX_SF_OFFSET { hi } else { seed };
+        st.sf_offset_prev = if hi <= MAX_SF_OFFSET { hi } else { seed };
 
         // ⚠️ **一趟都不够省**时（预算小到连最粗的量化都塞不下）退化成
         // 「用偏移上界那一趟」：位数超预算，但**位流仍然合法**。
@@ -1484,4 +1575,94 @@ fn write_band(w: &mut BitWriter, band: &[f32], sf: u8, cb: u8) -> crate::Result<
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 一段确定性的立体声测试信号（左右不同，才能验出「两边各算各的」）。
+    fn stereo_frames(n: usize) -> Vec<Frame> {
+        let mut state = 12345u32;
+        let mut frames = Vec::new();
+        for t in 0..n {
+            let mut planes = Vec::new();
+            for ch in 0..2usize {
+                let mut p = vec![0f32; LONG_LEN];
+                for (i, v) in p.iter_mut().enumerate() {
+                    state = state.wrapping_mul(1103515245).wrapping_add(12345);
+                    let noise = ((state >> 16) as f32 / 32768.0) - 1.0;
+                    let k = (t * LONG_LEN + i) as f32;
+                    let tone = (k * if ch == 0 { 0.07 } else { 0.13 }).sin() * 6000.0;
+                    // 每 3 帧来一次瞬态，把短窗那条路也带上。
+                    let env = if t % 3 == 2 && i < 200 { 3.0 } else { 1.0 };
+                    *v = (tone + noise * 300.0) * env;
+                }
+                planes.push(p);
+            }
+            frames.push(Frame { planes });
+        }
+        frames
+    }
+
+    /// **`threads = 2` 必须与 `threads = 1` 逐字节相同。**
+    ///
+    /// 声道并行只改「谁在什么时候算」，不改写出来的字节 —— 这是它能放心开的原因，
+    /// 也是这条并行唯一的判据。线程数封顶到声道数，所以 `threads = 8` 也该一样。
+    #[test]
+    fn parallel_channels_produce_identical_bytes() {
+        let frames = stereo_frames(8);
+        let mut one = Encoder::new(EncoderConfig {
+            threads: 1,
+            ..Default::default()
+        })
+        .expect("建编码器");
+        let mut two = Encoder::new(EncoderConfig {
+            threads: 2,
+            ..Default::default()
+        })
+        .expect("建编码器");
+        let mut many = Encoder::new(EncoderConfig {
+            threads: 8,
+            ..Default::default()
+        })
+        .expect("建编码器");
+        for (i, f) in frames.iter().enumerate() {
+            let a = one.encode_frame(f).expect("1 线程");
+            let b = two.encode_frame(f).expect("2 线程");
+            let c = many.encode_frame(f).expect("8 线程");
+            assert_eq!(a, b, "第 {i} 帧：1 线程与 2 线程的输出不同");
+            assert_eq!(a, c, "第 {i} 帧：1 线程与 8 线程的输出不同");
+        }
+    }
+
+    /// 单声道给多少线程都该退化成串行 —— 没有第二个声道可以并行。
+    #[test]
+    fn mono_ignores_thread_count() {
+        let frames: Vec<Frame> = stereo_frames(3)
+            .into_iter()
+            .map(|f| Frame {
+                planes: vec![f.planes[0].clone()],
+            })
+            .collect();
+        let mut one = Encoder::new(EncoderConfig {
+            channels: 1,
+            threads: 1,
+            ..Default::default()
+        })
+        .expect("建编码器");
+        let mut four = Encoder::new(EncoderConfig {
+            channels: 1,
+            threads: 4,
+            ..Default::default()
+        })
+        .expect("建编码器");
+        for (i, f) in frames.iter().enumerate() {
+            assert_eq!(
+                one.encode_frame(f).expect("1 线程"),
+                four.encode_frame(f).expect("4 线程"),
+                "第 {i} 帧：单声道下线程数不该影响输出"
+            );
+        }
+    }
 }

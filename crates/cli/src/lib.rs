@@ -103,6 +103,12 @@ pub struct ConvertOptions {
     ///
     /// 这是**目标**不是保证：编码器不做码率控制，实际码率在它附近浮动。
     pub aac_bitrate: u32,
+    /// **编码时用几个线程**（默认 **1** = 不并行）。
+    ///
+    /// 现在只有 AAC 的**声道并行**吃这个值（双声道 → 两个声道各一个线程，
+    /// 总工作量不变、输出逐字节相同），线程数会被封顶到声道数。
+    /// 默认 1：CLI 不替用户猜「这台机器现在还有多少算力」—— 要快就显式给 `--threads 2`。
+    pub threads: usize,
     /// `.mp4` 的**视频**目标码率（bit/s）。`None` = 按固定的 `qscale` 编（默认）。
     ///
     /// 开着的时候 `qscale` 只当**起步值**，编码器逐帧调它去够目标码率。
@@ -139,6 +145,7 @@ impl Default for ConvertOptions {
             fps: None,
             audio: Mp4Audio::default(),
             aac_bitrate: 128_000,
+            threads: 1,
             video_bitrate: None,
         }
     }
@@ -659,6 +666,7 @@ fn convert_to_mp4(
                 channels: af.channels as u8,
                 sample_rate: af.sample_rate,
                 bitrate: opts.aac_bitrate,
+                threads: opts.threads,
                 kb_window: false,
             })?)
         }

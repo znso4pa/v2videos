@@ -6,6 +6,7 @@
 //! 选项：
 //!   -o, --out-dir <DIR>   输出目录（默认：输入所在目录）
 //!   -q, --qscale <1..31>  量化尺度（默认 6；越大越小越糊）
+//!       --threads <N>     编码线程数（默认 1）
 //!       --mp4             输出 MP4（MPEG-4 Part 2）；默认是 WMV（MP43 in ASF）
 //!       --video-bitrate N 只对 --mp4 有效：视频目标码率（bit/s），逐帧调 qscale 去够它
 //!       --fps <N>         只对 --mp4 有效：VOL 里声明的帧率（默认从时间戳推）
@@ -35,6 +36,9 @@ v2v —— WMV/ASF 批量转码（纯 Rust：解封装 → 解码 → 编码 →
       --mp4             输出 .mp4（MPEG-4 Part 2 + AAC），默认输出 .wmv（MP43 in ASF）
       --pcm             .mp4 的音频用未压缩 PCM（sowt）而不是 AAC
       --aac-bitrate N   .mp4 走 AAC 时的目标码率（默认 128000 bit/s）
+      --threads N       编码线程数（默认 1）。现在只有 AAC 的**声道并行**吃它
+                        （双声道 → 2；封顶到声道数，单声道给多少都是 1）。
+                        输出与 1 线程**逐字节相同**，只是两个声道同时算。
       --video-bitrate N .mp4 的**视频**目标码率（bit/s；也可写 500k / 1.5M）。
                         开了就逐帧调 qscale 去够它，`-q` 退化成起步值。
                         不传 = 按固定的 -q 编（旧行为）。
@@ -124,6 +128,17 @@ fn run(args: &[String]) -> Result<bool, String> {
                     .ok_or("--aac-bitrate 后面要跟数字")?
                     .parse()
                     .map_err(|_| "--aac-bitrate 要正整数（bit/s）".to_string())?;
+            }
+            "--threads" => {
+                let v: usize = it
+                    .next()
+                    .ok_or("--threads 后面要跟数字")?
+                    .parse()
+                    .map_err(|_| "--threads 要正整数".to_string())?;
+                if v == 0 {
+                    return Err("--threads 要正整数".into());
+                }
+                opts.threads = v;
             }
             "--video-bitrate" => {
                 let v = it.next().ok_or("--video-bitrate 后面要跟数字")?;
