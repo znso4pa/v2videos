@@ -126,6 +126,11 @@ pub struct EncoderConfig {
     /// 和 MP43 不同，这里**没有**「量化后 level 必须塞进 8 位 escape」的约束 ——
     /// MPEG-4 的 ESC3 是 12 位，所以 qscale 可以放心取小。
     pub qscale: u8,
+    /// **目标码率（bit/s）**。`Some` 时开**跨帧反馈式码率控制**（逐帧调 qscale，见模块文档）；
+    /// `None` 时整段用固定的 `qscale`（旧行为）。
+    ///
+    /// 开着的时候 `qscale` 只当**起步值**用 —— 控制器会按实际花费把它拉走。
+    pub bitrate: Option<u32>,
     /// 要不要逐宏块试 AC 预测（见模块文档）。默认开。
     pub ac_pred: bool,
     /// **周期 I 帧间隔**（帧数）。`0` = 只首帧是 I（默认，与「全 I 帧」行为一致）。
@@ -148,6 +153,7 @@ impl Default for EncoderConfig {
             height: 0,
             fps_num: 25,
             qscale: 4,
+            bitrate: None,
             ac_pred: true,
             keyframe_interval: 0,
             low_delay: true,
@@ -179,6 +185,73 @@ pub struct Encoder {
     /// **上一帧里走了帧内路径的宏块数**（P 帧判决的结果；I 帧恒为全部）。
     /// 测试与调用方用它确认「画面切换时帧内真的接管了」。
     pub intra_mbs_last: usize,
+    /// **本帧要用的 qscale**。码率控制关着时恒等于 `cfg.qscale`，开着时逐帧变。
+    cur_qscale: u8,
+    /// 码率控制器的状态。`cfg.bitrate` 是 `None` 时也是 `None`。
+    rc: Option<RateCtl>,
+}
+
+/// 单趟**跨帧反馈**式码率控制的状态。
+///
+/// 思路只有两条：
+///
+/// 1. **虚拟缓冲**记「累计超支/结余」（`buffer`）。它负责长期不跑偏。
+/// 2. **位数大致与 qscale 成反比**（`bits ≈ 内容复杂度 / q`），所以「想让下一帧花
+///    `wanted` 位，就把 q 乘上 `本帧位数 / wanted`」。它负责短期跟得上。
+///
+/// 三个防抖动的夹子（都是踩过 AAC 那边「一帧跳到底」的坑之后加的）：
+/// 每帧 q 最多动 `RC_MAX_STEP` 档、缓冲偏差摊到 `RC_PULL_FRAMES` 帧里纠、
+/// 「该花多少位」有下限。**宁可慢慢收敛，也不要一帧把 q 顶到 31 再荡回来。**
+struct RateCtl {
+    /// 目标每帧位数 = `bitrate / fps`。
+    target_bits: f64,
+    /// 虚拟缓冲占用（位数）。**正 = 已超支**，负 = 还有结余。
+    buffer: f64,
+    /// 缓冲容量（位数）—— 也是控制器「能容忍多大的累计偏差」。
+    buffer_size: f64,
+    /// 已编码帧数与累计位数（收尾时自证「有没有落在目标附近」）。
+    frames: u64,
+    total_bits: u64,
+}
+
+/// 每帧 qscale 最多动几档 —— 防一帧跳到底。
+const RC_MAX_STEP: f64 = 2.0;
+/// 缓冲偏差摊到几帧里纠回来（越大越温和）。
+const RC_PULL_FRAMES: f64 = 8.0;
+/// 「下一帧该花多少位」相对目标的下限（防止 wanted 掉到 0 或负数）。
+const RC_MIN_WANTED: f64 = 0.25;
+/// 缓冲容量 = 几帧的预算。
+const RC_BUFFER_FRAMES: f64 = 8.0;
+
+impl RateCtl {
+    fn new(bitrate: u32, fps: u32) -> Self {
+        let target_bits = f64::from(bitrate) / f64::from(fps);
+        Self {
+            target_bits,
+            buffer: 0.0,
+            buffer_size: target_bits * RC_BUFFER_FRAMES,
+            frames: 0,
+            total_bits: 0,
+        }
+    }
+
+    /// 记下这一帧实际花掉的位数，返回**下一帧**该用的 qscale。
+    fn next_qscale(&mut self, bits: u64, cur_q: u8) -> u8 {
+        let bits = bits as f64;
+        self.frames += 1;
+        self.total_bits += bits as u64;
+        self.buffer =
+            (self.buffer + bits - self.target_bits).clamp(-self.buffer_size, self.buffer_size);
+
+        // 「下一帧该花多少位」：目标，再按缓冲偏差纠一点（不是一帧纠完）。
+        let wanted = (self.target_bits - self.buffer / RC_PULL_FRAMES)
+            .clamp(self.target_bits * RC_MIN_WANTED, self.target_bits * 4.0);
+
+        // bits 大致与 q 成反比 → 想让下一帧花 `wanted` 位，q 就乘 `bits / wanted`。
+        let want_q = f64::from(cur_q) * bits / wanted;
+        let step = (want_q - f64::from(cur_q)).clamp(-RC_MAX_STEP, RC_MAX_STEP);
+        (f64::from(cur_q) + step).round().clamp(1.0, f64::from(QSCALE_MAX)) as u8
+    }
 }
 
 impl Encoder {
@@ -196,6 +269,9 @@ impl Encoder {
         if cfg.fps_num == 0 {
             return Err(Error::Bad("帧率分子不能是 0"));
         }
+        if cfg.bitrate == Some(0) {
+            return Err(Error::Bad("目标码率不能是 0"));
+        }
         Ok(Self {
             mb_w: (cfg.width as usize).div_ceil(16),
             mb_h: (cfg.height as usize).div_ceil(16),
@@ -206,8 +282,23 @@ impl Encoder {
             frames_since_i: 0,
             last_key_frame: false,
             intra_mbs_last: 0,
+            cur_qscale: cfg.qscale,
+            rc: cfg.bitrate.map(|b| RateCtl::new(b, cfg.fps_num)),
             cfg,
         })
+    }
+
+    /// 码率控制开着时：`(已编码帧数, 累计位数)`；关着时 `None`。
+    ///
+    /// 调用方（CLI / 测试）用它自证「实际码率有没有落在目标附近」——
+    /// 这是码率控制唯一值得看的判据。
+    pub fn rate_control_stats(&self) -> Option<(u64, u64)> {
+        self.rc.as_ref().map(|rc| (rc.frames, rc.total_bits))
+    }
+
+    /// 本帧实际用的 qscale（码率控制开着时会逐帧变，调试/测试用）。
+    pub fn current_qscale(&self) -> u8 {
+        self.cur_qscale
     }
 
     pub fn config(&self) -> &EncoderConfig {
@@ -294,7 +385,7 @@ impl Encoder {
         let (pw, ph) = (mb_w * 16, mb_h * 16);
         let (py, pu, pv) = pad_planes(frame, pw, ph);
 
-        let qscale = self.cfg.qscale;
+        let qscale = self.cur_qscale;
         let q = i32::from(qscale);
         let qmul = q << 1;
         let qadd = (q - 1) | 1;
@@ -378,7 +469,7 @@ impl Encoder {
 
         self.intra_mbs_last = mb_w * mb_h;
         self.reference = Some(cur);
-        Ok(w.finish())
+        Ok(self.note_frame(w.finish()))
     }
 
     /// 编一个 **P 帧**（只含 VOP 头 + 宏块）。
@@ -398,7 +489,7 @@ impl Encoder {
         let (pw, ph) = (mb_w * 16, mb_h * 16);
         let (sy, su, sv) = pad_planes(frame, pw, ph);
 
-        let qscale = self.cfg.qscale;
+        let qscale = self.cur_qscale;
         let q = i32::from(qscale);
         let (qmul, qadd) = (q << 1, (q - 1) | 1);
         let y_dc_scale = i32::from(tables::Y_DC_SCALE[qscale as usize]);
@@ -456,7 +547,18 @@ impl Encoder {
 
         self.intra_mbs_last = st.intra_mbs;
         self.reference = Some(st.cur);
-        Ok(w.finish())
+        Ok(self.note_frame(w.finish()))
+    }
+
+    /// 收下一个编好的帧：把位数报给码率控制器，并定下一帧的 qscale。
+    ///
+    /// 关着码率控制时是个**直通**（原样返回），所以调用点不必分支。
+    fn note_frame(&mut self, bytes: Vec<u8>) -> Vec<u8> {
+        if let Some(rc) = self.rc.as_mut() {
+            // `* 8`：按位算 —— 预算本来就是位。
+            self.cur_qscale = rc.next_qscale(bytes.len() as u64 * 8, self.cur_qscale);
+        }
+        bytes
     }
 }
 

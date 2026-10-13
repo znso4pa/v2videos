@@ -650,3 +650,122 @@ fn every_p_frame_stays_within_tolerance() {
     // P 帧漂移会让最差的那帧比平均低，但不该低到难看。
     assert!(worst >= 28.0, "有一帧画质崩了（最差 {worst:.2} dB）");
 }
+
+// ==================== 码率控制 ====================
+//
+// 素材用 `test_frame`（渐变 + 移动方块 + 细条纹）而不是 `low_motion_frame`：
+// 后者太可压 —— qscale=4 的自然码率只有 30 kbps，而 qscale 顶到 31 也还有 33 kbps
+// （重建变糊 → P 帧预测变差 → 反而更费位）。**可达区间几乎是平的，测不出控制器。**
+//
+// 所以下面的目标一律**先量可达区间再取**，绝不写死 kbps —— 写死的常数换个素材就炸，
+// 而且**炸得像是编码器的错**。
+
+/// 编一段并顺带收下**每帧用的 qscale**与统计。码率控制必须开着。
+fn encode_with_rc(cfg: EncoderConfig, frames: &[Frame]) -> (Vec<u8>, Vec<u8>, (u64, u64)) {
+    let mut e = Encoder::new(cfg).expect("建编码器");
+    let mut es = e.elementary_stream_header();
+    let mut qs = Vec::with_capacity(frames.len());
+    for f in frames {
+        qs.push(e.current_qscale());
+        es.extend_from_slice(&e.encode_frame(f).expect("编一帧"));
+    }
+    let stats = e.rate_control_stats().expect("码率控制应当开着");
+    (es, qs, stats)
+}
+
+/// 一段素材在固定 `qscale` 下的**自然码率**（kbps）。
+fn natural_kbps(qscale: u8, frames: &[Frame]) -> f64 {
+    let cfg = EncoderConfig {
+        width: W,
+        height: H,
+        fps_num: FPS,
+        qscale,
+        keyframe_interval: 25,
+        ..Default::default()
+    };
+    let (es, _) = encode_raw_es(cfg, frames);
+    es.len() as f64 * 8.0 / frames.len() as f64 * f64::from(FPS) / 1000.0
+}
+
+/// **码率控制唯一值得看的判据**：整段的实际码率落在目标附近。
+///
+/// 目标取在**实测可达区间 `[q31, q4]` 的内部**（两个位置各试一次）。
+/// 这条前提必须先钉住 —— 目标要是落在区间外，测的其实是「qscale 只有 1..31」这个事实。
+#[test]
+fn rate_control_lands_near_the_target() {
+    let frames: Vec<Frame> = (0..24).map(test_frame).collect();
+    let q4 = natural_kbps(4, &frames);
+    let q31 = natural_kbps(31, &frames);
+    println!("自然码率：qscale=4 → {q4:.0} kbps；qscale=31 → {q31:.0} kbps");
+    assert!(
+        q4 > q31 * 1.5,
+        "这段素材的码率对 qscale 不敏感（{q4:.0} vs {q31:.0} kbps），测不了码率控制"
+    );
+
+    let mut steady = Vec::new();
+    for f in [0.3f64, 0.75] {
+        let target = q31 + (q4 - q31) * f;
+        let cfg = EncoderConfig {
+            bitrate: Some((target * 1000.0) as u32),
+            width: W,
+            height: H,
+            fps_num: FPS,
+            qscale: 4,
+            keyframe_interval: 25,
+            ..Default::default()
+        };
+        let (_es, qs, (n, bits)) = encode_with_rc(cfg, &frames);
+        assert_eq!(n, frames.len() as u64, "帧数不能少（不许靠丢帧省码率）");
+
+        let got = bits as f64 / n as f64 * f64::from(FPS) / 1000.0;
+        let ratio = got / target;
+        // 稳态 q（跳过前半段收敛期）。
+        let tail = &qs[qs.len() / 2..];
+        let q_avg = tail.iter().map(|q| f64::from(*q)).sum::<f64>() / tail.len() as f64;
+        steady.push(q_avg);
+        println!(
+            "目标 {target:.0} kbps → 实际 {got:.0} kbps（比值 {ratio:.2}）；稳态 q 均值 {q_avg:.2}"
+        );
+        assert!(
+            (0.7..=1.4).contains(&ratio),
+            "目标 {target:.0} kbps，实际 {got:.0} kbps（比值 {ratio:.2}）"
+        );
+    }
+    // 目标越高，稳态 q 必须越小 —— 不然「落在目标附近」可能只是碰巧。
+    assert!(
+        steady[1] < steady[0],
+        "目标变高之后稳态 q 没降（{:.2} vs {:.2}）",
+        steady[1],
+        steady[0]
+    );
+}
+
+/// 码率控制编出来的流 ffmpeg 也要解得开 —— qscale 逐帧变会动 VOP 头，值得钉一下。
+#[test]
+fn ffmpeg_decodes_a_rate_controlled_stream() {
+    let frames: Vec<Frame> = (0..20).map(test_frame).collect();
+    let cfg = EncoderConfig {
+        width: W,
+        height: H,
+        fps_num: FPS,
+        qscale: 8,
+        bitrate: Some((natural_kbps(4, &frames) * 1000.0) as u32),
+        keyframe_interval: 10,
+        ..Default::default()
+    };
+    let (es, qs, _) = encode_with_rc(cfg, &frames);
+    assert!(
+        qs.iter().any(|q| *q != qs[0]),
+        "qscale 一帧都没变，控制器根本没生效：{qs:?}"
+    );
+
+    let path = std::env::temp_dir().join("v2v_mp4v_rc.m4v");
+    std::fs::write(&path, &es).expect("写");
+    let (got, _) = decode_to_yuv(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(
+        got.len(),
+        frames.len() * (W * H * 3 / 2) as usize,
+        "解出来的帧数不对"
+    );
+}

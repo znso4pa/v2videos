@@ -7,6 +7,7 @@
 //!   -o, --out-dir <DIR>   输出目录（默认：输入所在目录）
 //!   -q, --qscale <1..31>  量化尺度（默认 6；越大越小越糊）
 //!       --mp4             输出 MP4（MPEG-4 Part 2）；默认是 WMV（MP43 in ASF）
+//!       --video-bitrate N 只对 --mp4 有效：视频目标码率（bit/s），逐帧调 qscale 去够它
 //!       --fps <N>         只对 --mp4 有效：VOL 里声明的帧率（默认从时间戳推）
 //!   -g, --gop <N>         周期 I 帧间隔，0=只首帧（默认 250）
 //!   -n, --max-frames <N>  最多转多少帧（默认全部；预览/局部转换用）
@@ -34,6 +35,9 @@ v2v —— WMV/ASF 批量转码（纯 Rust：解封装 → 解码 → 编码 →
       --mp4             输出 .mp4（MPEG-4 Part 2 + AAC），默认输出 .wmv（MP43 in ASF）
       --pcm             .mp4 的音频用未压缩 PCM（sowt）而不是 AAC
       --aac-bitrate N   .mp4 走 AAC 时的目标码率（默认 128000 bit/s）
+      --video-bitrate N .mp4 的**视频**目标码率（bit/s；也可写 500k / 1.5M）。
+                        开了就逐帧调 qscale 去够它，`-q` 退化成起步值。
+                        不传 = 按固定的 -q 编（旧行为）。
       --fps <N>         --mp4 专用：VOL 里声明的帧率（默认从样本时间戳推）
   -g, --gop <N>         周期 I 帧间隔（默认 250；0 = 只首帧是 I）
                         对 .mp4 也有效 —— 传 0 就是全 I 帧（大但每帧独立可解）
@@ -52,6 +56,24 @@ v2v —— WMV/ASF 批量转码（纯 Rust：解封装 → 解码 → 编码 →
         我们只有 mp4v 编码器没有解码器，所以这条路**不做** PSNR 校验。
         -g 0 会编成全 I 帧（文件大得多，但每帧独立可解、适合剪辑）。
 ";
+
+/// 解析码率：纯数字按 bit/s 算，也接受 `k` / `M` 后缀（`500k`、`1.5M`）。
+fn parse_bitrate(s: &str) -> Result<u32, String> {
+    let t = s.trim();
+    let (num, mul) = match t.chars().last() {
+        Some('k') | Some('K') => (&t[..t.len() - 1], 1_000.0),
+        Some('m') | Some('M') => (&t[..t.len() - 1], 1_000_000.0),
+        _ => (t, 1.0),
+    };
+    let v: f64 = num
+        .parse()
+        .map_err(|_| format!("--video-bitrate 看不懂 `{s}`（要 bit/s，也可写 500k / 1.5M）"))?;
+    let bits = v * mul;
+    if !(bits >= 1.0 && bits <= f64::from(u32::MAX)) {
+        return Err(format!("--video-bitrate `{s}` 超出范围"));
+    }
+    Ok(bits.round() as u32)
+}
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -102,6 +124,11 @@ fn run(args: &[String]) -> Result<bool, String> {
                     .ok_or("--aac-bitrate 后面要跟数字")?
                     .parse()
                     .map_err(|_| "--aac-bitrate 要正整数（bit/s）".to_string())?;
+            }
+            "--video-bitrate" => {
+                let v = it.next().ok_or("--video-bitrate 后面要跟数字")?;
+                let n = parse_bitrate(v)?;
+                opts.video_bitrate = Some(n);
             }
             "--fps" => {
                 let v: u32 = it
@@ -168,8 +195,12 @@ fn run(args: &[String]) -> Result<bool, String> {
         // `.mp4` 没有解码器可比，见 lib.rs 的模块文档。
         OutputFormat::Mp4 => "不支持（.mp4 无解码器）",
     };
+    let vbr = match opts.video_bitrate {
+        Some(b) => format!("，视频目标 {} kbps", b / 1000),
+        None => String::new(),
+    };
     eprintln!(
-        "v2v：{} 个文件 → {}（{}，qscale {}，GOP {}，校验 {}）",
+        "v2v：{} 个文件 → {}（{}，qscale {}，GOP {}，校验 {}{}）",
         inputs.len(),
         out_dir.display(),
         match opts.format {
@@ -185,7 +216,8 @@ fn run(args: &[String]) -> Result<bool, String> {
         } else {
             opts.keyframe_interval.to_string()
         },
-        verify
+        verify,
+        vbr
     );
 
     let results = convert_batch(&inputs, &out_dir, &opts);
@@ -199,7 +231,7 @@ fn run(args: &[String]) -> Result<bool, String> {
                     None => "未校验".into(),
                 };
                 eprintln!(
-                    "  ✓ {} → {}：{} 帧（{} 关键帧）+ {} 个音频样本，{} → {} 字节，PSNR {}",
+                    "  ✓ {} → {}：{} 帧（{} 关键帧）+ {} 个音频样本，{} → {} 字节，PSNR {}{}",
                     input.display(),
                     out.display(),
                     rep.frames,
@@ -207,7 +239,12 @@ fn run(args: &[String]) -> Result<bool, String> {
                     rep.audio_payloads,
                     rep.bytes_in,
                     rep.bytes_out,
-                    psnr
+                    psnr,
+                    match rep.video_kbps {
+                        // 码率控制开着才有 —— 这是「有没有够到目标」的唯一凭据。
+                        Some(k) => format!("，视频实际 {k:.0} kbps"),
+                        None => String::new(),
+                    }
                 );
                 if rep.skipped_audio > 0 {
                     eprintln!(
@@ -224,4 +261,29 @@ fn run(args: &[String]) -> Result<bool, String> {
     }
     eprintln!("完成：{} 成功 / {} 失败", results.len() - failed, failed);
     Ok(failed == 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_bitrate;
+
+    #[test]
+    fn parses_bitrate_with_optional_suffix() {
+        assert_eq!(parse_bitrate("300000").unwrap(), 300_000);
+        assert_eq!(parse_bitrate("500k").unwrap(), 500_000);
+        assert_eq!(parse_bitrate("1.5M").unwrap(), 1_500_000);
+        assert_eq!(parse_bitrate(" 2K ").unwrap(), 2_000);
+        assert_eq!(parse_bitrate("128k").unwrap(), 128_000);
+    }
+
+    #[test]
+    fn rejects_garbage_and_out_of_range() {
+        for bad in ["", "abc", "12x", "0", "-5", "999999M"] {
+            assert!(
+                parse_bitrate(bad).is_err(),
+                "`{bad}` 不该被接受，却解析成了 {:?}",
+                parse_bitrate(bad)
+            );
+        }
+    }
 }
