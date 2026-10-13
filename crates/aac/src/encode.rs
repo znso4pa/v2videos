@@ -581,7 +581,13 @@ impl Encoder {
             } else {
                 self.num_sfb()
             };
-            write_ics_info(&mut w, max_sfb as u8, seq, &plan.group_lens);
+            write_ics_info(
+                &mut w,
+                max_sfb as u8,
+                seq,
+                &plan.group_lens,
+                self.cfg.kb_window,
+            );
             // `ms_mask_present`：0 = 不用 M/S；**2 = 所有频带都用**（后面不跟掩码位）；
             // 1 = 后面跟逐带掩码（每带 1 位）。
             //
@@ -865,7 +871,7 @@ impl Encoder {
         // `common_window = 1` 时 `ics_info` 由元素头那边写一次（两个声道共用），
         // 通道元素体里**不再写** —— 多写一次整条位流就错位。
         if write_ics {
-            write_ics_info(&mut w, max_sfb as u8, seq, group_lens);
+            write_ics_info(&mut w, max_sfb as u8, seq, group_lens, self.cfg.kb_window);
         }
         for g in groups {
             write_sections(&mut w, &g.band_cb, &g.band_zero, run_bits);
@@ -1689,11 +1695,25 @@ fn av_log2(v: i32) -> u32 {
 /// 但从 `section_data` 起全错位，第二个通道连 `window_sequence` 都读成了长窗 ——
 /// 症状是「`number of scalefactor bands in group (56) exceeds limit (49)`」，
 /// **看起来像频带表错了，其实是少写/多写了一位**。
-fn write_ics_info(w: &mut BitWriter, max_sfb: u8, seq: WindowSequence, group_lens: &[usize]) {
+fn write_ics_info(
+    w: &mut BitWriter,
+    max_sfb: u8,
+    seq: WindowSequence,
+    group_lens: &[usize],
+    kb_window: bool,
+) {
     w.put(0, 1); // ics_reserved
     // ⚠️ `EIGHT_SHORT_SEQUENCE = 2`（不是 1 —— 1 是 `LONG_START`）。见 `WindowSequence`。
     w.put(seq as u32, 2);
-    w.put(0, 1); // use_kb_window = 0（正弦窗；KBD 时两边的 cfg 都会改这里 —— 目前统一 0）
+    // ⚠️ 这一位必须与**编码端实际用的窗**一致（`cfg.kb_window`）—— 传进来，别写死。
+    //
+    // 解码端只拿它决定用哪张窗表，**不校验与内容是否一致**：写错了位流照样合法、
+    // ffmpeg 照样解得开、帧数也对，只是它拿正弦窗去重建 KBD 窗编出来的系数。
+    // 后果在重建公式里：重叠区要 `w_a·w_s + w_a'·w_s' = 1` 才能抵消时域混叠，
+    // 两端同系时正弦与 KBD **各自**都满足，一错一配就不满足了 —— 误差表现为
+    // 帧边界的「呼吸」。所以判据只能是解码回来的 SNR，见
+    // `tests/ffmpeg_roundtrip.rs` 的 `kb_window_bit_matches_the_window_actually_used`。
+    w.put(if kb_window { 1 } else { 0 }, 1); // use_kb_window
     if seq == WindowSequence::EightShort {
         // ⚠️ 短窗的 max_sfb 只有 **4 位**（长窗 6 位），后面跟 7 位的
         // **窗口分组**，每一位的语义是「**1 = 并进当前组、0 = 开新组**」。
