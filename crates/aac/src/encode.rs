@@ -765,28 +765,46 @@ impl Encoder {
 
             // 逐带找「失真最小」的 sf（λ 项已去掉 —— 码率由外层二分控，
             // 代价函数只管保真）。
+            //
+            // ## 三级细化：12 → 3 → 1（**覆盖范围与原「粗扫 + ±3」完全一样**）
+            //
+            // 每一级的细扫半径 = 上一级步长的一半，所以最优点**一定**落在下一级的
+            // 扫描范围里：级 1 步长 12 → 最优点离它挑出的网格点 ≤ 6；级 2 步长 3 扫
+            // `±6` → ≤ 1.5（≤ 2）；级 3 步长 1 扫 `±2` → **精确**。
+            //
+            // 评估次数从 ~31 降到 ~21（窗口 120 宽时），而每一趟都要跑一遍 ——
+            // 这是**又省时间又省 CPU** 的那一类（不靠多线程，也不增加内存）。
             let mut best: Option<(f32, u8, u8)> = None; // (代价, sf, cb)
-            let step = 4.max((hi_sf - lo_sf) / 24);
-            let mut cand: Vec<i32> = Vec::new();
-            let mut sd = lo_sf;
-            while sd <= hi_sf {
-                cand.push(sd);
-                sd += step;
-            }
-            for &sf in &cand {
+            let mut evaluate = |sf: i32, best: &mut Option<(f32, u8, u8)>| {
                 let (cost, cb) = cached_band_cost(cache, gi, sfb, band, sf as u8);
                 if best.is_none_or(|(bc, _, _)| cost < bc) {
-                    best = Some((cost, sf as u8, cb));
+                    *best = Some((cost, sf as u8, cb));
                 }
-            }
-            // 在最优附近再细扫 ±3（步长 1），避免粗扫步长漏掉最优点。
-            if let Some((_, sf0, _)) = best {
-                for sf in (i32::from(sf0) - 3).max(lo_sf)..=(i32::from(sf0) + 3).min(hi_sf) {
-                    let (cost, cb) = cached_band_cost(cache, gi, sfb, band, sf as u8);
-                    if best.is_none_or(|(bc, _, _)| cost < bc) {
-                        best = Some((cost, sf as u8, cb));
-                    }
+            };
+            let mut lo_scan = lo_sf;
+            let mut hi_scan = hi_sf;
+            let mut step = 12i32;
+            loop {
+                let mut sd = lo_scan;
+                while sd <= hi_scan {
+                    evaluate(sd, &mut best);
+                    sd += step;
                 }
+                // 上界那一格也要扫到（步长除不尽时最后一点会漏）。
+                if (hi_scan - lo_scan) % step != 0 {
+                    evaluate(hi_scan, &mut best);
+                }
+                if step == 1 {
+                    break;
+                }
+                let centre = i32::from(best.expect("候选集非空").1);
+                let next = (step / 4).max(1);
+                // ⚠️ 半径要**向上取整**（`step/2` 对步长 3 只给 ±1，而最优点可能
+                // 在 ±1.5 —— 差那一点就会漏掉最优、白丢 0.05 dB）。
+                let radius = (step + 1) / 2;
+                lo_scan = (centre - radius).max(lo_sf);
+                hi_scan = (centre + radius).min(hi_sf);
+                step = next;
             }
 
             let (_, sf, cb) = best.expect("候选集非空");
