@@ -299,10 +299,14 @@ impl Encoder {
         // 而它写在最前面。若先写占位再回填，就得有位级 patch 的能力；
         // 把「选」与「写」分开就没有这个问题，而且更省（不用回填）。
         let mut prev_sf: Option<i32> = None;
+        // 逐带的掩蔽阈值（整帧算一次，与 sf_offset 无关 —— 阈值只看源信号）。
+        let thresh = masking_thresholds(spec, &self.swb, self.cfg.sample_rate, sf_floor);
+
         for sfb in 0..max_sfb {
             let lo = self.swb[sfb] as usize;
             let hi = self.swb[sfb + 1] as usize;
             let band = &spec[lo..hi];
+            let th = thresh[sfb];
 
             // 搜索窗口 = 「整帧下界 + 偏移」∩「差分约束 ±60」∩ `0..=255`。
             //
@@ -338,7 +342,7 @@ impl Encoder {
                 sd += step;
             }
             for &sf in &cand {
-                let (cost, cb) = band_cost(band, sf as u8);
+                let (cost, cb) = band_cost(band, sf as u8, th);
                 if best.is_none_or(|(bc, _, _)| cost < bc) {
                     best = Some((cost, sf as u8, cb));
                 }
@@ -346,7 +350,7 @@ impl Encoder {
             // 在最优附近再细扫 ±3（步长 1），避免粗扫步长漏掉最优点。
             if let Some((_, sf0, _)) = best {
                 for sf in (i32::from(sf0) - 3).max(lo_sf)..=(i32::from(sf0) + 3).min(hi_sf) {
-                    let (cost, cb) = band_cost(band, sf as u8);
+                    let (cost, cb) = band_cost(band, sf as u8, th);
                     if best.is_none_or(|(bc, _, _)| cost < bc) {
                         best = Some((cost, sf as u8, cb));
                     }
@@ -590,27 +594,117 @@ fn band_is_zero(band: &[f32], sf: u8) -> bool {
     band.iter().all(|&c| quant_one(c.abs(), q34v, 16) == 0)
 }
 
+/// 先算好每带的 Bark 中心频率 —— 「邻近带」是按 Bark 距离算的，
+/// 不是按频带序号。低频的带很密（几十 Hz 一个）、高频很疏
+/// （一个带跨几千 Hz），按序号算会把高频的掩蔽扩散弄得过宽。
+fn bark_of(swb: &[u16], sample_rate: u32) -> Vec<f32> {
+    swb.windows(2)
+        .map(|w| {
+            // 带的中心频率（Hz）。
+            let fc = (f64::from(w[0]) + f64::from(w[1])) * 0.5 * f64::from(sample_rate)
+                / (2.0 * LONG_LEN as f64);
+            // Bark 尺度的常用近似（Traunmüller 1990）：
+            //   z = 26.81·f / (1960 + f) − 0.53
+            (26.81 * fc / (1960.0 + fc) - 0.53) as f32
+        })
+        .collect()
+}
+
+/// 逐带的**掩蔽阈值**（相对值，单位与谱系数的平方一致）。
+///
+/// ## 模型
+///
+/// ```text
+///   扩展函数（掩蔽的扩散）：
+///     低频掩蔽高频强、高频掩蔽低频弱 —— 这是听觉的实测特性
+///       slope = 低频侧 27 dB/Bark、高频侧 −24 dB/Bark（Schroeder 等的经典值）
+///     扩散量 = Σ_b 能量[b] · 10^(-slope·|zb − z| / 10)
+///
+///   阈值：
+///     thresh[sfb] = 本带能量 + 扩散来的部分，再夹一个下限
+/// ```
+///
+/// 为什么需要它：**逐带独立地「比原始平方误差」是错的度量** ——
+/// 它把「一个响带旁边的高频误差」和「安静段里的误差」同等看待。
+/// 前者听不见（被掩蔽了），后者很刺耳。按阈值归一化之后，
+/// 代价函数就能把位数花在**听得见**的地方。
+///
+/// ⚠️ 这是个**简化模型**：不做 FFT 分析（直接用谱系数当掩蔽源）、
+/// 不含绝对听阈（安静段的阈值会偏乐观）。但它抓住了主要矛盾 ——
+/// 「强带掩蔽邻近带」。
+fn masking_thresholds(spec: &[f32], swb: &[u16], sample_rate: u32, sf_floor: i32) -> Vec<f32> {
+    let n = swb.len() - 1;
+    let bark = bark_of(swb, sample_rate);
+
+    // 每带的能量（谱系数的平方和）。
+    let energy: Vec<f64> = (0..n)
+        .map(|sfb| {
+            let (lo, hi) = (swb[sfb] as usize, swb[sfb + 1] as usize);
+            spec[lo..hi]
+                .iter()
+                .map(|&c| f64::from(c) * f64::from(c))
+                .sum()
+        })
+        .collect();
+
+    // 全帧的能量尺度 —— 用来定「阈值下限」。没有下限的话，
+    // 安静带的阈值趋近 0，代价会被放大到不合理的程度。
+    let total: f64 = energy.iter().sum();
+    let floor = (total / n as f64) * 1e-4 + 1e-12;
+
+    (0..n)
+        .map(|sfb| {
+            let mut spread = 0f64;
+            for (b, &e) in energy.iter().enumerate() {
+                let dz = f64::from(bark[b] - bark[sfb]);
+                // 扩展函数：dz > 0 表示「b 在 sfb 的高频侧」，
+                // 那时用 24 dB/Bark（高频掩蔽低频弱）；
+                // dz <= 0 表示 b 在低频侧，用 27 dB/Bark（低频掩蔽高频强）。
+                let slope = if dz > 0.0 { -24.0 } else { 27.0 };
+                spread += e * 10f64.powf(slope * dz.abs() / 10.0);
+            }
+            (0.5 * energy[sfb] + spread).max(floor) as f32
+        })
+        .collect()
+}
+
 /// 一个频带在给定 `sf` 下的 `(代价, 最优码本)`。
 ///
-/// **代价就是量化失真**（平方误差），逐码本比、取最小的。
+/// ## 代价是**掩蔽归一化**的失真
 ///
-/// ⚠️ 这里**故意没有 λ · 位数那一项**。原因见 `encode_pass` 的说明：
-/// 码率由外层的「二分搜 sf 偏移」用**硬预算**控制；
-/// 再在这里掺一个软权重只会互相干扰，而且 λ 的量级（1e-4）在失真（1e9）
-/// 面前根本不起作用 —— 实测踩过，白忙一场。
-fn band_cost(band: &[f32], sf: u8) -> (f32, u8) {
+/// ```text
+///   代价 = Σ (误差² / 阈值²)
+/// ```
+///
+/// 除以阈值让「听不见的误差」几乎不花代价、而「安静段里的误差」被放大。
+/// 阈值来自 `masking_thresholds`（邻带的掩蔽扩散）。
+///
+/// ## ⚠️ 这里**故意没有 λ · 位数那一项**
+///
+/// 码率由外层的「二分搜 sf 偏移」用**硬预算**控制。再在这里掺一个软权重
+/// 只会互相干扰，而且 λ 的量级（1e-4）在失真（1e9）面前根本不起作用
+/// —— 实测踩过，白忙一场（码率是目标的 3.4 倍）。
+///
+/// **两者是正交的分工**：外层管「花多少位」，这里管「位花在哪」。
+fn band_cost(band: &[f32], sf: u8, threshold: f32) -> (f32, u8) {
+    // 归一化因子：1/阈值²。夹一个下限防除 0（阈值已经在下游夹过，这里是二次保险）。
+    let inv_th = 1.0 / threshold.max(1e-12);
+
     let mut best: Option<(f32, u8)> = None;
     for cb in 1..=11usize {
         let (_bits, dist) = band_code(band, sf, cb);
-        if best.is_none_or(|(bc, _)| dist < bc) {
-            best = Some((dist, cb as u8));
+        // `band_code` 给的是原始平方误差；乘上 `1/阈值²` 就是归一化代价。
+        let cost = dist * inv_th * inv_th;
+        if best.is_none_or(|(bc, _)| cost < bc) {
+            best = Some((cost, cb as u8));
         }
     }
     // cb == 0 是「全零带」的伪码本，作为兜底参与比较。
     let zero_dist: f64 = band.iter().map(|&c| f64::from(c) * f64::from(c)).sum();
+    let zero_cost = zero_dist as f32 * inv_th * inv_th;
     match best {
-        Some((c, cb)) if c <= zero_dist as f32 => (c, cb),
-        _ => (zero_dist as f32, 0),
+        Some((c, cb)) if c <= zero_cost => (c, cb),
+        _ => (zero_cost, 0),
     }
 }
 
