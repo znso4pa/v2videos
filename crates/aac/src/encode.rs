@@ -203,6 +203,63 @@ impl AudioSpecificConfig {
 }
 
 /// AAC-LC 编码器。有状态：要跨帧维护 50% 重叠的那半块样本。
+/// `band_cost` 的**帧内缓存**（每个声道一份，跨帧复用）。
+///
+/// 同一帧要跑多「趟」（外层按位数预算二分搜全局 sf 偏移），而**趟与趟之间很多
+/// 频带的候选 sf 窗口是同一套** —— 窗口主要由「上一个非零带 ± 60」决定，只有被
+/// `floor = sf_floor + 偏移` 抬起来的那部分才随偏移移动。所以同一个 `(带, sf)`
+/// 会被反复求值，而它的值只取决于该带的谱系数（一帧内不变）。
+///
+/// 缓存返回的值与现算**逐位相同**，所以输出逐字节不变 —— 纯提速。
+/// 内存：每带 `256 × (f32,u8)` = 2 KB；长窗约 50 条带 → 100 KB，短窗最多 8 组
+/// 共 ~112 条带 → 约 230 KB。**挂在声道状态上跨帧复用，不随帧增长。**
+struct BandCostCache {
+    /// `tables[组][带][sf] = (代价, 码本)`；码本为 `NO_CB` = 还没算过。
+    tables: Vec<Vec<Vec<(f32, u8)>>>,
+}
+
+/// 「这一格还没算过」的哨兵 —— 真码本只到 11，所以 `0xFF` 安全。
+const NO_CB: u8 = 0xFF;
+
+impl BandCostCache {
+    fn new() -> Self {
+        Self { tables: Vec::new() }
+    }
+
+    /// 按这一帧的形状准备（组数 + 每组条带数）。形状没变就只清空，**不重新分配**。
+    fn reset(&mut self, shapes: &[usize]) {
+        self.tables.resize_with(shapes.len(), Vec::new);
+        for (g, &n) in shapes.iter().enumerate() {
+            let t = &mut self.tables[g];
+            t.resize_with(n, Vec::new);
+            for band in t.iter_mut() {
+                band.resize(256, (0.0, NO_CB));
+                for e in band.iter_mut() {
+                    e.1 = NO_CB;
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn get(&self, g: usize, b: usize, sf: u8) -> Option<(f32, u8)> {
+        let e = *self.tables.get(g)?.get(b)?.get(sf as usize)?;
+        (e.1 != NO_CB).then_some(e)
+    }
+
+    #[inline]
+    fn put(&mut self, g: usize, b: usize, sf: u8, v: (f32, u8)) {
+        if let Some(e) = self
+            .tables
+            .get_mut(g)
+            .and_then(|t| t.get_mut(b))
+            .and_then(|t| t.get_mut(sf as usize))
+        {
+            *e = v;
+        }
+    }
+}
+
 /// **一个声道自己的状态** —— 编码时唯一可变的东西。
 ///
 /// 抽出来是为了能**两个声道并行**：`encode_channel` 除了这个结构之外只读
@@ -221,6 +278,8 @@ struct ChannelState {
     /// ⚠️ 这个「前/后」的划分是**不需要前瞻**就能决定 `LONG_START` 的关键：
     /// 「下一帧会不会是短窗」由**本帧自己的后段攻击**决定，而它是本帧已知的。
     attack_prev: Option<usize>,
+    /// `band_cost` 的帧内缓存（见 `BandCostCache`）。
+    cost_cache: BandCostCache,
     /// **上一帧选中的 `sf_offset`** —— 下一帧搜偏移时的**种子**。
     ///
     /// 相邻帧的谱形状是连续的，所以上一帧的答案是很好的出发点：从它出发做
@@ -298,6 +357,7 @@ impl Encoder {
                 .map(|_| ChannelState {
                     overlap: vec![0f32; LONG_LEN],
                     attack_prev: None,
+                    cost_cache: BandCostCache::new(),
                     sf_offset_prev: SF_OFFSET_SEED_INIT,
                 })
                 .collect(),
@@ -460,6 +520,8 @@ impl Encoder {
     /// 所以用 `&mut` 带进带出：上一组最后一个非零带的 sf 是下一组的差分基准。
     fn plan_group<'a>(
         &self,
+        cache: &mut BandCostCache,
+        gi: usize,
         spec: &'a [f32],
         swb: &'a [u16],
         sf_floor: i32,
@@ -512,7 +574,7 @@ impl Encoder {
                 sd += step;
             }
             for &sf in &cand {
-                let (cost, cb) = band_cost(band, sf as u8);
+                let (cost, cb) = cached_band_cost(cache, gi, sfb, band, sf as u8);
                 if best.is_none_or(|(bc, _, _)| cost < bc) {
                     best = Some((cost, sf as u8, cb));
                 }
@@ -520,7 +582,7 @@ impl Encoder {
             // 在最优附近再细扫 ±3（步长 1），避免粗扫步长漏掉最优点。
             if let Some((_, sf0, _)) = best {
                 for sf in (i32::from(sf0) - 3).max(lo_sf)..=(i32::from(sf0) + 3).min(hi_sf) {
-                    let (cost, cb) = band_cost(band, sf as u8);
+                    let (cost, cb) = cached_band_cost(cache, gi, sfb, band, sf as u8);
                     if best.is_none_or(|(bc, _, _)| cost < bc) {
                         best = Some((cost, sf as u8, cb));
                     }
@@ -627,6 +689,7 @@ impl Encoder {
     /// 拆成若干项，每项的频带表 = `组内窗口数 × 128 点的划分`。
     fn encode_pass(
         &self,
+        cache: &mut BandCostCache,
         seq: WindowSequence,
         group_specs: &[(&[f32], &[u16], usize)],
         sf_floor: i32,
@@ -635,8 +698,8 @@ impl Encoder {
     ) -> crate::Result<(BitWriter, u32)> {
         let mut prev_sf: Option<i32> = None;
         let mut plans: Vec<GroupPlan<'_>> = Vec::with_capacity(group_specs.len());
-        for &(spec, swb, _) in group_specs {
-            plans.push(self.plan_group(spec, swb, sf_floor, sf_offset, &mut prev_sf));
+        for (gi, &(spec, swb, _)) in group_specs.iter().enumerate() {
+            plans.push(self.plan_group(cache, gi, spec, swb, sf_floor, sf_offset, &mut prev_sf));
         }
         let lens: Vec<usize> = group_specs.iter().map(|&(_, _, l)| l).collect();
         self.write_pass(seq, &plans, &lens, tns_data)
@@ -818,6 +881,10 @@ impl Encoder {
             .map(|((s, t), &l)| (s.as_slice(), t.as_slice(), l))
             .collect();
 
+        // 缓存按这一帧的形状重置（形状没变就只清空，不重新分配）。
+        let shapes: Vec<usize> = group_specs.iter().map(|&(_, swb, _)| swb.len() - 1).collect();
+        st.cost_cache.reset(&shapes);
+
         // ---- 3. 搜「位数 ≤ 预算」的最小偏移 ----
         //
         // 偏移越大 → 量化越粗 → 位数越少、失真越大，所以「位数」关于偏移单调，
@@ -836,7 +903,7 @@ impl Encoder {
         let mut lo: i32 = -1;
         let mut hi: i32 = MAX_SF_OFFSET + 1;
         let (pass, bits) =
-            self.encode_pass(seq, &group_specs, sf_floor, seed, tns_data.as_ref())?;
+            self.encode_pass(&mut st.cost_cache, seq, &group_specs, sf_floor, seed, tns_data.as_ref())?;
         if bits <= budget {
             hi = seed;
             chosen = Some(pass);
@@ -850,7 +917,7 @@ impl Encoder {
             while lo < MAX_SF_OFFSET {
                 let o = (lo + step).min(MAX_SF_OFFSET);
                 let (pass, bits) =
-                    self.encode_pass(seq, &group_specs, sf_floor, o, tns_data.as_ref())?;
+                    self.encode_pass(&mut st.cost_cache, seq, &group_specs, sf_floor, o, tns_data.as_ref())?;
                 if bits <= budget {
                     hi = o;
                     chosen = Some(pass);
@@ -863,7 +930,7 @@ impl Encoder {
             while hi > 0 {
                 let o = (hi - step).max(0);
                 let (pass, bits) =
-                    self.encode_pass(seq, &group_specs, sf_floor, o, tns_data.as_ref())?;
+                    self.encode_pass(&mut st.cost_cache, seq, &group_specs, sf_floor, o, tns_data.as_ref())?;
                 if bits > budget {
                     lo = o;
                     break;
@@ -878,7 +945,7 @@ impl Encoder {
         while lo + 1 < hi {
             let mid = (lo + hi) / 2;
             let (pass, bits) =
-                self.encode_pass(seq, &group_specs, sf_floor, mid, tns_data.as_ref())?;
+                self.encode_pass(&mut st.cost_cache, seq, &group_specs, sf_floor, mid, tns_data.as_ref())?;
             if bits <= budget {
                 hi = mid;
                 chosen = Some(pass);
@@ -895,7 +962,7 @@ impl Encoder {
         let pass = match chosen {
             Some(p) => p,
             None => {
-                self.encode_pass(seq, &group_specs, sf_floor, MAX_SF_OFFSET, tns_data.as_ref())?
+                self.encode_pass(&mut st.cost_cache, seq, &group_specs, sf_floor, MAX_SF_OFFSET, tns_data.as_ref())?
                     .0
             }
         };
@@ -1199,6 +1266,25 @@ fn masking_thresholds(spec: &[f32], swb: &[u16], sample_rate: u32, _sf_floor: i3
 ///
 /// **结论**：阈值不能当**权重**用。要用它得改成「按带分配比特」
 /// （让量化噪声落在阈值之下），而不是给失真乘一个系数。
+/// 带缓存的 `band_cost`：命中就直接返回，没命中才算并记下。
+///
+/// 值**逐位相同**（同一帧里同一条带的谱系数不变），所以决策不会变 → 输出逐字节不变。
+#[inline]
+fn cached_band_cost(
+    cache: &mut BandCostCache,
+    gi: usize,
+    sfb: usize,
+    band: &[f32],
+    sf: u8,
+) -> (f32, u8) {
+    if let Some(v) = cache.get(gi, sfb, sf) {
+        return v;
+    }
+    let v = band_cost(band, sf);
+    cache.put(gi, sfb, sf, v);
+    v
+}
+
 fn band_cost(band: &[f32], sf: u8) -> (f32, u8) {
     let mut best: Option<(f32, u8)> = None;
     for cb in 1..=11usize {
