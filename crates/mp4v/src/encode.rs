@@ -799,6 +799,13 @@ impl PState<'_> {
     ///
     /// 两个中心是 `(0,0)`（静止场景）与预测值（运动场景）。结果再夹进
     /// `clamp_mv` 的可表示集合 —— 夹完的 MV 一定能被解码端原样还原。
+    ///
+    /// ## 为什么仍是全搜
+    ///
+    /// 试过换成菱形搜索（LDSP + ±2 收尾）：候选从 578 降到 ~50、快 4 倍，
+    /// 但在一段运动较多的素材上 **-0.35 dB**（同码率，且体积还大 0.3%）。
+    /// 本仓的取舍是「main 允许正确但慢」，而我们本来就落后 ffmpeg 0.4–0.6 dB，
+    /// 所以**不拿画质换这一档速度**。真正的提速应该走「同样的候选、更便宜的一遍」。
     fn motion_estimate(&self, mbx: usize, mby: usize, pred: (i32, i32)) -> (i32, i32) {
         let (pw, ph) = (self.pw, self.refp.ph);
         let refp = self.refp;
@@ -811,6 +818,22 @@ impl PState<'_> {
         let mut tmp = [0u8; 256];
         let mut sad_of = |mv: (i32, i32)| -> u64 {
             let p = mc_params(mbx, mby, mv, pw, ph);
+            // **整像素、且不用边缘复制**时，参考块就是参考帧里的一个 16×16 矩形：
+            // 直接算 SAD，省掉「先 `mc_luma16` 拷进 `tmp` 再读出来」的两趟内存流量。
+            // 全搜的候选里 98% 是这种（半像素只有最后那 9 个），所以这一条很值。
+            // 值与原路径**逐位相同**（`dxy == 0` 时 `put_pixels` 就是纯拷贝），
+            // 所以输出逐字节不变。
+            if p.dxy == 0 && !p.need_emu {
+                let base = p.src_y as usize * pw + p.src_x as usize;
+                let mut acc = 0u64;
+                for r in 0..16usize {
+                    let row = &refp.y[base + r * pw..base + r * pw + 16];
+                    for c in 0..16usize {
+                        acc += (cur[r * 16 + c] as i32 - row[c] as i32).unsigned_abs() as u64;
+                    }
+                }
+                return acc;
+            }
             mc_luma16(&mut tmp, 16, 0, 0, refp, &p, NO_ROUNDING);
             let mut acc = 0u64;
             for i in 0..256usize {
@@ -821,14 +844,27 @@ impl PState<'_> {
 
         let mut best = (0i32, 0i32);
         let mut best_sad = sad_of(best);
-        let mut seen = std::collections::HashSet::new();
-        seen.insert(best);
-        for (cx, cy) in [(0i32, 0i32), pred] {
+        // 两个搜索窗可能**大幅重叠**（`pred ≈ (0,0)` 时几乎完全重合），所以重叠区
+        // 只算一次。原来是拿 `HashSet` 去重 —— 每个宏块一次堆分配、每个候选一次哈希：
+        // 500 帧的素材下来是 15 万次分配 / 8700 万次插入，全是纯开销。
+        //
+        // 改成「先算出重叠矩形，第二个窗跳过它」：候选的**集合**与**求值顺序**
+        // 都和 `HashSet` 版本一致，所以输出逐字节不变。
+        let lo_x = (-ME_RANGE).max(pred.0 - ME_RANGE);
+        let hi_x = ME_RANGE.min(pred.0 + ME_RANGE);
+        let lo_y = (-ME_RANGE).max(pred.1 - ME_RANGE);
+        let hi_y = ME_RANGE.min(pred.1 + ME_RANGE);
+        let overlap = lo_x <= hi_x && lo_y <= hi_y;
+        for (center, second) in [((0i32, 0i32), false), (pred, true)] {
             for dy in -ME_RANGE..=ME_RANGE {
                 for dx in -ME_RANGE..=ME_RANGE {
-                    let cand = (cx + dx, cy + dy);
-                    if !seen.insert(cand) {
-                        continue;
+                    let cand = (center.0 + dx, center.1 + dy);
+                    if second
+                        && overlap
+                        && (lo_x..=hi_x).contains(&cand.0)
+                        && (lo_y..=hi_y).contains(&cand.1)
+                    {
+                        continue; // 第一个窗已经算过
                     }
                     let s = sad_of(cand);
                     if s < best_sad {
