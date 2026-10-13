@@ -51,6 +51,7 @@ fn run() -> Result<(), String> {
     let mut bitrate = 128_000u32;
     let mut kb_window = false;
     let mut threads = 1usize;
+    let mut ms_stereo = true;
 
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -58,6 +59,7 @@ fn run() -> Result<(), String> {
             "--channels" => channels = next(&mut args, "--channels")?,
             "--bitrate" => bitrate = next(&mut args, "--bitrate")?,
             "--threads" => threads = next(&mut args, "--threads")?,
+            "--no-ms" => ms_stereo = false,
             "--kb" => kb_window = true,
             "-h" | "--help" => {
                 println!(
@@ -99,6 +101,7 @@ fn run() -> Result<(), String> {
         sample_rate,
         bitrate,
         threads,
+        ms_stereo,
         kb_window,
     })
     .map_err(|e| format!("建编码器：{e}"))?;

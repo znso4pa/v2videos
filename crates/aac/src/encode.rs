@@ -129,6 +129,11 @@ pub struct EncoderConfig {
     pub bitrate: u32,
     /// 用 KBD 窗而不是正弦窗。默认正弦（不需要 Bessel 函数，AAC 里也常用）。
     pub kb_window: bool,
+    /// 双声道时允不允许用 **M/S 立体声**（默认开）。
+    ///
+    /// 逐帧决策：两个声道相关时才用（判据见 `use_midside`）。开了它，位流里会写
+    /// `common_window = 1` + `ms_mask_present = 1`。
+    pub ms_stereo: bool,
     /// **编码时用几个线程**（默认 **1** = 不并行）。
     ///
     /// ## 为什么由调用者给、而不是库自己探测
@@ -159,6 +164,7 @@ impl Default for EncoderConfig {
             sample_rate: 44100,
             bitrate: 128_000,
             kb_window: false,
+            ms_stereo: true,
             threads: 1,
         }
     }
@@ -203,6 +209,98 @@ impl AudioSpecificConfig {
 }
 
 /// AAC-LC 编码器。有状态：要跨帧维护 50% 重叠的那半块样本。
+/// 一帧的**窗决策**（`window_sequence` + 分组）。
+///
+/// 双声道走 `common_window = 1` 时两个声道**共用同一份 `ics_info`**，所以窗序列与
+/// 分组必须两个声道一致 —— 决策得提到 `encode_frame` 里**联合**做，不能各声道各决定。
+/// 单声道就用自己那一份。
+struct WindowPlan {
+    /// 本帧用不用短窗（`EIGHT_SHORT_SEQUENCE`）。
+    short: bool,
+    /// 分组长度（长窗恒 `[1]`）。
+    group_lens: Vec<usize>,
+    /// 每个声道本帧的攻击（要写回 `ChannelState::attack_prev`）。
+    attacks: Vec<Option<usize>>,
+}
+
+impl WindowPlan {
+    /// 一个声道的窗决策（单声道走这条）。
+    fn for_one(attack: Option<usize>, prev_attack: Option<usize>) -> Self {
+        let short = attack.is_some() || prev_attack.is_some();
+        let attack_pos = attack.or(prev_attack).unwrap_or(8);
+        let group_lens = if short {
+            group_lengths(WINDOW_GROUPING[attack_pos])
+        } else {
+            vec![1]
+        };
+        Self {
+            short,
+            group_lens,
+            attacks: vec![attack],
+        }
+    }
+
+    /// **双声道联合**的窗决策：只要**任一**声道（本帧或上一帧）有攻击就用短窗，
+    /// 分组位置取两个声道里**最早**的那个攻击。
+    fn for_pair(attacks: &[Option<usize>], prev: &[Option<usize>]) -> Self {
+        let short = (0..attacks.len()).any(|ch| attacks[ch].is_some() || prev[ch].is_some());
+        let attack_pos = (0..attacks.len())
+            .filter_map(|ch| attacks[ch].or(prev[ch]))
+            .min()
+            .unwrap_or(8);
+        let group_lens = if short {
+            group_lengths(WINDOW_GROUPING[attack_pos])
+        } else {
+            vec![1]
+        };
+        Self {
+            short,
+            group_lens,
+            attacks: attacks.to_vec(),
+        }
+    }
+}
+
+/// 把一个声道的这一帧推进它的重叠历史（AAC 是 50% 重叠，左半就是上一帧）。
+fn push_history(hist: &mut [f32], samples: &[f32]) {
+    let n = samples.len().min(LONG_LEN);
+    hist[..n].copy_from_slice(&samples[..n]);
+    for v in &mut hist[n..] {
+        *v = 0.0;
+    }
+}
+
+/// 用不用 M/S 立体声（`ms_mask_present = 1`：**所有**频带都用）。
+///
+/// ## 判据：比两套表示的 **L1 范数**
+///
+/// `M = (L+R)/2`、`S = (L-R)/2`。L1 是**齐次**的（整体放大 2 倍 = sf 抬 2 档、位数不变），
+/// 所以直接比 L1 就是比「各自在自己那一档 sf 下要花多少位」：
+///
+/// - 相关性强（`L ≈ R`）：`L1(M) + L1(S) ≈ L1(L)`，而 L/R 是 `2·L1(L)` → **选 M/S**
+/// - 不相关：`≈ 1.4·(L1(L) + L1(R))` → 选 L/R
+/// - 反相（`R = -L`）：两者相等（平局 → 选 L/R，少一次变换）
+///
+/// ## ⚠️ 为什么是「逐帧」而不是「逐带」
+///
+/// 逐带掩码（`ms_mask_present = 2`）要求**先把两个声道的谱都算出来**再决定，
+/// 而现在每个声道是「算谱 → 搜索 → 写」一条路走到底（还能两个声道并行）。
+/// 逐帧决策可以在**时域**先变换 —— MDCT 是线性的，`MDCT((L+R)/2) = (MDCT(L)+MDCT(R))/2`
+/// —— 于是完全不用动结构。先做逐帧，把「有没有 M/S」这件事跑通；逐带留到下一步。
+fn use_midside(l: &[f32], r: &[f32]) -> bool {
+    let mut l1_lr = 0f64;
+    let mut l1_ms = 0f64;
+    for (a, b) in l.iter().zip(r) {
+        l1_lr += f64::from(a.abs()) + f64::from(b.abs());
+        l1_ms += f64::from(((a + b) * 0.5).abs()) + f64::from(((a - b) * 0.5).abs());
+    }
+    // 留一点余量：势均力敌时不换（换了也只是白算一遍变换）。
+    l1_ms < l1_lr * MS_MARGIN
+}
+
+/// M/S 决策的余量（`< 1.0` 表示「M/S 要明显更省才用」）。实测调这个值。
+const MS_MARGIN: f64 = 0.98;
+
 /// `band_cost` 的**帧内缓存**（每个声道一份，跨帧复用）。
 ///
 /// 同一帧要跑多「趟」（外层按位数预算二分搜全局 sf 偏移），而**趟与趟之间很多
@@ -266,8 +364,15 @@ impl BandCostCache {
 /// `Encoder` 的其余部分，所以两个声道之间没有共享的可变状态。
 /// 谁起线程由调用者定（`EncoderConfig::threads`），库不自己探测核数。
 struct ChannelState {
-    /// 上一帧的后半段（`N` 个样本），与这一帧拼成 `2N`（AAC 是 50% 重叠）。
+    /// 上一帧的后半段（`N` 个样本），与这一帧拼成 `2N`（AAC 是 50% 重叠）——
+    /// **原始域**（L / R）的那一份。
     overlap: Vec<f32>,
+    /// 同一件事，但存的是 **M/S 域**（`M = (L+R)/2` / `S = L-R`）的那一份。
+    ///
+    /// ⚠️ **两套历史都要维护**，因为 M/S 是**逐帧**决策的：MDCT 的重叠必须与
+    /// 本帧实际编的那个域一致（TDAC 要求「上一帧那一半」是同一个信号），
+    /// 而下一帧可能换回另一个域。两套各 4 KB，代价可忽略。
+    overlap_ms: Vec<f32>,
     /// 「上一帧的攻击落在哪个子块」（`None` = 没有攻击）。
     ///
     /// 短窗的覆盖区是 `buf[448..1600]`（见 `encode_channel`），换算到**本帧样本**
@@ -356,6 +461,7 @@ impl Encoder {
             chans: (0..cfg.channels)
                 .map(|_| ChannelState {
                     overlap: vec![0f32; LONG_LEN],
+                    overlap_ms: vec![0f32; LONG_LEN],
                     attack_prev: None,
                     cost_cache: BandCostCache::new(),
                     sf_offset_prev: SF_OFFSET_SEED_INIT,
@@ -416,17 +522,75 @@ impl Encoder {
         let is_stereo = self.cfg.channels == 2;
         let mut any_short = false;
 
+        let mut chans = std::mem::take(&mut self.chans);
+
+        // ---- M/S 立体声：逐帧决策，决定本帧**实际要编的信号** ----
+        //
+        // MDCT 是线性的（`MDCT((L+R)/2) = (MDCT(L)+MDCT(R))/2`），所以逐帧的 M/S
+        // 可以在**时域**先变换再进 MDCT —— 不用把「两个声道的谱都算出来」才能决定。
+        let ms_planes: Option<Vec<Vec<f32>>> = (is_stereo && self.cfg.ms_stereo).then(|| {
+            let (l, r) = (&frame.planes[0], &frame.planes[1]);
+            // ⚠️ **两个都要减半**：解码端用的是 `butterflies_float`（`L = M + S`、
+            // `R = M − S`，没有额外缩放），所以编码端必须是
+            // `M = (L+R)/2`、`S = (L−R)/2` —— 解这个方程组得到的。
+            // 只减 M 不减 S 的话，解出来是 `1.5L − 0.5R`：位流**解得开**（语法全对），
+            // 但波形是错的 —— 实测 SNR 从 11.27 dB 掉到 **5.48 dB**。
+            vec![
+                l.iter().zip(r).map(|(a, b)| (a + b) * 0.5).collect(),
+                l.iter().zip(r).map(|(a, b)| (a - b) * 0.5).collect(),
+            ]
+        });
+        let use_ms = ms_planes.is_some()
+            && use_midside(&frame.planes[0], &frame.planes[1]);
+        let coded: &[Vec<f32>] = if use_ms {
+            ms_planes.as_ref().expect("use_ms 蕴含 ms_planes")
+        } else {
+            &frame.planes
+        };
+
+        // ---- 窗决策（双声道**联合**，因为要共用一份 `ics_info`）----
+        // 攻击检测跑在**本帧实际要编的信号**上（M/S 时就是 M/S）。
+        let plan = if is_stereo {
+            let attacks: Vec<Option<usize>> = coded.iter().map(|p| detect_attack(p)).collect();
+            let prev: Vec<Option<usize>> = chans.iter().map(|c| c.attack_prev).collect();
+            WindowPlan::for_pair(&attacks, &prev)
+        } else {
+            WindowPlan::for_one(detect_attack(&coded[0]), chans[0].attack_prev)
+        };
+
         // ---- 元素头 ----
         // SCE = 0，CPE = 1。
         w.put(if is_stereo { 1 } else { 0 }, 3);
         w.put(0, 4); // 元素实例标签（每帧都从 0 起）
         if is_stereo {
-            // `common_window = 0`：两个通道各自带自己的 ICS。
+            // `common_window = 1`：两个通道**共用一份 `ics_info`**。
             //
-            // 走 common_window 能让两通道共用一套窗与频带划分，还能开 MS/IS ——
-            // 但那条路要求两个通道的 ICS **完全一致**（`ics_info` 只写一份），
-            // 并且要处理 ms_mask。先把 `common_window = 0` 这条窄路走通。
-            w.put(0, 1);
+            // 这是 M/S 立体声的**前提**（`ms_mask_present` 只在 common_window 下存在）。
+            // 代价是两个声道的窗序列与分组必须一致 —— 所以决策提到了上面那一步联合做。
+            w.put(1, 1);
+            let seq = if plan.short {
+                WindowSequence::EightShort
+            } else {
+                WindowSequence::OnlyLong
+            };
+            // ⚠️ `max_sfb` 短窗要用**短窗那张频带表**的条带数（4 位），长窗才用长表的
+            // （6 位）。写错会让解码端按错误的频带数读 `section_data` —— 报出来的是
+            // 「number of bands (7) exceeds limit (1)」这种看着像分组错的信息。
+            let max_sfb = if plan.short {
+                self.swb_short.len() - 1
+            } else {
+                self.num_sfb()
+            };
+            write_ics_info(&mut w, max_sfb as u8, seq, &plan.group_lens);
+            // `ms_mask_present`：0 = 不用 M/S；**2 = 所有频带都用**（后面不跟掩码位）；
+            // 1 = 后面跟逐带掩码（每带 1 位）。
+            //
+            // ⚠️ **1 和 2 的语义我一开始记反了**（以为 1 = 全部带）。ffmpeg 的
+            // 解码器与编码器两边都确认：`1` 是「掩码跟在后面」，`2` 才是「全部带」。
+            // 记反的后果不是「音质差一点」，而是**整条位流错位** —— 解码端把掩码位
+            // 当成了通道数据，报出来的是 `Number of bands (65) exceeds limit (49)`
+            // 这种看着像频带表错的信息（症状离根因很远）。
+            w.put(if use_ms { 2 } else { 0 }, 2);
         }
 
         // ---- 声道元素体：串行，或（调用者要求时）两个声道并行 ----
@@ -437,8 +601,8 @@ impl Encoder {
         //
         // ⚠️ 线程数由**调用者**给（`EncoderConfig::threads`），库不自己探测核数：
         // 只有调用者知道这台机器 / 这个 App 还有多少算力可用（Android 上尤其如此）。
-        let mut chans = std::mem::take(&mut self.chans);
-        let bodies = self.encode_channel_bodies(&mut chans, frame);
+        let bodies =
+            self.encode_channel_bodies(&mut chans, coded, ms_planes.as_deref(), &plan, !is_stereo, use_ms);
         self.chans = chans;
         for (body, short) in bodies? {
             w.append(&body);
@@ -473,15 +637,49 @@ impl Encoder {
     fn encode_channel_bodies(
         &self,
         chans: &mut [ChannelState],
-        frame: &Frame,
+        coded: &[Vec<f32>],
+        ms_planes: Option<&[Vec<f32>]>,
+        plan: &WindowPlan,
+        write_ics: bool,
+        use_ms: bool,
     ) -> crate::Result<Vec<(BitWriter, bool)>> {
         let n = self.cfg.channels as usize;
         let threads = self.cfg.threads.min(n).max(1);
+
+        // ---- 重叠历史：**两套都往下更新**，再挑出本帧要用的那一套 ----
+        //
+        // 本帧用哪一套由 `use_ms` 定；但两套都必须跟着走 —— 下一帧可能换域，
+        // 而 MDCT 的 TDAC 要求「上一帧那一半」是**同一个域**的信号。
+        // 复制一份（4 KB/声道）是为了绕开「同时借 `chans[ch]` 与 `self`」的借用冲突。
+        let hist: Vec<Vec<f32>> = (0..n)
+            .map(|ch| {
+                if use_ms {
+                    chans[ch].overlap_ms.clone()
+                } else {
+                    chans[ch].overlap.clone()
+                }
+            })
+            .collect();
+        for ch in 0..n {
+            push_history(&mut chans[ch].overlap, &coded[ch]);
+            if let Some(ms) = ms_planes {
+                push_history(&mut chans[ch].overlap_ms, &ms[ch]);
+            }
+        }
+
         if threads < 2 || n < 2 {
             let mut out = Vec::with_capacity(n);
             for ch in 0..n {
                 let mut w = BitWriter::new();
-                let short = self.encode_channel(&mut chans[ch], &mut w, &frame.planes[ch])?;
+                let short = self.encode_channel(
+                    &mut chans[ch],
+                    &mut w,
+                    &coded[ch],
+                    &hist[ch],
+                    plan,
+                    ch,
+                    write_ics,
+                )?;
                 out.push((w, short));
             }
             return Ok(out);
@@ -489,19 +687,21 @@ impl Encoder {
 
         // 双声道并行：每个线程只碰**自己那份** `ChannelState`（`split_at_mut` 保证
         // 不重叠），`self` 全程只读 —— 所以两个声道之间没有共享的可变状态。
-        let (a, b) = chans.split_at_mut(1);
-        let (p0, p1) = (&frame.planes[0], &frame.planes[1]);
+        //
         // ⚠️ 闭包里不能用 `?`（它的返回类型是那个元组），所以两边都先把 `Result`
         // 带出来，到外面再展开。
+        let (a, b) = chans.split_at_mut(1);
+        let (p0, p1) = (&coded[0], &coded[1]);
+        let (h0, h1) = (&hist[0], &hist[1]);
         let (r0, r1) = std::thread::scope(|scope| {
             let h = scope.spawn(|| {
                 let mut w = BitWriter::new();
-                let short = self.encode_channel(&mut a[0], &mut w, p0)?;
+                let short = self.encode_channel(&mut a[0], &mut w, p0, h0, plan, 0, write_ics)?;
                 Ok::<_, Error>((w, short))
             });
             let mut w1 = BitWriter::new();
             let r1 = self
-                .encode_channel(&mut b[0], &mut w1, p1)
+                .encode_channel(&mut b[0], &mut w1, p1, h1, plan, 1, write_ics)
                 .map(|short| (w1, short));
             (h.join(), r1)
         });
@@ -622,6 +822,7 @@ impl Encoder {
         groups: &[GroupPlan<'_>],
         group_lens: &[usize],
         tns_data: Option<&Tns>,
+        write_ics: bool,
     ) -> crate::Result<(BitWriter, u32)> {
         // `global_gain` = 第一个非零带的 sf（全零帧用 100）。
         let global_gain: u8 = groups
@@ -635,7 +836,11 @@ impl Encoder {
 
         let mut w = BitWriter::new();
         w.put(u32::from(global_gain), 8);
-        write_ics_info(&mut w, max_sfb as u8, seq, group_lens);
+        // `common_window = 1` 时 `ics_info` 由元素头那边写一次（两个声道共用），
+        // 通道元素体里**不再写** —— 多写一次整条位流就错位。
+        if write_ics {
+            write_ics_info(&mut w, max_sfb as u8, seq, group_lens);
+        }
         for g in groups {
             write_sections(&mut w, &g.band_cb, &g.band_zero, run_bits);
         }
@@ -695,6 +900,7 @@ impl Encoder {
         sf_floor: i32,
         sf_offset: i32,
         tns_data: Option<&Tns>,
+        write_ics: bool,
     ) -> crate::Result<(BitWriter, u32)> {
         let mut prev_sf: Option<i32> = None;
         let mut plans: Vec<GroupPlan<'_>> = Vec::with_capacity(group_specs.len());
@@ -702,7 +908,7 @@ impl Encoder {
             plans.push(self.plan_group(cache, gi, spec, swb, sf_floor, sf_offset, &mut prev_sf));
         }
         let lens: Vec<usize> = group_specs.iter().map(|&(_, _, l)| l).collect();
-        self.write_pass(seq, &plans, &lens, tns_data)
+        self.write_pass(seq, &plans, &lens, tns_data, write_ics)
     }
 
 
@@ -731,29 +937,30 @@ impl Encoder {
         st: &mut ChannelState,
         w: &mut BitWriter,
         samples: &[f32],
+        hist: &[f32],
+        plan: &WindowPlan,
+        ch: usize,
+        write_ics: bool,
     ) -> crate::Result<bool> {
         // ---- 1. 攒 2N 个样本 → 开窗 → MDCT ----
+        //
+        // 左半 = **上一帧的后半**（AAC 是 50% 重叠）。`hist` 由调用方给 ——
+        // 它要按本帧编的域（原始 / M/S）挑对应的那一套，并且**两套都往下更新**。
         let mut buf = vec![0f32; 2 * LONG_LEN];
-        // 左半 = 上一帧的后半（AAC 是 50% 重叠）
-        buf[..LONG_LEN].copy_from_slice(&st.overlap);
-        // 右半 = 这一帧（不足补 0）
+        buf[..LONG_LEN].copy_from_slice(hist);
         let n = samples.len().min(LONG_LEN);
         buf[LONG_LEN..LONG_LEN + n].copy_from_slice(&samples[..n]);
-        // 存下这一帧，作为下一帧的左半
-        st.overlap[..n].copy_from_slice(&samples[..n]);
-        for v in &mut st.overlap[n..] {
-            *v = 0.0;
-        }
 
-        // ---- 窗序列 ----
+        // ---- 窗序列（由调用者决定，见 `WindowPlan`）----
         //
         // 攻击打在这一帧 → 本帧用短窗；**下一帧也要用短窗**（攻击的能量在
         // 50% 重叠区里会跨进下一帧的前半 —— 长窗会把攻击「摊平」成一帧的
         // pre-echo，这正是短窗要解决的东西）。
-        let attack = detect_attack(samples);
-        let prev_attack = st.attack_prev;
-        let short = attack.is_some() || prev_attack.is_some();
-        st.attack_prev = attack;
+        //
+        // ⚠️ 决策**不在这里做**：双声道要共用一份 `ics_info`（`common_window = 1`），
+        // 所以两个声道必须拿到同一份窗序列与分组。
+        st.attack_prev = plan.attacks[ch];
+        let short = plan.short;
         let seq = if short {
             WindowSequence::EightShort
         } else {
@@ -769,12 +976,7 @@ impl Encoder {
         //
         // ⚠️ 实测这一条值 5~7 dB：第一版「8 个窗口一组」在瞬态素材上
         // SNR 10.2 dB（ffmpeg 自己的 AAC 是 17.8 dB），分组后追上来一大截。
-        let attack_pos = attack.or(prev_attack).unwrap_or(8);
-        let group_lens: Vec<usize> = if short {
-            group_lengths(WINDOW_GROUPING[attack_pos])
-        } else {
-            vec![1]
-        };
+        let group_lens: &[usize] = &plan.group_lens;
 
         // 各组的虚拟谱（**带主序**）与频带表。长窗只有一组，与短窗共用同一套
         // 选 sf / 选码本 / 写位流的机制（见 `GroupPlan`）。
@@ -814,7 +1016,7 @@ impl Encoder {
                 .map(|(a, b)| (b - a) as usize)
                 .collect();
             let mut w0 = 0usize;
-            for &gl in &group_lens {
+            for &gl in group_lens {
                 let mut v: Vec<f32> = Vec::with_capacity(gl * SHORT_LEN);
                 for (b, &width) in widths.iter().enumerate() {
                     let lo = self.swb_short[b] as usize;
@@ -877,7 +1079,7 @@ impl Encoder {
         let group_specs: Vec<(&[f32], &[u16], usize)> = specs
             .iter()
             .zip(&swbs)
-            .zip(&group_lens)
+            .zip(group_lens)
             .map(|((s, t), &l)| (s.as_slice(), t.as_slice(), l))
             .collect();
 
@@ -903,7 +1105,7 @@ impl Encoder {
         let mut lo: i32 = -1;
         let mut hi: i32 = MAX_SF_OFFSET + 1;
         let (pass, bits) =
-            self.encode_pass(&mut st.cost_cache, seq, &group_specs, sf_floor, seed, tns_data.as_ref())?;
+            self.encode_pass(&mut st.cost_cache, seq, &group_specs, sf_floor, seed, tns_data.as_ref(), write_ics)?;
         if bits <= budget {
             hi = seed;
             chosen = Some(pass);
@@ -917,7 +1119,7 @@ impl Encoder {
             while lo < MAX_SF_OFFSET {
                 let o = (lo + step).min(MAX_SF_OFFSET);
                 let (pass, bits) =
-                    self.encode_pass(&mut st.cost_cache, seq, &group_specs, sf_floor, o, tns_data.as_ref())?;
+                    self.encode_pass(&mut st.cost_cache, seq, &group_specs, sf_floor, o, tns_data.as_ref(), write_ics)?;
                 if bits <= budget {
                     hi = o;
                     chosen = Some(pass);
@@ -930,7 +1132,7 @@ impl Encoder {
             while hi > 0 {
                 let o = (hi - step).max(0);
                 let (pass, bits) =
-                    self.encode_pass(&mut st.cost_cache, seq, &group_specs, sf_floor, o, tns_data.as_ref())?;
+                    self.encode_pass(&mut st.cost_cache, seq, &group_specs, sf_floor, o, tns_data.as_ref(), write_ics)?;
                 if bits > budget {
                     lo = o;
                     break;
@@ -945,7 +1147,7 @@ impl Encoder {
         while lo + 1 < hi {
             let mid = (lo + hi) / 2;
             let (pass, bits) =
-                self.encode_pass(&mut st.cost_cache, seq, &group_specs, sf_floor, mid, tns_data.as_ref())?;
+                self.encode_pass(&mut st.cost_cache, seq, &group_specs, sf_floor, mid, tns_data.as_ref(), write_ics)?;
             if bits <= budget {
                 hi = mid;
                 chosen = Some(pass);
@@ -962,7 +1164,7 @@ impl Encoder {
         let pass = match chosen {
             Some(p) => p,
             None => {
-                self.encode_pass(&mut st.cost_cache, seq, &group_specs, sf_floor, MAX_SF_OFFSET, tns_data.as_ref())?
+                self.encode_pass(&mut st.cost_cache, seq, &group_specs, sf_floor, MAX_SF_OFFSET, tns_data.as_ref(), write_ics)?
                     .0
             }
         };
