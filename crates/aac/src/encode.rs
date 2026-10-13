@@ -41,6 +41,7 @@ use v2v_msmpeg4::BitWriter;
 
 use crate::mdct::{kbd_aac_window, mdct, sine_window, LONG_LEN, SHORT_LEN};
 use crate::tables;
+use crate::tns::{self, Tns};
 use crate::Error;
 
 /// AAC 的窗序列（`window_sequence`，位流里占 2 位）。
@@ -177,6 +178,8 @@ pub struct Encoder {
     overlap: Vec<Vec<f32>>,
     /// 长窗的开窗表（`2N` 长）。
     window: Vec<f32>,
+    /// 采样率索引（TNS 的几张表按它索引）。
+    sr_idx: usize,
     /// 已经编过多少帧 —— 用来交替「这一帧有没有上一帧的右半」。
     frame_index: u64,
     /// 每个频带的边界（含末尾），长 `num_sfb + 1`。
@@ -247,6 +250,7 @@ impl Encoder {
         Ok(Self {
             overlap: vec![vec![0f32; LONG_LEN]; cfg.channels as usize],
             window,
+            sr_idx: sr_idx as usize,
             frame_index: 0,
             swb,
             swb_short,
@@ -450,6 +454,7 @@ impl Encoder {
         seq: WindowSequence,
         groups: &[GroupPlan<'_>],
         group_lens: &[usize],
+        tns_data: Option<&Tns>,
     ) -> crate::Result<(BitWriter, u32)> {
         // `global_gain` = 第一个非零带的 sf（全零帧用 100）。
         let global_gain: u8 = groups
@@ -472,10 +477,9 @@ impl Encoder {
             write_scalefactors(&mut w, &g.band_sf, &g.band_zero, &mut prev_sf);
         }
 
-        // pulse / tns / gain：都不做，各写一个 0 位。
-        w.put(0, 1);
-        w.put(0, 1);
-        w.put(0, 1);
+        w.put(0, 1); // pulse：不做
+        write_tns(&mut w, tns_data);
+        w.put(0, 1); // gain control：不做
 
         for g in groups {
             for sfb in 0..max_sfb {
@@ -522,6 +526,7 @@ impl Encoder {
         group_specs: &[(&[f32], &[u16], usize)],
         sf_floor: i32,
         sf_offset: i32,
+        tns_data: Option<&Tns>,
     ) -> crate::Result<(BitWriter, u32)> {
         let mut prev_sf: Option<i32> = None;
         let mut plans: Vec<GroupPlan<'_>> = Vec::with_capacity(group_specs.len());
@@ -529,7 +534,7 @@ impl Encoder {
             plans.push(self.plan_group(spec, swb, sf_floor, sf_offset, &mut prev_sf));
         }
         let lens: Vec<usize> = group_specs.iter().map(|&(_, _, l)| l).collect();
-        self.write_pass(seq, &plans, &lens)
+        self.write_pass(seq, &plans, &lens, tns_data)
     }
 
 
@@ -672,6 +677,21 @@ impl Encoder {
             swbs.push(self.swb.clone());
         }
 
+        // ---- TNS（只做长窗）----
+        //
+        // 短窗已经在时间上把瞬态切开了，TNS 的收益主要落在**长窗**帧上
+        // （音乐里绝大多数帧），所以先只做长窗 —— 短窗那条路的谱是
+        // 「组→带→组内窗口」重排过的，要做也得先把布局还原回去。
+        let tns_data = if short {
+            None
+        } else {
+            let t = tns::search(&specs[0], &swbs[0], self.sr_idx, self.num_sfb());
+            if let Some(t) = &t {
+                tns::apply(&mut specs[0], t, &swbs[0], self.sr_idx, self.num_sfb());
+            }
+            t
+        };
+
         // ---- 2. sf 的下界：不把峰值系数裁到 MAX_QUANT 之上 ----
         // 取各组的**最严**下界（任何一组被裁都是失真）。
         let sf_floor = specs
@@ -705,7 +725,7 @@ impl Encoder {
         let mut chosen: Option<BitWriter> = None;
         while lo <= hi {
             let mid = (lo + hi) / 2;
-            let (pass, bits) = self.encode_pass(seq, &group_specs, sf_floor, mid)?;
+            let (pass, bits) = self.encode_pass(seq, &group_specs, sf_floor, mid, tns_data.as_ref())?;
             if bits <= budget {
                 chosen = Some(pass);
                 hi = mid - 1;
@@ -718,7 +738,7 @@ impl Encoder {
         // 让码率超标比「编不出东西」好 —— 而且这种情况只会在极端配置下出现。
         let pass = match chosen {
             Some(p) => p,
-            None => self.encode_pass(seq, &group_specs, sf_floor, hi.max(0))?.0,
+            None => self.encode_pass(seq, &group_specs, sf_floor, hi.max(0), tns_data.as_ref())?.0,
         };
         w.append(&pass);
         Ok(short)
@@ -1161,6 +1181,31 @@ fn write_ics_info(w: &mut BitWriter, max_sfb: u8, seq: WindowSequence, group_len
     } else {
         w.put(u32::from(max_sfb), 6);
         w.put(0, 1); // predictor_data_present（LC 不允许预测，恒 0）
+    }
+}
+
+/// `tns_data` 的写出（长窗：`n_filt` 2 位、`length` 6 位、`order` 5 位）。
+///
+/// ⚠️ `coef_compress` **恒写 0**：开了压缩，解码端会改用另一张量化表
+/// （`tns_tmp2_map_1_4`），而编码端的「压缩」只是平移索引 —— 两端的系数值
+/// 就对不上了。少一位不如少一个 bug（ffmpeg 的注释也说这条压缩并不无损）。
+fn write_tns(w: &mut BitWriter, tns_data: Option<&Tns>) {
+    match tns_data {
+        None => w.put(0, 1), // tns_data_present = 0
+        Some(t) => {
+            w.put(1, 1); // tns_data_present
+            w.put(t.filters.len() as u32, 2); // n_filt（长窗 2 位）
+            w.put(1, 1); // coef_res = 1（4 位系数）
+            for f in &t.filters {
+                w.put(u32::from(f.length), 6);
+                w.put(u32::from(f.order), 5);
+                w.put(u32::from(f.direction), 1);
+                w.put(0, 1); // coef_compress = 0
+                for &c in &f.coef_idx {
+                    w.put(u32::from(c), 4);
+                }
+            }
+        }
     }
 }
 

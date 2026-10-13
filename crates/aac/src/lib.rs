@@ -41,6 +41,7 @@
 mod encode;
 pub mod mdct;
 pub mod tables;
+mod tns;
 
 pub use encode::{AudioSpecificConfig, Encoder, EncoderConfig, Frame, AOT_AAC_LC};
 // 错误类型复用 msmpeg4 的（`mp4v` 也是这么做的）—— 它本来就是「编解码器的通用错误」。

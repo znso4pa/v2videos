@@ -264,6 +264,20 @@ def gen():
     o.ints("CB_MAXVAL", "u8", nums(body(et, "aac_cb_maxval")))
     o.ints("CB_RANGE", "u8", nums(body(et, "aac_cb_range")))
 
+    # ── TNS（时域噪声整形）─────────────────────────────────────────────────
+    # `tns_tmp2_map_0_4`：4 位系数量化表（16 项）。编码端量化与解码端重建**用同一张**，
+    # 所以必须一致 —— 它也是「为什么不能开系数压缩」的原因：开了压缩，解码端会改用
+    # `tns_tmp2_map_1_4`（另一张表），两端的值就对不上了。
+    tns_map = [float(x) for x in re.findall(r"-?\d+\.\d+", body(at, "tns_tmp2_map_0_4"))]
+    assert len(tns_map) == 16, f"tns_tmp2_map_0_4 项数 {len(tns_map)}"
+    o.w("/// `tns_tmp2_map_0_4`：TNS 的 4 位系数量化表（编码端量化 / 解码端重建共用）。\n")
+    o.w("pub static TNS_COEF_4BIT: [f32; 16] = [\n")
+    for v in tns_map:
+        o.w(f"    {v},\n")
+    o.w("];\n\n")
+    o.ints("TNS_MAX_BANDS_1024", "u8", nums(body(at, "ff_tns_max_bands_1024")))
+    o.ints("TNS_MIN_SFB_LONG", "u8", nums(body(et, "tns_min_sfb_long"))[:13])
+
     # 采样率索引 → 采样率（用于 AudioSpecificConfig 的 4 位字段）。
     o.ints(
         "SAMPLE_RATES",
