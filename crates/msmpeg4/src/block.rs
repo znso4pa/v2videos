@@ -16,6 +16,7 @@
 
 use crate::bitreader::BitReader;
 use crate::error::{Error, Result};
+use crate::tables;
 use crate::vlc::Vlc;
 
 /// 一张 RL 表：前缀码 + 每个符号的 (run, level) + `last` 分界，外加两张派生表。
@@ -71,6 +72,39 @@ impl RlTable {
             max_run,
             index_run,
         }
+    }
+
+    /// `ff_rl_table` 的 6 张表：0/1/2 = 帧内亮度（低 / 高 / 中运动），3/4/5 = 色度 / 帧间。
+    ///
+    /// ⚠️ **解码端与编码端共用这一份** —— 这张派发表以前在 `frame.rs` 与 `encode.rs`
+    /// 里各写了一遍（逐项参数完全相同）。按 AGENTS.md「一张派发表只有一份真源」：
+    /// 加表、改 `last`、换码表都只改这里。
+    ///
+    /// 2 与 5 是 MPEG-4 的通用表（`ff_mpeg4_rl_intra` / `ff_h263_rl_inter`，各 102 项）——
+    /// 都已经生成好了。P 帧的 `rl_table_index = 2` 会落到 5（`3 + 2`）。
+    ///
+    /// 下标越界**明确报 Unsupported**，不猜一张表顶上（读坏帧头时 `rl_table_index`
+    /// 可以到 3 以上）。
+    pub fn for_standard(index: usize) -> Result<Self> {
+        Ok(match index {
+            0 => Self::new(&tables::RL0_VLC, &tables::RL0_RUN, &tables::RL0_LEVEL, 85),
+            1 => Self::new(&tables::RL2_VLC, &tables::RL2_RUN, &tables::RL2_LEVEL, 119),
+            2 => Self::new(
+                &tables::RL_INTRA_VLC,
+                &tables::RL_INTRA_RUN,
+                &tables::RL_INTRA_LEVEL,
+                67,
+            ),
+            3 => Self::new(&tables::RL1_VLC, &tables::RL1_RUN, &tables::RL1_LEVEL, 81),
+            4 => Self::new(&tables::RL4_VLC, &tables::RL4_RUN, &tables::RL4_LEVEL, 99),
+            5 => Self::new(
+                &tables::RL_INTER_VLC,
+                &tables::RL_INTER_RUN,
+                &tables::RL_INTER_LEVEL,
+                58,
+            ),
+            _ => return Err(Error::Unsupported(format!("RL 表下标 {index}"))),
+        })
     }
 
     /// **编码侧**的反查：`(last, run, level)` → 符号下标。

@@ -254,9 +254,9 @@ impl Decoder {
 
         // 系数表：帧内用 `rl_table_index`（亮度）/ `3 + rl_chroma_table_index`（色度）；
         // 帧间一律 `3 + rl_table_index`。
-        let rl_luma = rl_table(header.rl_table_index as usize)?;
-        let rl_chroma = rl_table(3 + header.rl_chroma_table_index as usize)?;
-        let rl_inter = rl_table(3 + header.rl_table_index as usize)?;
+        let rl_luma = RlTable::for_standard(header.rl_table_index as usize)?;
+        let rl_chroma = RlTable::for_standard(3 + header.rl_chroma_table_index as usize)?;
+        let rl_inter = RlTable::for_standard(3 + header.rl_table_index as usize)?;
         let mb_intra_vlc = Vlc::new(&tables::MB_INTRA);
         let mb_non_intra_vlc = Vlc::new(&tables::MB_NON_INTRA);
         let dc_vlc = Vlc::new(&tables::DC[header.dc_table_index as usize][0]);
@@ -922,32 +922,6 @@ pub fn mc_mb(
         no_rounding,
     );
     (p.dxy, emu)
-}
-
-/// `ff_rl_table` 的 6 张表。0/1/2 = 帧内亮度（低/高/中运动），3/4/5 = 色度 / 帧间。
-/// 其中 2 与 5 是 MPEG-4 的通用表，目前没生成 —— 遇到就明确报 Unsupported，不猜。
-fn rl_table(index: usize) -> Result<RlTable> {
-    Ok(match index {
-        0 => RlTable::new(&tables::RL0_VLC, &tables::RL0_RUN, &tables::RL0_LEVEL, 85),
-        1 => RlTable::new(&tables::RL2_VLC, &tables::RL2_RUN, &tables::RL2_LEVEL, 119),
-        2 => RlTable::new(
-            &tables::RL_INTRA_VLC,
-            &tables::RL_INTRA_RUN,
-            &tables::RL_INTRA_LEVEL,
-            67,
-        ),
-        3 => RlTable::new(&tables::RL1_VLC, &tables::RL1_RUN, &tables::RL1_LEVEL, 81),
-        4 => RlTable::new(&tables::RL4_VLC, &tables::RL4_RUN, &tables::RL4_LEVEL, 99),
-        // 5 = 帧间通用表 `ff_h263_rl_inter`（n=102, last=58）。P 帧的 `rl_table_index=2`
-        // 会落到这里（`3 + 2`）。
-        5 => RlTable::new(
-            &tables::RL_INTER_VLC,
-            &tables::RL_INTER_RUN,
-            &tables::RL_INTER_LEVEL,
-            58,
-        ),
-        _ => return Err(Error::Unsupported(format!("RL 表下标 {index}"))),
-    })
 }
 
 #[cfg(test)]
