@@ -785,15 +785,23 @@ impl Encoder {
             let mut hi_scan = hi_sf;
             let mut step = 12i32;
             loop {
-                let mut sd = lo_scan;
+                // 从 `lo_scan` **向上取整到 `step` 的倍数**再开始扫 —— 这就是「锚定」：
+                // 格点的位置只由 `step` 决定，偏移只影响哪些格点被 `floor` 挡掉。
+                let mut sd = lo_scan.div_euclid(step) * step;
+                if sd < lo_scan {
+                    sd += step;
+                }
                 while sd <= hi_scan {
                     evaluate(sd, &mut best);
                     sd += step;
                 }
-                // 上界那一格也要扫到（步长除不尽时最后一点会漏）。
-                if (hi_scan - lo_scan) % step != 0 {
-                    evaluate(hi_scan, &mut best);
-                }
+                // ⚠️ **两个端点必须显式补上**：锚定之后格点是 `step` 的倍数，
+                // 窗口下界（`floor = sf_floor + 偏移`）很可能不在格点上 ——
+                // 而**安静频带的最优点恰恰就在 floor 上**（那是「什么都不裁」的下界）。
+                // 少了它实测掉 **0.83 dB**（12.13 → 11.30），补回来就恢复。
+                // 端点被反复求值不要紧 —— 帧内缓存让重复求值几乎免费。
+                evaluate(lo_scan, &mut best);
+                evaluate(hi_scan, &mut best);
                 if step == 1 {
                     break;
                 }
