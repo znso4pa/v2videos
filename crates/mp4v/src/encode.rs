@@ -189,6 +189,12 @@ pub struct Encoder {
     cur_qscale: u8,
     /// 码率控制器的状态。`cfg.bitrate` 是 `None` 时也是 `None`。
     rc: Option<RateCtl>,
+    /// **参考帧的 MV 场**（每宏块一个，光栅序）—— 运动估计的**时间预测**。
+    ///
+    /// 菱形搜索从三个起点各走一遍：`(0,0)`（静止）、`pred`（邻居中值）、
+    /// 以及**同位宏块在上一帧的 MV**（运动的连续性）。
+    /// 空 `Vec` = 还没有上一帧（第一帧 P 帧），那时只走前两个起点。
+    mv_prev: Vec<(i32, i32)>,
 }
 
 /// 单趟**跨帧反馈**式码率控制的状态。
@@ -284,6 +290,7 @@ impl Encoder {
             intra_mbs_last: 0,
             cur_qscale: cfg.qscale,
             rc: cfg.bitrate.map(|b| RateCtl::new(b, cfg.fps_num)),
+            mv_prev: Vec::new(),
             cfg,
         })
     }
@@ -518,6 +525,8 @@ impl Encoder {
         // 两处都加会变成每帧 +2，GOP 直接减半。
         self.last_key_frame = false;
 
+        // 时间预测要用**参考帧**的 MV 场 —— 取出来（绕开借用），编完再写回本帧的。
+        let mv_prev = std::mem::take(&mut self.mv_prev);
         let mut st = PState {
             refp: &refp,
             cur: Planes::new(pw, ph),
@@ -535,6 +544,7 @@ impl Encoder {
             dc: DcGrid::new(mb_w, mb_h, y_dc_scale, c_dc_scale),
             ac: AcGrid::new(mb_w, mb_h),
             mv: vec![(0, 0); mb_w * mb_h],
+            mv_prev: &mv_prev,
             intra_mbs: 0,
             rl_intra: &rl_intra,
             rl_inter: &rl_inter,
@@ -547,6 +557,8 @@ impl Encoder {
 
         self.intra_mbs_last = st.intra_mbs;
         self.reference = Some(st.cur);
+        // 本帧的 MV 场留给下一帧当**时间预测**的起点。
+        self.mv_prev = std::mem::take(&mut st.mv);
         Ok(self.note_frame(w.finish()))
     }
 
@@ -764,6 +776,8 @@ struct PState<'a> {
     ac: AcGrid,
     /// 每宏块一个 MV（只做 16×16 模式，亮度那 2×2 个格子填的是同一个值）。
     mv: Vec<(i32, i32)>,
+    /// 参考帧的 MV 场（时间预测的起点）。长度对不上就当作没有。
+    mv_prev: &'a [(i32, i32)],
     intra_mbs: usize,
     rl_intra: &'a RlTable,
     rl_inter: &'a RlTable,
@@ -795,17 +809,23 @@ impl PState<'_> {
         (mid_pred(a.0, b.0, c.0), mid_pred(a.1, b.1, c.1))
     }
 
-    /// 运动估计：整像素粗搜（两个中心各 ±`ME_RANGE`）+ 半像素细化。
+    /// 运动估计：**三个起点 + 菱形搜索（LDSP）+ 全搜 ±2 收尾**，最后半像素细化。
     ///
-    /// 两个中心是 `(0,0)`（静止场景）与预测值（运动场景）。结果再夹进
-    /// `clamp_mv` 的可表示集合 —— 夹完的 MV 一定能被解码端原样还原。
+    /// 起点是 `(0,0)`（静止）、`pred`（邻居中值，运动场景）与**同位宏块上一帧的 MV**
+    /// （运动的连续性）。结果再夹进 `clamp_mv` 的可表示集合 —— 夹完的 MV 一定能被
+    /// 解码端原样还原。
     ///
-    /// ## 为什么仍是全搜
+    /// ## 为什么不是全搜
     ///
-    /// 试过换成菱形搜索（LDSP + ±2 收尾）：候选从 578 降到 ~50、快 4 倍，
-    /// 但在一段运动较多的素材上 **-0.35 dB**（同码率，且体积还大 0.3%）。
-    /// 本仓的取舍是「main 允许正确但慢」，而我们本来就落后 ffmpeg 0.4–0.6 dB，
-    /// 所以**不拿画质换这一档速度**。真正的提速应该走「同样的候选、更便宜的一遍」。
+    /// 全搜是 `17×17 × 2 个中心 = 578` 个候选，每个候选都要搬 16×16 个像素再求和，
+    /// 实测占了视频侧 **94%** 的时间（全 I 帧 500 帧 0.59 s vs GOP12 10.07 s）。
+    /// 菱形通常 20–40 个候选就落在同一个（或更好的）SAD 上。
+    ///
+    /// ## ⚠️ 这会改变输出
+    ///
+    /// MV 不同 → 位流不同。所以它不是「同语义更快」：质量必须重新对账
+    /// （**固定 qscale** 下比 PSNR 与体积 —— 开码率控制时不同的 MV 场会让控制器
+    /// 落到不同的 qscale，比出来的差不干净）。三个起点就是为了把这一档差补回来。
     fn motion_estimate(&self, mbx: usize, mby: usize, pred: (i32, i32)) -> (i32, i32) {
         let (pw, ph) = (self.pw, self.refp.ph);
         let refp = self.refp;
@@ -820,9 +840,7 @@ impl PState<'_> {
             let p = mc_params(mbx, mby, mv, pw, ph);
             // **整像素、且不用边缘复制**时，参考块就是参考帧里的一个 16×16 矩形：
             // 直接算 SAD，省掉「先 `mc_luma16` 拷进 `tmp` 再读出来」的两趟内存流量。
-            // 全搜的候选里 98% 是这种（半像素只有最后那 9 个），所以这一条很值。
-            // 值与原路径**逐位相同**（`dxy == 0` 时 `put_pixels` 就是纯拷贝），
-            // 所以输出逐字节不变。
+            // 值与原路径**逐位相同**（`dxy == 0` 时 `put_pixels` 就是纯拷贝）。
             if p.dxy == 0 && !p.need_emu {
                 let base = p.src_y as usize * pw + p.src_x as usize;
                 let mut acc = 0u64;
@@ -842,42 +860,88 @@ impl PState<'_> {
             acc
         };
 
-        let mut best = (0i32, 0i32);
-        let mut best_sad = sad_of(best);
-        // 两个搜索窗可能**大幅重叠**（`pred ≈ (0,0)` 时几乎完全重合），所以重叠区
-        // 只算一次。原来是拿 `HashSet` 去重 —— 每个宏块一次堆分配、每个候选一次哈希：
-        // 500 帧的素材下来是 15 万次分配 / 8700 万次插入，全是纯开销。
+        // ---- 三个起点**各走一遍菱形**，取最好的结果 ----
         //
-        // 改成「先算出重叠矩形，第二个窗跳过它」：候选的**集合**与**求值顺序**
-        // 都和 `HashSet` 版本一致，所以输出逐字节不变。
-        let lo_x = (-ME_RANGE).max(pred.0 - ME_RANGE);
-        let hi_x = ME_RANGE.min(pred.0 + ME_RANGE);
-        let lo_y = (-ME_RANGE).max(pred.1 - ME_RANGE);
-        let hi_y = ME_RANGE.min(pred.1 + ME_RANGE);
-        let overlap = lo_x <= hi_x && lo_y <= hi_y;
-        for (center, second) in [((0i32, 0i32), false), (pred, true)] {
-            for dy in -ME_RANGE..=ME_RANGE {
-                for dx in -ME_RANGE..=ME_RANGE {
-                    let cand = (center.0 + dx, center.1 + dy);
-                    if second
-                        && overlap
-                        && (lo_x..=hi_x).contains(&cand.0)
-                        && (lo_y..=hi_y).contains(&cand.1)
-                    {
-                        continue; // 第一个窗已经算过
+        // 只从「三个起点里最好的那个」出发是不够的：SAD 面在强边缘 + 细线上是**多峰**的，
+        // 从一个起点出发的菱形会落在离它最近的那个盆地里。三个起点各走一遍
+        // （约 3×30 个候选，仍比全搜的 578 少一个数量级）才把「漏掉真最优」压下去。
+        let temporal = self.mv_prev.get(mby * self.mb_w + mbx).copied();
+        let mut starts = [(0i32, 0i32); 3];
+        starts[0] = (0, 0);
+        starts[1] = pred;
+        let mut n_starts = 2;
+        if let Some(t) = temporal {
+            starts[n_starts] = t;
+            n_starts += 1;
+        }
+
+        // 搜索窗 = 三个起点各自的 ±`ME_RANGE`。
+        let in_window = |c: (i32, i32)| -> bool {
+            let near =
+                |cx: i32, cy: i32| (c.0 - cx).abs() <= ME_RANGE && (c.1 - cy).abs() <= ME_RANGE;
+            starts[..n_starts].iter().any(|&(sx, sy)| near(sx, sy))
+        };
+
+        // 8 个点（±2 与对角）。菱形只覆盖 `(±2,0)/(0,±2)/(±1,±1)`，
+        // 所以每个起点走完还要补一圈全搜 ±2。
+        const LDSP: [(i32, i32); 8] = [
+            (0, -2),
+            (1, -1),
+            (2, 0),
+            (1, 1),
+            (0, 2),
+            (-1, 1),
+            (-2, 0),
+            (-1, -1),
+        ];
+        let mut best = (0i32, 0i32);
+        let mut best_sad = u64::MAX;
+        for &start in &starts[..n_starts] {
+            let mut cur_best = start;
+            let mut cur_sad = sad_of(start);
+            // 大菱形走到收敛（硬上限只是防御：窗口有限，正常几个来回就收敛）。
+            for _ in 0..32 {
+                let mut improved = false;
+                for &(dx, dy) in &LDSP {
+                    let cand = (cur_best.0 + dx, cur_best.1 + dy);
+                    if !in_window(cand) {
+                        continue;
                     }
                     let s = sad_of(cand);
-                    if s < best_sad {
-                        best_sad = s;
-                        best = cand;
-                        if s == 0 {
-                            // 完全匹配，再搜也不会有更低的。
-                            return clamp_mv(best, pred);
-                        }
+                    if s < cur_sad {
+                        cur_sad = s;
+                        cur_best = cand;
+                        improved = true;
+                    }
+                }
+                if !improved {
+                    break;
+                }
+            }
+            // 收尾：最优周围全搜 ±2（补菱形漏掉的格子）。
+            let base = cur_best;
+            for dy in -2..=2i32 {
+                for dx in -2..=2i32 {
+                    let cand = (base.0 + dx, base.1 + dy);
+                    if cand == base || !in_window(cand) {
+                        continue;
+                    }
+                    let s = sad_of(cand);
+                    if s < cur_sad {
+                        cur_sad = s;
+                        cur_best = cand;
                     }
                 }
             }
+            if cur_sad < best_sad {
+                best_sad = cur_sad;
+                best = cur_best;
+            }
+            if best_sad == 0 {
+                return clamp_mv(best, pred);
+            }
         }
+
         // 半像素细化：最优整像素周围 ±1 个半像素。
         let base = best;
         for dy in -1..=1i32 {

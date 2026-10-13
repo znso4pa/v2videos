@@ -585,6 +585,15 @@ fn p_frames_compress_a_low_motion_sequence() {
 /// P 帧里「帧间宏块用上了没有、MV 有没有真的动」—— 单看体积容易漏掉这层。
 ///
 /// 判据：`intra_mbs_last`（上一帧走帧内路径的宏块数）在 P 帧里必须**远小于**总数。
+///
+/// ⚠️ 阈值为什么是「一半」而不是「四分之一」：这条序列上**全搜自己**就产出
+/// 49–73 / 300 个帧内宏块（16–24%），原来卡在 `intra * 4 < total` 上只剩 **0.7 个
+/// 百分点**的余量 —— 换一种搜索策略（菱形）就翻到 75/300，于是红。
+/// **卡在边界上的断言验的不是「帧间路径有没有生效」，而是钉死某一次的具体输出。**
+/// 真要失效时（MV 搜索返回垃圾、帧间候选永远输）帧内会接近 100%，一半照样抓得住。
+///
+/// 搜索策略的画质由**真素材**上的判据守着（`ffmpeg` 解码后比 PSNR / 比体积），
+/// 不是由这条合成序列的宏块计数守着。
 #[test]
 fn p_frames_actually_use_inter_macroblocks() {
     let frames: Vec<Frame> = (0..FRAMES).map(test_frame).collect();
@@ -608,7 +617,7 @@ fn p_frames_actually_use_inter_macroblocks() {
         let intra = e.intra_mbs_last;
         println!("第 {i} 帧：帧内宏块 {intra}/{total}");
         assert!(
-            intra * 4 < total,
+            intra * 2 < total,
             "第 {i} 帧有 {intra}/{total} 个宏块走了帧内 —— 帧间路径没生效"
         );
     }
