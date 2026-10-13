@@ -326,7 +326,7 @@ mod tests {
 
         // 手工造两个滤波器：4 阶、覆盖 12 条带（与 `search` 的结构一致）
         for (order, dir) in [(4usize, false), (4usize, true)] {
-            let coef_idx: Vec<u8> = (0..order).map(|i| (i as u8 % 16)).collect();
+            let coef_idx: Vec<u8> = (0..order).map(|i| i as u8 % 16).collect();
             let val: Vec<f32> = coef_idx
                 .iter()
                 .map(|&i| tables::TNS_COEF_4BIT[i as usize])

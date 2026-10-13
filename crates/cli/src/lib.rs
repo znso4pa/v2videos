@@ -142,7 +142,8 @@ impl Default for ConvertOptions {
 #[derive(Debug, Clone)]
 pub struct ConvertReport {
     pub frames: usize,
-    /// 关键帧数（含首帧）。`.mp4` 目前是**全 I 帧**，所以这里等于 `frames`。
+    /// 关键帧数（含首帧）。`.wmv` 恒等于 `frames`（MP43 那条路全 I 帧）；
+    /// `.mp4` 是编码器**真正标了**关键帧的帧数（`-g 0` 时才是全 I 帧）。
     pub key_frames: usize,
     /// 写进输出的音频样本数。
     ///
