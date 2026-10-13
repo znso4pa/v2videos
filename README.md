@@ -64,7 +64,7 @@ V2V_ASF_SAMPLE=/path/to/sample.wmv cargo test --release -- --ignored
 | **解封装**  | ASF / WMV（`v2v-asf`）、AVI（`v2v-avi`）                                                                         | 与 `ffprobe` 逐字段对：轨道、尺寸、包数、关键帧数                                                                  |
 | **解码**   | MS-MPEG-4 v3（MP43）：I 帧 + P 帧（skip、MV 中值预测、半像素运动补偿、帧间残差）                                                     | 与 `ffmpeg` **逐像素**对：整段样本**每一帧最大差 0**                                                            |
 | **编码**   | MP43 **I 帧 + P 帧**：正向 DCT + 量化 + DC / RL 熵编码、运动估计（整像素粗搜 + 半像素细化）、skip 宏块                                    | 编出来的 I+P 序列交给 `ffmpeg` 解，与自己的解码器**逐像素一致**                                                       |
-| **编码**   | MPEG-4 Part 2（`v2v-mp4v`）**I 帧 + P 帧**：DC / AC 预测（逐宏块比位数择优）、运动估计（整像素粗搜 + 半像素细化）、中值 MV 预测、skip 宏块、逐宏块帧内/帧间判决 | 编出来的流交给 `ffmpeg` 解，真样本 **44.8 dB**（同 qscale 下 ffmpeg 自己的 mpeg4 是 43.6 dB）；**视频载荷比全 I 帧小 2.3 倍** |
+| **编码**   | MPEG-4 Part 2（`v2v-mp4v`）**I 帧 + P 帧**：DC / AC 预测（逐宏块比位数择优）、运动估计（整像素粗搜 + 半像素细化）、中值 MV 预测、skip 宏块、逐宏块帧内/帧间判决；`--video-bitrate` 时**逐帧调 qscale** 的码率控制 | 编出来的流交给 `ffmpeg` 解，真样本 **44.8 dB**（同 qscale 下 ffmpeg 自己的 mpeg4 是 43.6 dB）；**视频载荷比全 I 帧小 2.3 倍**；码率控制实测命中目标（371→373、621→618 kbps） |
 | **音频直通** | 转换时原样搬音频轨（ASF 多流复用）                                                                                         | 真样本整文件（208 秒音乐）：输出音频与源**逐样本 0 差异**（36,700,160 字节完全一致）                                           |
 | **音频解码** | WMA v1/v2（`v2v-wma`）→ PCM                                                                                   | 真样本整轨与 ffmpeg 的 PCM **最大差 2**（s16 满量程 32768）；转进 MP4 后**对齐偏移 0 采样点**                             |
 | **音频编码** | AAC-LC（`v2v-aac`）：MDCT + 量化 + Huffman 码本 + **短窗**（瞬态）+ 窗口分组 + **TNS**（长窗）；二分搜 sf 偏移够目标码率 | ffmpeg 解得开；码率命中目标；真音乐上质量随码率**单调**变好（127k / 256k = 11.5 / 18.3 dB，同码率 ffmpeg 的 AAC 是 13.1 / 22.2 dB）；瞬态素材上**短窗 vs 长窗 12.02 vs 10.49 dB、体积小 29%** |
@@ -100,9 +100,12 @@ AAC 编码器现在**比 ffmpeg 的 AAC 低 1.6–3.8 dB**（127k / 256k 的真�
 ```bash
 cargo run --release -p v2v-cli -- convert <输入.wmv>... -o <输出目录> [-q 6] [-g 250] [-n 100]
 cargo run --release -p v2v-cli -- convert --mp4 <输入.wmv>... -o <输出目录> [-q 6] [-g 12] [--fps 25]
+cargo run --release -p v2v-cli -- convert --mp4 --video-bitrate 500k <输入.wmv>... -o <输出目录>
 ```
 
 `.mp4` 的音频默认 AAC：`--aac-bitrate 128000` 给目标码率，`--pcm` 退回未压缩 `sowt`。
+`--video-bitrate` 只对 `.mp4` 有效：给了它就按目标码率**逐帧调 qscale**（`-q` 退化成起步值），
+转完会报**实际**码率；不传就还是按固定的 `-q` 编。
 
 批量：一个输入失败不影响其他。默认（`.wmv`）转完会把输出**解码回来**与源帧比 PSNR；  
 `--mp4` 不做这个校验 —— 我们只有 `mp4v` 编码器、没有解码器（那条路的正确性由  

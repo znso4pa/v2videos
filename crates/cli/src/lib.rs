@@ -103,6 +103,11 @@ pub struct ConvertOptions {
     ///
     /// 这是**目标**不是保证：编码器不做码率控制，实际码率在它附近浮动。
     pub aac_bitrate: u32,
+    /// `.mp4` 的**视频**目标码率（bit/s）。`None` = 按固定的 `qscale` 编（默认）。
+    ///
+    /// 开着的时候 `qscale` 只当**起步值**，编码器逐帧调它去够目标码率。
+    /// 只对 `.mp4` 有效 —— `.wmv` 那条路（MP43）还没有码率控制。
+    pub video_bitrate: Option<u32>,
 }
 
 /// `.mp4` 的音频轨编码方式。
@@ -134,6 +139,7 @@ impl Default for ConvertOptions {
             fps: None,
             audio: Mp4Audio::default(),
             aac_bitrate: 128_000,
+            video_bitrate: None,
         }
     }
 }
@@ -158,6 +164,10 @@ pub struct ConvertReport {
     ///
     /// `.mp4` 恒为 `None` —— 我们只有 `mp4v` 编码器、没有解码器，没法自己校验，见模块文档。
     pub psnr_db: Option<f64>,
+    /// `.mp4` 视频轨的**实际**平均码率（kbps）。开了 `--video-bitrate` 才有。
+    ///
+    /// 码率控制唯一值得看的数就是它 —— 落在目标附近才算真的生效了。
+    pub video_kbps: Option<f64>,
 }
 
 /// 转码错误。
@@ -453,6 +463,8 @@ fn convert_to_asf(
         bytes_in,
         bytes_out: wmv.len() as u64,
         psnr_db,
+        // `.wmv`（MP43）那条路还没有码率控制。
+        video_kbps: None,
     })
 }
 
@@ -613,12 +625,13 @@ fn convert_to_mp4(
         .unwrap_or(DEFAULT_FPS)
         .clamp(1, 120);
 
-    // ---- 视频编码器：MPEG-4 Part 2，全 I 帧 ----
+    // ---- 视频编码器：MPEG-4 Part 2 ----
     let mut enc = v2v_mp4v::Encoder::new(v2v_mp4v::EncoderConfig {
         width: w,
         height: h,
         fps_num: fps,
         qscale: opts.qscale,
+        bitrate: opts.video_bitrate,
         keyframe_interval: opts.keyframe_interval,
         ..Default::default()
     })?;
@@ -821,6 +834,11 @@ fn convert_to_mp4(
     let mp4 = mux.finish();
     write_out(output, &mp4)?;
 
+    // 码率控制开着时把**实际**码率报出去 —— 这是唯一能证明它生效的数。
+    let video_kbps = enc.rate_control_stats().and_then(|(n, bits)| {
+        (n > 0).then(|| bits as f64 / n as f64 * f64::from(fps) / 1000.0)
+    });
+
     Ok(ConvertReport {
         frames,
         key_frames,
@@ -830,6 +848,7 @@ fn convert_to_mp4(
         bytes_out: mp4.len() as u64,
         // 没有 mp4v 解码器可比，见模块文档。
         psnr_db: None,
+        video_kbps,
     })
 }
 
