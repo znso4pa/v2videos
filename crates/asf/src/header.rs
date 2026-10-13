@@ -14,6 +14,21 @@ use crate::types::{AudioFormat, FileInfo, PayloadExt, Stream, StreamKind, VideoF
 /// 单个对象 payload 的上限。防一个坏 `Size` 直接把内存吃光。
 const MAX_OBJECT: usize = 16 * 1024 * 1024;
 
+/// `Max Packet Size` 的上限。
+///
+/// 这个字段是**文件自己声明的**，而 `read_one_packet` 的读法是
+/// 「先按它分配整包缓冲」（`vec![0u8; packet_size]`）—— 不挡的话，一个坏文件
+/// 声明 4 GiB 就真的会去分配 4 GiB。
+///
+/// ⚠️ **ffmpeg 也有这个字段不校验**（它只查 `min_pktsize`），但它**不按它分配**：
+/// 包体是逐字段从流里读的，`max_pktsize` 只当默认值与 seek 数学用。我们的读法是
+/// 「整包进内存再解析」，所以这一条得自己挡。
+///
+/// 取值：与 `MAX_OBJECT` 同一个量级（同一个理由）。参照 ffmpeg 的 ASF **封装器**
+/// 自己的上限是 65536（`asfenc.c` 的 `PACKET_SIZE_MAX`）、默认 3200 —— 16 MiB 是
+/// 它们的 256× / 5000×，不会误伤合法文件。
+const MAX_PACKET: u32 = 16 * 1024 * 1024;
+
 pub(crate) struct Header {
     pub info: FileInfo,
     pub streams: Vec<Stream>,
@@ -102,6 +117,9 @@ fn parse_file_properties(c: &mut Cursor, info: &mut FileInfo) -> Result<()> {
     info.max_packet_size = c.u32()?;
     if info.min_packet_size >= (1 << 29) {
         return Err(Error::Bad("min packet size too large"));
+    }
+    if info.max_packet_size > MAX_PACKET {
+        return Err(Error::Bad("max packet size too large"));
     }
     info.max_bitrate = c.u32()?;
     Ok(())
