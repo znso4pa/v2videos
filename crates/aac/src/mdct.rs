@@ -158,15 +158,36 @@ fn bessel_i0(x: f64) -> f64 {
 /// → **解码输出电平固定偏小**（实测比值 0.532，四档幅度都一样）。
 /// 这种「形状全对、只差一个常数倍」的错误最容易被当成「调参问题」去试，
 /// 而它其实是**定标契约**没对上。
+/// ## 余弦用**三项递推**生成，不在内层调 `cos()`
+///
+/// 内层角度 `base·(i + 0.5 + n/2)` 对 `i` 是**等差**的（步长就是 `base`），
+/// 所以整串余弦可以用切比雪夫递推生成：
+///
+/// ```text
+/// cos(θ + step) = 2·cos(step)·cos(θ) − cos(θ − step)
+/// ```
+///
+/// 每个样本 **2 乘 1 减**，替掉一次 libm 的 `cos()`（长窗一次 MDCT 是
+/// `1024 × 2048 ≈ 210 万`次）。递推在 f64 下稳定（等价于平面旋转，误差 ~n·eps
+/// ≈ 1e-13），而输出最后只取 f32（精度 6e-8）—— `mdct_round_trips_with_overlap`
+/// 与 ffmpeg 的 SNR 对账都钉着这条。
 pub fn mdct(input: &[f32], out: &mut [f32]) {
     let n = out.len();
     debug_assert_eq!(input.len(), 2 * n);
     let scale = PI / n as f64;
+    let offset = 0.5 + n as f64 / 2.0;
     for (k, o) in out.iter_mut().enumerate() {
         let base = scale * (k as f64 + 0.5);
+        let two_cos_step = 2.0 * base.cos();
+        let start = base * offset;
+        let mut prev = (start - base).cos();
+        let mut cur = start.cos();
         let mut s = 0f64;
-        for (i, &x) in input.iter().enumerate() {
-            s += x as f64 * (base * (i as f64 + 0.5 + n as f64 / 2.0)).cos();
+        for &x in input.iter() {
+            s += x as f64 * cur;
+            let next = two_cos_step * cur - prev;
+            prev = cur;
+            cur = next;
         }
         *o = (2.0 * s) as f32;
     }

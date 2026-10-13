@@ -826,22 +826,42 @@ impl WmaDecoder {
     /// ⚠️ **整体取负**。教科书 IMDCT 用 `+cos(...)`，但 ffmpeg 的 MDCT 约定是它的
     /// 相反数 —— 实测：我们的输出与 ffmpeg 的 PCM 互相关正好是 **−1.0000**
     /// （完美反相、幅度与波形全对）。所以这里取负号，不是「调参」。
+    ///
+    /// ## 余弦用**三项递推**生成，不在内层调 `cos()`
+    ///
+    /// `ang(i) = π/n·(k+0.5)·(i + 0.5 + n/2)` 对 `i` 是**等差**的
+    /// （`ang(i) = ang(0) + i·step`），所以整串余弦可以由切比雪夫递推生成：
+    ///
+    /// ```text
+    /// cos(θ + step) = 2·cos(step)·cos(θ) − cos(θ − step)
+    /// ```
+    ///
+    /// 每个样本 **2 乘 1 减**，替掉一次 libm 的 `cos()` —— 这不是微调：
+    /// 递推在 f64 下稳定（与平面旋转等价，误差 ~1e-12），而输出最后只取 f32
+    /// （精度 6e-8），所以值看不出差别。
     fn imdct(&mut self, ch: usize) {
         let l = self.block_len;
         let n = l;
         for v in self.output[..2 * l].iter_mut() {
             *v = 0.0;
         }
+        let nf = n as f64;
+        let half_plus = 0.5 + nf / 2.0;
         for k in 0..l {
             let c = self.coefs[ch][k];
             if c == 0.0 {
                 continue;
             }
-            for i in 0..2 * l {
-                let ang = std::f64::consts::PI / n as f64
-                    * (i as f64 + 0.5 + n as f64 / 2.0)
-                    * (k as f64 + 0.5);
-                self.output[i] -= (c as f64 * ang.cos()) as f32;
+            let step = std::f64::consts::PI / nf * (k as f64 + 0.5);
+            let two_cos_step = 2.0 * step.cos();
+            let base = step * half_plus;
+            let mut prev = (base - step).cos();
+            let mut cur = base.cos();
+            for v in self.output[..2 * l].iter_mut() {
+                *v -= (f64::from(c) * cur) as f32;
+                let next = two_cos_step * cur - prev;
+                prev = cur;
+                cur = next;
             }
         }
     }
