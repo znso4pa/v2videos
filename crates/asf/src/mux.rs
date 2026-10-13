@@ -9,10 +9,12 @@
 //!
 //! - **Header Object**：File Properties + Stream Properties + Header Extension
 //!   （空的）。Codec Comment / 内容描述是可选对象，不写。
-//! - **数据包**：每包恰好 `PACKET_SIZE`（3200）字节；EC 头 `0x82` + 2 字节 EC 数据；
-//!   **单载荷**（不做多载荷打包 —— 合法 ASF，只是每包少塞几个 payload）；
+//! - **数据包**：每包恰好 `PACKET_SIZE`（3200）字节；EC 头 `0x82` + 2 字节 EC 数据。
+//!   **多载荷打包**（一个包尽量塞满多个载荷，与 ffmpeg 同）：
 //!   载荷头 15 字节 = 流号 | 关键帧位 + 媒体对象号 + 对象内偏移 + 8 字节
-//!   replicated data（对象总长 + 显示时间）。
+//!   replicated data（对象总长 + 显示时间）；多载荷时**每个载荷头再加 2 字节长度字段**，
+//!   包头也多一个「载荷数」字节。单载荷包（样本本身就装不下第二个）走 15 字节头、
+//!   写完立刻 flush。
 //! - **帧大于包容量时分片**：同一帧的分片共用媒体对象号、偏移递增 ——
 //!   解封装端按这个重组（我们的解包器与 ffmpeg 都这么做）。
 //! - **padding**：包内剩余空间按 ASF 规范写 padding 长度字段（<256 用 1 字节、
@@ -38,12 +40,20 @@ use crate::types::AudioFormat;
 const PACKET_SIZE: usize = 3200;
 /// preroll（毫秒）。载荷的显示时间与包的发送时间都按它偏移 —— 与 ffmpeg 一致。
 const PREROLL_MS: u32 = 3100;
-/// 单载荷的载荷头长度：流号(1) + 对象号(1) + 偏移(4) + replicated 长度(1) + replicated(8)。
+/// **单载荷**的载荷头长度：流号(1) + 对象号(1) + 偏移(4) + replicated 长度(1) + replicated(8)。
 const PAYLOAD_HEADER_SIZE: usize = 15;
+/// **多载荷**的载荷头长度 = 上面 15 + 2 字节载荷长度字段（`ASF_PAYLOAD_LENGTH_FIELD_SIZE`）。
+const PAYLOAD_HEADER_SIZE_MULTI: usize = PAYLOAD_HEADER_SIZE + 2;
 /// 包头最小长度：EC(1+2) + 长度类型(1) + 属性(1) + 发送时间(4) + 时长(2)。
 const PACKET_HEADER_MIN_SIZE: usize = 11;
-/// 单载荷包里载荷的最大长度。
-const PAYLOAD_CAPACITY: usize = PACKET_SIZE - PACKET_HEADER_MIN_SIZE - PAYLOAD_HEADER_SIZE;
+/// 单载荷包的全部固定开销（包头 + 载荷头）。
+const SINGLE_PAYLOAD_HEADERS: usize = PACKET_HEADER_MIN_SIZE + PAYLOAD_HEADER_SIZE;
+/// 多载荷包的全部固定开销：包头 + 载荷数(1) + **两个**载荷头 —— 与 ffmpeg 的
+/// `MULTI_PAYLOAD_HEADERS` 同式（多算一个载荷头是为了给「后面还能再塞一个」留余量）。
+const MULTI_PAYLOAD_HEADERS: usize =
+    PACKET_HEADER_MIN_SIZE + 1 + 2 * PAYLOAD_HEADER_SIZE_MULTI;
+/// 一个包里最多几个载荷。与 ffmpeg 的 `ASF_PAYLOADS_PER_PACKET` 同值。
+const PAYLOADS_PER_PACKET: usize = 63;
 
 /// 索引槽的时间粒度（100 ns 单位 = 1 秒）。与 ffmpeg 的 `ASF_INDEXED_INTERVAL` 同值。
 const ASF_INDEXED_INTERVAL: u64 = 10_000_000;
@@ -76,7 +86,20 @@ pub struct AsfMuxer {
     seq: u8,
     /// 音频的媒体对象号（独立计数）。
     seq_audio: u8,
+    /// 已封好的数据包（每个恰好 `PACKET_SIZE`）。
     packets: Vec<Vec<u8>>,
+    /// 正在攒的那个包的**载荷区**（包头在 `flush_packet()` 时才拼到前面）。
+    packet: Vec<u8>,
+    /// 这个包还剩多少字节没被载荷占用（含还没写的填充）。
+    packet_size_left: usize,
+    /// 这个包里已经塞了几个载荷。
+    packet_nb_payloads: usize,
+    /// 这个包走多载荷还是单载荷 —— 在包刚开始时按第一个样本的大小定死。
+    multi_payloads_present: bool,
+    /// 包内第一个载荷的显示时间（毫秒，不含 preroll）。`None` = 包还没开始。
+    packet_ts_start: Option<u32>,
+    /// 包内最后一个载荷的显示时间。包头里的「时长」= 它与 start 之差。
+    packet_ts_end: u32,
     /// 已见到的最大显示时间（毫秒，不含 preroll）。
     max_pts_ms: u32,
     /// Simple Index 的槽表：下标 = 秒（含 preroll 偏移），值是那一秒该从哪个包起读。
@@ -109,6 +132,12 @@ impl AsfMuxer {
             seq: 1,
             seq_audio: 1,
             packets: Vec::new(),
+            packet: Vec::with_capacity(PACKET_SIZE),
+            packet_size_left: PACKET_SIZE,
+            packet_nb_payloads: 0,
+            multi_payloads_present: false,
+            packet_ts_start: None,
+            packet_ts_end: 0,
             max_pts_ms: 0,
             index: Vec::new(),
             next_packet_number: 0,
@@ -121,48 +150,19 @@ impl AsfMuxer {
 
     /// 写一个音频载荷（**直通**：调用方给的就是源的载荷字节）。
     ///
-    /// 音频流的号是 2（视频是 1）。音频载荷一般不大，整块塞进一个包；
-    /// 超过单包容量的会自动分片（与视频同一条路径）。
+    /// 音频流的号是 2（视频是 1）。音频载荷会和别的载荷一起塞进同一个包
+    /// （音频不允许跨包分片 —— 解封装端要整块）。
     pub fn write_audio(&mut self, data: &[u8], pts_ms: u32) -> Result<()> {
         if self.audio.is_none() {
             return Err(Error::Bad("没声明音频流，却要写音频载荷"));
         }
-        // 与 ffmpeg 一致：每个包都会推进 `end_sec`（音频不是关键帧，所以不进索引）。
+        // 与 ffmpeg 一致：每个样本都会推进 `end_sec`（音频不是关键帧，所以不进索引）。
         self.end_sec = Self::start_sec(pts_ms);
         if data.is_empty() {
             return Ok(());
         }
         self.max_pts_ms = self.max_pts_ms.max(pts_ms);
-        let mut offset = 0usize;
-        while offset < data.len() {
-            let mut chunk = (data.len() - offset).min(PAYLOAD_CAPACITY);
-            if chunk == PAYLOAD_CAPACITY - 1 {
-                chunk -= 1;
-            }
-            let pad = PACKET_SIZE - PACKET_HEADER_MIN_SIZE - PAYLOAD_HEADER_SIZE - chunk;
-            let mut p = Vec::with_capacity(PACKET_SIZE);
-            p.push(0x82);
-            p.push(0);
-            p.push(0);
-            match pad {
-                0 => p.push(0x00),
-                1..=255 => p.push(0x08),
-                _ => p.push(0x10),
-            }
-            p.push(0x5D);
-            match pad {
-                1..=255 => p.push((pad - 1) as u8),
-                _ if pad >= 256 => p.extend_from_slice(&((pad - 2) as u16).to_le_bytes()),
-                _ => {}
-            }
-            p.extend_from_slice(&pts_ms.to_le_bytes());
-            p.extend_from_slice(&0u16.to_le_bytes());
-            self.payload(&mut p, data, offset, chunk, false, pts_ms, 2, self.seq_audio)?;
-            p.resize(PACKET_SIZE, 0);
-            self.packets.push(p);
-            offset += chunk;
-        }
-        self.seq_audio = self.seq_audio.wrapping_add(1);
+        self.put_frame(data, false, pts_ms, 2, true);
         Ok(())
     }
 
@@ -173,55 +173,196 @@ impl AsfMuxer {
         }
         self.max_pts_ms = self.max_pts_ms.max(pts_ms);
         self.end_sec = Self::start_sec(pts_ms);
-        // 索引要的是「这一帧从第几个包起、占几个包」—— 在写包之前记下起点。
+        // 索引要的是「这一帧从第几个包起、占几个包」—— 在写之前记下起点。
+        // ⚠️ 载荷是**攒着**的：这一帧可能落在还没封出去的那个包里，此时
+        // `packet_count` 会是 0。ffmpeg 的索引里也有这种条目（实测它自己产的
+        // 文件第一条就是 `pktnum:0, pktct:0`），读法兼容 —— 读端只用包号定位。
         let packet_number = self.packets.len() as u32;
-
-        let mut offset = 0usize;
-        while offset < data.len() {
-            let mut chunk = (data.len() - offset).min(PAYLOAD_CAPACITY);
-            // ffmpeg 的 off-by-one 回避：chunk 占满 `capacity - 1` 时 padding 字段
-            // 会把账挤爆，缩 1 字节。
-            if chunk == PAYLOAD_CAPACITY - 1 {
-                chunk -= 1;
-            }
-            let pad = PACKET_SIZE - PACKET_HEADER_MIN_SIZE - PAYLOAD_HEADER_SIZE - chunk;
-
-            // ---- 包头（布局逐字段对应 put_payload_parsing_info）----
-            let mut p = Vec::with_capacity(PACKET_SIZE);
-            p.push(0x82); // 错误纠正存在 + EC 数据 2 字节
-            p.push(0);
-            p.push(0);
-            // 长度类型标志：无序列 / 无包长；有 padding 才写 padding 字段
-            match pad {
-                0 => p.push(0x00),
-                1..=255 => p.push(0x08), // padding 长度 = 1 字节
-                _ => p.push(0x10),       // padding 长度 = 2 字节
-            }
-            p.push(0x5D); // 属性标志：对象号 1 字节 / 偏移 4 字节 / replicated 1 字节 / 流号 1 字节
-            match pad {
-                1..=255 => p.push((pad - 1) as u8),
-                _ if pad >= 256 => p.extend_from_slice(&((pad - 2) as u16).to_le_bytes()),
-                _ => {}
-            }
-            p.extend_from_slice(&pts_ms.to_le_bytes()); // 发送时间（不含 preroll）
-            p.extend_from_slice(&0u16.to_le_bytes()); // 时长：单载荷恒 0
-
-            // ---- 载荷 ----
-            self.payload(&mut p, data, offset, chunk, key_frame, pts_ms, 1, self.seq)?;
-            debug_assert!(p.len() <= PACKET_SIZE);
-            p.resize(PACKET_SIZE, 0); // padding 补齐
-            self.packets.push(p);
-
-            offset += chunk;
-        }
-        self.seq = self.seq.wrapping_add(1);
-
+        self.put_frame(data, key_frame, pts_ms, 1, false);
         // 只有关键帧进索引 —— 与 ffmpeg 的 `flags & AV_PKT_FLAG_KEY` 一致。
         if key_frame {
             let packet_count = (self.packets.len() as u32 - packet_number) as u16;
             self.update_index(Self::start_sec(pts_ms), packet_number, packet_count);
         }
         Ok(())
+    }
+
+    /// 把一个样本写进数据包。**逐字照抄** `asfenc.c` 的 `put_frame()`。
+    ///
+    /// 一个包尽量塞满多个载荷；塞不下就 `flush_packet()` 换新包。
+    /// 样本本身大于整个包时按 `frag_len1` 切片 —— 同一帧的分片共用媒体对象号、
+    /// 偏移递增，解封装端据此重组。
+    fn put_frame(&mut self, data: &[u8], key_frame: bool, pts_ms: u32, stream: u8, is_audio: bool) {
+        let m_obj_size = data.len();
+        let mut m_obj_offset = 0usize;
+
+        while m_obj_offset < m_obj_size {
+            let mut payload_len = m_obj_size - m_obj_offset;
+            let frag_len1;
+
+            if self.packet_ts_start.is_none() {
+                // 包还没开始：按**第一个样本**的大小决定这个包走单载荷还是多载荷。
+                // 装得下第二个载荷头才有多载荷的意义 —— 与 ffmpeg 的
+                // `multi_payload_constant` 同式。
+                let multi_payload_constant = PACKET_SIZE - MULTI_PAYLOAD_HEADERS;
+                self.multi_payloads_present = payload_len < multi_payload_constant;
+                self.packet_size_left = PACKET_SIZE;
+                frag_len1 = if self.multi_payloads_present {
+                    multi_payload_constant - 1
+                } else {
+                    PACKET_SIZE - SINGLE_PAYLOAD_HEADERS
+                };
+                self.packet_ts_start = Some(pts_ms);
+            } else {
+                let left = self
+                    .packet_size_left
+                    .saturating_sub(PAYLOAD_HEADER_SIZE_MULTI + PACKET_HEADER_MIN_SIZE + 1);
+                // 音频载荷不许跨包分片：装不下就换包。
+                if left < payload_len && is_audio {
+                    self.flush_packet();
+                    continue;
+                }
+                // 包内时间跨度超过 u16（毫秒）就换包 —— 包头的「时长」字段只有 2 字节。
+                let start = self.packet_ts_start.unwrap_or(pts_ms);
+                if pts_ms > start.saturating_add(u16::MAX as u32) {
+                    self.flush_packet();
+                    continue;
+                }
+                frag_len1 = left;
+            }
+
+            if frag_len1 > 0 {
+                if payload_len > frag_len1 {
+                    payload_len = frag_len1;
+                } else if payload_len == frag_len1 - 1 {
+                    // 再占满 1 字节会把 padding 长度字段挤爆 —— 与 ffmpeg 同款回避。
+                    payload_len = frag_len1 - 2;
+                }
+                self.put_payload_header(
+                    stream,
+                    pts_ms,
+                    m_obj_size,
+                    m_obj_offset,
+                    payload_len,
+                    key_frame,
+                );
+                self.packet
+                    .extend_from_slice(&data[m_obj_offset..m_obj_offset + payload_len]);
+                if self.multi_payloads_present {
+                    self.packet_size_left -= payload_len + PAYLOAD_HEADER_SIZE_MULTI;
+                } else {
+                    self.packet_size_left -= payload_len + PAYLOAD_HEADER_SIZE;
+                }
+                self.packet_ts_end = pts_ms;
+                self.packet_nb_payloads += 1;
+            } else {
+                payload_len = 0;
+            }
+
+            m_obj_offset += payload_len;
+
+            if !self.multi_payloads_present {
+                self.flush_packet();
+            } else if self.packet_size_left
+                <= PAYLOAD_HEADER_SIZE_MULTI + PACKET_HEADER_MIN_SIZE + 1
+            {
+                self.flush_packet();
+            } else if self.packet_nb_payloads == PAYLOADS_PER_PACKET {
+                self.flush_packet();
+            }
+        }
+
+        // 媒体对象号是**每帧** +1，不是每载荷。
+        if stream == 1 {
+            self.seq = self.seq.wrapping_add(1);
+        } else {
+            self.seq_audio = self.seq_audio.wrapping_add(1);
+        }
+    }
+
+    /// 写一个载荷头到当前包的载荷区。**逐字照抄** `asfenc.c` 的 `put_payload_header()`。
+    fn put_payload_header(
+        &mut self,
+        stream: u8,
+        pts_ms: u32,
+        m_obj_size: usize,
+        m_obj_offset: usize,
+        payload_len: usize,
+        key_frame: bool,
+    ) {
+        self.packet
+            .push((if key_frame { 0x80 } else { 0x00 }) | stream);
+        self.packet
+            .push(if stream == 1 { self.seq } else { self.seq_audio });
+        self.packet
+            .extend_from_slice(&(m_obj_offset as u32).to_le_bytes());
+        self.packet.push(0x08); // replicated data 长度（恒 8：对象总长 + 显示时间）
+        self.packet
+            .extend_from_slice(&(m_obj_size as u32).to_le_bytes());
+        self.packet
+            .extend_from_slice(&(pts_ms.wrapping_add(PREROLL_MS)).to_le_bytes());
+        if self.multi_payloads_present {
+            self.packet
+                .extend_from_slice(&(payload_len as u16).to_le_bytes());
+        }
+    }
+
+    /// 把攒好的载荷区封成一个完整数据包。**逐字照抄** `asfenc.c` 的 `flush_packet()`
+    /// 与它调用的 `put_payload_parsing_info()`。
+    ///
+    /// `packet_size_left` 数的是「载荷区之外还剩多少」，但 `padsize` 要**先扣掉包头
+    /// 最小长度**（多载荷再扣掉那个载荷数字节）—— 剩下的才是「填充长度字段 + 填充
+    /// 字节」，所以字段值是 `padsize - 1`（2 字节字段时 `- 2`）。这就是 ffmpeg
+    /// 那套 off-by-one 的来历。
+    fn flush_packet(&mut self) {
+        let start = self
+            .packet_ts_start
+            .expect("包还没开始就 flush（不该发生）");
+        let duration = self.packet_ts_end.saturating_sub(start);
+        let nb_payloads = self.packet_nb_payloads;
+
+        let mut padsize = self.packet_size_left - PACKET_HEADER_MIN_SIZE;
+        if self.multi_payloads_present {
+            padsize -= 1;
+        }
+
+        let mut hdr = Vec::with_capacity(20);
+        hdr.push(0x82); // 错误纠正存在 + EC 数据 2 字节
+        hdr.push(0);
+        hdr.push(0);
+        // 长度类型标志：无序列字段 / 无包长字段；多载荷位 + padding 字段宽度。
+        let mut length_type = if self.multi_payloads_present { 0x01 } else { 0x00 };
+        if padsize > 0 {
+            length_type |= if padsize < 256 { 0x08 } else { 0x10 };
+        }
+        hdr.push(length_type);
+        hdr.push(0x5D); // 属性标志：对象号 1 字节 / 偏移 4 字节 / replicated 1 字节 / 流号 1 字节
+        if length_type & 0x10 != 0 {
+            hdr.extend_from_slice(&((padsize - 2) as u16).to_le_bytes());
+        }
+        if length_type & 0x08 != 0 {
+            hdr.push((padsize - 1) as u8);
+        }
+        hdr.extend_from_slice(&start.to_le_bytes()); // 发送时间（不含 preroll）
+        hdr.extend_from_slice(&(duration as u16).to_le_bytes());
+        if self.multi_payloads_present {
+            // 载荷数（低 6 位）+ 「载荷长度字段是 2 字节」位（0x80，与 ffmpeg 的
+            // `ASF_PAYLOAD_FLAGS` 同值）。
+            hdr.push((nb_payloads as u8) | 0x80);
+        }
+
+        let mut p = Vec::with_capacity(PACKET_SIZE);
+        p.extend_from_slice(&hdr);
+        p.extend_from_slice(&self.packet);
+        debug_assert!(p.len() <= PACKET_SIZE, "包拼过头了：{}", p.len());
+        p.resize(PACKET_SIZE, 0); // padding 补齐
+        self.packets.push(p);
+
+        self.packet.clear();
+        self.packet_size_left = PACKET_SIZE;
+        self.packet_nb_payloads = 0;
+        self.multi_payloads_present = false;
+        self.packet_ts_start = None;
     }
 
     /// 一个显示时间（毫秒）落在索引的第几秒。**逐字照抄** `asf_write_packet`：
@@ -281,31 +422,12 @@ impl AsfMuxer {
         self.next_start_sec = start_sec;
     }
 
-    /// 写一个载荷（头 + 数据）到包缓冲 `p`。
-    #[allow(clippy::too_many_arguments)]
-    fn payload(
-        &self,
-        p: &mut Vec<u8>,
-        data: &[u8],
-        offset: usize,
-        chunk: usize,
-        key_frame: bool,
-        pts_ms: u32,
-        stream: u8,
-        seq: u8,
-    ) -> Result<()> {
-        p.push((if key_frame { 0x80 } else { 0x00 }) | stream);
-        p.push(seq);
-        p.extend_from_slice(&(offset as u32).to_le_bytes());
-        p.push(0x08); // replicated data 长度（恒 8：对象总长 + 显示时间）
-        p.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        p.extend_from_slice(&(pts_ms.wrapping_add(PREROLL_MS)).to_le_bytes());
-        p.extend_from_slice(&data[offset..offset + chunk]);
-        Ok(())
-    }
-
     /// 收尾：拼出整个文件。
     pub fn finish(mut self) -> Vec<u8> {
+        // 把没攒满的那个包也发出去（对应 `asf_write_trailer` 开头的 `flush_packet`）。
+        if self.packet_ts_start.is_some() {
+            self.flush_packet();
+        }
         // 收尾那一趟（对应 `asf_write_trailer`）：把最后一个关键帧之后到片尾的槽补齐。
         // ffmpeg 只在**写过关键帧**时才写索引对象 —— `if (asf->next_start_sec)`。
         if self.next_start_sec > 0 {
@@ -542,71 +664,199 @@ mod tests {
         (interval, max_packet, entries)
     }
 
-    /// 数据区里第 `n` 个 ASF 包的**第一个载荷的流字节**（关键帧位在最高位）。
-    fn packet_stream_byte(file: &[u8], n: usize) -> u8 {
+    /// 数据区里第 `n` 个 ASF 包的**全部载荷**：`(流号, 关键帧, 对象内偏移, 载荷长度)`。
+    ///
+    /// 自己再解一遍包布局 —— 于是测试既验索引，也顺手验了包头 / 载荷头写对了。
+    /// ⚠️ 多载荷打包之后，**包的开头未必是我们要找的那个载荷**（前面的帧可能先塞进来），
+    /// 所以不能只看第一个载荷。
+    fn payloads_of_packet(file: &[u8], n: usize) -> Vec<(u8, bool, u32, usize)> {
         let header_size = u64::from_le_bytes(file[16..24].try_into().unwrap()) as usize;
         let packets_start = header_size + 50; // Data Object 头固定 50 字节
         let p = &file[packets_start + n * PACKET_SIZE..][..PACKET_SIZE];
-        let pad_len = match p[3] {
+
+        let length_type = p[3];
+        let multi = length_type & 0x01 != 0;
+        let pad_field = match length_type & 0x18 {
             0x00 => 0,
             0x08 => 1,
             0x10 => 2,
-            other => panic!("未知的长度类型字节 {other:#04x}"),
+            other => panic!("未知的 padding 字段宽度 {other:#04x}"),
         };
-        p[PACKET_HEADER_MIN_SIZE + pad_len]
+        // 包头：EC(3) + 长度类型(1) + 属性(1) + padding 字段 + 发送时间(4) + 时长(2)
+        let mut i = 5 + pad_field + 4 + 2;
+        let count = if multi {
+            assert_eq!(p[i] & 0x80, 0x80, "载荷长度字段应是 2 字节");
+            let c = (p[i] & 0x3f) as usize;
+            i += 1;
+            c
+        } else {
+            1
+        };
+
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            let stream = p[i] & 0x7f;
+            let key = p[i] & 0x80 != 0;
+            i += 1;
+            i += 1; // 媒体对象号
+            let obj_offset = u32::from_le_bytes(p[i..i + 4].try_into().unwrap());
+            i += 4;
+            let replic = p[i] as usize; // 恒 8：对象总长(4) + 显示时间(4)
+            i += 1 + replic;
+            // 单载荷包的载荷长度由 padding 反推，这里用不到；多载荷包自带 2 字节长度。
+            let len = if multi {
+                let v = u16::from_le_bytes(p[i..i + 2].try_into().unwrap()) as usize;
+                i += 2;
+                v
+            } else {
+                0
+            };
+            out.push((stream, key, obj_offset, len));
+            i += len;
+        }
+        out
+    }
+
+    /// 索引对象在文件里的偏移。
+    fn index_offset(file: &[u8]) -> usize {
+        file.windows(16)
+            .position(|w| w == guid::SIMPLE_INDEX)
+            .expect("文件里要有 Simple Index 对象")
+    }
+
+    /// 一个显示时间落在第几个槽 —— **preroll 的 3.1 秒先占掉 4 个槽**，所以 pts=0 是第 4 个。
+    #[test]
+    fn start_sec_carries_the_preroll_offset() {
+        assert_eq!(AsfMuxer::start_sec(0), 4);
+        assert_eq!(AsfMuxer::start_sec(900), 4);
+        assert_eq!(AsfMuxer::start_sec(1000), 5);
+        assert_eq!(AsfMuxer::start_sec(2000), 6);
+        // 与 ffmpeg 的整数式 `(3100*10000 + pts*10000 + INTERVAL - 1) / INTERVAL` 逐项对齐。
+        for pts in [0u32, 1, 999, 1000, 1001, 5000, 12_345, 600_000] {
+            let want = ((3100 + pts as u64 + 999) / 1000) as i32;
+            assert_eq!(AsfMuxer::start_sec(pts), want, "pts={pts}");
+        }
     }
 
     /// 槽的填法必须与 ffmpeg 的 `update_index()` 一致 —— 手算一遍钉住。
     ///
-    /// 帧 A：关键帧 @ 0 ms → `start_sec = ceil(3.1) = 4`，包 0，占 1 包  
-    /// 帧 B：关键帧 @ 2000 ms → `start_sec = ceil(5.1) = 6`，包 1，占 1 包  
-    /// 收尾：`update_index(end_sec + 1 = 7)` 补出最后一个槽  
-    /// ⇒ 7 个槽：前 6 个指 A(0,1)，最后 1 个指 B(1,1)。
+    /// 三次关键帧 + 一趟收尾（`(start_sec, 起始包号, 包数)`）：
+    ///
+    /// | 调用 | 效果 |
+    /// |---|---|
+    /// | `(4, 0, 2)` | 第一次调用：先把当前关键帧记成「上一个」→ 槽 0..3 = `(0,2)` |
+    /// | `(6, 5, 1)` | 槽 4、5 填的是**上一个**关键帧 `(0,2)`；之后 next = `(5,1)` |
+    /// | `(7, 9, 3)` | 槽 6 = `(5,1)`；之后 next = `(9,3)` |
+    /// | `(8, 0, 0)` | 收尾那一趟 → 槽 7 = `(9,3)` |
     #[test]
-    fn index_slots_follow_ffmpeg_semantics() {
+    fn update_index_slots_follow_ffmpeg_semantics() {
         let mut m = AsfMuxer::new(VideoStreamInfo {
             width: 64,
             height: 48,
             fourcc: u32::from_le_bytes(*b"MP43"),
         });
-        m.write_video(&[7u8; 100], true, 0).unwrap();
-        m.write_video(&[9u8; 100], true, 2000).unwrap();
-        let file = m.finish();
+        m.update_index(4, 0, 2);
+        m.update_index(6, 5, 1);
+        m.update_index(7, 9, 3);
+        m.update_index(8, 0, 0); // 收尾那一趟
 
-        let (interval, max_packet, entries) = parse_index(&file);
-        assert_eq!(interval, ASF_INDEXED_INTERVAL, "索引时间间隔 = 1 秒");
-        assert_eq!(max_packet, 1);
-        let mut want = vec![(0u32, 1u16); 6];
-        want.push((1, 1));
-        assert_eq!(entries, want);
+        let got: Vec<(u32, u16)> = m
+            .index
+            .iter()
+            .map(|e| (e.packet_number, e.packet_count))
+            .collect();
+        assert_eq!(
+            got,
+            vec![(0, 2), (0, 2), (0, 2), (0, 2), (0, 2), (0, 2), (5, 1), (9, 3)]
+        );
+        assert_eq!(m.maximum_packet, 3, "Max Packet Count 取各次包数的最大值");
+        assert_eq!(m.next_start_sec, 8, "条目数 = 收尾之后的 next_start_sec");
     }
 
-    /// 大帧跨包时，槽里的「包数」要记整帧占的包数，不是 1。
-    ///
-    /// 帧 A：关键帧 @ 0 ms，9000 字节 → 3 包（包 0..2）  
-    /// 帧 B：关键帧 @ 3000 ms，100 字节 → 1 包（包 3）  
-    /// ⇒ 8 个槽：前 7 个指 A(0,3)，最后 1 个指 B(3,1)；`max packet count = 3`。
+    /// 落到文件里的索引：每个槽指到的包，必须**含有**那个关键帧的起始载荷
+    /// （`obj_offset == 0`、流号 1、关键帧位）。多载荷打包后包的开头未必是它。
     #[test]
-    fn index_records_packet_span_of_a_fragmented_key_frame() {
+    fn index_points_at_the_packets_that_hold_the_key_frames() {
         let mut m = AsfMuxer::new(VideoStreamInfo {
             width: 64,
             height: 48,
             fourcc: u32::from_le_bytes(*b"MP43"),
         });
-        let big: Vec<u8> = (0..9000).map(|i| (i * 7 + 1) as u8).collect();
-        m.write_video(&big, true, 0).unwrap();
-        m.write_video(&[3u8; 100], true, 3000).unwrap();
+        // 每 1 秒一个关键帧（第 3 秒那个很大、跨包），中间夹 3 个非关键帧，跑 10 秒。
+        // 每帧 800 字节 → 1 秒的载荷约 3.3 KB，正好撑出约 1 个包/秒。
+        let mut pts = 0u32;
+        for sec in 0..10usize {
+            let size = if sec == 3 { 9000 } else { 800 };
+            let data: Vec<u8> = (0..size).map(|i| (i * 13 + sec) as u8).collect();
+            m.write_video(&data, true, pts).unwrap();
+            for k in 1..4u32 {
+                m.write_video(&[k as u8; 800], false, pts + k * 40).unwrap();
+            }
+            pts += 1000;
+        }
         let file = m.finish();
 
         let (_, max_packet, entries) = parse_index(&file);
-        assert_eq!(max_packet, 3);
-        let mut want = vec![(0u32, 3u16); 7];
-        want.push((3, 1));
-        assert_eq!(entries, want);
+        assert!(entries.len() > 10, "10 秒 + preroll 应产生十几个槽");
+        assert!(max_packet >= 2, "第 3 秒那个大帧要跨好几个包：{max_packet}");
 
-        // 槽指到的包，第一个载荷必须是**关键帧**（这正是 seek 能用的前提）。
-        assert_eq!(packet_stream_byte(&file, 0) & 0x80, 0x80);
-        assert_eq!(packet_stream_byte(&file, 3) & 0x80, 0x80);
+        let header_size = u64::from_le_bytes(file[16..24].try_into().unwrap()) as usize;
+        let nb_packets = (index_offset(&file) - header_size - 50) / PACKET_SIZE;
+
+        let mut last = 0u32;
+        let mut distinct: Vec<u32> = Vec::new();
+        for (n, c) in &entries {
+            assert!(*n as usize + *c as usize <= nb_packets, "槽 {n} 越界");
+            assert!(*n >= last, "槽的包号单调不减");
+            last = *n;
+            if !distinct.contains(n) {
+                distinct.push(*n);
+            }
+        }
+        for n in &distinct {
+            let ps = payloads_of_packet(&file, *n as usize);
+            assert!(
+                ps.iter().any(|(s, k, off, _)| *s == 1 && *k && *off == 0),
+                "槽指到的包 {n} 里没有视频关键帧的起始载荷：{ps:?}"
+            );
+        }
+    }
+
+    /// **本次改动的验收判据**：载荷要占掉文件的大部分，而不是一帧一包、其余全是填充。
+    ///
+    /// 同样 300 个 200 字节的帧：单载荷打包（改动前）是 300 个包 ≈ 960 KB，
+    /// 载荷只占 6%；多载荷打包后应当贴着载荷走。
+    #[test]
+    fn packing_fills_packets_instead_of_wasting_them() {
+        let mut m = AsfMuxer::new(VideoStreamInfo {
+            width: 64,
+            height: 48,
+            fourcc: u32::from_le_bytes(*b"MP43"),
+        });
+        let payload: usize = 300 * 200;
+        let mut pts = 0u32;
+        for i in 0..300u32 {
+            let data: Vec<u8> = (0..200).map(|k| (k as u32 + i) as u8).collect();
+            m.write_video(&data, i % 25 == 0, pts).unwrap();
+            pts += 40;
+        }
+        let file = m.finish();
+
+        let overhead = file.len() - payload;
+        assert!(
+            file.len() <= payload * 3 / 2,
+            "载荷 {payload} 字节，文件却 {0} 字节（开销 {1} 字节）—— 包没被塞满",
+            file.len(),
+            overhead
+        );
+
+        // 而且不能靠丢样本换体积。
+        let mut d = AsfDemuxer::new(Cursor::new(&file)).expect("解封装");
+        let mut n = 0;
+        while d.next_sample().unwrap().is_some() {
+            n += 1;
+        }
+        assert_eq!(n, 300, "样本一个都不能少");
     }
 
     /// 非关键帧不进索引；整段没有关键帧时**不写**索引对象。
@@ -637,42 +887,54 @@ mod tests {
         assert!(!entries.is_empty());
     }
 
-    /// 索引里的包号必须都在文件里，且槽单调不减（seek 才能二分）。
+    /// 音频与视频混在一个包里也要能原样解回来（音频**不许跨包分片**）。
     #[test]
-    fn index_entries_are_monotonic_and_in_range() {
-        let mut m = AsfMuxer::new(VideoStreamInfo {
-            width: 64,
-            height: 48,
-            fourcc: u32::from_le_bytes(*b"MP43"),
-        });
-        // 每 1 秒一个关键帧，中间夹 4 个非关键帧，跑 10 秒。
-        let mut pts = 0u32;
-        for sec in 0..10 {
-            let size = if sec == 3 { 9000 } else { 60 };
-            let data: Vec<u8> = (0..size).map(|i| (i * 13 + sec) as u8).collect();
-            m.write_video(&data, true, pts).unwrap();
-            for k in 1..5 {
-                m.write_video(&[k as u8; 40], false, pts + k * 40).unwrap();
+    fn audio_and_video_share_packets_and_roundtrip() {
+        let mut m = AsfMuxer::with_audio(
+            VideoStreamInfo {
+                width: 64,
+                height: 48,
+                fourcc: u32::from_le_bytes(*b"MP43"),
+            },
+            Some(crate::types::AudioFormat {
+                format_tag: 0x0161,
+                channels: 2,
+                sample_rate: 44_100,
+                avg_bytes_per_sec: 16_000,
+                block_align: 1000,
+                bits_per_sample: 16,
+                extra: Vec::new(),
+            }),
+        );
+        let vframes: Vec<Vec<u8>> = (0..40u32)
+            .map(|i| (0..300).map(|k| (k as u32 + i) as u8).collect())
+            .collect();
+        // 每 4 个视频帧夹一帧音频 —— 音频帧数正好是 `40 / 4`。
+        let aframes: Vec<Vec<u8>> = (0..10u32)
+            .map(|i| (0..1000).map(|k| (k as u32 * 3 + i) as u8).collect())
+            .collect();
+        // 交错着喂，模拟 CLI 的写法。
+        for i in 0..vframes.len() {
+            m.write_video(&vframes[i], i % 10 == 0, (i * 40) as u32).unwrap();
+            if i % 4 == 0 {
+                m.write_audio(&aframes[i / 4], (i * 40) as u32).unwrap();
             }
-            pts += 1000;
         }
         let file = m.finish();
 
-        let (_, max_packet, entries) = parse_index(&file);
-        assert!(entries.len() > 10, "10 秒 + preroll 应产生十几个槽");
-        assert_eq!(max_packet, 3, "只有第 3 秒那个大帧占 3 包");
-
-        let nb_packets = (file.len()
-            - (u64::from_le_bytes(file[16..24].try_into().unwrap()) as usize + 50))
-            / PACKET_SIZE;
-        let mut last = 0u32;
-        for (n, c) in &entries {
-            assert!(*n as usize + *c as usize <= nb_packets, "槽 {n} 越界");
-            assert!(*c >= 1, "包数至少 1");
-            assert!(*n >= last, "槽的包号单调不减");
-            assert_eq!(packet_stream_byte(&file, *n as usize) & 0x80, 0x80);
-            last = *n;
+        let mut d = AsfDemuxer::new(Cursor::new(&file)).expect("解封装");
+        assert_eq!(d.streams().len(), 2, "视频 + 音频两条流");
+        let mut got_v = Vec::new();
+        let mut got_a = Vec::new();
+        while let Some(s) = d.next_sample().unwrap() {
+            if s.stream == 1 {
+                got_v.push(s.data);
+            } else {
+                got_a.push(s.data);
+            }
         }
+        assert_eq!(got_v, vframes);
+        assert_eq!(got_a, aframes);
     }
 
     #[test]
@@ -682,7 +944,7 @@ mod tests {
             height: 48,
             fourcc: u32::from_le_bytes(*b"MP43"),
         });
-        // 帧 0：大帧（跨包分片）；帧 1：小帧（单包 + padding）；帧 2：恰好 capacity-1 附近
+        // 帧 0：大帧（跨包分片）；帧 1：小帧；帧 2：恰好贴着单载荷容量附近
         let big: Vec<u8> = (0..9000).map(|i| (i * 7) as u8).collect();
         let small = vec![42u8; 100];
         let mid: Vec<u8> = (0..3172).map(|i| (i * 13) as u8).collect();
@@ -712,28 +974,34 @@ mod tests {
         assert_eq!(got[2].data, mid);
     }
 
+    /// 每包恰好 `PACKET_SIZE`，且头部声明的包数与「包区长度」一致、索引紧跟在包区之后。
     #[test]
-    fn packet_count_matches_header_and_each_packet_is_full_size() {
+    fn every_packet_is_exactly_packet_size_and_counted_in_the_header() {
         let mut m = AsfMuxer::new(VideoStreamInfo {
             width: 32,
             height: 32,
             fourcc: u32::from_le_bytes(*b"MP43"),
         });
-        let f0: Vec<u8> = (0..9000).map(|i| (i * 3) as u8).collect(); // 3 包
-        let f1: Vec<u8> = vec![1u8; 10]; // 1 包
+        let f0: Vec<u8> = (0..9000).map(|i| (i * 3) as u8).collect();
         m.write_video(&f0, true, 0).unwrap();
-        m.write_video(&f1, false, 33).unwrap();
+        for k in 0..50u32 {
+            m.write_video(&[k as u8; 10], false, 33 + k * 33).unwrap();
+        }
         let file = m.finish();
 
-        // Data Object 头里的包数 = 实际包数；每包恰好 PACKET_SIZE。
         let mut d = AsfDemuxer::new(Cursor::new(&file)).expect("解封装");
-        assert_eq!(d.info().packet_count, 4, "9000→3 包 + 10→1 包");
-        // 文件总大小应与 File Properties 里写的一致
         assert_eq!(d.info().file_size, file.len() as u64);
+        let header_size = u64::from_le_bytes(file[16..24].try_into().unwrap()) as usize;
+        assert_eq!(
+            index_offset(&file),
+            header_size + 50 + d.info().packet_count as usize * PACKET_SIZE,
+            "包区必须正好是「包数 × PACKET_SIZE」，索引紧随其后"
+        );
+
         let mut n = 0u64;
         while d.next_sample().unwrap().is_some() {
             n += 1;
         }
-        assert_eq!(n, 2);
+        assert_eq!(n, 51, "50 个小帧会被塞进同一个包，但样本一个都不能少");
     }
 }
