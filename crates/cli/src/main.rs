@@ -36,6 +36,7 @@ v2v —— WMV/ASF 批量转码（纯 Rust：解封装 → 解码 → 编码 →
       --mp4             输出 .mp4（MPEG-4 Part 2 + AAC），默认输出 .wmv（MP43 in ASF）
       --pcm             .mp4 的音频用未压缩 PCM（sowt）而不是 AAC
       --aac-bitrate N   .mp4 走 AAC 时的目标码率（默认 128000 bit/s）
+      --no-ms           关掉 AAC 的 M/S 立体声（默认开；只为对比测量）
       --threads N       编码线程数（默认 1）。现在只有 AAC 的**声道并行**吃它
                         （双声道 → 2；封顶到声道数，单声道给多少都是 1）。
                         输出与 1 线程**逐字节相同**，只是两个声道同时算。
@@ -129,6 +130,7 @@ fn run(args: &[String]) -> Result<bool, String> {
                     .parse()
                     .map_err(|_| "--aac-bitrate 要正整数（bit/s）".to_string())?;
             }
+            "--no-ms" => opts.ms_stereo = false,
             "--threads" => {
                 let v: usize = it
                     .next()

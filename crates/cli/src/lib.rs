@@ -103,6 +103,10 @@ pub struct ConvertOptions {
     ///
     /// 这是**目标**不是保证：编码器不做码率控制，实际码率在它附近浮动。
     pub aac_bitrate: u32,
+    /// 双声道 AAC 允不允许用 **M/S 立体声**（默认开）。
+    ///
+    /// 逐帧决策（两个声道相关时才用）。关掉它只为对比测量 —— 正常都该开着。
+    pub ms_stereo: bool,
     /// **编码时用几个线程**（默认 **1** = 不并行）。
     ///
     /// 现在只有 AAC 的**声道并行**吃这个值（双声道 → 两个声道各一个线程，
@@ -145,6 +149,7 @@ impl Default for ConvertOptions {
             fps: None,
             audio: Mp4Audio::default(),
             aac_bitrate: 128_000,
+            ms_stereo: true,
             threads: 1,
             video_bitrate: None,
         }
@@ -667,6 +672,7 @@ fn convert_to_mp4(
                 sample_rate: af.sample_rate,
                 bitrate: opts.aac_bitrate,
                 threads: opts.threads,
+                ms_stereo: opts.ms_stereo,
                 kb_window: false,
             })?)
         }
