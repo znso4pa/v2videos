@@ -108,6 +108,15 @@ pub const CB_RANGE: [u8; 12] = [0, 3, 3, 3, 3, 9, 9, 8, 8, 13, 13, 17];
 /// 只有第 11 本是 escape 码本（`ESC_BT`）。
 const CB_ESC: usize = 11;
 
+/// `sf_offset` 的搜索上界（含）。
+///
+/// 够粗了：偏移每 +4 让量化精度翻一倍，+120 相当于把每带的 sf 抬到几乎全零带；
+/// 再往上位数不再降（全零带的位数是常数）。
+const MAX_SF_OFFSET: i32 = 120;
+
+/// 第一帧（还没有上一帧的答案）的搜索种子 —— 取区间中点。
+const SF_OFFSET_SEED_INIT: i32 = MAX_SF_OFFSET / 2;
+
 /// 编码配置。
 #[derive(Debug, Clone, Copy)]
 pub struct EncoderConfig {
@@ -213,6 +222,13 @@ pub struct Encoder {
     /// 光看「ffmpeg 解得开」证明不了它真的被走过（长窗也解得开）。
     /// 测试用它断言「这段瞬态素材确实进了短窗那条路」。
     short_frames: u64,
+
+    /// 每声道**上一帧选中的 `sf_offset`** —— 下一帧搜偏移时的**种子**。
+    ///
+    /// 相邻帧的谱形状是连续的，所以上一帧的答案是很好的出发点：从它出发做
+    /// 指数搜索，绝大多数帧 2–4 趟就收敛（固定区间二分恒 7 趟）。
+    /// **找的还是同一个答案**（最小的可行偏移），所以输出逐字节不变。
+    sf_offset_prev: Vec<i32>,
 }
 
 impl Encoder {
@@ -258,6 +274,7 @@ impl Encoder {
             attack_prev: vec![None; cfg.channels as usize],
             bits_per_frame: bits_per_frame as u32,
             short_frames: 0,
+            sf_offset_prev: vec![SF_OFFSET_SEED_INIT; cfg.channels as usize],
             cfg,
         })
     }
@@ -710,32 +727,86 @@ impl Encoder {
             .map(|((s, t), &l)| (s.as_slice(), t.as_slice(), l))
             .collect();
 
-        // ---- 3. 二分搜「位数 ≤ 预算」的最小偏移 ----
+        // ---- 3. 搜「位数 ≤ 预算」的最小偏移 ----
         //
-        // 偏移越大 → 量化越粗 → 位数越少、失真越大，所以「位数」关于偏移单调。
-        // 二分出的这个最小偏移就是「码率不超标的前提下保真最好」的那一档。
+        // 偏移越大 → 量化越粗 → 位数越少、失真越大，所以「位数」关于偏移单调，
+        // 「最小的可行偏移」是良定义的；它就是「码率不超标的前提下保真最好」的那一档。
+        //
+        // ⚠️ **搜索从上一帧的答案出发做指数搜索**，而不是每帧都从 `[0, 120]`
+        // 重新二分：相邻帧的谱形状连续，上一帧的答案通常就在真值 ±1 里，
+        // 实测 2–4 趟就收敛（固定二分恒 7 趟，而每趟都要整帧量化 + 计费 + 写位流）。
+        // 找的**还是同一个答案**，所以位流逐字节不变 —— 这是纯提速，不改语义。
+        //
+        // 括号约定：`lo` = 已知**不可行**的最大偏移（`-1` = 还不知道），
+        // `hi` = 已知**可行**的最小偏移（`MAX_SF_OFFSET + 1` = 还不知道）。
         let budget = self.bits_per_frame;
-        let mut lo = 0i32;
-        // 上界 120：够粗了（偏移每 +4 让量化精度翻一倍；+120 相当于把每带
-        // 的 sf 抬到几乎全零带）。再往上位数不再降（全零带位数是常数）。
-        let mut hi = 120i32;
+        let seed = self.sf_offset_prev[ch].clamp(0, MAX_SF_OFFSET);
         let mut chosen: Option<BitWriter> = None;
-        while lo <= hi {
-            let mid = (lo + hi) / 2;
-            let (pass, bits) = self.encode_pass(seq, &group_specs, sf_floor, mid, tns_data.as_ref())?;
-            if bits <= budget {
+        let mut lo: i32 = -1;
+        let mut hi: i32 = MAX_SF_OFFSET + 1;
+        let (pass, bits) =
+            self.encode_pass(seq, &group_specs, sf_floor, seed, tns_data.as_ref())?;
+        if bits <= budget {
+            hi = seed;
+            chosen = Some(pass);
+        } else {
+            lo = seed;
+        }
+
+        // 指数搜索把另一侧也夹住：步长 1、2、4…（真值离种子远时才多探几次）。
+        let mut step = 1i32;
+        if chosen.is_none() {
+            while lo < MAX_SF_OFFSET {
+                let o = (lo + step).min(MAX_SF_OFFSET);
+                let (pass, bits) =
+                    self.encode_pass(seq, &group_specs, sf_floor, o, tns_data.as_ref())?;
+                if bits <= budget {
+                    hi = o;
+                    chosen = Some(pass);
+                    break;
+                }
+                lo = o;
+                step = step.saturating_mul(2);
+            }
+        } else {
+            while hi > 0 {
+                let o = (hi - step).max(0);
+                let (pass, bits) =
+                    self.encode_pass(seq, &group_specs, sf_floor, o, tns_data.as_ref())?;
+                if bits > budget {
+                    lo = o;
+                    break;
+                }
+                hi = o;
                 chosen = Some(pass);
-                hi = mid - 1;
-            } else {
-                lo = mid + 1;
+                step = step.saturating_mul(2);
             }
         }
+
+        // 夹住了就二分收尾 —— 种子准的时候这一步一次都不跑。
+        while lo + 1 < hi {
+            let mid = (lo + hi) / 2;
+            let (pass, bits) =
+                self.encode_pass(seq, &group_specs, sf_floor, mid, tns_data.as_ref())?;
+            if bits <= budget {
+                hi = mid;
+                chosen = Some(pass);
+            } else {
+                lo = mid;
+            }
+        }
+        // 记住这一帧的答案，给下一帧当种子（`hi` 超界 = 这一帧没有任何可行偏移）。
+        self.sf_offset_prev[ch] = if hi <= MAX_SF_OFFSET { hi } else { seed };
+
         // ⚠️ **一趟都不够省**时（预算小到连最粗的量化都塞不下）退化成
         // 「用偏移上界那一趟」：位数超预算，但**位流仍然合法**。
         // 让码率超标比「编不出东西」好 —— 而且这种情况只会在极端配置下出现。
         let pass = match chosen {
             Some(p) => p,
-            None => self.encode_pass(seq, &group_specs, sf_floor, hi.max(0), tns_data.as_ref())?.0,
+            None => {
+                self.encode_pass(seq, &group_specs, sf_floor, MAX_SF_OFFSET, tns_data.as_ref())?
+                    .0
+            }
         };
         w.append(&pass);
         Ok(short)
