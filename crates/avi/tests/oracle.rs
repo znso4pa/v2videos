@@ -279,7 +279,7 @@ fn same_stream_in_avi_and_wmv_matches() {
     };
     let mut asf_frames = Vec::new();
     // AVI 那边被 `-t 2` 截过，所以它更短 —— 读到**它的长度**就够，
-    // 不用把整条 ASF 流读尽（5201 帧会白等）。
+    // 不用把整条 ASF 流读尽（整条读完要白等很久）。
     while asf_frames.len() < avi_frames.len().max(1) {
         match sd.next_sample().expect("读 WMV") {
             Some(s) if s.stream == snum => asf_frames.push(s),

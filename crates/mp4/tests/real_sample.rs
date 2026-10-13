@@ -3,19 +3,19 @@
 //! ## 参考产物怎么来
 //!
 //! ```bash
-//! # 纯视频参考：MPEG-4 Part 2（mp4v），25 fps 320×240，75 帧
-//! ffmpeg -i host.wmv -map 0:v -c:v mpeg4 -an -f mp4 refv.mp4
-//! # 裸 PCM（s16le 44.1 kHz 立体声）—— 喂给我们的 sowt 轨
-//! ffmpeg -i host.wmv -map 0:a -c:a pcm_s16le -f s16le host.pcm
+//! # 纯视频参考：把一个带 MP43 视频轨的样本转成 MPEG-4 Part 2（mp4v）的 MP4
+//! ffmpeg -i <样本.wmv> -map 0:v -c:v mpeg4 -an -f mp4 <参考.mp4>
+//! # 裸 PCM（s16le）—— 喂给我们的 sowt 轨
+//! ffmpeg -i <样本.wmv> -map 0:a -c:a pcm_s16le -f s16le <裸 PCM>
 //! ```
 //!
 //! ## 怎么跑
 //!
 //! ```bash
-//! V2V_MP4_REF=refv.mp4 V2V_MP4_OUT=/tmp/ours_v.mp4 \
+//! V2V_MP4_REF=<参考.mp4> V2V_MP4_OUT=/tmp/ours_v.mp4 \
 //! cargo test -p v2v-mp4 --test real_sample -- --ignored --nocapture
 //!
-//! V2V_MP4_REF=refv.mp4 V2V_MP4_PCM=host.pcm V2V_MP4_OUT_AV=/tmp/ours_av.mp4 \
+//! V2V_MP4_REF=<参考.mp4> V2V_MP4_PCM=<裸 PCM> V2V_MP4_OUT_AV=/tmp/ours_av.mp4 \
 //! cargo test -p v2v-mp4 --test real_sample -- --ignored --nocapture
 //! ```
 //!
