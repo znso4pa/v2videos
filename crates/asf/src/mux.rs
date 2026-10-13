@@ -19,11 +19,16 @@
 //!   否则 2 字节）；`chunk == capacity - 1` 时缩 1 字节 —— 与 ffmpeg 同款
 //!   off-by-one 回避（padding 字段本身会吃掉 1 字节）。
 //!
+//! - **Simple Index**：数据对象之后追加一个索引对象 —— 每 1 秒一个槽，槽里是
+//!   `(起始包号, 包数)`，播放器 seek 不必逐包扫。布局与槽的填法逐字段对照
+//!   `asfenc.c` 的 `asf_write_index` / `update_index` / `asf_write_packet`；
+//!   见 `update_index()` 的注释。
+//!
 //! ## 已知边界
 //!
 //! - 全部在内存里缓冲（`finish()` 返回整个文件）。流式写出待做 —— 对批量转换
 //!   的体积没影响（WMV 本来就要整个头部已知包数才能填），只影响内存峰值。
-//! - 不写 Simple Index：播放器 seek 会退化到逐包扫。待做。
+//! - 索引只按**关键帧**建条目（与 ffmpeg 一致）；整段没有关键帧时不写索引对象。
 
 use crate::error::{Error, Result};
 use crate::guid::{self, Guid};
@@ -39,6 +44,16 @@ const PAYLOAD_HEADER_SIZE: usize = 15;
 const PACKET_HEADER_MIN_SIZE: usize = 11;
 /// 单载荷包里载荷的最大长度。
 const PAYLOAD_CAPACITY: usize = PACKET_SIZE - PACKET_HEADER_MIN_SIZE - PAYLOAD_HEADER_SIZE;
+
+/// 索引槽的时间粒度（100 ns 单位 = 1 秒）。与 ffmpeg 的 `ASF_INDEXED_INTERVAL` 同值。
+const ASF_INDEXED_INTERVAL: u64 = 10_000_000;
+
+/// 索引里的一个槽。字段就是文件里那 6 字节（包号 4 + 包数 2）。
+#[derive(Debug, Clone, Copy)]
+struct IndexEntry {
+    packet_number: u32,
+    packet_count: u16,
+}
 
 /// 视频流的封装参数。
 #[derive(Debug, Clone)]
@@ -64,6 +79,18 @@ pub struct AsfMuxer {
     packets: Vec<Vec<u8>>,
     /// 已见到的最大显示时间（毫秒，不含 preroll）。
     max_pts_ms: u32,
+    /// Simple Index 的槽表：下标 = 秒（含 preroll 偏移），值是那一秒该从哪个包起读。
+    /// `next_start_sec` 恒等于 `index.len()`（下面 `update_index()` 维持这个不变量）。
+    index: Vec<IndexEntry>,
+    /// 下一个关键帧的「起始包号 / 包数」—— 填槽时用的是**上一个**关键帧的值。
+    next_packet_number: u32,
+    next_packet_count: u16,
+    /// 已填到第几秒（也就是 `index.len()`）。
+    next_start_sec: i32,
+    /// 最后一个包落在第几秒。收尾时用它 +1 把尾巴补齐。
+    end_sec: i32,
+    /// 单帧占用的最大包数，写进索引头的 `Max Packet Count`。
+    maximum_packet: u16,
 }
 
 impl AsfMuxer {
@@ -83,6 +110,12 @@ impl AsfMuxer {
             seq_audio: 1,
             packets: Vec::new(),
             max_pts_ms: 0,
+            index: Vec::new(),
+            next_packet_number: 0,
+            next_packet_count: 0,
+            next_start_sec: 0,
+            end_sec: 0,
+            maximum_packet: 0,
         }
     }
 
@@ -94,6 +127,8 @@ impl AsfMuxer {
         if self.audio.is_none() {
             return Err(Error::Bad("没声明音频流，却要写音频载荷"));
         }
+        // 与 ffmpeg 一致：每个包都会推进 `end_sec`（音频不是关键帧，所以不进索引）。
+        self.end_sec = Self::start_sec(pts_ms);
         if data.is_empty() {
             return Ok(());
         }
@@ -137,6 +172,9 @@ impl AsfMuxer {
             return Ok(()); // 空样本没有媒体对象可写
         }
         self.max_pts_ms = self.max_pts_ms.max(pts_ms);
+        self.end_sec = Self::start_sec(pts_ms);
+        // 索引要的是「这一帧从第几个包起、占几个包」—— 在写包之前记下起点。
+        let packet_number = self.packets.len() as u32;
 
         let mut offset = 0usize;
         while offset < data.len() {
@@ -177,7 +215,70 @@ impl AsfMuxer {
             offset += chunk;
         }
         self.seq = self.seq.wrapping_add(1);
+
+        // 只有关键帧进索引 —— 与 ffmpeg 的 `flags & AV_PKT_FLAG_KEY` 一致。
+        if key_frame {
+            let packet_count = (self.packets.len() as u32 - packet_number) as u16;
+            self.update_index(Self::start_sec(pts_ms), packet_number, packet_count);
+        }
         Ok(())
+    }
+
+    /// 一个显示时间（毫秒）落在索引的第几秒。**逐字照抄** `asf_write_packet`：
+    ///
+    /// ```c
+    /// start_sec = (int)((PREROLL_TIME * 10000 + pts + ASF_INDEXED_INTERVAL - 1)
+    ///           / ASF_INDEXED_INTERVAL);
+    /// ```
+    ///
+    /// 其中 `pts` 已经由 `pts *= 10000` 从毫秒换算成 100 ns 单位 —— ffmpeg 给 ASF 流的
+    /// 时基是 `1/1000`（`asfenc.c` 的 `avpriv_set_pts_info(.., 32, 1, 1000)`）。
+    /// 所以第 0 秒的槽号不是 0 而是 4：preroll 的 3.1 秒先占掉 4 个槽。
+    fn start_sec(pts_ms: u32) -> i32 {
+        ((PREROLL_MS as u64 * 10_000 + pts_ms as u64 * 10_000 + ASF_INDEXED_INTERVAL - 1)
+            / ASF_INDEXED_INTERVAL) as i32
+    }
+
+    /// 填索引槽。**逐字照抄** `asfenc.c` 的 `update_index()`：
+    ///
+    /// ```c
+    /// if (start_sec > asf->next_start_sec) {
+    ///     if (!asf->next_start_sec) {          /* 第一次调用：先把当前关键帧记成「上一个」 */
+    ///         asf->next_packet_number = packet_number;
+    ///         asf->next_packet_count  = packet_count;
+    ///     }
+    ///     for (i = asf->next_start_sec; i < start_sec; i++) {
+    ///         index_ptr[i].packet_number = asf->next_packet_number;
+    ///         index_ptr[i].packet_count  = asf->next_packet_count;
+    ///     }
+    /// }
+    /// asf->maximum_packet     = FFMAX(asf->maximum_packet, packet_count);
+    /// asf->next_packet_number = packet_number;
+    /// asf->next_packet_count  = packet_count;
+    /// asf->next_start_sec     = start_sec;
+    /// ```
+    ///
+    /// 效果：槽 `i` 答的是「seek 到第 `i` 秒该从哪个包起」—— 取**已见过的、不晚于它**
+    /// 的那个关键帧。所以开头那几个槽（preroll 段）都指向第一个关键帧。
+    fn update_index(&mut self, start_sec: i32, packet_number: u32, packet_count: u16) {
+        if start_sec > self.next_start_sec {
+            if self.next_start_sec == 0 {
+                self.next_packet_number = packet_number;
+                self.next_packet_count = packet_count;
+            }
+            // `index.len() == next_start_sec` 是不变量，所以这等价于
+            // `for (i = next_start_sec; i < start_sec; i++) index_ptr[i] = ...`。
+            while (self.index.len() as i32) < start_sec {
+                self.index.push(IndexEntry {
+                    packet_number: self.next_packet_number,
+                    packet_count: self.next_packet_count,
+                });
+            }
+        }
+        self.maximum_packet = self.maximum_packet.max(packet_count);
+        self.next_packet_number = packet_number;
+        self.next_packet_count = packet_count;
+        self.next_start_sec = start_sec;
     }
 
     /// 写一个载荷（头 + 数据）到包缓冲 `p`。
@@ -204,7 +305,13 @@ impl AsfMuxer {
     }
 
     /// 收尾：拼出整个文件。
-    pub fn finish(self) -> Vec<u8> {
+    pub fn finish(mut self) -> Vec<u8> {
+        // 收尾那一趟（对应 `asf_write_trailer`）：把最后一个关键帧之后到片尾的槽补齐。
+        // ffmpeg 只在**写过关键帧**时才写索引对象 —— `if (asf->next_start_sec)`。
+        if self.next_start_sec > 0 {
+            self.update_index(self.end_sec + 1, 0, 0);
+        }
+
         let nb_packets = self.packets.len() as u64;
         let data_size = 50 + nb_packets * PACKET_SIZE as u64;
 
@@ -329,6 +436,23 @@ impl AsfMuxer {
             out.extend_from_slice(p);
         }
 
+        // ---- Simple Index ----
+        // 逐字段对应 `asf_write_index()`：GUID + 长度 + file id(16) + 时间间隔(8)
+        // + 最大包数(4) + 条目数(4) + 条目(6×n)。它写出的长度是
+        // `24 + 16 + 8 + 4 + 4 + 6n` —— 正是 `object()` 拼出来的总长。
+        if !self.index.is_empty() {
+            let mut body = Vec::with_capacity(32 + 6 * self.index.len());
+            body.extend_from_slice(&self.file_id);
+            body.extend_from_slice(&ASF_INDEXED_INTERVAL.to_le_bytes());
+            body.extend_from_slice(&u32::from(self.maximum_packet).to_le_bytes());
+            body.extend_from_slice(&(self.index.len() as u32).to_le_bytes());
+            for e in &self.index {
+                body.extend_from_slice(&e.packet_number.to_le_bytes());
+                body.extend_from_slice(&e.packet_count.to_le_bytes());
+            }
+            out.extend_from_slice(&object(guid::SIMPLE_INDEX, &body));
+        }
+
         // 回填 File Properties 里的文件总大小（= 当前总长）。
         let file_size = out.len() as u64;
         let fp_at = header_body_start + 24; // object 头 24 字节之后
@@ -384,6 +508,172 @@ mod tests {
     use super::*;
     use crate::AsfDemuxer;
     use std::io::Cursor;
+
+    /// 从文件里找出 Simple Index 对象，解析出 `(时间间隔, 最大包数, 条目)`。
+    ///
+    /// 这里**故意自己再解一遍**（而不是调 muxer 内部状态）—— 测的是落到文件里的字节。
+    fn parse_index(file: &[u8]) -> (u64, u32, Vec<(u32, u16)>) {
+        let at = file
+            .windows(16)
+            .position(|w| w == guid::SIMPLE_INDEX)
+            .expect("文件里要有 Simple Index 对象");
+        let mut p = at + 16;
+        let size = u64::from_le_bytes(file[p..p + 8].try_into().unwrap());
+        p += 8;
+        assert_eq!(&file[p..p + 16], &[0u8; 16][..], "索引里的 file id");
+        p += 16;
+        let interval = u64::from_le_bytes(file[p..p + 8].try_into().unwrap());
+        p += 8;
+        let max_packet = u32::from_le_bytes(file[p..p + 4].try_into().unwrap());
+        p += 4;
+        let count = u32::from_le_bytes(file[p..p + 4].try_into().unwrap());
+        p += 4;
+        // 长度字段 = 24(对象头) + 16(file id) + 8(间隔) + 4(最大包数) + 4(条目数) + 6×n
+        assert_eq!(size as usize, 24 + 32 + 6 * count as usize, "对象长度字段");
+        let mut entries = Vec::new();
+        for _ in 0..count {
+            let n = u32::from_le_bytes(file[p..p + 4].try_into().unwrap());
+            p += 4;
+            let c = u16::from_le_bytes(file[p..p + 2].try_into().unwrap());
+            p += 2;
+            entries.push((n, c));
+        }
+        assert_eq!(p, at + size as usize, "条目总长与对象长度字段自洽");
+        (interval, max_packet, entries)
+    }
+
+    /// 数据区里第 `n` 个 ASF 包的**第一个载荷的流字节**（关键帧位在最高位）。
+    fn packet_stream_byte(file: &[u8], n: usize) -> u8 {
+        let header_size = u64::from_le_bytes(file[16..24].try_into().unwrap()) as usize;
+        let packets_start = header_size + 50; // Data Object 头固定 50 字节
+        let p = &file[packets_start + n * PACKET_SIZE..][..PACKET_SIZE];
+        let pad_len = match p[3] {
+            0x00 => 0,
+            0x08 => 1,
+            0x10 => 2,
+            other => panic!("未知的长度类型字节 {other:#04x}"),
+        };
+        p[PACKET_HEADER_MIN_SIZE + pad_len]
+    }
+
+    /// 槽的填法必须与 ffmpeg 的 `update_index()` 一致 —— 手算一遍钉住。
+    ///
+    /// 帧 A：关键帧 @ 0 ms → `start_sec = ceil(3.1) = 4`，包 0，占 1 包  
+    /// 帧 B：关键帧 @ 2000 ms → `start_sec = ceil(5.1) = 6`，包 1，占 1 包  
+    /// 收尾：`update_index(end_sec + 1 = 7)` 补出最后一个槽  
+    /// ⇒ 7 个槽：前 6 个指 A(0,1)，最后 1 个指 B(1,1)。
+    #[test]
+    fn index_slots_follow_ffmpeg_semantics() {
+        let mut m = AsfMuxer::new(VideoStreamInfo {
+            width: 64,
+            height: 48,
+            fourcc: u32::from_le_bytes(*b"MP43"),
+        });
+        m.write_video(&[7u8; 100], true, 0).unwrap();
+        m.write_video(&[9u8; 100], true, 2000).unwrap();
+        let file = m.finish();
+
+        let (interval, max_packet, entries) = parse_index(&file);
+        assert_eq!(interval, ASF_INDEXED_INTERVAL, "索引时间间隔 = 1 秒");
+        assert_eq!(max_packet, 1);
+        let mut want = vec![(0u32, 1u16); 6];
+        want.push((1, 1));
+        assert_eq!(entries, want);
+    }
+
+    /// 大帧跨包时，槽里的「包数」要记整帧占的包数，不是 1。
+    ///
+    /// 帧 A：关键帧 @ 0 ms，9000 字节 → 3 包（包 0..2）  
+    /// 帧 B：关键帧 @ 3000 ms，100 字节 → 1 包（包 3）  
+    /// ⇒ 8 个槽：前 7 个指 A(0,3)，最后 1 个指 B(3,1)；`max packet count = 3`。
+    #[test]
+    fn index_records_packet_span_of_a_fragmented_key_frame() {
+        let mut m = AsfMuxer::new(VideoStreamInfo {
+            width: 64,
+            height: 48,
+            fourcc: u32::from_le_bytes(*b"MP43"),
+        });
+        let big: Vec<u8> = (0..9000).map(|i| (i * 7 + 1) as u8).collect();
+        m.write_video(&big, true, 0).unwrap();
+        m.write_video(&[3u8; 100], true, 3000).unwrap();
+        let file = m.finish();
+
+        let (_, max_packet, entries) = parse_index(&file);
+        assert_eq!(max_packet, 3);
+        let mut want = vec![(0u32, 3u16); 7];
+        want.push((3, 1));
+        assert_eq!(entries, want);
+
+        // 槽指到的包，第一个载荷必须是**关键帧**（这正是 seek 能用的前提）。
+        assert_eq!(packet_stream_byte(&file, 0) & 0x80, 0x80);
+        assert_eq!(packet_stream_byte(&file, 3) & 0x80, 0x80);
+    }
+
+    /// 非关键帧不进索引；整段没有关键帧时**不写**索引对象。
+    #[test]
+    fn index_is_omitted_when_there_is_no_key_frame() {
+        let mut m = AsfMuxer::new(VideoStreamInfo {
+            width: 32,
+            height: 32,
+            fourcc: u32::from_le_bytes(*b"MP43"),
+        });
+        m.write_video(&[1u8; 50], false, 0).unwrap();
+        m.write_video(&[2u8; 50], false, 40).unwrap();
+        let file = m.finish();
+        assert!(
+            !file.windows(16).any(|w| w == guid::SIMPLE_INDEX),
+            "没有关键帧就不该有索引对象"
+        );
+
+        // 有关键帧时才有。
+        let mut m = AsfMuxer::new(VideoStreamInfo {
+            width: 32,
+            height: 32,
+            fourcc: u32::from_le_bytes(*b"MP43"),
+        });
+        m.write_video(&[1u8; 50], true, 0).unwrap();
+        let file = m.finish();
+        let (_, _, entries) = parse_index(&file);
+        assert!(!entries.is_empty());
+    }
+
+    /// 索引里的包号必须都在文件里，且槽单调不减（seek 才能二分）。
+    #[test]
+    fn index_entries_are_monotonic_and_in_range() {
+        let mut m = AsfMuxer::new(VideoStreamInfo {
+            width: 64,
+            height: 48,
+            fourcc: u32::from_le_bytes(*b"MP43"),
+        });
+        // 每 1 秒一个关键帧，中间夹 4 个非关键帧，跑 10 秒。
+        let mut pts = 0u32;
+        for sec in 0..10 {
+            let size = if sec == 3 { 9000 } else { 60 };
+            let data: Vec<u8> = (0..size).map(|i| (i * 13 + sec) as u8).collect();
+            m.write_video(&data, true, pts).unwrap();
+            for k in 1..5 {
+                m.write_video(&[k as u8; 40], false, pts + k * 40).unwrap();
+            }
+            pts += 1000;
+        }
+        let file = m.finish();
+
+        let (_, max_packet, entries) = parse_index(&file);
+        assert!(entries.len() > 10, "10 秒 + preroll 应产生十几个槽");
+        assert_eq!(max_packet, 3, "只有第 3 秒那个大帧占 3 包");
+
+        let nb_packets = (file.len()
+            - (u64::from_le_bytes(file[16..24].try_into().unwrap()) as usize + 50))
+            / PACKET_SIZE;
+        let mut last = 0u32;
+        for (n, c) in &entries {
+            assert!(*n as usize + *c as usize <= nb_packets, "槽 {n} 越界");
+            assert!(*c >= 1, "包数至少 1");
+            assert!(*n >= last, "槽的包号单调不减");
+            assert_eq!(packet_stream_byte(&file, *n as usize) & 0x80, 0x80);
+            last = *n;
+        }
+    }
 
     #[test]
     fn roundtrips_through_our_own_demuxer() {
