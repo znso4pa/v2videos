@@ -492,6 +492,8 @@ fn muxes_video_plus_pcm_audio_and_keeps_both_intact() {
             timescale: RATE,
             codec: AudioCodec::Pcm { bits: 16, big_endian: false },
             avg_bitrate: 0,
+            // PCM 没有编码器延迟。
+            priming: 0,
         },
     );
 

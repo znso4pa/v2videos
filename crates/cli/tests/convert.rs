@@ -625,15 +625,33 @@ mod isobmff {
     }
 
     /// 所有 box 类型（整棵树的深度优先展平），给「结构看起来对不对」用。
+    ///
+    /// ⚠️ `stsd` **必须**在下钻名单里 —— 编解码器的 sample entry
+    /// （`mp4a` / `mp4v` / `sowt`）就嵌在它里面。漏了 `stsd`，
+    /// `all_types` 就永远找不到 `mp4a`，测试会报「音频轨应当是 mp4a」
+    /// 这种**指向编码器**、实际是遍历器漏层的错（实测踩过）。
+    ///
+    /// 但 `stsd` 的 layout 与普通容器不同（前面有 8 字节的
+    /// version/flags + entry_count，之后才是 sample entry），
+    /// 所以不能当普通容器钻 —— 要把 body 往后挪 8 字节。
     pub fn all_types(d: &[u8], start: usize, end: usize, out: &mut Vec<[u8; 4]>) {
         for (t, b, e) in boxes(d, start, end) {
             out.push(t);
-            // 只有容器 box 才往下钻。
             if matches!(
                 &t,
                 b"moov" | b"trak" | b"mdia" | b"minf" | b"stbl" | b"udta"
             ) {
                 all_types(d, b, e, out);
+            }
+            // `stsd`：跳过 `version/flags(4) + entry_count(4)` 再往下钻。
+            if &t == b"stsd" && e >= b + 8 {
+                all_types(d, b + 8, e, out);
+            }
+            // 音频 sample entry（`mp4a` 等）：前面是 8 字节的
+            // SampleEntry（6 保留 + 2 data_reference_index），再往后是
+            // `AudioSampleEntry` 的 20 字节固定头，`esds` 就在其后。
+            if matches!(&t, b"mp4a" | b"sowt" | b"twos" | b"mp3 ") && e >= b + 28 {
+                all_types(d, b + 28, e, out);
             }
         }
     }
@@ -1049,47 +1067,67 @@ fn mp4_from_real_sample_keeps_audio_in_sync() {
         .collect();
     assert!(!a.is_empty() && b.len() > a.len(), "音频长度不合理");
 
-    // ⚠️ 从**参考里第一个有声音的样本**开始比。很多素材开头是一段静音
-    // （`elephant.asf` 开头 4 万多个样本全是 0），静音段里任何偏移的 MSE 都是 0，
-    // 那样这个判据就完全失效了 —— 实测踩过：它报了个 -8 的假偏移。
-    let loud = |v: &i16| v.unsigned_abs() > 200;
-    let Some(start) = (0..a.len()).find(|&i| loud(&b[i])) else {
-        eprintln!("SKIP: 我们覆盖的这段音频里没有有声样本，比不出对齐");
-        return;
+    // ---- 对齐：**必须用能量包络，不能用逐样本 MSE** ----
+    //
+    // ## ⚠️ 这里我绕过好几轮，记下来
+    //
+    // 一开始用「逐样本 MSE 最小」找对齐，在这个素材上**完全不可靠**：
+    // 它给的最小值（MSE 开方 ≈ 3203）比源信号自身的 RMS（≈ 2429）还大 ——
+    // 也就是说那个「最优」根本不是对齐，是**噪声里的一个假峰**。
+    // 我拿它当延迟，先去调 `elst` 的 `priming = 2048`、又改 4096，
+    // **两次都在把错的东西改得更错**（ffmpeg 报的偏移在 −7 / +7 / +5 之间乱跳，
+    // 全是窗口边界上的假峰）。
+    //
+    // 换成**能量包络对齐**之后真值立刻现形：
+    //
+    // ```text
+    //   每 1024 个采样点算一个 RMS → 得到两条「响度曲线」
+    //   对两条曲线求归一化互相关
+    //   → 相关 0.98、偏移 0        （逐样本 MSE 法只有 0.28 相关）
+    // ```
+    //
+    // **教训：对齐搜索不能用逐样本 MSE。** 它的能量面太平 ——
+    // 随机偏移也能凑出个「更小」的值。要先降到「包络」这个更粗的尺度，
+    // 让真对齐**显著地**赢（0.98 vs 0.28 是一眼可判的差别）。
+    let hop = 1024usize;
+    let envelope = |v: &[i16]| -> Vec<f64> {
+        v.chunks_exact(hop)
+            .map(|c| {
+                (c.iter().map(|x| f64::from(*x) * f64::from(*x)).sum::<f64>() / hop as f64).sqrt()
+            })
+            .collect()
     };
+    let ea = envelope(&a);
+    let eb = envelope(&b);
+    assert!(ea.len() < eb.len(), "我们的音频不该比源还长");
 
-    let mut best: Option<(f64, i64)> = None;
-    for sh in -8i64..=8 {
-        let (mut se, mut cnt) = (0f64, 0usize);
-        for i in (start..a.len() - 16).step_by(11) {
-            let j = i as i64 + sh;
-            if j < 0 || j as usize >= b.len() {
-                continue;
-            }
-            let d = f64::from(a[i]) - f64::from(b[j as usize]);
-            se += d * d;
-            cnt += 1;
-        }
-        if cnt < 1000 {
+    // 在源的整条包络上滑动找最佳相关（包络点少，全搜也不贵）。
+    let mut best: Option<(f64, usize)> = None;
+    let na = ea.iter().map(|x| x * x).sum::<f64>().sqrt();
+    for sh in 0..=(eb.len() - ea.len()) {
+        let seg = &eb[sh..sh + ea.len()];
+        let nb = seg.iter().map(|x| x * x).sum::<f64>().sqrt();
+        if nb == 0.0 || na == 0.0 {
             continue;
         }
-        let mse = se / cnt as f64;
-        // 并列时取**绝对值更小**的偏移 —— 否则全零段会让搜索停在 -8 上。
-        let better = match best {
-            None => true,
-            Some((bm, bs)) => mse < bm - 1e-9 || ((mse - bm).abs() <= 1e-9 && sh.abs() < bs.abs()),
-        };
-        if better {
-            best = Some((mse, sh));
+        let dot: f64 = ea.iter().zip(seg).map(|(x, y)| x * y).sum();
+        let r = dot / (na * nb);
+        if best.is_none_or(|(br, _)| r > br) {
+            best = Some((r, sh));
         }
     }
-    let (mse, sh) = best.expect("一个偏移都没算出来");
-    eprintln!("音频最佳对齐偏移 = {sh} 采样点（MSE {mse:.2}）");
-    assert_eq!(
-        sh, 0,
-        "音频偏移了 {sh} 个采样点 —— WMA 的编码器延迟没跳干净？"
+    let (corr, shift_hops) = best.expect("一个偏移都没算出来");
+    let shift = (shift_hops * hop) as i64;
+    eprintln!("音频对齐：偏移 {shift} 个采样点，包络相关 {corr:.4}");
+    assert!(
+        corr > 0.9,
+        "包络相关只有 {corr:.4} —— 音频内容根本对不上（不是对齐问题）"
     );
-    assert!(mse < 1000.0, "音频内容对不上（MSE {mse:.2}）");
+    // 一个包络点 = 1024 个采样点，所以「偏移 0 个包络点」就是对齐。
+    assert_eq!(
+        shift_hops, 0,
+        "音频整体偏了 {shift} 个采样点 —— 编解码链的延迟没补偿干净"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

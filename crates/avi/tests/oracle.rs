@@ -95,7 +95,10 @@ fn handmade_avi() -> Vec<u8> {
     u32le(&mut strf, 0);
     u32le(&mut strf, 0);
 
-    let strl = list(b"strl", &[chunk(b"strh", &strh), chunk(b"strf", &strf)].concat());
+    let strl = list(
+        b"strl",
+        &[chunk(b"strh", &strh), chunk(b"strf", &strf)].concat(),
+    );
     let hdrl = list(b"hdrl", &[chunk(b"avih", &avih), strl].concat());
 
     // movi：三帧（第三帧长度是奇数，验补齐）
@@ -113,8 +116,8 @@ fn handmade_avi() -> Vec<u8> {
     // idx1：偏移相对 movi **数据**起点
     let mut idx1 = Vec::new();
     let entries = [
-        (f0.len() as u32, 0x10u32, 0u32),          // 关键帧
-        (f1.len() as u32, 0u32, 8 + 3 + 1),        // 非关键帧
+        (f0.len() as u32, 0x10u32, 0u32),           // 关键帧
+        (f1.len() as u32, 0u32, 8 + 3 + 1),         // 非关键帧
         (f2.len() as u32, 0u32, 8 + 3 + 1 + 8 + 4), // 非关键帧
     ];
     for (size, flags, off) in entries {
@@ -229,8 +232,17 @@ fn same_stream_in_avi_and_wmv_matches() {
     }
 
     // ffmpeg 写出的这个 AVI 声明 1000fps（保留源的 1/1000 时基），
-    // 所以 2 秒里有 2009 个帧槽、只有 118 个真有数据。取前 100 帧对账。
-    let n = 100usize;
+    // 所以里面大部分帧槽是空的，只有少数真有数据。
+    //
+    // ⚠️ **不要硬编码帧数**。这个数取决于样本本身的时长与帧率
+    // （2 秒 / 25fps 只有 51 帧，但 4 秒 / 50fps 就有 200 帧）——
+    // 写死 `n = 100` 会对低帧率样本直接失败，看着像 AVI 解封装坏了、
+    // 其实是**测试的前提**不成立（实测踩过）。
+    //
+    // 也不能「AVI 读尽、ASF 读尽」然后比总数：上面的 ffmpeg 命令带 `-t 2`，
+    // **只截了 2 秒**装进 AVI，而 ASF 侧是整条流 —— 总数当然对不上。
+    // 正解是**两边各读尽**，然后比**较短的**那个长度（见下面的 `n`）。
+    let n = usize::MAX;
 
     // ---- AVI 侧 ----
     let mut ad = AviDemuxer::new(std::fs::File::open(&avi_path).expect("开 AVI")).expect("解 AVI");
@@ -254,8 +266,8 @@ fn same_stream_in_avi_and_wmv_matches() {
     }
 
     // ---- ASF 侧（同一条码流）----
-    let mut sd = v2v_asf::AsfDemuxer::new(std::fs::File::open(&src).expect("开 WMV"))
-        .expect("解 WMV");
+    let mut sd =
+        v2v_asf::AsfDemuxer::new(std::fs::File::open(&src).expect("开 WMV")).expect("解 WMV");
     let (snum, sw, sh) = {
         let v = sd
             .streams()
@@ -266,7 +278,9 @@ fn same_stream_in_avi_and_wmv_matches() {
         (v.number, vf.width, vf.height)
     };
     let mut asf_frames = Vec::new();
-    while asf_frames.len() < n {
+    // AVI 那边被 `-t 2` 截过，所以它更短 —— 读到**它的长度**就够，
+    // 不用把整条 ASF 流读尽（5201 帧会白等）。
+    while asf_frames.len() < avi_frames.len().max(1) {
         match sd.next_sample().expect("读 WMV") {
             Some(s) if s.stream == snum => asf_frames.push(s),
             Some(_) => {}
@@ -281,20 +295,19 @@ fn same_stream_in_avi_and_wmv_matches() {
     );
     assert_eq!(aw, sw);
     assert_eq!(ah, sh);
-    assert!(
-        avi_frames.len() >= n,
-        "AVI 里只读到 {} 帧（空槽应该被跳过、不是当成空样本）",
-        avi_frames.len()
-    );
-    assert!(asf_frames.len() >= n, "WMV 里没读到足够的帧");
+
+    // 取两边的**较小长度**来逐帧比 —— AVI 那边被 `-t 2` 截过，
+    // 所以它通常更短，用它的长度去比 ASF 的**前缀**。
+    // 关键断言是「同一序号的帧字节完全相同」，长度只决定比多少帧。
+    let n = avi_frames.len().min(asf_frames.len());
+    assert!(n > 0, "两边的视频帧都是空的");
 
     // 帧字节逐字节相同 + 关键帧标志一致
     let mut keys_avi = 0;
     let mut keys_asf = 0;
     for i in 0..n {
         assert_eq!(
-            avi_frames[i].data,
-            asf_frames[i].data,
+            avi_frames[i].data, asf_frames[i].data,
             "第 {i} 帧：AVI 与 WMV 里的码流字节不一致"
         );
         assert_eq!(
@@ -356,7 +369,10 @@ fn empty_chunks_are_skipped_but_still_advance_time() {
     for _ in 0..5 {
         u32le(&mut strf, 0);
     }
-    let strl = list(b"strl", &[chunk(b"strh", &strh), chunk(b"strf", &strf)].concat());
+    let strl = list(
+        b"strl",
+        &[chunk(b"strh", &strh), chunk(b"strf", &strf)].concat(),
+    );
     let hdrl = list(b"hdrl", &[chunk(b"avih", &avih), strl].concat());
 
     // 槽 0 有数据、槽 1 空、槽 2 有数据 → 只应吐 2 个样本，时间戳 0 与 2 ms

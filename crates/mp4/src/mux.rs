@@ -88,6 +88,16 @@ pub struct AudioTrack {
     pub codec: AudioCodec,
     /// 平均码率（bit/s）。只写进 `esds` 与 `btrt`；PCM 用不上。
     pub avg_bitrate: u32,
+    /// **编码器预热样本数**（`priming`）—— 解码器要跳过开头这么多个采样点。
+    ///
+    /// AAC 这类「MDCT + 50% 重叠」的编码器**必然有延迟**：编码器开头灌进去的
+    /// 是补零的窗，解码出来的头一两个块是渐入段（实测 2048 个采样点）。
+    /// 不补偿的话音频整体比视频晚 2048/44100 ≈ 46 ms，口型会对不上。
+    ///
+    /// 补偿用 `edts`/`elst`（编辑列表），**不是**「把开头编的静音扔掉」——
+    /// 后者会让编码器失去预热、第一帧的质量反而变差。
+    /// PCM 这类无延迟的编码填 0。
+    pub priming: u32,
 }
 
 /// 一个已写入 `mdat` 的样本。
@@ -205,8 +215,14 @@ impl Mp4Muxer {
         self.out[self.mdat_at..self.mdat_at + 4].copy_from_slice(&mdat_size.to_be_bytes());
         self.out[self.mdat_at + 4..self.mdat_at + 8].copy_from_slice(b"mdat");
 
-        let vdur = track_duration_ms(&self.video_samples, self.video.as_ref().map(|v| v.timescale));
-        let adur = track_duration_ms(&self.audio_samples, self.audio.as_ref().map(|a| a.timescale));
+        let vdur = track_duration_ms(
+            &self.video_samples,
+            self.video.as_ref().map(|v| v.timescale),
+        );
+        let adur = track_duration_ms(
+            &self.audio_samples,
+            self.audio.as_ref().map(|a| a.timescale),
+        );
         let movie_duration = vdur.max(adur);
 
         let mut moov = BoxBuilder::new(b"moov");
@@ -285,6 +301,14 @@ fn trak_audio(a: &AudioTrack, track_id: u32, samples: &[SampleRec]) -> BoxBuilde
     let mut trak = BoxBuilder::new(b"trak");
     // 音频轨的 `tkhd`：宽高为 0、音量为满、`alternate_group` 为 1（与 ffmpeg 一致）。
     trak.child(tkhd(track_id, track_duration, 0, 0, 0x0100, 1));
+    // `edts` / `elst`：告诉播放器「跳过开头 `priming` 个采样点」。
+    //
+    // ⚠️ `media_time` 用的单位是**本轨的 media timescale**（音频轨就是采样率），
+    // 而 `segment_duration` 用的是**影片时间轴**（`mvhd` 的 timescale = 1000）。
+    // 两个单位不一样 —— AGENTS.md 里就记着这条（当初在别的项目上踩过）。
+    if a.priming > 0 {
+        trak.child(edts(a.priming, a.timescale, track_duration));
+    }
     trak.child(mdia(
         b"soun",
         "SoundHandler",
@@ -295,7 +319,50 @@ fn trak_audio(a: &AudioTrack, track_id: u32, samples: &[SampleRec]) -> BoxBuilde
     trak
 }
 
-fn tkhd(track_id: u32, duration: u64, width: u16, height: u16, volume: u16, alt: u16) -> BoxBuilder {
+/// `edts`（edit box）—— 一条 `elst` 条目：「跳过开头的编码器预热，之后是正片」。
+///
+/// ## 两个单位不一样，这是最容易写错的地方
+///
+/// ```text
+///   media_time       ← 本轨的 media timescale（音频轨 = 采样率）
+///   segment_duration ← movie timescale（`mvhd` 的 1000 = 毫秒）
+/// ```
+///
+/// 所以 `priming` 个采样点换算到影片时间轴是
+/// `priming * MOVIE_TIMESCALE / media_timescale`。
+/// **不能直接拿 `priming` 去减 `track_duration`** —— 那是笔「秒减采样点」的糊涂账。
+///
+/// AGENTS.md 里记着同一条坑（`elst.segment_duration` 是 movie 时间轴、
+/// `media_time` 是媒体时间轴，两个单位不一样）。
+fn edts(priming: u32, media_timescale: u32, track_duration: u64) -> BoxBuilder {
+    // 预热段在**影片时间轴**上的长度。
+    let priming_movie =
+        u64::from(priming) * u64::from(MOVIE_TIMESCALE) / u64::from(media_timescale).max(1);
+
+    let mut elst = BoxBuilder::new(b"elst");
+    elst.full(0, 0); // version 0 / flags
+    elst.u32(1); // entry_count
+                 // segment_duration：正片在影片时间轴上的长度 = 总时长 − 预热段。
+    elst.u32(track_duration.saturating_sub(priming_movie) as u32);
+    // media_time：**从媒体时间轴的哪里开始播** = 预热了多少个采样点。
+    // `-1` 在 `elst` 里是「空编辑」的约定值，但正片编辑用真实的起始点。
+    elst.u32(priming);
+    elst.u16(1); // media_rate_integer = 1.0
+    elst.u16(0); // media_rate_fraction
+
+    let mut edts = BoxBuilder::new(b"edts");
+    edts.child(elst);
+    edts
+}
+
+fn tkhd(
+    track_id: u32,
+    duration: u64,
+    width: u16,
+    height: u16,
+    volume: u16,
+    alt: u16,
+) -> BoxBuilder {
     let mut b = BoxBuilder::new(b"tkhd");
     b.full(0, 0x0000_0003); // track_enabled | track_in_movie
     b.u32(0); // creation_time
@@ -590,10 +657,19 @@ fn audio_sample_entry(b: &mut BoxBuilder, a: &AudioTrack, bits: u16) {
 
 fn audio_entry(a: &AudioTrack) -> Vec<u8> {
     match &a.codec {
-        AudioCodec::Es { object_type, decoder_specific_info } => {
+        AudioCodec::Es {
+            object_type,
+            decoder_specific_info,
+        } => {
             let mut b = BoxBuilder::new(b"mp4a");
             audio_sample_entry(&mut b, a, 16);
-            b.child(esds(2, *object_type, 0x05, a.avg_bitrate, decoder_specific_info));
+            b.child(esds(
+                2,
+                *object_type,
+                0x05,
+                a.avg_bitrate,
+                decoder_specific_info,
+            ));
             b.child(btrt(a.avg_bitrate));
             b.finish()
         }
@@ -723,7 +799,12 @@ mod tests {
 
     #[test]
     fn contiguous_samples_merge_into_one_chunk_but_a_gap_splits_it() {
-        let mk = |off, size| SampleRec { offset: off, size, duration: 1, key: true };
+        let mk = |off, size| SampleRec {
+            offset: off,
+            size,
+            duration: 1,
+            key: true,
+        };
         // 0..10 连着，然后跳到 100（中间有别轨的样本）
         let s = vec![mk(0, 10), mk(10, 20), mk(100, 5)];
         assert_eq!(chunk_runs(&s), vec![2, 1], "前两个一块，第三个自己一块");
@@ -741,17 +822,36 @@ mod tests {
     #[test]
     fn stsz_falls_back_to_default_size_when_every_sample_is_equal() {
         let s: Vec<SampleRec> = (0..1000)
-            .map(|i| SampleRec { offset: i * 4, size: 4, duration: 1, key: true })
+            .map(|i| SampleRec {
+                offset: i * 4,
+                size: 4,
+                duration: 1,
+                key: true,
+            })
             .collect();
         let b = stsz(&s).finish();
-        assert_eq!(u32::from_be_bytes(b[12..16].try_into().unwrap()), 4, "default size");
+        assert_eq!(
+            u32::from_be_bytes(b[12..16].try_into().unwrap()),
+            4,
+            "default size"
+        );
         assert_eq!(u32::from_be_bytes(b[16..20].try_into().unwrap()), 1000);
         assert_eq!(b.len(), 20, "省掉了整张表");
 
         // 不等长时必须逐项写
         let s = vec![
-            SampleRec { offset: 0, size: 4, duration: 1, key: true },
-            SampleRec { offset: 4, size: 8, duration: 1, key: true },
+            SampleRec {
+                offset: 0,
+                size: 4,
+                duration: 1,
+                key: true,
+            },
+            SampleRec {
+                offset: 4,
+                size: 8,
+                duration: 1,
+                key: true,
+            },
         ];
         let b = stsz(&s).finish();
         assert_eq!(u32::from_be_bytes(b[12..16].try_into().unwrap()), 0);
@@ -763,10 +863,26 @@ mod tests {
         // chunk 大小：1,1,1,2,2,2 → 两项
         let b = stsc(&[1, 1, 1, 2, 2, 2]).finish();
         assert_eq!(u32::from_be_bytes(b[12..16].try_into().unwrap()), 2, "两项");
-        assert_eq!(u32::from_be_bytes(b[16..20].try_into().unwrap()), 1, "first_chunk");
-        assert_eq!(u32::from_be_bytes(b[20..24].try_into().unwrap()), 1, "每 chunk 1 个");
-        assert_eq!(u32::from_be_bytes(b[28..32].try_into().unwrap()), 4, "从第 4 个 chunk 起");
-        assert_eq!(u32::from_be_bytes(b[32..36].try_into().unwrap()), 2, "每 chunk 2 个");
+        assert_eq!(
+            u32::from_be_bytes(b[16..20].try_into().unwrap()),
+            1,
+            "first_chunk"
+        );
+        assert_eq!(
+            u32::from_be_bytes(b[20..24].try_into().unwrap()),
+            1,
+            "每 chunk 1 个"
+        );
+        assert_eq!(
+            u32::from_be_bytes(b[28..32].try_into().unwrap()),
+            4,
+            "从第 4 个 chunk 起"
+        );
+        assert_eq!(
+            u32::from_be_bytes(b[32..36].try_into().unwrap()),
+            2,
+            "每 chunk 2 个"
+        );
     }
 
     #[test]
@@ -777,8 +893,12 @@ mod tests {
                 channels: 2,
                 sample_rate: 44100,
                 timescale: 44100,
-                codec: AudioCodec::Pcm { bits: 16, big_endian: false },
+                codec: AudioCodec::Pcm {
+                    bits: 16,
+                    big_endian: false,
+                },
                 avg_bitrate: 0,
+                priming: 0,
             },
         );
         m.write_video(&[1, 2, 3], true, 512).unwrap();
@@ -811,15 +931,40 @@ mod tests {
     #[test]
     fn stss_is_omitted_when_every_frame_is_a_key_frame() {
         let samples = vec![
-            SampleRec { offset: 0, size: 1, duration: 512, key: true },
-            SampleRec { offset: 1, size: 1, duration: 512, key: true },
+            SampleRec {
+                offset: 0,
+                size: 1,
+                duration: 512,
+                key: true,
+            },
+            SampleRec {
+                offset: 1,
+                size: 1,
+                duration: 512,
+                key: true,
+            },
         ];
         assert!(stss(&samples).is_none(), "全关键帧 → 不写 stss");
 
         let mixed = vec![
-            SampleRec { offset: 0, size: 1, duration: 512, key: true },
-            SampleRec { offset: 1, size: 1, duration: 512, key: false },
-            SampleRec { offset: 2, size: 1, duration: 512, key: true },
+            SampleRec {
+                offset: 0,
+                size: 1,
+                duration: 512,
+                key: true,
+            },
+            SampleRec {
+                offset: 1,
+                size: 1,
+                duration: 512,
+                key: false,
+            },
+            SampleRec {
+                offset: 2,
+                size: 1,
+                duration: 512,
+                key: true,
+            },
         ];
         let b = stss(&mixed).expect("有非关键帧 → 要写").finish();
         assert_eq!(&b[4..8], b"stss");
@@ -831,10 +976,19 @@ mod tests {
     #[test]
     fn stts_run_length_compresses_equal_durations() {
         let samples: Vec<SampleRec> = (0..75)
-            .map(|i| SampleRec { offset: i, size: 1, duration: 512, key: i == 0 })
+            .map(|i| SampleRec {
+                offset: i,
+                size: 1,
+                duration: 512,
+                key: i == 0,
+            })
             .collect();
         let b = stts(&samples).finish();
-        assert_eq!(u32::from_be_bytes(b[12..16].try_into().unwrap()), 1, "只一项");
+        assert_eq!(
+            u32::from_be_bytes(b[12..16].try_into().unwrap()),
+            1,
+            "只一项"
+        );
         assert_eq!(u32::from_be_bytes(b[16..20].try_into().unwrap()), 75);
         assert_eq!(u32::from_be_bytes(b[20..24].try_into().unwrap()), 512);
     }
