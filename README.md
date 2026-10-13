@@ -26,11 +26,15 @@ crates/
   avi      AVI（RIFF）解封装
   msmpeg4  MS-MPEG-4 v3（MP43）解码（I / P）+ 编码（I / P，含运动估计与帧内/帧间判决）
   wma      WMA v1/v2 音频解码（帧头 / LSP 指数 / 系数 / IMDCT）
-  mp4v     MPEG-4 Part 2（mp4v）**编码** —— 目前全 I 帧
-  mp4      MP4 / ISOBMFF **封装**（ftyp / mdat / moov，视频 + PCM 音频）
+  mp4v     MPEG-4 Part 2（mp4v）**编码**：I / P + 码率控制
+  aac      **AAC-LC 编码**：MDCT（长/短窗）+ TNS + Huffman 码本 + 码率控制
+  mp4      MP4 / ISOBMFF **封装**（ftyp / mdat / moov；音频 AAC 或 PCM）
   cli      `v2v` 命令行：**批量转码**（解封装 → 解码 → 编码 → 封装）
 tools/
-  gen_tables.py   生成 VLC / 反量化表（附自检：前缀无关、Kraft 和、逐码往返）
+  gen_tables.py     H.263 / MPEG-4 Part 2 的 VLC / 反量化表（附自检：前缀无关、Kraft 和、逐码往返）
+  check_tables.py   用**第二个独立来源**核对 msmpeg4 的表
+  gen_aac_tables.py AAC 的 Huffman 码表 / 频带表
+  gen_wma_tables.py WMA 解码的码表 / 频率表
 ```
 
 ## 构建与测试
@@ -63,9 +67,9 @@ V2V_ASF_SAMPLE=/path/to/sample.wmv cargo test --release -- --ignored
 | **编码**   | MPEG-4 Part 2（`v2v-mp4v`）**I 帧 + P 帧**：DC / AC 预测（逐宏块比位数择优）、运动估计（整像素粗搜 + 半像素细化）、中值 MV 预测、skip 宏块、逐宏块帧内/帧间判决 | 编出来的流交给 `ffmpeg` 解，真样本 **44.8 dB**（同 qscale 下 ffmpeg 自己的 mpeg4 是 43.6 dB）；**视频载荷比全 I 帧小 2.3 倍** |
 | **音频直通** | 转换时原样搬音频轨（ASF 多流复用）                                                                                         | 真样本整文件（208 秒音乐）：输出音频与源**逐样本 0 差异**（36,700,160 字节完全一致）                                           |
 | **音频解码** | WMA v1/v2（`v2v-wma`）→ PCM                                                                                   | 真样本整轨与 ffmpeg 的 PCM **最大差 2**（s16 满量程 32768）；转进 MP4 后**对齐偏移 0 采样点**                             |
-| **音频编码** | AAC-LC（`v2v-aac`）：MDCT + 量化 + Huffman 码本 + **短窗**（瞬态）+ 窗口分组 | ffmpeg 解得开；码率命中目标（二分搜 sf 偏移）；质量与 ffmpeg 的 AAC 同基准比（差 2 dB 内）；瞬态素材上**短窗 vs 长窗 12.02 vs 10.49 dB、体积小 29%** |
-| **封装**   | ASF 写（`.wmv`，单视频流）                                                                                          | `ffprobe` 认；自己解封装字节一致；ffmpeg 解出来的像素与我们的解码器**逐位一致**                                              |
-| **封装**   | MP4 / ISOBMFF 写（`v2v-mp4`，`mp4v` + `sowt` PCM）                                                              | 真样本 mp4v 轨的 `stsz`/`stts`/`stss`/`stco` 与 ffmpeg **逐项相同**、逐帧 MD5 一致；PCM 轨原样往返                   |
+| **音频编码** | AAC-LC（`v2v-aac`）：MDCT + 量化 + Huffman 码本 + **短窗**（瞬态）+ 窗口分组 + **TNS**（长窗）；二分搜 sf 偏移够目标码率 | ffmpeg 解得开；码率命中目标；真音乐上质量随码率**单调**变好（127k / 256k = 11.5 / 18.3 dB，同码率 ffmpeg 的 AAC 是 13.1 / 22.2 dB）；瞬态素材上**短窗 vs 长窗 12.02 vs 10.49 dB、体积小 29%** |
+| **封装**   | ASF 写（`.wmv`，单视频流）：**多载荷打包** + **Simple Index**（每 1 秒一个 seek 槽） | `ffprobe` 认；自己解封装字节一致；ffmpeg 解出来的像素与我们的解码器**逐位一致**；真样本 250 帧载荷占文件 **89%**（改前 24%）、体积小 3.8 倍；`ffmpeg -ss` 能读出我们写的索引 |
+| **封装**   | MP4 / ISOBMFF 写（`v2v-mp4`，视频 `mp4v`；音频 `mp4a`+`esds`（AAC）或 `sowt` PCM）                                     | 真样本 mp4v 轨的 `stsz`/`stts`/`stss`/`stco` 与 ffmpeg **逐项相同**、逐帧 MD5 一致；PCM 轨原样往返；AAC 轨 ffmpeg 解得开 |
 
 **两条输出路**（`v2v convert`，默认 `.wmv`）：
 
@@ -73,20 +77,23 @@ V2V_ASF_SAMPLE=/path/to/sample.wmv cargo test --release -- --ignored
 # .wmv：视频重编码成 MP43，音频**直通**（零损失），会做 PSNR 校验
 v2v convert in.wmv -o out/
 
-# .mp4：视频重编码成 MPEG-4 Part 2（-g 给 GOP；默认 0 = 全 I 帧），音频解成 PCM
+# .mp4：视频重编码成 MPEG-4 Part 2（-g 给 GOP，默认 250 帧 ≈ 10 秒；0 = 全 I 帧），
+#       音频 WMA → PCM → **AAC-LC**（--pcm 可退回未压缩 PCM）
 v2v convert --mp4 -g 12 in.wmv -o out/
 ```
 
 **为什么 `.mp4` 必须重编码**：MP4 / 3GP 容器**不收 MP43**（`mp4`/`3gp`/`3g2` 三个 muxer 都报  
 `codec not currently supported in container`），`mov` 收但是单向街 —— 写出来的东西 ffmpeg  
 自己读不回来。WMA 同理。所以 `.wmv → .mp4` 这条路上视频必须过一遍 MPEG-4 Part 2 编码器，  
-音频必须解成 PCM（`sowt`）。
+音频必须解成 PCM 再重编码（默认 AAC，`--pcm` 则是原封不动的 `sowt`）。
 
 **还没做**：MPEG-4 Part 2 的 **B 帧**与 8×8 运动补偿、AAC 的 **M/S 立体声 / PNS**
-（TNS 已做，只覆盖长窗）、音频**编码**（WMA 只能解）、Simple Index、其他容器与编解码器。
+（TNS 已做，只覆盖长窗）、WMA **编码器**（现在只能解）、MP4 的分片 / `co64`、其他容器与编解码器。
 
-⚠️ **AAC 编码器在真音乐上还有明显的质量问题**（同一个文件，码率越高反而越差）——
-细节与已排除的怀疑写在 `TODO.md`（本地），这是下一步最该啃的一块。
+AAC 编码器现在**比 ffmpeg 的 AAC 低 1.6–3.8 dB**（127k / 256k 的真音乐），且随码率**单调**
+变好 —— 早先「码率越高反而越差」是代价函数里 f32 溢出的 bug，已修。剩下的差距主要来自
+**没有 M/S 立体声**、心理声学模型只做「按带乘权重」（真正的**按带分配比特**还没做）、以及
+`plan_group` 的全局量化下界（频谱动态范围大时安静频带吃亏）。细节在 `TODO.md`（本地）。
 
 ## 命令行
 
@@ -94,6 +101,8 @@ v2v convert --mp4 -g 12 in.wmv -o out/
 cargo run --release -p v2v-cli -- convert <输入.wmv>... -o <输出目录> [-q 6] [-g 250] [-n 100]
 cargo run --release -p v2v-cli -- convert --mp4 <输入.wmv>... -o <输出目录> [-q 6] [-g 12] [--fps 25]
 ```
+
+`.mp4` 的音频默认 AAC：`--aac-bitrate 128000` 给目标码率，`--pcm` 退回未压缩 `sowt`。
 
 批量：一个输入失败不影响其他。默认（`.wmv`）转完会把输出**解码回来**与源帧比 PSNR；  
 `--mp4` 不做这个校验 —— 我们只有 `mp4v` 编码器、没有解码器（那条路的正确性由  
