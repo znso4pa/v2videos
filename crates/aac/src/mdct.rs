@@ -34,6 +34,22 @@ use std::f64::consts::PI;
 /// 长块的样本数（MDCT 输出点数）。
 pub const LONG_LEN: usize = 1024;
 
+/// 短块的样本数（`EIGHT_SHORT_SEQUENCE` 下每个窗口的 MDCT 输出点数）。
+///
+/// 一帧 = 8 个短窗，每个窗口的**输入**长 `2·SHORT_LEN = 256`、步进 128
+/// （相邻窗口 50% 重叠），8×128 = 1024 个系数 —— 与长窗的总系数数一致。
+pub const SHORT_LEN: usize = 128;
+
+/// 短块的开窗表（长 `2·SHORT_LEN = 256`）。`kb = true` 用 KBD（alpha=6.0，
+/// 与 ffmpeg 的 `ff_kbd_window_init(.., 6.0, 128)` 同口径），否则正弦窗。
+pub fn short_window(kb: bool) -> Vec<f32> {
+    if kb {
+        kbd_aac_window(SHORT_LEN, 6.0)
+    } else {
+        sine_window(SHORT_LEN)
+    }
+}
+
 /// 正弦窗 `w[n] = sin( π/(2N) · (n + 1/2) )`，长度 `2N`。
 ///
 /// AAC 用的是「半窗」——`sin` 的相位只走 π/2，所以两份窗相加（且一份倒序）恰好为 1。

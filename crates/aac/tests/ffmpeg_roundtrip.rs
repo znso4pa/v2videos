@@ -21,7 +21,6 @@
 use std::process::{Command, Stdio};
 
 use v2v_aac::{Encoder, EncoderConfig, Frame};
-use v2v_msmpeg4::BitWriter;
 
 const SR: u32 = 44100;
 const FREQ: f64 = 440.0;
@@ -37,6 +36,18 @@ fn has_ffmpeg() -> bool {
         .unwrap_or(false)
 }
 
+/// 进程内唯一的临时文件路径。
+///
+/// **必须唯一**：`cargo test` 默认多线程跑，同一个测试二进制里的两个测试
+/// 如果共用一个临时路径，一个在写、另一个的 ffmpeg 在读 —— 会读到半截数据，
+/// 表现为**随机失败**（msmpeg4 那边踩过一次，见那边的 `tests/common/mod.rs`）。
+fn unique_temp(stem: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("{stem}_{}_{n}", std::process::id()))
+}
+
 /// `n` 个样本的 440 Hz 正弦（交织立体声），范围 `[-AMP, AMP]`。
 fn sine(n: usize, channels: usize) -> Vec<Vec<f32>> {
     (0..channels)
@@ -50,19 +61,6 @@ fn sine(n: usize, channels: usize) -> Vec<Vec<f32>> {
         .collect()
 }
 
-/// 交织成 `f32le` 字节流（喂给 ffmpeg）。
-fn interleave(planes: &[Vec<f32>]) -> Vec<u8> {
-    let ch = planes.len();
-    let n = planes[0].len();
-    let mut out = Vec::with_capacity(n * ch * 4);
-    for i in 0..n {
-        for p in planes {
-            out.extend_from_slice(&p[i].to_le_bytes());
-        }
-    }
-    out
-}
-
 /// 用 ffmpeg 解一段 AAC（裸帧要包成 ADTS 才认），返回每个声道的 f32 样本。
 fn decode_aac(frames: &[Vec<u8>], channels: u8) -> Vec<Vec<f32>> {
     // 拼一个 ADTS 容器：每个裸帧前面加 7 字节头。
@@ -71,7 +69,7 @@ fn decode_aac(frames: &[Vec<u8>], channels: u8) -> Vec<Vec<f32>> {
         adts.extend_from_slice(&adts_header(f.len(), channels));
         adts.extend_from_slice(f);
     }
-    let path = std::env::temp_dir().join("v2v_aac_ours.aac");
+    let path = unique_temp("v2v_aac_ours.aac");
     std::fs::write(&path, &adts).expect("写 ADTS");
 
     // ⚠️ 两点：
@@ -81,7 +79,7 @@ fn decode_aac(frames: &[Vec<u8>], channels: u8) -> Vec<Vec<f32>> {
     // 2. **用 `s16le` 而不是 `f32le`**：`f32le` 是 ±1 归一化的，而本测试的输入是
     //    int16 量级（`AMP = 12000`）。口径不同会让「幅度比」算出 0.000，
     //    看起来像位流全错、其实是**单位没对齐**。用 `s16le` 就和输入同量级了。
-    let raw_path = std::env::temp_dir().join("v2v_aac_ours.pcm");
+    let raw_path = unique_temp("v2v_aac_ours.pcm");
     // ⚠️ 先删残留 —— 不然 ffmpeg 失败时会把**上一次运行**的输出读回来，
     // 量出来的样本数/能量对不上，而且看起来像编码器的错。实测踩过：
     // 同一个文件名在两个测试间复用，读到了上一轮的长度。
@@ -134,7 +132,7 @@ fn decode_aac(frames: &[Vec<u8>], channels: u8) -> Vec<Vec<f32>> {
 /// 与 `decode_aac` 的区别：那个是「我们编的裸帧 + 我们加的 ADTS 头」，
 /// 这个是「别人（ffmpeg）编好的完整 ADTS 文件」—— 音质对标要用后者做对照。
 fn decode_aac_file(path: &std::path::Path) -> Vec<Vec<f32>> {
-    let raw_path = std::env::temp_dir().join("v2v_quality_ref.pcm");
+    let raw_path = unique_temp("v2v_quality_ref.pcm");
     let _ = std::fs::remove_file(&raw_path);
     let out = Command::new("ffmpeg")
         .args([
@@ -199,9 +197,11 @@ fn adts_header(payload: usize, channels: u8) -> [u8; 7] {
 fn goertzel(x: &[f32], freq: f64, sr: f64) -> f64 {
     let k = 2.0 * std::f64::consts::PI * freq / sr;
     let coeff = 2.0 * k.cos();
-    let (mut s0, mut s1, mut s2) = (0f64, 0f64, 0f64);
+    // 递推 `s0 = x + coeff·s1 − s2`，初值 `s1 = s2 = 0`。
+    // `s0` 在循环里先算后读，所以不需要在外面初始化。
+    let (mut s1, mut s2) = (0f64, 0f64);
     for &v in x {
-        s0 = f64::from(v) + coeff * s1 - s2;
+        let s0 = f64::from(v) + coeff * s1 - s2;
         s2 = s1;
         s1 = s0;
     }
@@ -455,11 +455,9 @@ fn quality_is_within_2db_of_ffmpeg() {
         return;
     }
     let secs = 6usize;
-    let total = SR as usize * secs;
-    let tmp = std::env::temp_dir();
 
     // 干净基准 PCM（用 ffmpeg 生成粉噪声 —— 全频段，量化问题最容易显形）。
-    let pcm = tmp.join("v2v_quality_src.pcm");
+    let pcm = unique_temp("v2v_quality_src.pcm");
     let ok = Command::new("ffmpeg")
         .args([
             "-v",
@@ -502,7 +500,7 @@ fn quality_is_within_2db_of_ffmpeg() {
     let ours_dec = decode_aac(&ours, 1);
 
     // ---- ffmpeg 的编码器（同一份 PCM）----
-    let ref_aac = tmp.join("v2v_quality_ref.aac");
+    let ref_aac = unique_temp("v2v_quality_ref.aac");
     let ok = Command::new("ffmpeg")
         .args([
             "-v",
@@ -589,10 +587,8 @@ fn quality_per_bit_is_within_55pct_of_ffmpeg() {
         return;
     }
     let secs = 6usize;
-    let total = SR as usize * secs;
-    let tmp = std::env::temp_dir();
 
-    let pcm = tmp.join("v2v_quality_src.pcm");
+    let pcm = unique_temp("v2v_quality_src.pcm");
     let ok = Command::new("ffmpeg")
         .args([
             "-v",
@@ -635,7 +631,7 @@ fn quality_per_bit_is_within_55pct_of_ffmpeg() {
     let ours_dec = decode_aac(&ours, 1);
 
     // ---- ffmpeg ----
-    let ref_aac = tmp.join("v2v_qpb_ref.aac");
+    let ref_aac = unique_temp("v2v_qpb_ref.aac");
     let ok = Command::new("ffmpeg")
         .args([
             "-v",
@@ -714,5 +710,102 @@ fn quality_per_bit_is_within_55pct_of_ffmpeg() {
     assert!(
         worse <= 2.0,
         "按码率归一的差距到了 {worse:.1} 倍（我们 {a:.5} vs ffmpeg {b:.5}）—— 这不是指标波动，是真退步"
+    );
+}
+
+/// **打击乐式信号**：每 4096 个样本一记「敲击」（瞬间起音 + 快速衰减）。
+///
+/// 敲击**故意不从帧边界起**（偏移 512）：瞬态检测是**段间**比较
+/// （某段能量比前一段暴涨），落在帧首的话前面没有可比的那一段，
+/// 反而触发不了 —— 这点踩过，所以偏移量是刻意的。
+fn percussive(n: usize, channels: usize) -> Vec<Vec<f32>> {
+    let mut out = vec![vec![0f32; n]; channels];
+    for (ch, plane) in out.iter_mut().enumerate() {
+        let mut base = 512usize;
+        while base < n {
+            let len = 300.min(n - base);
+            for k in 0..len {
+                let env = (-(k as f64) / 35.0).exp();
+                let ph = 2.0 * std::f64::consts::PI * 180.0 * ((base + k) as f64) / SR as f64;
+                let sign = if ch == 1 { -1.0 } else { 1.0 };
+                plane[base + k] = (sign * AMP * env * ph.sin()) as f32;
+            }
+            base += 4096;
+        }
+    }
+    out
+}
+
+/// **短窗**（`EIGHT_SHORT_SEQUENCE`）那条路：瞬态素材要真的走进去，且位流合法。
+///
+/// ## 为什么不能只断言「ffmpeg 解得开」
+///
+/// 长窗也解得开 —— 「ffmpeg 没报错」**证明不了**短窗那条路被走过。
+/// 所以这里用打击乐式信号逼出瞬态检测，再用 `short_frame_count()`
+/// 断言它**确实**触发了。这是「全绿 ≠ 全测过」的又一次应用。
+///
+/// 三条判据：
+/// 1. **覆盖**：编码器真的用了短窗（`short_frame_count() > 0`）；
+/// 2. **合法**：ffmpeg 解得开、不报 error / corrupt（`decode_aac` 自己会断言）；
+/// 3. **定标**：解出来的总能量与输入同量级 —— 短窗那条路没把电平搞坏。
+#[test]
+fn short_window_frames_are_valid_and_actually_used() {
+    if !has_ffmpeg() {
+        eprintln!("SKIP: PATH 上没有 ffmpeg");
+        return;
+    }
+    let channels = 2u8;
+    let total = SR as usize * 2;
+    let pcm = percussive(total, channels as usize);
+
+    let mut enc = Encoder::new(EncoderConfig {
+        channels,
+        sample_rate: SR,
+        bitrate: 128_000,
+        kb_window: false,
+    })
+    .expect("建编码器");
+
+    let mut frames = Vec::new();
+    let mut i = 0usize;
+    while i < total {
+        let n = (total - i).min(1024);
+        let planes: Vec<Vec<f32>> = pcm.iter().map(|p| p[i..i + n].to_vec()).collect();
+        frames.push(enc.encode_frame(&Frame { planes }).expect("编一帧"));
+        i += 1024;
+    }
+
+    // ---- 判据 1：短窗那条路真的被走过 ----
+    let short = enc.short_frame_count();
+    println!("{} 帧里用了 {short} 帧短窗", frames.len());
+    assert!(
+        short > 0,
+        "瞬态素材竟然没触发短窗 —— 这条测试失去了意义（检测阈值不对，或短窗没接上）"
+    );
+
+    // ---- 判据 2（合法）：ffmpeg 解不开 / 报错会在 decode_aac 里断言失败 ----
+    let got = decode_aac(&frames, channels);
+    println!("ffmpeg 解出 {} 个样本（输入 {total}）", got[0].len());
+
+    // ---- 判据 3：总能量同量级（定标没坏）----
+    //
+    // 用**总能量**而不是逐样本比对：解码器有 1024 个样本的延迟，
+    // 逐样本比要先对齐，而能量对整体平移免疫。短窗只影响「误差怎么在时间上分布」，
+    // 不该让电平整体偏移。
+    let energy = |p: &[f32]| -> f64 { p.iter().map(|&x| f64::from(x) * f64::from(x)).sum() };
+    let e_in: f64 = pcm.iter().map(|p| energy(p)).sum();
+    let e_out: f64 = got.iter().map(|p| energy(p)).sum();
+    let ratio = e_out / e_in.max(1e-9);
+    println!("总能量比（解码 / 输入）{ratio:.3}（期望 ≈ 1）");
+    assert!(
+        (0.5..2.0).contains(&ratio),
+        "总能量差了 {ratio:.3} 倍 —— 短窗那条路的定标有问题"
+    );
+
+    // 解出来的长度不该比输入多出一大截（帧边界 / 语法长度写错会让它膨胀）。
+    assert!(
+        got[0].len() <= total + 4096,
+        "解出来的样本数 {} 远超输入 {total} —— 帧边界写错了",
+        got[0].len()
     );
 }

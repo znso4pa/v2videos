@@ -39,9 +39,44 @@
 
 use v2v_msmpeg4::BitWriter;
 
-use crate::mdct::{kbd_aac_window, mdct, sine_window, LONG_LEN};
+use crate::mdct::{kbd_aac_window, mdct, sine_window, LONG_LEN, SHORT_LEN};
 use crate::tables;
 use crate::Error;
+
+/// AAC 的窗序列（`window_sequence`，位流里占 2 位）。
+///
+/// ⚠️ **这四个数值是格式定义，不能改**（`aac.h` 的 `enum WindowSequence`）：
+/// `ONLY_LONG = 0`、`LONG_START = 1`、`EIGHT_SHORT = 2`、`LONG_STOP = 3`。
+///
+/// 这里踩过一次大坑：第一版把 `EIGHT_SHORT_SEQUENCE` 当成 **1**（其实 1 是
+/// `LONG_START`）。后果是解码端按「长窗」读 `max_sfb`（6 位而不是 4 位），
+/// 我们写的 `1110` + 分组头两位 `00` 被读成 **56**，报的是
+/// `Number of scalefactor bands in group (56) exceeds limit (49)` ——
+/// **报错指向频带数，根因却是一个枚举值**。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(dead_code)] // `LongStart` / `LongStop` 的值要正确，但暂时还不发（见 TODO）
+pub enum WindowSequence {
+    OnlyLong = 0,
+    LongStart = 1,
+    EightShort = 2,
+    LongStop = 3,
+}
+
+/// 一个**窗口组**的编码计划：虚拟谱 + 频带表 + 选出来的逐带 sf/码本。
+///
+/// 长窗只有一组（组内 1 个窗口，频带 = 1024 点的划分）；短窗按分组规则拆成
+/// 若干组，每组的频带表 = `组内窗口数 × 128 点的划分`（见 `encode_channel`）。
+///
+/// `spec` 是**带主序**的：带 0 的（组内全部窗口）→ 带 1 的 → …，
+/// 与解码端 `decode_spectrum_and_dequant` 的读取顺序一致
+/// （它对一个组逐带逐窗口读：`cfo = coef + 128·窗口`）。
+struct GroupPlan<'a> {
+    spec: &'a [f32],
+    swb: &'a [u16],
+    band_sf: Vec<i32>,
+    band_cb: Vec<u8>,
+    band_zero: Vec<bool>,
+}
 
 /// Audio Object Type：AAC-LC。
 pub const AOT_AAC_LC: u8 = 2;
@@ -140,12 +175,28 @@ pub struct Encoder {
     cfg: EncoderConfig,
     /// 上一帧的后半段（`N` 个样本），与这一帧拼成 `2N`。
     overlap: Vec<Vec<f32>>,
-    /// 开窗用的表（`2N` 长）。
+    /// 长窗的开窗表（`2N` 长）。
     window: Vec<f32>,
     /// 已经编过多少帧 —— 用来交替「这一帧有没有上一帧的右半」。
     frame_index: u64,
     /// 每个频带的边界（含末尾），长 `num_sfb + 1`。
     swb: Vec<u16>,
+    /// **短窗**（`EIGHT_SHORT_SEQUENCE`）的频带边界与开窗表。
+    ///
+    /// 短窗一帧 = 8 个 128 点的 MDCT；频带划分用 `SWB_OFFSET_128`。
+    swb_short: Vec<u16>,
+    window_short: Vec<f32>,
+    /// 每声道「上一帧的攻击落在哪个子块」（`None` = 没有攻击）。
+    ///
+    /// 短窗的覆盖区是 `buf[448..1600]`（见 `encode_channel`），换算到**本帧样本**
+    /// 就是 `[-576, +576)`：所以一帧里的攻击落在**前 ~576 个样本**（子块 0..=4）
+    /// 时本帧要用短窗；落在**后 448 个样本**（子块 5..=7）时，攻击其实落在
+    /// **下一帧**的窗口覆盖区里 —— 于是本帧发 `LONG_START`、下一帧发短窗。
+    ///
+    /// ⚠️ 这个「前/后」的划分是**不需要前瞻**就能决定 `LONG_START` 的关键：
+    /// 「下一帧会不会是短窗」由**本帧自己的后段攻击**决定，而它是本帧已知的。
+    attack_prev: Vec<Option<usize>>,
+
     /// 每帧的**位数预算**（`bitrate / 帧率 / 声道数`）。
     ///
     /// ⚠️ 用「预算 + 二分搜偏移」而不是「λ 权重」——
@@ -153,6 +204,12 @@ pub struct Encoder {
     /// 实测码率 432 kbps（目标是 128k，差 3.4 倍）。
     /// 位数预算是个**硬约束**，二分搜能保证逼近它 —— 见 `encode_channel` 的说明。
     bits_per_frame: u32,
+    /// 已经编过多少帧**短窗**（`EIGHT_SHORT_SEQUENCE`）。
+    ///
+    /// 存在的理由：短窗是**由信号内容触发**的（瞬态攻击），不是配置项 ——
+    /// 光看「ffmpeg 解得开」证明不了它真的被走过（长窗也解得开）。
+    /// 测试用它断言「这段瞬态素材确实进了短窗那条路」。
+    short_frames: u64,
 }
 
 impl Encoder {
@@ -168,6 +225,8 @@ impl Encoder {
         })?;
         let len = tables::SWB_OFFSET_1024_LEN[sr_idx as usize] as usize;
         let swb = tables::SWB_OFFSET_1024[sr_idx as usize][..len].to_vec();
+        let len_s = tables::SWB_OFFSET_128_LEN[sr_idx as usize] as usize;
+        let swb_short = tables::SWB_OFFSET_128[sr_idx as usize][..len_s].to_vec();
 
         let window = if cfg.kb_window {
             // 长窗 alpha = 4.0（`aactab.c` 里的 `ff_kbd_window_init(.., 4.0, 1024)`）。
@@ -176,7 +235,9 @@ impl Encoder {
         } else {
             sine_window(LONG_LEN)
         };
-
+        // 短窗与长窗**同系**：编码端写 `use_kb_window` 是每个 ics_info 一个位，
+        // 简化起见长短窗永远同系（解码端只拿它决定用哪张窗表，不校验一致性）。
+        let window_short = crate::mdct::short_window(cfg.kb_window);
         // 每帧的位数预算。`bitrate` 是**目标**不是保证 —— 编码器靠
         // 「二分搜整帧 sf 偏移」逼近它（见 `encode_channel`）。
         let frames_per_sec = f64::from(cfg.sample_rate) / LONG_LEN as f64;
@@ -188,7 +249,11 @@ impl Encoder {
             window,
             frame_index: 0,
             swb,
+            swb_short,
+            window_short,
+            attack_prev: vec![None; cfg.channels as usize],
             bits_per_frame: bits_per_frame as u32,
+            short_frames: 0,
             cfg,
         })
     }
@@ -212,6 +277,12 @@ impl Encoder {
         self.swb.len() - 1
     }
 
+    /// 已经编过多少帧**短窗**。短窗由信号内容触发（瞬态攻击），不是配置项，
+    /// 所以测试要靠它确认「瞬态素材真的进了短窗那条路」。
+    pub fn short_frame_count(&self) -> u64 {
+        self.short_frames
+    }
+
     /// 编一帧。
     ///
     /// `frame.planes[i]` 长度必须是 1024（或更短 —— 短了补 0，最后一帧用得上）。
@@ -228,6 +299,7 @@ impl Encoder {
 
         let mut w = BitWriter::new();
         let is_stereo = self.cfg.channels == 2;
+        let mut any_short = false;
 
         // ---- 元素头 ----
         // SCE = 0，CPE = 1。
@@ -243,7 +315,12 @@ impl Encoder {
         }
 
         for ch in 0..self.cfg.channels as usize {
-            self.encode_channel(&mut w, ch, &frame.planes[ch])?;
+            if self.encode_channel(&mut w, ch, &frame.planes[ch])? {
+                any_short = true;
+            }
+        }
+        if any_short {
+            self.short_frames += 1;
         }
 
         // ---- 结尾的 END 元素 ----
@@ -262,49 +339,33 @@ impl Encoder {
         Ok(w.finish())
     }
 
-    /// **编一「趟」**：给定整帧 `sf_offset`，选出逐带 sf/码本、写出一条完整的
-    /// 通道元素位流（含 `global_gain` / `ics_info` / `section_data` /
-    /// `scalefactor_data` / 谱系数），返回 `(字节, 位数)`。
+    /// 给**一个窗口组**选逐带的 sf 与码本（**不写位流**）。
     ///
-    /// ## 为什么要有「趟」这个概念
+    /// 「先选、后写」是刻意的：`global_gain` 是「第一个非零带的 sf」，而它写在
+    /// 最前面 —— 先选完再写就不用做位级回填。
     ///
-    /// `bitrate` 是个**硬预算**，而 sf 与位数是单调关系：
-    /// **偏移越大 → 量化越粗 → 位数越少、失真越大**。
-    /// 于是外层（`encode_channel`）二分搜「位数刚好不超过预算的最小偏移」，
-    /// 就是在「码率不超标」的前提下拿到最好的音质。
-    ///
-    /// ⚠️ 这条路的**每一趟都必须自己把位流写全**，不能只算位数 ——
-    /// 因为选中的那一趟要直接作为输出。只算位数、最后再编一次的做法，
-    /// 会让「算出来的位数」与「真正写出的位数」在两个不同的代码路径上，
-    /// 一旦不一致（我踩过：`band_cost` 与 `write_band` 的 escape 计数写法不同），
-    /// 预算就形同虚设。**同一条路径既算又写**是这里刻意选的。
-    ///
-    /// `sf_floor` 是整帧 sf 的下界（不把峰值裁到 `MAX_QUANT` 之上）。
-    fn encode_pass(
+    /// `prev_sf` 是**跨组延续**的差分链（解码端的 `offset[0]` 不按组重置），
+    /// 所以用 `&mut` 带进带出：上一组最后一个非零带的 sf 是下一组的差分基准。
+    fn plan_group<'a>(
         &self,
-        spec: &[f32],
+        spec: &'a [f32],
+        swb: &'a [u16],
         sf_floor: i32,
         sf_offset: i32,
-    ) -> crate::Result<(BitWriter, u32)> {
-        let max_sfb = self.num_sfb();
+        prev_sf: &mut Option<i32>,
+    ) -> GroupPlan<'a> {
+        let max_sfb = swb.len() - 1;
         // ⚠️ `band_sf` 就是要写进位流、且**与 `global_gain` 同域**（0..255）的那个值。
         // 解码端解出来的 `sfo = band_sf − 100` —— 那个 100 只在解码端出现一次。
         let mut band_sf = vec![0i32; max_sfb];
         let mut band_cb = vec![0u8; max_sfb];
         let mut band_zero = vec![false; max_sfb];
-
-        // ⚠️ **先选 sf、再写位流** —— 不先写再回填。
-        //
-        // 因为 `global_gain` **就是第一个非零带的 sf**（`rusty_aac::global_gain` 逐字如此），
-        // 而它写在最前面。若先写占位再回填，就得有位级 patch 的能力；
-        // 把「选」与「写」分开就没有这个问题，而且更省（不用回填）。
-        let mut prev_sf: Option<i32> = None;
         // 逐带的掩蔽阈值（整帧算一次，与 sf_offset 无关 —— 阈值只看源信号）。
-        let thresh = masking_thresholds(spec, &self.swb, self.cfg.sample_rate, sf_floor);
+        let thresh = masking_thresholds(spec, swb, self.cfg.sample_rate, sf_floor);
 
         for sfb in 0..max_sfb {
-            let lo = self.swb[sfb] as usize;
-            let hi = self.swb[sfb + 1] as usize;
+            let lo = swb[sfb] as usize;
+            let hi = swb[sfb + 1] as usize;
             let band = &spec[lo..hi];
             let th = thresh[sfb];
 
@@ -314,7 +375,7 @@ impl Encoder {
             // `0..=255` 是 `sf` 自己的位宽。**偏移只抬下界** ——
             // 若把上界也压低，会挡住「该带本来想用更粗的 sf」的合法选择。
             let floor = (sf_floor + sf_offset).clamp(0, 255);
-            let (lo_sf, hi_sf) = match prev_sf {
+            let (lo_sf, hi_sf) = match *prev_sf {
                 Some(p) => (
                     floor.max(p - SCALE_MAX_DIFF).clamp(0, 255),
                     (p + SCALE_MAX_DIFF).clamp(0, 255),
@@ -327,12 +388,12 @@ impl Encoder {
                 band_sf[sfb] = sf;
                 band_cb[sfb] = 0;
                 band_zero[sfb] = true;
-                prev_sf = None;
+                *prev_sf = None;
                 continue;
             }
 
-            // 逐带找「失真最小」的 sf（λ 项已去掉 —— 见本函数的说明，
-            // 码率由外层二分控，代价函数只管保真）。
+            // 逐带找「失真最小」的 sf（λ 项已去掉 —— 码率由外层二分控，
+            // 代价函数只管保真）。
             let mut best: Option<(f32, u8, u8)> = None; // (代价, sf, cb)
             let step = 4.max((hi_sf - lo_sf) / 24);
             let mut cand: Vec<i32> = Vec::new();
@@ -362,47 +423,115 @@ impl Encoder {
             band_cb[sfb] = cb;
             band_zero[sfb] = cb == 0 || band_is_zero(band, sf);
             if !band_zero[sfb] {
-                prev_sf = Some(i32::from(sf));
+                *prev_sf = Some(i32::from(sf));
             }
         }
 
-        // ---- 写位流 ----
-        //
+        GroupPlan {
+            spec,
+            swb,
+            band_sf,
+            band_cb,
+            band_zero,
+        }
+    }
+
+    /// 把**所有窗口组**的位流写全。
+    ///
+    /// ```text
+    /// global_gain → ics_info → [各组的 section_data] → [各组的 scalefactor_data]
+    ///             → pulse/tns/gain → [各组的谱系数]
+    /// ```
+    ///
+    /// ⚠️ 顺序是规范定的：**section 与 scalefactor 都是「先把所有组写完」**，
+    /// 谱数据再按组写 —— 不是「一组一段」地交错。写错了解码端会从第二组开始错位。
+    fn write_pass(
+        &self,
+        seq: WindowSequence,
+        groups: &[GroupPlan<'_>],
+        group_lens: &[usize],
+    ) -> crate::Result<(BitWriter, u32)> {
         // `global_gain` = 第一个非零带的 sf（全零帧用 100）。
-        let global_gain: u8 = band_sf
+        let global_gain: u8 = groups
             .iter()
-            .zip(&band_zero)
+            .flat_map(|g| g.band_sf.iter().zip(&g.band_zero))
             .find(|(_, z)| !**z)
             .map_or(100, |(sf, _)| (*sf).clamp(0, 255) as u8);
 
+        let max_sfb = groups[0].band_sf.len();
+        let run_bits = if seq == WindowSequence::EightShort { 3 } else { 5 };
+
         let mut w = BitWriter::new();
         w.put(u32::from(global_gain), 8);
-        write_ics_info(&mut w, max_sfb as u8);
-        write_sections(&mut w, &band_cb, &band_zero);
-        write_scalefactors(&mut w, &band_sf, &band_zero, global_gain);
+        write_ics_info(&mut w, max_sfb as u8, seq, group_lens);
+        for g in groups {
+            write_sections(&mut w, &g.band_cb, &g.band_zero, run_bits);
+        }
+        let mut prev_sf = i32::from(global_gain);
+        for g in groups {
+            write_scalefactors(&mut w, &g.band_sf, &g.band_zero, &mut prev_sf);
+        }
 
         // pulse / tns / gain：都不做，各写一个 0 位。
         w.put(0, 1);
         w.put(0, 1);
         w.put(0, 1);
 
-        for sfb in 0..max_sfb {
-            if band_zero[sfb] {
-                continue;
+        for g in groups {
+            for sfb in 0..max_sfb {
+                if g.band_zero[sfb] {
+                    continue;
+                }
+                let lo = g.swb[sfb] as usize;
+                let hi = g.swb[sfb + 1] as usize;
+                write_band(
+                    &mut w,
+                    &g.spec[lo..hi],
+                    g.band_sf[sfb].clamp(0, 255) as u8,
+                    g.band_cb[sfb],
+                )?;
             }
-            let lo = self.swb[sfb] as usize;
-            let hi = self.swb[sfb + 1] as usize;
-            write_band(
-                &mut w,
-                &spec[lo..hi],
-                band_sf[sfb].clamp(0, 255) as u8,
-                band_cb[sfb],
-            )?;
         }
 
         let bits = w.bit_pos() as u32;
         Ok((w, bits))
     }
+
+    /// **编一「趟」**：给定整帧 `sf_offset`，给每个窗口组选 sf/码本、写出完整的
+    /// 通道元素体，返回 `(位流, 位数)`。
+    ///
+    /// ## 为什么要有「趟」这个概念
+    ///
+    /// `bitrate` 是个**硬预算**，而 sf 与位数是单调关系：
+    /// **偏移越大 → 量化越粗 → 位数越少、失真越大**。
+    /// 于是外层（`encode_channel`）二分搜「位数刚好不超过预算的最小偏移」，
+    /// 就是在「码率不超标」的前提下拿到最好的音质。
+    ///
+    /// ⚠️ 这条路的**每一趟都必须自己把位流写全**，不能只算位数 ——
+    /// 因为选中的那一趟要直接作为输出。只算位数、最后再编一次的做法，
+    /// 会让「算出来的位数」与「真正写出的位数」在两个不同的代码路径上，
+    /// 一旦不一致（我踩过：`band_cost` 与 `write_band` 的 escape 计数写法不同），
+    /// 预算就形同虚设。**同一条路径既算又写**是这里刻意选的。
+    ///
+    /// `group_specs` 每项是 `(该组的虚拟谱, 该组的频带表, 组内窗口数)`。
+    /// 长窗只有一项（`self.swb` + `self.num_sfb()` 个带）；短窗按分组规则
+    /// 拆成若干项，每项的频带表 = `组内窗口数 × 128 点的划分`。
+    fn encode_pass(
+        &self,
+        seq: WindowSequence,
+        group_specs: &[(&[f32], &[u16], usize)],
+        sf_floor: i32,
+        sf_offset: i32,
+    ) -> crate::Result<(BitWriter, u32)> {
+        let mut prev_sf: Option<i32> = None;
+        let mut plans: Vec<GroupPlan<'_>> = Vec::with_capacity(group_specs.len());
+        for &(spec, swb, _) in group_specs {
+            plans.push(self.plan_group(spec, swb, sf_floor, sf_offset, &mut prev_sf));
+        }
+        let lens: Vec<usize> = group_specs.iter().map(|&(_, _, l)| l).collect();
+        self.write_pass(seq, &plans, &lens)
+    }
+
 
     /// 一个通道元素（`single_channel_element`）的完整编码。
     ///
@@ -429,7 +558,7 @@ impl Encoder {
         w: &mut BitWriter,
         ch: usize,
         samples: &[f32],
-    ) -> crate::Result<()> {
+    ) -> crate::Result<bool> {
         // ---- 1. 攒 2N 个样本 → 开窗 → MDCT ----
         let mut buf = vec![0f32; 2 * LONG_LEN];
         // 左半 = 上一帧的后半（AAC 是 50% 重叠）
@@ -443,19 +572,126 @@ impl Encoder {
             *v = 0.0;
         }
 
-        for (b, wv) in buf.iter_mut().zip(self.window.iter()) {
-            *b *= *wv;
+        // ---- 窗序列 ----
+        //
+        // 攻击打在这一帧 → 本帧用短窗；**下一帧也要用短窗**（攻击的能量在
+        // 50% 重叠区里会跨进下一帧的前半 —— 长窗会把攻击「摊平」成一帧的
+        // pre-echo，这正是短窗要解决的东西）。
+        let attack = detect_attack(samples);
+        let prev_attack = self.attack_prev[ch];
+        let short = attack.is_some() || prev_attack.is_some();
+        self.attack_prev[ch] = attack;
+        let seq = if short {
+            WindowSequence::EightShort
+        } else {
+            WindowSequence::OnlyLong
+        };
+
+        // 短窗的**分组**：一个组内的窗口共用一套 sf/码本 —— 把攻击所在的窗口
+        // 单独分出来，组里其余窗口才不会被攻击的尺度「带跑」。
+        //
+        // 分组规则照 3GPP TS26.403 5.4.1（ffmpeg 的 `aacpsy.c` 用同一张表）：
+        // 表按**攻击所在的子块序号**（0..8，8 = 本帧没有攻击）查 8 位的掩码，
+        // 位 i = 0 表示「窗口 i 另起一组」。
+        //
+        // ⚠️ 实测这一条值 5~7 dB：第一版「8 个窗口一组」在瞬态素材上
+        // SNR 10.2 dB（ffmpeg 自己的 AAC 是 17.8 dB），分组后追上来一大截。
+        let attack_pos = attack.or(prev_attack).unwrap_or(8);
+        let group_lens: Vec<usize> = if short {
+            group_lengths(WINDOW_GROUPING[attack_pos])
+        } else {
+            vec![1]
+        };
+
+        // 各组的虚拟谱（**带主序**）与频带表。长窗只有一组，与短窗共用同一套
+        // 选 sf / 选码本 / 写位流的机制（见 `GroupPlan`）。
+        let mut specs: Vec<Vec<f32>> = Vec::new();
+        let mut swbs: Vec<Vec<u16>> = Vec::new();
+        if short {
+            // 8 个短窗：窗口 w 吃 `buf[448 + w·128 .. 448 + w·128 + 256]`
+            // （相邻 50% 重叠），各产 128 个系数。
+            //
+            // ⚠️ **那个 448 不是可选的**：`EIGHT_SHORT_SEQUENCE` 的 8 个窗
+            // 一共只覆盖 1152 个样本（7×128 + 256），在 2048 的窗里是**居中**的
+            // —— 两端各留 448 个样本的零填充。ffmpeg 的合成端就是这么摆的
+            // （`out + 448 + i*128`，见 `aacdec_dsp_template.c` 的
+            // `vector_fmul_window(out + 448 + 0*128, ...)` 那一串）。
+            //
+            // 第一版按 `w·128` 铺（漏了 448），后果是**攻击点落在覆盖区之外**：
+            // 帧内 512 处的攻击在 `buf[1024+512] = buf[1536]`，而窗口只铺到
+            // `896+256 = 1152` —— 编码器「看见了攻击、选了短窗」，
+            // 却把攻击本身漏在窗外，位流还完全合法（所以只有真素材才暴露）。
+            const SHORT_PAD: usize = 448;
+            let mut s8 = vec![0f32; LONG_LEN];
+            for w in 0..8 {
+                let off = SHORT_PAD + w * SHORT_LEN;
+                let mut win = vec![0f32; 2 * SHORT_LEN];
+                for (k, v) in win.iter_mut().enumerate() {
+                    *v = buf[off + k] * self.window_short[k];
+                }
+                mdct(&win, &mut s8[w * SHORT_LEN..(w + 1) * SHORT_LEN]);
+            }
+            // 位流按「组 → 带 → 组内窗口」排（解码端 `decode_spectrum_and_dequant`
+            // 对一个组逐带逐窗口读：`cfo = coef + 128·窗口`）。把每组、每条带、
+            // 组内各窗口的系数**重排成带主序**：频带 b 的数据 = 组内各窗口这条带的
+            // 拼接 —— 于是选 sf / 选码本 / 写位流的机制与长窗**完全共用**。
+            let widths: Vec<usize> = self.swb_short[..self.swb_short.len() - 1]
+                .iter()
+                .zip(&self.swb_short[1..])
+                .map(|(a, b)| (b - a) as usize)
+                .collect();
+            let mut w0 = 0usize;
+            for &gl in &group_lens {
+                let mut v: Vec<f32> = Vec::with_capacity(gl * SHORT_LEN);
+                for (b, &width) in widths.iter().enumerate() {
+                    let lo = self.swb_short[b] as usize;
+                    for j in 0..gl {
+                        let w = w0 + j;
+                        v.extend_from_slice(&s8[w * SHORT_LEN + lo..w * SHORT_LEN + lo + width]);
+                    }
+                }
+                debug_assert_eq!(v.len(), gl * SHORT_LEN);
+                specs.push(v);
+                // 该组的频带边界 = `组内窗口数 × 128 点的划分`（末项 = 128·gl）。
+                swbs.push(
+                    self.swb_short
+                        .iter()
+                        .map(|&o| o * gl as u16)
+                        .collect::<Vec<u16>>(),
+                );
+                w0 += gl;
+            }
+            debug_assert_eq!(w0, 8);
+        } else {
+            for (b, wv) in buf.iter_mut().zip(self.window.iter()) {
+                *b *= *wv;
+            }
+            let mut s = vec![0f32; LONG_LEN];
+            mdct(&buf, &mut s);
+            specs.push(s);
+            swbs.push(self.swb.clone());
         }
-        let mut spec = vec![0f32; LONG_LEN];
-        mdct(&buf, &mut spec);
 
         // ---- 2. sf 的下界：不把峰值系数裁到 MAX_QUANT 之上 ----
-        let sf_floor = min_sf_for_peak(&spec, &self.swb);
+        // 取各组的**最严**下界（任何一组被裁都是失真）。
+        let sf_floor = specs
+            .iter()
+            .zip(&swbs)
+            .map(|(s, t)| min_sf_for_peak(s, t))
+            .max()
+            .unwrap_or(0);
 
         // ⚠️ **这里不写元素头** —— `ID_SCE`/`ID_CPE` 与标签由 `encode_frame` 写。
         // 一开始在这里又写了一遍（3+4 位），整条位流错位 7 位，
         // ffmpeg 报的是「scalefactor bands 56 > 49」这种看着像频带表错的信息。
         // **症状与根因隔得很远**，所以这条注释留在这里。
+
+        let group_specs: Vec<(&[f32], &[u16], usize)> = specs
+            .iter()
+            .zip(&swbs)
+            .zip(&group_lens)
+            .map(|((s, t), &l)| (s.as_slice(), t.as_slice(), l))
+            .collect();
 
         // ---- 3. 二分搜「位数 ≤ 预算」的最小偏移 ----
         //
@@ -469,7 +705,7 @@ impl Encoder {
         let mut chosen: Option<BitWriter> = None;
         while lo <= hi {
             let mid = (lo + hi) / 2;
-            let (pass, bits) = self.encode_pass(&spec, sf_floor, mid)?;
+            let (pass, bits) = self.encode_pass(seq, &group_specs, sf_floor, mid)?;
             if bits <= budget {
                 chosen = Some(pass);
                 hi = mid - 1;
@@ -482,11 +718,64 @@ impl Encoder {
         // 让码率超标比「编不出东西」好 —— 而且这种情况只会在极端配置下出现。
         let pass = match chosen {
             Some(p) => p,
-            None => self.encode_pass(&spec, sf_floor, hi.max(0))?.0,
+            None => self.encode_pass(seq, &group_specs, sf_floor, hi.max(0))?.0,
         };
         w.append(&pass);
-        Ok(())
+        Ok(short)
     }
+}
+
+/// **瞬态攻击检测**：返回攻击落在哪个子块（`None` = 没有攻击）。
+///
+/// 把一帧 1024 个样本切成 8 段（每段 128，与短窗的时间分辨率一致），
+/// 算各段能量；某一段的能量比前一段**暴涨**（≥8 倍）且绝对量够大，就算攻击，
+/// 返回那一段的下标。位置要拿去查 `WINDOW_GROUPING`（分组表按攻击位置索引）。
+///
+/// ## 两个参数为什么这么定
+///
+/// - **比值 8**：太敏感会把正常音符的开头当攻击（短窗高频分辨率差、
+///   稳态信号画质反而掉）；太钝又抓不到打击乐。8× ≈ 3 个二的幂，
+///   是「下一子块比这一子块响得多」的下限。
+/// - **绝对下限**：能量阈值取「每样本 RMS ≈ 90」的整段能量
+///   （128·90² ≈ 1e6）—— 静音段之间 0 比 0 的「暴涨」不算数。
+fn detect_attack(samples: &[f32]) -> Option<usize> {
+    const SEG: usize = SHORT_LEN; // 128
+    const RATIO: f64 = 8.0;
+    const FLOOR: f64 = 1e6;
+
+    let mut prev = 0f64;
+    let mut have_prev = false;
+    for (i, seg) in samples.chunks(SEG).enumerate() {
+        let e: f64 = seg.iter().map(|&x| f64::from(x) * f64::from(x)).sum();
+        if have_prev && e > FLOOR && e > RATIO * prev {
+            return Some(i.min(8));
+        }
+        prev = e;
+        have_prev = true;
+    }
+    None
+}
+
+/// 短窗的**窗口分组表**（3GPP TS26.403 5.4.1，与 ffmpeg 的 `aacpsy.c` 同一张）。
+///
+/// 按「攻击所在的子块序号」索引（0..8；8 = 本帧没有攻击，表里最后两项相同）。
+/// 掩码的位 i = 0 表示**窗口 i 另起一组**；位 i = 1 表示并进当前组。
+/// 一个组内的窗口共用一套 sf 与码本。
+const WINDOW_GROUPING: [u8; 9] = [
+    0xB6, 0x6C, 0xD8, 0xB2, 0x66, 0xC6, 0x96, 0x36, 0x36,
+];
+
+/// 把 `WINDOW_GROUPING` 的掩码翻成每组的窗口数（和 = 8）。
+fn group_lengths(mask: u8) -> Vec<usize> {
+    let mut lens = vec![1usize];
+    for i in 1..8 {
+        if (mask >> i) & 1 == 0 {
+            lens.push(1);
+        } else {
+            *lens.last_mut().expect("至少一组") += 1;
+        }
+    }
+    lens
 }
 
 /// 频谱里每个频带「不把最响的系数量化到超过 `MAX_QUANT`」所需的最小 sf。
@@ -632,7 +921,9 @@ fn bark_of(swb: &[u16], sample_rate: u32) -> Vec<f32> {
 /// ⚠️ 这是个**简化模型**：不做 FFT 分析（直接用谱系数当掩蔽源）、
 /// 不含绝对听阈（安静段的阈值会偏乐观）。但它抓住了主要矛盾 ——
 /// 「强带掩蔽邻近带」。
-fn masking_thresholds(spec: &[f32], swb: &[u16], sample_rate: u32, sf_floor: i32) -> Vec<f32> {
+fn masking_thresholds(spec: &[f32], swb: &[u16], sample_rate: u32, _sf_floor: i32) -> Vec<f32> {
+    // `_sf_floor`（整帧的 sf 下界）在这里还用不上 —— 阈值只看源信号。
+    // 留着签名是为了「将来把阈值抬到量化噪声下限」那条路不用改调用方。
     let n = swb.len() - 1;
     let bark = bark_of(swb, sample_rate);
 
@@ -829,13 +1120,48 @@ fn av_log2(v: i32) -> u32 {
     31 - (v as u32).leading_zeros()
 }
 
-/// ICS 头：`ics_reserved(1) window_sequence(2) use_kb_window(1) max_sfb(6) predictor_present(1)`。
-fn write_ics_info(w: &mut BitWriter, max_sfb: u8) {
+/// ICS 头：`ics_reserved(1) window_sequence(2) use_kb_window(1) max_sfb(6/4) …`。
+///
+/// ⚠️ **短窗没有 `predictor_data_present` 那一位** —— 它只写在长窗分支里，
+/// 短窗分支的解码端是直接 `predictor_present = 0` 赋值（不读位）。
+/// 一开始给短窗也写了这一位，整条位流后移 1 位：第一个通道的 `ics_info` 还读得对，
+/// 但从 `section_data` 起全错位，第二个通道连 `window_sequence` 都读成了长窗 ——
+/// 症状是「`number of scalefactor bands in group (56) exceeds limit (49)`」，
+/// **看起来像频带表错了，其实是少写/多写了一位**。
+fn write_ics_info(w: &mut BitWriter, max_sfb: u8, seq: WindowSequence, group_lens: &[usize]) {
     w.put(0, 1); // ics_reserved
-    w.put(0, 2); // window_sequence = ONLY_LONG_SEQUENCE
-    w.put(0, 1); // use_kb_window = 0（正弦窗）
-    w.put(u32::from(max_sfb), 6);
-    w.put(0, 1); // predictor_data_present
+    // ⚠️ `EIGHT_SHORT_SEQUENCE = 2`（不是 1 —— 1 是 `LONG_START`）。见 `WindowSequence`。
+    w.put(seq as u32, 2);
+    w.put(0, 1); // use_kb_window = 0（正弦窗；KBD 时两边的 cfg 都会改这里 —— 目前统一 0）
+    if seq == WindowSequence::EightShort {
+        // ⚠️ 短窗的 max_sfb 只有 **4 位**（长窗 6 位），后面跟 7 位的
+        // **窗口分组**，每一位的语义是「**1 = 并进当前组、0 = 开新组**」。
+        // 所以「一个组装下全部 8 个窗口」= 写 **7 个 1**。
+        //
+        // 第一版写成了 7 个 0（把语义记反了）—— 解码端于是认为有 **8 个组**，
+        // 每组的 section 只描述 1 个频带；它接着把我们后面的 flag/ID_END 位
+        // 当成分段数据读，报出 `Number of bands (6) exceeds limit (1)`
+        // —— 症状是「频带数超了」，根因却是**分组位的极性**。
+        w.put(u32::from(max_sfb), 4);
+        // 分组位：7 位，位 j 对应「窗口 j+1」——**1 = 并进当前组、0 = 开新组**。
+        // 所以「一个组装 8 个窗」= 7 个 1；组边界处写 0。
+        let mut bits = [1u32; 7];
+        let mut acc = 0usize;
+        for &len in &group_lens[..group_lens.len().saturating_sub(1)] {
+            acc += len;
+            bits[acc - 1] = 0;
+        }
+        let mut packed = 0u32;
+        for b in bits {
+            packed = (packed << 1) | b;
+        }
+        w.put(packed, 7);
+        // ⚠️ 到此为止 —— 短窗分支**没有** `predictor_data_present`
+        // （解码端只在长窗分支里读它，见 `decode_ics_info`）。
+    } else {
+        w.put(u32::from(max_sfb), 6);
+        w.put(0, 1); // predictor_data_present（LC 不允许预测，恒 0）
+    }
 }
 
 /// `section_data`：把**连续同码本**的频带并成一段，每段写 `(sect_cb, sect_len)`。
@@ -843,7 +1169,7 @@ fn write_ics_info(w: &mut BitWriter, max_sfb: u8) {
 /// 全零带归到码本 0。长度用「转义 + 续接」编码：
 /// 写 `run_bits` 位的值；等于满值就走续接（再把 `sect_len` 加上那个满值），
 /// 所以任何长度都能用若干个满值 + 一个非满值表示。
-fn write_sections(w: &mut BitWriter, band_cb: &[u8], band_zero: &[bool]) {
+fn write_sections(w: &mut BitWriter, band_cb: &[u8], band_zero: &[bool], run_bits: u32) {
     let n = band_cb.len();
     let mut i = 0usize;
     while i < n {
@@ -860,30 +1186,31 @@ fn write_sections(w: &mut BitWriter, band_cb: &[u8], band_zero: &[bool]) {
             }
             len += 1;
         }
-        // ⚠️ 段长度**不能是 31 的整数倍** —— 那样末尾会写出一个 0，
+        // ⚠️ 段长度**不能是转义值的整数倍** —— 那样末尾会写出一个 0，
         // 解码端的 `while (k < max_sfb)` 就转不动了。
         // 碰到整除就把最后一段砍掉 1 个频带，剩下那个自成一段（长度 1）。
+        let run_esc = (1usize << run_bits) - 1;
         let mut this = len;
-        if this % 31 == 0 {
+        if this % run_esc == 0 {
             this -= 1;
-            write_section(w, cb, this);
+            write_section(w, cb, this, run_bits);
             // 多出来的那一个频带：如果它本来是同码本，单独成一段（长度 1）；
-            // 长度 1 不是 31 的倍数，合法。
+            // 长度 1 不是转义值的倍数，合法。
             let tail_cb = if band_zero[i + this] {
                 0
             } else {
                 band_cb[i + this]
             };
-            write_section(w, tail_cb, 1);
+            write_section(w, tail_cb, 1, run_bits);
             i += len;
             continue;
         }
-        write_section(w, cb, this);
+        write_section(w, cb, this, run_bits);
         i += len;
     }
 }
 
-/// 一段 `section` 的写出（长窗：`sect_len` 用 5 位、转义值 31）。
+/// 一段 `section` 的写出（长窗 5 位/转义 31，短窗 3 位/转义 7）。
 ///
 /// 解码端是 `sect_end += sect_len_incr; .. while (sect_len_incr == 31)` ——
 /// **每写一个值都会被加上去**，所以长于 31 的段用「若干个 31 + 一个余数」表示。
@@ -892,22 +1219,23 @@ fn write_sections(w: &mut BitWriter, band_cb: &[u8], band_zero: &[bool]) {
 /// 而 `while (k < max_sfb)` 的循环条件仍成立 —— 死循环 / 位流错位。
 /// 所以正好整除时要拆成 `31, ..., 31, 31`（把最后一个 31 拆成 `31` 与……不行），
 /// 正确做法是让**最后一个**值落在 `1..=30`：`31 × n + r`，`r ∈ 1..=30`。
-fn write_section(w: &mut BitWriter, cb: u8, len: usize) {
-    const RUN_BITS: u32 = 5;
-    const RUN_ESC: usize = (1 << RUN_BITS) - 1; // 31
+fn write_section(w: &mut BitWriter, cb: u8, len: usize, run_bits: u32) {
+    // 长窗 `sect_len_incr` 用 5 位（转义值 31）；**短窗只用 3 位**（转义值 7）。
+    // 「段长不能是转义值的整数倍」的约束对两种位宽同样成立。
+    let run_esc = (1usize << run_bits) - 1;
     debug_assert!(len > 0, "段的长度不能是 0");
     w.put(u32::from(cb), 4);
     // 先写足够的 31，直到剩下的部分能用一个 1..=30 的数表示。
     let mut left = len;
-    while left > RUN_ESC {
-        // 若 `left - 31` 会落在「31 的整数倍且余 0」上，就少写一个 31。
-        if (left - RUN_ESC) % RUN_ESC == 0 {
+    while left > run_esc {
+        // 若 `left - 转义值` 会落在「转义值整数倍且余 0」上，就少写一个转义。
+        if (left - run_esc) % run_esc == 0 {
             break;
         }
-        w.put(RUN_ESC as u32, RUN_BITS);
-        left -= RUN_ESC;
+        w.put(run_esc as u32, run_bits);
+        left -= run_esc;
     }
-    if left > RUN_ESC {
+    if left > run_esc {
         // 走到这里说明 `left` 是 31 的整数倍 —— 拆成 (left - 1) 个 31 再加……
         // 不行，`left - 1` 不是 31 的倍数。改用「先写 30，再写剩下的 31」。
         // 但 30 不是转义值，会被当成段结束。所以唯一合法的拆法是
@@ -917,14 +1245,14 @@ fn write_section(w: &mut BitWriter, cb: u8, len: usize) {
         // 必须保证这一点 —— 见那里的处理。
         unreachable!("段长度不能是 31 的整数倍（write_sections 应当已经拆开）");
     }
-    w.put(left as u32, RUN_BITS);
+    w.put(left as u32, run_bits);
 }
 
 /// `scalefactor_data`：相邻非零带的 sf **差分** + 60，查 `SCALE_DIFF_ZERO` 码表。
 ///
 /// ⚠️ 差分链是**跳过零带**的：零带不参与，下一个非零带与**上一个非零带**做差。
 /// 这条与 `encode_scale_factors` 一致（它只在 `!zeroes` 时更新 `off_sf`）。
-fn write_scalefactors(w: &mut BitWriter, band_sf: &[i32], band_zero: &[bool], global_gain: u8) {
+fn write_scalefactors(w: &mut BitWriter, band_sf: &[i32], band_zero: &[bool], prev: &mut i32) {
     // ⚠️ 差分的**基准是 `global_gain` 本身**，不是 `global_gain - 100`。
     //
     // 解码端（`decode_scalefactors`，逐字）：
@@ -940,18 +1268,19 @@ fn write_scalefactors(w: &mut BitWriter, band_sf: &[i32], band_zero: &[bool], gl
     // 所以 **`sfo = global_gain + Σdiff - 100`**。要让 `sfo == band_sf`，
     // 差分链的起点（也就是第一条 diff 的"上一个值"）必须是 **`global_gain`**；
     // 写成 `global_gain - 100` 会让整条链整体偏 100（`2^(100/4) = 2^25` 倍）。
-    let mut prev: i32 = i32::from(global_gain);
+    // ⚠️ 差分链**跨组延续**（解码端的 `offset[0]` 不按组重置），所以 `prev`
+    // 由调用方带进带出；`write_pass` 用 `global_gain` 初始化它。
     for sfb in 0..band_sf.len() {
         if band_zero[sfb] {
             continue;
         }
-        let diff = band_sf[sfb] - prev + 60;
+        let diff = band_sf[sfb] - *prev + 60;
         let idx = diff.clamp(0, 120) as usize;
         w.put(
             tables::SCALEFACTOR_CODE[idx],
             u32::from(tables::SCALEFACTOR_BITS[idx]),
         );
-        prev = band_sf[sfb];
+        *prev = band_sf[sfb];
     }
 }
 

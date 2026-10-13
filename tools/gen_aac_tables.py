@@ -231,6 +231,33 @@ def gen():
     o.ints("SWB_OFFSET_1024_LEN", "u16", lens)
     o.table2("SWB_OFFSET_1024", "u16", padded)
 
+    # ── 短窗（EIGHT_SHORT_SEQUENCE）的频带边界 ─────────────────────────────
+    # 同一套指针表套路：`ff_swb_offset_128[sampling_index]`（含末尾的 128）+
+    # `ff_aac_num_swb_128[sampling_index]`。短窗一条频带只有 128 个系数里的几格，
+    # 而**分组内的每个窗口共用一套 sf/码本** —— 所以编码端把「一个组的频带 b」
+    # 看成「8 个窗口的这条带拼接」，位流按 带→组内窗口 的顺序写（解码端
+    # `decode_spectrum_and_dequant` 就是这么读的：cfo = coef + 128·窗口）。
+    m128 = re.search(r"ff_swb_offset_128\[\]\s*=\s*\{(.*?)\};", at, re.S)
+    # ⚠️ 指针表的**注释**里也提到表名（"swb_offset_128_64 is a duplicate..."），
+    # 不剥注释会把注释里的名字也当成指针 —— 13 个指针抓成 15 个。
+    body128 = re.sub(r"/\*.*?\*/|//[^\n]*", " ", m128.group(1), flags=re.S)
+    ptr128 = re.findall(r"swb_offset_128_(\d+)", body128)
+    assert len(ptr128) == 13, f"ff_swb_offset_128 应有 13 个指针，得到 {len(ptr128)}"
+    swb128 = [nums(body(at, f"swb_offset_128_{n}")) for n in ptr128]
+    # 各行末尾必须是 128（块的系数总数），这是频带表的自检。
+    for i, r in enumerate(swb128):
+        assert r and r[-1] == 128, f"swb_offset_128 #{i} 末尾不是 128：{r[-3:]}"
+    lens128 = [len(r) for r in swb128]
+    maxlen128 = max(lens128)
+    padded128 = [r + [0] * (maxlen128 - len(r)) for r in swb128]
+    o.ints("NUM_SWB_128", "u8", nums(body(at, "ff_aac_num_swb_128")))
+    # 自检：num_swb 与边界表长度 - 1 一致（边界表含 0 和 128）。
+    nswb = nums(body(at, "ff_aac_num_swb_128"))
+    for i, l in enumerate(lens128):
+        assert nswb[i] == l - 1, f"num_swb_128[{i}]={nswb[i]} 与边界表长度 {l} 不符"
+    o.ints("SWB_OFFSET_128_LEN", "u16", lens128)
+    o.table2("SWB_OFFSET_128", "u16", padded128)
+
     # ── 码本参数 ────────────────────────────────────────────────────────────
     # `aac_cb_maxval`：码本能表示的量化值的上限（0..16）；
     # `aac_cb_range`：索引码本时的进制（`curidx = curidx * range + q`）。
