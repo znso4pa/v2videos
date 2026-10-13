@@ -12,14 +12,20 @@
 use std::f64::consts::PI;
 
 /// `COS[u][x] = cos((2x+1)uπ/16)`。
-fn cos_table() -> [[f64; 8]; 8] {
-    let mut t = [[0f64; 8]; 8];
-    for (u, row) in t.iter_mut().enumerate() {
-        for (x, v) in row.iter_mut().enumerate() {
-            *v = ((2 * x + 1) as f64 * u as f64 * PI / 16.0).cos();
+///
+/// 表与输入块无关，缓存以避免在块循环中重复构造。
+/// 保留原来的浮点表达式和运算顺序，不改变变换的定标与舍入。
+fn cos_table() -> &'static [[f64; 8]; 8] {
+    static T: std::sync::OnceLock<[[f64; 8]; 8]> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let mut t = [[0f64; 8]; 8];
+        for (u, row) in t.iter_mut().enumerate() {
+            for (x, v) in row.iter_mut().enumerate() {
+                *v = ((2 * x + 1) as f64 * u as f64 * PI / 16.0).cos();
+            }
         }
-    }
-    t
+        t
+    })
 }
 
 /// 正向 8×8 DCT。`pix` 是 8×8 像素块（`stride` = 一行字节数），
