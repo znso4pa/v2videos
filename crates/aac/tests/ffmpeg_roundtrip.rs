@@ -1029,3 +1029,131 @@ fn kb_window_bit_matches_the_window_actually_used() {
         sine_db - kb_db
     );
 }
+
+/// 带**尖锐攻击**的信号：周期性「静音 20 ms → 直接满幅」。
+///
+/// 专门用来触发**短窗**。稳态信号（正弦、粉噪声）根本不会让攻击检测器动 ——
+/// 这就是「短窗那条路整帧坏掉」能藏到今天的原因（见 `TODO.md`）。
+fn attacked_signal(secs: usize) -> Vec<f32> {
+    let n = secs * SR as usize;
+    (0..n)
+        .map(|i| {
+            let t = i as f32 / SR as f32;
+            if t % 0.5 < 0.02 {
+                0.0
+            } else {
+                (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 20000.0
+            }
+        })
+        .collect()
+}
+
+/// 逐帧（1024 样本）SNR 的 `(最差, 中位)` —— 对齐偏移借 `aligned_snr` 找。
+fn per_frame_snr(got: &[f32], src: &[f32]) -> (f64, f64) {
+    let (_, sh) = aligned_snr(got, src);
+    const MARGIN: usize = 20000;
+    let hi = got.len().saturating_sub(sh).min(src.len());
+    let mut v: Vec<f64> = Vec::new();
+    let mut i = MARGIN;
+    while i + 1024 + MARGIN < hi {
+        let (mut se, mut sp) = (0f64, 0f64);
+        for k in 0..1024 {
+            let d = f64::from(got[i + k + sh]) - f64::from(src[i + k]);
+            se += d * d;
+            sp += f64::from(src[i + k]) * f64::from(src[i + k]);
+        }
+        if sp > 1.0 {
+            v.push(10.0 * (sp / se.max(1e-9)).log10());
+        }
+        i += 1024;
+    }
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    (
+        v.first().copied().unwrap_or(f64::NAN),
+        v[v.len() / 2].max(f64::NAN),
+    )
+}
+
+/// **尖锐攻击**上我们的最差帧不能比 ffmpeg 差太多。
+///
+/// 自己跟自己比不够 —— 短窗那条路两边会一起错（那正是它藏住的原因），
+/// 所以参照物必须是 **ffmpeg 编同一份 PCM**。
+///
+/// ⚠️ **现在标着 `#[ignore]`：它会红，而红的是真 bug**（短窗帧整帧坏，见 `TODO.md`）。
+/// 实测 2026-10-14：我们最差帧 **9.4 dB**、ffmpeg 30.4 dB（中位我们 78.1、ffmpeg 66.6）。
+/// 修好短窗那条路之后**去掉 `#[ignore]`** —— 它就是那条线的验收判据。
+#[test]
+#[ignore = "已知 bug：短窗帧整帧坏（TODO.md「高码率天花板的根因」）"]
+fn a_sharp_attack_does_not_break_a_whole_frame() {
+    if !has_ffmpeg() {
+        eprintln!("SKIP: PATH 上没有 ffmpeg");
+        return;
+    }
+    let src = attacked_signal(4);
+
+    // ---- 我们 ----
+    let mut e = Encoder::new(EncoderConfig {
+        channels: 1,
+        sample_rate: SR,
+        bitrate: 128_000,
+        threads: 1,
+        kb_window: false,
+        ms_stereo: true,
+    })
+    .expect("建编码器");
+    let mut ours = Vec::new();
+    for chunk in src.chunks(1024) {
+        let mut p = chunk.to_vec();
+        p.resize(1024, 0.0);
+        ours.push(e.encode_frame(&Frame { planes: vec![p] }).expect("编一帧"));
+    }
+    let ours_dec = decode_aac(&ours, 1);
+    let (w_ours, m_ours) = per_frame_snr(&ours_dec[0], &src);
+
+    // ---- ffmpeg（同一份 PCM）----
+    let pcm = unique_temp("v2v_attack_src.pcm");
+    let mut bytes = Vec::with_capacity(src.len() * 2);
+    for &s in &src {
+        bytes.extend_from_slice(&(s as i16).to_le_bytes());
+    }
+    std::fs::write(&pcm, &bytes).expect("写基准 PCM");
+    let ref_aac = unique_temp("v2v_attack_ref.aac");
+    let ok = Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-f",
+            "s16le",
+            "-ar",
+            &SR.to_string(),
+            "-ac",
+            "1",
+            "-i",
+            pcm.to_str().unwrap(),
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128000",
+            // ⚠️ 显式给容器：`unique_temp` 会把 pid 接在**扩展名之后**，
+            // ffmpeg 靠扩展名认不出 muxer（报「Unable to find a suitable output format」）。
+            "-f",
+            "adts",
+            "-y",
+            ref_aac.to_str().unwrap(),
+        ])
+        .status()
+        .expect("跑 ffmpeg");
+    assert!(ok.success(), "ffmpeg 没能编基准 AAC");
+    let ff_dec = decode_aac_file(&ref_aac);
+    let (w_ff, m_ff) = per_frame_snr(&ff_dec[0], &src);
+
+    eprintln!(
+        "尖锐攻击 @128k：我们 最差 {w_ours:.1} / 中位 {m_ours:.1} dB；\
+         ffmpeg 最差 {w_ff:.1} / 中位 {m_ff:.1} dB"
+    );
+    assert!(
+        w_ours >= w_ff - 8.0,
+        "尖锐攻击上我们的最差帧 {w_ours:.1} dB，ffmpeg 是 {w_ff:.1} dB —— \
+         差太多，短窗那条路（见 TODO.md）"
+    );
+}
