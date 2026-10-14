@@ -215,46 +215,104 @@ impl AudioSpecificConfig {
 /// 分组必须两个声道一致 —— 决策得提到 `encode_frame` 里**联合**做，不能各声道各决定。
 /// 单声道就用自己那一份。
 struct WindowPlan {
-    /// 本帧用不用短窗（`EIGHT_SHORT_SEQUENCE`）。
-    short: bool,
+    /// 本帧的窗序列（`ONLY_LONG` / `LONG_START` / `EIGHT_SHORT` / `LONG_STOP`）。
+    ///
+    /// ⚠️ **不能只有「长/短」两态**：长 ↔ 短之间必须走过渡窗，否则相邻两帧的窗
+    /// 在重叠区不互补 —— 见 `decide_sequence` 与 `mdct::long_start_window`。
+    seq: WindowSequence,
     /// 分组长度（长窗恒 `[1]`）。
     group_lens: Vec<usize>,
     /// 每个声道本帧的攻击（要写回 `ChannelState::attack_prev`）。
     attacks: Vec<Option<usize>>,
 }
 
+/// **窗序列状态机**（照 `ffmpeg` 的 `psy_3gpp_window`，`aacpsy.c:443-463`）。
+///
+/// ```text
+///   ONLY_LONG   + 攻击 → LONG_START   （本帧仍是长窗，但尾巴给短窗让位）
+///   ONLY_LONG   + 无   → ONLY_LONG
+///   LONG_START  + 任意 → EIGHT_SHORT  （过渡窗已发，下一帧必须是短窗）
+///   LONG_STOP   + 攻击 → LONG_START
+///   LONG_STOP   + 无   → ONLY_LONG
+///   EIGHT_SHORT + 攻击 → EIGHT_SHORT  （继续短窗）
+///   EIGHT_SHORT + 无   → LONG_STOP    （本帧仍是长窗，但头给上一帧的短窗让位）
+/// ```
+///
+/// ## 为什么不能长↔短直接跳（实测）
+///
+/// MDCT 的完美重建要求**相邻两帧的窗在重叠区互补**（`w_a² + w_b² = 1`）。
+/// 长配长、短配短都天然满足，**长配短不满足**：长窗前半是上升的 `lwindow`，
+/// 而短窗帧两头是零 —— `[0, 448)` 那一段没有任何东西与长窗相加。
+///
+/// 帧对齐的 MDCT 域归因（真音乐 8 秒 @1 Mbps，逐帧与源比）：
+///
+/// | 帧类别 | 帧数占比 | 总误差占比 | 帧 SNR 中位 |
+/// |---|---|---|---|
+/// | 短窗 | 13.1% | 23.2% | 18.3 dB |
+/// | **紧跟短窗之后的长窗** | **6.0%** | **55.9%** | **11.7 dB** |
+/// | 紧邻短窗之前的长窗 | 6.0% | 15.2% | 15.2 dB |
+/// | 孤立的长窗 | 75.0% | **5.7%** | **69.0 dB** |
+///
+/// 孤立长窗只占 5.7% 的误差 —— 说明**长窗那条路本身是好的**，坏的是切换。
+fn decide_sequence(
+    attack: Option<usize>,
+    prev_attack: Option<usize>,
+    prev: WindowSequence,
+) -> (WindowSequence, Vec<usize>) {
+    match prev {
+        WindowSequence::OnlyLong => {
+            if attack.is_some() {
+                (WindowSequence::LongStart, vec![1])
+            } else {
+                (WindowSequence::OnlyLong, vec![1])
+            }
+        }
+        WindowSequence::LongStart => {
+            // 过渡窗已经发出去，本帧必然是短窗。攻击位置用上一帧记下来的那个
+            // （本帧不一定还有攻击 —— 但那不重要，短窗覆盖的正是上一帧的攻击）。
+            let pos = attack.or(prev_attack).unwrap_or(8);
+            (WindowSequence::EightShort, group_lengths(WINDOW_GROUPING[pos]))
+        }
+        WindowSequence::LongStop => {
+            if attack.is_some() {
+                (WindowSequence::LongStart, vec![1])
+            } else {
+                (WindowSequence::OnlyLong, vec![1])
+            }
+        }
+        WindowSequence::EightShort => {
+            if let Some(pos) = attack {
+                (WindowSequence::EightShort, group_lengths(WINDOW_GROUPING[pos]))
+            } else {
+                (WindowSequence::LongStop, vec![1])
+            }
+        }
+    }
+}
+
 impl WindowPlan {
     /// 一个声道的窗决策（单声道走这条）。
-    fn for_one(attack: Option<usize>, prev_attack: Option<usize>) -> Self {
-        let short = attack.is_some() || prev_attack.is_some();
-        let attack_pos = attack.or(prev_attack).unwrap_or(8);
-        let group_lens = if short {
-            group_lengths(WINDOW_GROUPING[attack_pos])
-        } else {
-            vec![1]
-        };
+    fn for_one(attack: Option<usize>, prev_attack: Option<usize>, prev: WindowSequence) -> Self {
+        let (seq, group_lens) = decide_sequence(attack, prev_attack, prev);
         Self {
-            short,
+            seq,
             group_lens,
             attacks: vec![attack],
         }
     }
 
-    /// **双声道联合**的窗决策：只要**任一**声道（本帧或上一帧）有攻击就用短窗，
+    /// **双声道联合**的窗决策：只要**任一**声道有攻击就算有攻击，
     /// 分组位置取两个声道里**最早**的那个攻击。
-    fn for_pair(attacks: &[Option<usize>], prev: &[Option<usize>]) -> Self {
-        let short = (0..attacks.len()).any(|ch| attacks[ch].is_some() || prev[ch].is_some());
-        let attack_pos = (0..attacks.len())
-            .filter_map(|ch| attacks[ch].or(prev[ch]))
-            .min()
-            .unwrap_or(8);
-        let group_lens = if short {
-            group_lengths(WINDOW_GROUPING[attack_pos])
-        } else {
-            vec![1]
-        };
+    fn for_pair(
+        attacks: &[Option<usize>],
+        prev: &[Option<usize>],
+        prev_seq: WindowSequence,
+    ) -> Self {
+        let attack = attacks.iter().copied().flatten().min();
+        let prev_attack = prev.iter().copied().flatten().min();
+        let (seq, group_lens) = decide_sequence(attack, prev_attack, prev_seq);
         Self {
-            short,
+            seq,
             group_lens,
             attacks: attacks.to_vec(),
         }
@@ -381,14 +439,13 @@ struct ChannelState {
     overlap_ms: Vec<f32>,
     /// 「上一帧的攻击落在哪个子块」（`None` = 没有攻击）。
     ///
-    /// 短窗的覆盖区是 `buf[448..1600]`（见 `encode_channel`），换算到**本帧样本**
-    /// 就是 `[-576, +576)`：所以一帧里的攻击落在**前 ~576 个样本**（子块 0..=4）
-    /// 时本帧要用短窗；落在**后 448 个样本**（子块 5..=7）时，攻击其实落在
-    /// **下一帧**的窗口覆盖区里 —— 于是本帧发 `LONG_START`、下一帧发短窗。
-    ///
-    /// ⚠️ 这个「前/后」的划分是**不需要前瞻**就能决定 `LONG_START` 的关键：
-    /// 「下一帧会不会是短窗」由**本帧自己的后段攻击**决定，而它是本帧已知的。
+    /// 只用来给**分组**定位：`EIGHT_SHORT` 帧拿它查 `WINDOW_GROUPING`，
+    /// 把攻击所在的那个窗口单独分一组（见 `decide_sequence`）。
+    /// 短窗的覆盖区是 `buf[448..1600]`，换算到**本帧样本**就是 `[-576, +576)`。
     attack_prev: Option<usize>,
+    /// 上一帧实际发出的**窗序列** —— 本帧的窗序列状态机拿它决定过渡态
+    /// （见 `decide_sequence`）。初值 `ONLY_LONG`（第一帧之前没有短窗）。
+    window_seq_prev: WindowSequence,
     /// `band_cost` 的帧内缓存（见 `BandCostCache`）。
     cost_cache: BandCostCache,
     /// **上一帧选中的 `sf_offset`** —— 下一帧搜偏移时的**种子**。
@@ -403,8 +460,12 @@ pub struct Encoder {
     cfg: EncoderConfig,
     /// 每声道一份可变状态。`threads >= 2` 时两个声道各在一个线程里动自己那份。
     chans: Vec<ChannelState>,
-    /// 长窗的开窗表（`2N` 长）。
+    /// **长窗**的开窗表（`2N` 长）。
     window: Vec<f32>,
+    /// **过渡窗**（长 ↔ 短）。没有它们就只能长↔短直接跳变、重叠区不互补
+    /// —— 见 `mdct::long_start_window` 与 `decide_sequence`。
+    window_long_start: Vec<f32>,
+    window_long_stop: Vec<f32>,
     /// 采样率索引（TNS 的几张表按它索引）。
     sr_idx: usize,
     /// 已经编过多少帧 —— 用来交替「这一帧有没有上一帧的右半」。
@@ -457,6 +518,10 @@ impl Encoder {
         // 短窗与长窗**同系**：编码端写 `use_kb_window` 是每个 ics_info 一个位，
         // 简化起见长短窗永远同系（解码端只拿它决定用哪张窗表，不校验一致性）。
         let window_short = crate::mdct::short_window(cfg.kb_window);
+        // 过渡窗（长 ↔ 短）—— 形状与解码端的 `LONG_START` / `LONG_STOP` 合成窗
+        // 成对，构造性判据见 `mdct::transition_windows_are_complementary`。
+        let window_long_start = crate::mdct::long_start_window(&window, &window_short);
+        let window_long_stop = crate::mdct::long_stop_window(&window, &window_short);
         // 每帧的位数预算。`bitrate` 是**目标**不是保证 —— 编码器靠
         // 「二分搜整帧 sf 偏移」逼近它（见 `encode_channel`）。
         let frames_per_sec = f64::from(cfg.sample_rate) / LONG_LEN as f64;
@@ -469,11 +534,14 @@ impl Encoder {
                     overlap: vec![0f32; LONG_LEN],
                     overlap_ms: vec![0f32; LONG_LEN],
                     attack_prev: None,
+                    window_seq_prev: WindowSequence::OnlyLong,
                     cost_cache: BandCostCache::new(),
                     sf_offset_prev: SF_OFFSET_SEED_INIT,
                 })
                 .collect(),
             window,
+            window_long_start,
+            window_long_stop,
             sr_idx: sr_idx as usize,
             frame_index: 0,
             swb,
@@ -559,9 +627,13 @@ impl Encoder {
         let plan = if is_stereo {
             let attacks: Vec<Option<usize>> = coded.iter().map(|p| detect_attack(p)).collect();
             let prev: Vec<Option<usize>> = chans.iter().map(|c| c.attack_prev).collect();
-            WindowPlan::for_pair(&attacks, &prev)
+            WindowPlan::for_pair(&attacks, &prev, chans[0].window_seq_prev)
         } else {
-            WindowPlan::for_one(detect_attack(&coded[0]), chans[0].attack_prev)
+            WindowPlan::for_one(
+                detect_attack(&coded[0]),
+                chans[0].attack_prev,
+                chans[0].window_seq_prev,
+            )
         };
 
         // ---- 元素头 ----
@@ -574,15 +646,13 @@ impl Encoder {
             // 这是 M/S 立体声的**前提**（`ms_mask_present` 只在 common_window 下存在）。
             // 代价是两个声道的窗序列与分组必须一致 —— 所以决策提到了上面那一步联合做。
             w.put(1, 1);
-            let seq = if plan.short {
-                WindowSequence::EightShort
-            } else {
-                WindowSequence::OnlyLong
-            };
+            // 窗序列直接来自状态机（含 `LONG_START` / `LONG_STOP` 两个过渡态）。
+            let seq = plan.seq;
+            let short = seq == WindowSequence::EightShort;
             // ⚠️ `max_sfb` 短窗要用**短窗那张频带表**的条带数（4 位），长窗才用长表的
             // （6 位）。写错会让解码端按错误的频带数读 `section_data` —— 报出来的是
             // 「number of bands (7) exceeds limit (1)」这种看着像分组错的信息。
-            let max_sfb = if plan.short {
+            let max_sfb = if short {
                 self.swb_short.len() - 1
             } else {
                 self.num_sfb()
@@ -1003,12 +1073,11 @@ impl Encoder {
         // ⚠️ 决策**不在这里做**：双声道要共用一份 `ics_info`（`common_window = 1`），
         // 所以两个声道必须拿到同一份窗序列与分组。
         st.attack_prev = plan.attacks[ch];
-        let short = plan.short;
-        let seq = if short {
-            WindowSequence::EightShort
-        } else {
-            WindowSequence::OnlyLong
-        };
+        // 本帧的窗序列（含 `LONG_START` / `LONG_STOP` 两个过渡态）—— 编完记下来，
+        // 下一帧的状态机要用它（见 `decide_sequence`）。
+        let seq = plan.seq;
+        st.window_seq_prev = seq;
+        let short = seq == WindowSequence::EightShort;
 
         // 短窗的**分组**：一个组内的窗口共用一套 sf/码本 —— 把攻击所在的窗口
         // 单独分出来，组里其余窗口才不会被攻击的尺度「带跑」。
@@ -1081,7 +1150,16 @@ impl Encoder {
             }
             debug_assert_eq!(w0, 8);
         } else {
-            for (b, wv) in buf.iter_mut().zip(self.window.iter()) {
+            // 长窗路径 —— 三种窗形：`ONLY_LONG` 是普通长窗；`LONG_START` /
+            // `LONG_STOP` 是**与短窗配对**的过渡窗（少了它们，长↔短直接跳变时
+            // 重叠区不互补 —— 见 `decide_sequence` 的实测表）。
+            let shape: &[f32] = match seq {
+                WindowSequence::OnlyLong => &self.window,
+                WindowSequence::LongStart => &self.window_long_start,
+                WindowSequence::LongStop => &self.window_long_stop,
+                WindowSequence::EightShort => unreachable!("短窗走上面那条分支"),
+            };
+            for (b, wv) in buf.iter_mut().zip(shape) {
                 *b *= *wv;
             }
             let mut s = vec![0f32; LONG_LEN];

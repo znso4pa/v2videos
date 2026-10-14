@@ -132,6 +132,74 @@ pub fn kbd_aac_window(n: usize, alpha: f64) -> Vec<f32> {
     w
 }
 
+/// 短窗那一串在 `2N` 的窗里**居中**摆，两端各留的零填充长度。
+///
+/// 8 个短窗一共覆盖 `7·s + 2·s = 9·s` 个样本（`s = SHORT_LEN`），所以
+/// `pad = (2N − 9s)/2`（1024 点时 = `(2048 − 1152)/2 = 448`）。
+fn short_pad(n: usize, s: usize) -> usize {
+    (2 * n - 9 * s) / 2
+}
+
+/// `LONG_START_SEQUENCE` 的 `2N` 点开窗表 —— **长窗 → 短窗**的过渡。
+///
+/// 逐段对着 `ffmpeg` 的 `apply_long_start_window`（`aacenc.c:425-435`）写，
+/// 解码端的 `LONG_START` 合成窗是同一套形状：
+///
+/// ```text
+///   [0,      N)       lwindow            长窗上升段（与上一帧的长窗互补）
+///   [N,      N+pad)   1.0                完全通过
+///   [N+pad,  N+pad+s) reverse(swindow)   与下一帧（短窗）第一个窗的上升沿互补
+///   [N+pad+s, 2N)     0                  短窗覆盖区之外，本帧不贡献
+/// ```
+///
+/// ## ⚠️ 为什么必须有它（实测）
+///
+/// `ONLY_LONG` 的前半是**上升**的 `lwindow`，它要求上一帧的后半也是 `lwindow`；
+/// 而短窗帧只在 `[pad, pad+9s)` 里有输出、两头是零。直接从 `EIGHT_SHORT` 跳到
+/// `ONLY_LONG`，长窗前半在 `[0, pad)` 那一段**没有任何东西与它相加** ——
+/// 帧对齐的 MDCT 域归因显示：「紧跟在短窗之后的长窗帧」只占 **6%** 的帧数，
+/// 却贡献了 **55.9%** 的总误差（孤立的长窗帧只有 5.7%，帧 SNR 中位 69 dB）。
+pub fn long_start_window(long: &[f32], short: &[f32]) -> Vec<f32> {
+    let n = long.len() / 2;
+    let s = short.len() / 2;
+    let pad = short_pad(n, s);
+    let mut w = vec![0f32; 2 * n];
+    w[..n].copy_from_slice(&long[..n]);
+    for v in w[n..n + pad].iter_mut() {
+        *v = 1.0;
+    }
+    for k in 0..s {
+        w[n + pad + k] = short[s - 1 - k];
+    }
+    w
+}
+
+/// `LONG_STOP_SEQUENCE` 的 `2N` 点开窗表 —— **短窗 → 长窗**的过渡
+/// （`long_start_window` 的镜像，对着 `apply_long_stop_window` 写）。
+///
+/// ```text
+///   [0,      pad)     0
+///   [pad,    pad+s)   swindow            与上一帧最后一个短窗的下降沿互补
+///   [pad+s,  N)       1.0
+///   [N,      2N)      reverse(lwindow)   长窗下降段
+/// ```
+pub fn long_stop_window(long: &[f32], short: &[f32]) -> Vec<f32> {
+    let n = long.len() / 2;
+    let s = short.len() / 2;
+    let pad = short_pad(n, s);
+    let mut w = vec![0f32; 2 * n];
+    for k in 0..s {
+        w[pad + k] = short[k];
+    }
+    for v in w[pad + s..n].iter_mut() {
+        *v = 1.0;
+    }
+    for k in 0..n {
+        w[n + k] = long[n - 1 - k];
+    }
+    w
+}
+
 /// 零阶修正贝塞尔函数 `I0(x)`（级数展开，`x` 不大时收敛很快）。
 fn bessel_i0(x: f64) -> f64 {
     let mut sum = 1.0f64;
@@ -332,6 +400,52 @@ mod tests {
         for i in 0..n {
             let s = f64::from(w[i]).powi(2) + f64::from(w[n + i]).powi(2);
             assert!((s - 1.0).abs() < 1e-6, "第 {i} 项的平方和是 {s}");
+        }
+    }
+
+    /// **过渡窗的互补性** —— 长 ↔ 短切换时重叠区必须 `w² + w² == 1`。
+    ///
+    /// 这条是过渡窗存在的**全部理由**：MDCT 的完美重建要求相邻两帧的窗在重叠区
+    /// 互补。长配长、短配短都天然满足（上面两条测试），但**长配短不满足** ——
+    /// 而原来的实现就是直接跳变（没有过渡窗），这正是「紧跟短窗之后的长窗帧」
+    /// 贡献 55.9% 总误差的原因。
+    #[test]
+    fn transition_windows_are_complementary() {
+        let (n, s) = (1024usize, 128usize);
+        let long = sine_window(n);
+        let short = sine_window(s);
+        let pad = (2 * n - 9 * s) / 2;
+
+        // 长 → 短：`LONG_START` 的尾巴（`reverse(swindow)`）与**下一帧第一个
+        // 短窗的上升沿**在重叠区相遇。
+        let ls = long_start_window(&long, &short);
+        assert_eq!(ls.len(), 2 * n, "开窗表是 2N 长");
+        for j in 0..s {
+            let a = f64::from(ls[n + pad + j]);
+            let b = f64::from(short[j]);
+            let sum = a * a + b * b;
+            assert!((sum - 1.0).abs() < 1e-5, "LONG_START 尾/短窗 第 {j} 项：{sum}");
+        }
+        // 它的前半是长窗上升段，必须与**上一帧长窗的后半**互补。
+        for i in 0..n {
+            let sum = f64::from(ls[i]).powi(2) + f64::from(long[n + i]).powi(2);
+            assert!((sum - 1.0).abs() < 1e-5, "LONG_START 前半 第 {i} 项：{sum}");
+        }
+
+        // 短 → 长：`LONG_STOP` 的开头（`swindow`）与**上一帧最后一个短窗的
+        // 下降沿**在重叠区相遇。
+        let st = long_stop_window(&long, &short);
+        assert_eq!(st.len(), 2 * n, "开窗表是 2N 长");
+        for j in 0..s {
+            let a = f64::from(st[pad + j]);
+            let b = f64::from(short[s + j]); // 短窗的后半 = 下降沿
+            let sum = a * a + b * b;
+            assert!((sum - 1.0).abs() < 1e-5, "LONG_STOP 头/短窗 第 {j} 项：{sum}");
+        }
+        // 它的后半是长窗下降段，必须与**下一帧长窗的前半**互补。
+        for i in 0..n {
+            let sum = f64::from(st[n + i]).powi(2) + f64::from(long[i]).powi(2);
+            assert!((sum - 1.0).abs() < 1e-5, "LONG_STOP 后半 第 {i} 项：{sum}");
         }
     }
 
