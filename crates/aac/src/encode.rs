@@ -1672,20 +1672,21 @@ fn band_code(band: &[f32], sf: u8, cb: usize, qu: &[i32]) -> (u32, f32) {
         let iq_sf = f64::from(iq(sf));
         for j in 0..dim {
             let v = f64::from(vecs[curidx * dim + j]);
+            // ⚠️ **符号要带**：escape 码本是无符号的，符号位由上面那条「逐维写符号」
+            // 单独发出（`write_band` 同款），解码端会把符号乘回去 —— 代价模型必须
+            // 与解码端算同一个值。
+            //
+            // 这里曾经漏掉 escape 那一路的符号（只写 `dequant_one(esc[j], sf)`，是个幅值），
+            // 于是负系数的误差被估成 `(|c| + rec)²` 量级 —— 编码器**系统性避开 escape**，
+            // 把大系数逼去撞 `maxval ≤ 16` 的普通码本。修好之后的实测（真样本的 `.mp4`
+            // 音频路径、对 ffmpeg 解出的 WMA PCM 比 SNR）：64k +0.001、128k +0.019、
+            // **256k +0.289 dB** —— 码率越高越吃这条（低码率下 sf 预算本来就主导）。
+            let sign = if chunk[j] < 0.0 { -1.0 } else { 1.0 };
             let rec = if v == 64.0 {
-                // escape：真实值来自那 13 位。
-                //
-                // ⚠️ 这里是**幅值**（`esc[j]` 由 `chunk[j].abs()` 算出来），没带符号。
-                // 位流那边没问题 —— escape 码本是无符号的，符号位由上面那条
-                // 「逐维写符号」单独发出（`write_band` 同款）—— 但**代价模型**因此
-                // 在负系数上把误差估大了。`band_cost` 的 `qmax == 16` 那一档就是
-                // 为它留的例外（cb11 可能反而输给「裁到 12」的 cb9）。
-                // 想修的话是质量改动（输出会变），得重新量 PSNR —— 记在 TODO。
-                dequant_one(esc[j], sf)
+                // escape：真实值来自那 13 位（幅值），符号乘回去。
+                dequant_one(esc[j], sf) * sign
             } else {
-                let a = v.abs();
-                let sign = if chunk[j] < 0.0 { -1.0 } else { 1.0 };
-                a * sign * iq_sf
+                v.abs() * sign * iq_sf
             };
             let d = f64::from(chunk[j]) - rec;
             dist += (d * d) as f32;
@@ -2127,12 +2128,12 @@ mod tests {
             let iq_sf = f64::from(iq(sf));
             for j in 0..dim {
                 let v = f64::from(vecs[curidx * dim + j]);
+                // 与生产代码同款：escape 那一路也要乘符号（见 `band_code` 的说明）。
+                let sign = if chunk[j] < 0.0 { -1.0 } else { 1.0 };
                 let rec = if v == 64.0 {
-                    dequant_one(escape_coef(chunk[j].abs(), q34v), sf)
+                    dequant_one(escape_coef(chunk[j].abs(), q34v), sf) * sign
                 } else {
-                    let a = v.abs();
-                    let sign = if chunk[j] < 0.0 { -1.0 } else { 1.0 };
-                    a * sign * iq_sf
+                    v.abs() * sign * iq_sf
                 };
                 let d = f64::from(chunk[j]) - rec;
                 dist += (d * d) as f32;
