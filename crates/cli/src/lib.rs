@@ -567,6 +567,29 @@ fn wma_frame_to_pcm(frames: Vec<Vec<Vec<f32>>>) -> Vec<u8> {
     out
 }
 
+/// 一个「将要写进 muxer 的载荷」+ 它的**交错序号**。
+///
+/// 序号 = `(样本序号, 样本内序号)`。串行版里「来自样本 i 的事件」全部排在
+/// 「来自样本 i+1 的事件」之前，所以这个键与串行版的事件顺序**逐一对齐** ——
+/// 排序回放之后 `mdat` 的排布就与原版逐字节相同。
+/// 音频尾巴（`flush_aac`）排在所有样本之后，用 `usize::MAX`。
+struct Pending {
+    key: (usize, usize),
+    kind: PendingKind,
+}
+
+enum PendingKind {
+    Video {
+        data: Vec<u8>,
+        key_frame: bool,
+        duration: u32,
+    },
+    Audio {
+        data: Vec<u8>,
+        duration: u32,
+    },
+}
+
 /// `.mp4`（MPEG-4 Part 2 in MP4）那条路。
 ///
 /// 与 `.wmv` 那条的三个实质差别：
@@ -730,20 +753,102 @@ fn convert_to_mp4(
     let mut dec = Decoder::new();
     let mut frames = 0usize;
     let mut key_frames = 0usize;
-    let mut audio_points = 0usize;
     let mut skipped_audio = 0usize;
-    // WMA 解码器与要跳的延迟样本数（`plan_audio` 里算好的）—— 拿出来单独持有，
-    // 因为循环里要 `&mut`。
-    let (mut wma_dec, mut skip_left) = match audio.as_mut() {
-        Some(a) => (a.decoder.take(), a.skip),
-        None => (None, 0),
+
+    // ---- 音频 worker：把「解 WMA + 编 AAC」整条链挪到另一个线程 ----
+    //
+    // 为什么能并行：AAC-LC **逐帧独立** —— 偏移搜索是「二分到最小可行偏移」，
+    // `sf_offset_prev` 只决定从哪儿开始探、不决定答案（`v2v-aac` 的注释写死了这点），
+    // WMA 解码也是逐帧流式的。所以音频那条链与视频那条互不依赖。
+    //
+    // ⚠️ **两边都不直接写 muxer**：`mdat` 是按 `write_video` / `write_audio` 的
+    // **调用顺序**铺出来的（`finish()` 只补长度 + 追加 `moov`），所以并行之后必须
+    // 把交错顺序**原样复现**。做法：给每个载荷记一个 `(样本序号, 样本内序号)`，
+    // 收齐后按这个键排序回放 —— 与串行版的事件顺序逐一对齐。
+    let a_point = audio.as_ref().map_or(0, |a| a.point);
+    let a_channels = src_audio.as_ref().map_or(0, |af| af.channels as usize);
+    let (tx_audio, rx_audio) = std::sync::mpsc::channel::<(usize, Vec<u8>)>();
+    let mut wma_dec = match audio.as_mut() {
+        Some(a) => a.decoder.take(),
+        None => None,
     };
-    // AAC 的待编样本缓冲（每声道一条，f32）。攒够 1024 个就编一帧。
-    let mut aac_pending: Vec<Vec<f32>> = Vec::new();
+    let mut skip_left = audio.as_ref().map_or(0, |a| a.skip);
+    let mut aac_enc = aac.take();
+    let audio_worker = std::thread::spawn(move || -> std::result::Result<(Vec<Pending>, usize), String> {
+        let mut out: Vec<Pending> = Vec::new();
+        let mut pending: Vec<Vec<f32>> = Vec::new();
+        let mut audio_points = 0usize;
+        while let Ok((idx, data)) = rx_audio.recv() {
+            let mut pcm = match wma_dec.as_mut() {
+                Some(d) => wma_frame_to_pcm(d.decode_superframe(&data).map_err(|e| e.to_string())?),
+                None => data,
+            };
+            if skip_left > 0 {
+                let drop = (skip_left * a_point).min(pcm.len());
+                pcm.drain(..drop);
+                skip_left -= drop / a_point;
+            }
+            if let Some(enc) = aac_enc.as_mut() {
+                // ---- AAC：攒够 1024 个采样点再编一帧 ----
+                //
+                // 源 PCM 是「交织的小端 16 位」，AAC 编码器要的是
+                // 「每声道一条、f32、范围 ±32768」——所以要先拆开、归一。
+                push_aac_pcm(&mut pending, &pcm, a_point, a_channels);
+                let mut sub = 0usize;
+                {
+                    let mut emit = |d: &[u8], dur: u32| {
+                        out.push(Pending {
+                            key: (idx, sub),
+                            kind: PendingKind::Audio {
+                                data: d.to_vec(),
+                                duration: dur,
+                            },
+                        });
+                        sub += 1;
+                    };
+                    drain_aac_frames(enc, &mut pending, &mut emit, &mut audio_points)
+                        .map_err(|e| e.to_string())?;
+                }
+                continue;
+            }
+            for (j, c) in pcm.chunks_exact(a_point).enumerate() {
+                out.push(Pending {
+                    key: (idx, j),
+                    kind: PendingKind::Audio {
+                        data: c.to_vec(),
+                        duration: 1,
+                    },
+                });
+                audio_points += 1;
+            }
+        }
+        // 收尾：把 AAC 的尾巴（不足 1024 个采样点）补零编出去。
+        if let Some(enc) = aac_enc.as_mut() {
+            let mut sub = 0usize;
+            {
+                let mut emit = |d: &[u8], dur: u32| {
+                    out.push(Pending {
+                        key: (usize::MAX, sub),
+                        kind: PendingKind::Audio {
+                            data: d.to_vec(),
+                            duration: dur,
+                        },
+                    });
+                    sub += 1;
+                };
+                flush_aac(enc, &mut pending, &mut emit, &mut audio_points)
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        Ok((out, audio_points))
+    });
+
     // 上一帧的视频时间戳（毫秒）—— `stts` 写的是**真实间隔**。
     let mut prev_vts: Option<i64> = None;
     let mut last_dur = (VTS as f64 / fps as f64).round().max(1.0) as u32;
     let mut stop = false;
+    let mut video_events: Vec<Pending> = Vec::new();
+    let mut sample_idx = 0usize;
 
     loop {
         let s = match queue.pop_front() {
@@ -752,42 +857,13 @@ fn convert_to_mp4(
             None => None,
         };
         let Some(s) = s else { break };
+        let idx = sample_idx;
+        sample_idx += 1;
 
-        // ---- 音频 ----
+        // ---- 音频：原样转给 worker（它自己解 WMA、编 AAC）----
         if Some(s.stream) == audio_num {
-            let plan = audio.as_ref().expect("audio_num 有值就一定有 plan");
-            let mut pcm = match wma_dec.as_mut() {
-                Some(d) => wma_frame_to_pcm(d.decode_superframe(&s.data)?),
-                None => s.data.clone(),
-            };
-            if skip_left > 0 {
-                let drop = (skip_left * plan.point).min(pcm.len());
-                pcm.drain(..drop);
-                skip_left -= drop / plan.point;
-            }
-            if let Some(enc) = aac.as_mut() {
-                // ---- AAC：攒够 1024 个采样点再编一帧 ----
-                //
-                // 源 PCM 是「交织的小端 16 位」，AAC 编码器要的是
-                // 「每声道一条、f32、范围 ±32768」——所以要先拆开、归一。
-                push_aac_pcm(
-                    &mut aac_pending,
-                    &pcm,
-                    plan.point,
-                    src_audio.as_ref().expect("有 plan 就一定有源格式").channels as usize,
-                );
-                drain_aac_frames(
-                    enc,
-                    &mut aac_pending,
-                    &mut mux,
-                    &mut audio_points,
-                    plan.point,
-                )?;
-                continue;
-            }
-            for c in pcm.chunks_exact(plan.point) {
-                mux.write_audio(c, 1)?;
-                audio_points += 1;
+            if tx_audio.send((idx, s.data)).is_err() {
+                break; // worker 已退出（出错），由下面的 join 报出来
             }
             continue;
         }
@@ -819,10 +895,17 @@ fn convert_to_mp4(
             enc.encode_frame(&frame)?
         };
         // 关键帧位来自编码器 —— 全 I 帧时 `stss` 会被整个省掉。
-        mux.write_video(&stream, enc.last_key_frame, last_dur)?;
         if enc.last_key_frame {
             key_frames += 1;
         }
+        video_events.push(Pending {
+            key: (idx, 0),
+            kind: PendingKind::Video {
+                data: stream,
+                key_frame: enc.last_key_frame,
+                duration: last_dur,
+            },
+        });
         frames += 1;
         if let Some(max) = opts.max_frames {
             if frames >= max {
@@ -832,9 +915,28 @@ fn convert_to_mp4(
         }
     }
 
-    // ---- 收尾：把 AAC 的尾巴（不足 1024 个采样点）补零编出去 ----
-    if let Some(enc) = aac.as_mut() {
-        flush_aac(enc, &mut aac_pending, &mut mux, &mut audio_points)?;
+    // 关掉发送端：worker 把剩下的样本处理完、编掉 AAC 的尾巴之后退出。
+    drop(tx_audio);
+    let (audio_events, audio_points) = match audio_worker.join() {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return Err(Error::Io(std::io::Error::other(format!("音频线程：{e}")))),
+        Err(_) => return Err(Error::Io(std::io::Error::other("音频线程 panic"))),
+    };
+
+    // ---- 按**原交错顺序**回放：`mdat` 的排布必须与串行版逐字节相同 ----
+    let mut all: Vec<Pending> = Vec::with_capacity(video_events.len() + audio_events.len());
+    all.extend(video_events);
+    all.extend(audio_events);
+    all.sort_by_key(|p| p.key); // 稳定排序；键本来就互不相同
+    for p in all {
+        match p.kind {
+            PendingKind::Video {
+                data,
+                key_frame,
+                duration,
+            } => mux.write_video(&data, key_frame, duration)?,
+            PendingKind::Audio { data, duration } => mux.write_audio(&data, duration)?,
+        }
     }
 
     let mp4 = mux.finish();
@@ -881,17 +983,21 @@ fn push_aac_pcm(pending: &mut Vec<Vec<f32>>, pcm: &[u8], point: usize, channels:
     }
 }
 
-/// 从待编缓冲里尽量多地编出 AAC 帧（每帧 1024 个采样点）并写进封装器。
+/// 从待编缓冲里尽量多地编出 AAC 帧（每帧 1024 个采样点）并**交给 `emit`**。
 ///
 /// ⚠️ **不足 1024 的部分要留着**，不能提前编 —— 提前编会补零，
 /// 而补进去的零会在输出里变成一小段可听的静音（每 1024 个点补一次就够听出来）。
 /// 剩下的尾巴由 `flush_aac` 在收尾时补零编出去。
+///
+/// ⚠️ 参数是 `emit` 回调而**不是** `&mut Mp4Muxer`：音频那条链现在跑在
+/// **另一个线程**上（见 `convert_to_mp4` 的音频 worker），不能直接碰 muxer ——
+/// 而 `mdat` 是按写入**调用顺序**铺的，并行后必须把交错顺序原样复现。
+/// 交给回调，串行与并行两条路就共用同一份实现，不会漂出第二份。
 fn drain_aac_frames(
     enc: &mut v2v_aac::Encoder,
     pending: &mut Vec<Vec<f32>>,
-    mux: &mut v2v_mp4::Mp4Muxer,
+    emit: &mut dyn FnMut(&[u8], u32),
     audio_samples: &mut usize,
-    _point: usize,
 ) -> Result<(), Error> {
     loop {
         let have = pending.first().map_or(0, |p| p.len());
@@ -904,7 +1010,7 @@ fn drain_aac_frames(
             .collect();
         let frame = enc.encode_frame(&v2v_aac::Frame { planes })?;
         // AAC 一帧就是 1024 个采样点，时间基是采样率 —— 所以时长写 1024。
-        mux.write_audio(&frame, AAC_FRAME_SAMPLES as u32)?;
+        emit(&frame, AAC_FRAME_SAMPLES as u32);
         // 计数用**输出侧的采样点数**（与 PCM 那条路同单位，报告里好对比）。
         *audio_samples += AAC_FRAME_SAMPLES;
     }
@@ -917,7 +1023,7 @@ fn drain_aac_frames(
 fn flush_aac(
     enc: &mut v2v_aac::Encoder,
     pending: &mut Vec<Vec<f32>>,
-    mux: &mut v2v_mp4::Mp4Muxer,
+    emit: &mut dyn FnMut(&[u8], u32),
     audio_samples: &mut usize,
 ) -> Result<(), Error> {
     let have = pending.first().map_or(0, |p| p.len());
@@ -934,7 +1040,7 @@ fn flush_aac(
         })
         .collect();
     let frame = enc.encode_frame(&v2v_aac::Frame { planes })?;
-    mux.write_audio(&frame, AAC_FRAME_SAMPLES as u32)?;
+    emit(&frame, AAC_FRAME_SAMPLES as u32);
     *audio_samples += AAC_FRAME_SAMPLES;
     Ok(())
 }
