@@ -709,7 +709,15 @@ fn decode_motion(
 
 /// 边缘复制：把 `bw × bh` 的区域填成
 /// `src[clamp(src_y+y)][clamp(src_x+x)]`。
-fn edge_emu(
+///
+/// ⚠️ **不分配**：旧版每块一次 `vec![0u8; bw*bh]`（luma 一次 MC 就 289 字节），
+/// 实测 `edge_emu` 一个人占整条链路的 **5.1%**（还带 malloc/free 的抖动）。
+/// 现在由调用方给一块**栈上**的 scratch —— 同样的值，少一趟堆。
+///
+/// 逐像素的两次 `clamp` 也去掉了：x 方向的越界形状**整块共用**，所以先把
+/// 「左侧贴边 / 中间连续 / 右侧贴边」三段算出来，每行只做一次切片拷贝 + 两次填充。
+fn edge_emu_into(
+    out: &mut [u8],
     src: &[u8],
     sstride: usize,
     src_x: i32,
@@ -718,22 +726,41 @@ fn edge_emu(
     bh: usize,
     w: usize,
     h: usize,
-) -> Vec<u8> {
-    let mut out = vec![0u8; bw * bh];
+) {
+    debug_assert!(out.len() >= bw * bh);
+    debug_assert!(w > 0 && h > 0);
+
+    // x 方向三段（对每一行都一样）：
+    //   [0, left)        贴左边界，取 row[0]
+    //   [left, bw-right) 连续区间，从 row[src_x + left] 起整段拷
+    //   [bw-right, bw)   贴右边界，取 row[w-1]
+    let left = (-src_x).clamp(0, bw as i32) as usize;
+    let right = (src_x + bw as i32 - w as i32).clamp(0, bw as i32) as usize;
+    let right = right.min(bw - left);
+    let mid = bw - left - right;
+
     for y in 0..bh {
         let sy = (src_y + y as i32).clamp(0, h as i32 - 1) as usize;
-        for x in 0..bw {
-            let sx = (src_x + x as i32).clamp(0, w as i32 - 1) as usize;
-            out[y * bw + x] = src[sy * sstride + sx];
+        let row = &src[sy * sstride..sy * sstride + w];
+        let d = &mut out[y * bw..y * bw + bw];
+        d[..left].fill(row[0]);
+        if mid > 0 {
+            let sx0 = (src_x + left as i32) as usize;
+            debug_assert!(sx0 + mid <= w, "连续段越出参考帧");
+            d[left..left + mid].copy_from_slice(&row[sx0..sx0 + mid]);
         }
+        d[bw - right..].fill(row[w - 1]);
     }
-    out
 }
 
 /// 半像素双线性搬运（`put_pixels` 一族）。
 ///
 /// `dxy` 的 bit0 = 水平半像素、bit1 = 垂直半像素。带舍入时：
 /// x2/y2 用 `(a+b+1)>>1`，xy2 用 `(a+b+c+d+2)>>2`；不带舍入各减 1。
+///
+/// ⚠️ 四种相位**分开写**、按**行切片**取源：旧版把相位判断放在内层循环里、
+/// 还用一个逐像素算地址的闭包（每像素 1~4 次带边界检查的索引）。
+/// **算法一字未改**（相加、移位、舍入常数全照旧），所以输出逐字节不变。
 fn put_pixels(
     dst: &mut [u8],
     dstride: usize,
@@ -755,17 +782,39 @@ fn put_pixels(
     } else {
         (1u32, 2u32)
     };
+    // 横向半像素要多读一格（`src_x + w`）；纵向半像素才碰下一行。
+    let sw = w + usize::from(hx);
     for y in 0..h {
-        for x in 0..w {
-            // ⚠️ 这里必须把 `y` / `x` 一起加进去 —— 只写相对偏移会让每一行/列都复制块首行。
-            let p = |oy: usize, ox: usize| src[(sy + y + oy) * sstride + sx + x + ox] as u32;
-            let v = match (hx, hy) {
-                (false, false) => p(0, 0),
-                (true, false) => (p(0, 0) + p(0, 1) + r1) >> 1,
-                (false, true) => (p(0, 0) + p(1, 0) + r1) >> 1,
-                (true, true) => (p(0, 0) + p(0, 1) + p(1, 0) + p(1, 1) + r2) >> 2,
-            };
-            dst[(dy + y) * dstride + dx + x] = v as u8;
+        let base = (sy + y) * sstride + sx;
+        let top = &src[base..base + sw];
+        let dbase = (dy + y) * dstride + dx;
+        let d = &mut dst[dbase..dbase + w];
+        match (hx, hy) {
+            (false, false) => d.copy_from_slice(&top[..w]),
+            (true, false) => {
+                for x in 0..w {
+                    d[x] = ((top[x] as u32 + top[x + 1] as u32 + r1) >> 1) as u8;
+                }
+            }
+            (false, true) => {
+                let bbase = (sy + y + 1) * sstride + sx;
+                let bot = &src[bbase..bbase + sw];
+                for x in 0..w {
+                    d[x] = ((top[x] as u32 + bot[x] as u32 + r1) >> 1) as u8;
+                }
+            }
+            (true, true) => {
+                let bbase = (sy + y + 1) * sstride + sx;
+                let bot = &src[bbase..bbase + sw];
+                for x in 0..w {
+                    d[x] = ((top[x] as u32
+                        + top[x + 1] as u32
+                        + bot[x] as u32
+                        + bot[x + 1] as u32
+                        + r2)
+                        >> 2) as u8;
+                }
+            }
         }
     }
 }
@@ -813,12 +862,20 @@ pub fn mc_luma16(
     no_rounding: bool,
 ) -> bool {
     // 裁剪范围用**参考帧自己的**尺寸：它才是真正被索引的缓冲。
-    let ybuf = if p.need_emu {
-        edge_emu(&refp.y, refp.pw, p.src_x, p.src_y, 17, 17, refp.pw, refp.ph)
-    } else {
-        Vec::new()
-    };
+    // scratch 在**栈上**（17×17 = 289 字节）—— 旧版这里每块一次 `vec![]`。
+    let mut ybuf = [0u8; 17 * 17];
     let (ysrc, ystride, yx, yy) = if p.need_emu {
+        edge_emu_into(
+            &mut ybuf,
+            &refp.y,
+            refp.pw,
+            p.src_x,
+            p.src_y,
+            17,
+            17,
+            refp.pw,
+            refp.ph,
+        );
         (&ybuf[..], 17usize, 0usize, 0usize)
     } else {
         (&refp.y[..], refp.pw, p.src_x as usize, p.src_y as usize)
@@ -856,12 +913,9 @@ pub fn mc_chroma8(
     let uvsrc_x = p.src_x >> 1;
     let uvsrc_y = p.src_y >> 1;
     let plane: &[u8] = if which == 0 { &refp.u } else { &refp.v };
-    let buf = if p.need_emu {
-        edge_emu(plane, cw, uvsrc_x, uvsrc_y, 9, 9, ew, eh)
-    } else {
-        Vec::new()
-    };
+    let mut buf = [0u8; 9 * 9];
     let (src, sstride, sx, sy) = if p.need_emu {
+        edge_emu_into(&mut buf, plane, cw, uvsrc_x, uvsrc_y, 9, 9, ew, eh);
         (&buf[..], 9usize, 0usize, 0usize)
     } else {
         (plane, cw, uvsrc_x as usize, uvsrc_y as usize)
@@ -980,5 +1034,110 @@ mod tests {
             Decoder::new().decode(&data, 16, 16),
             Err(Error::Bad(_))
         ));
+    }
+
+    /// 直接按定义写的边缘复制 —— oracle（逐像素 `clamp`，就是被换掉的那一版）。
+    fn direct_edge_emu(
+        src: &[u8],
+        sstride: usize,
+        src_x: i32,
+        src_y: i32,
+        bw: usize,
+        bh: usize,
+        w: usize,
+        h: usize,
+    ) -> Vec<u8> {
+        let mut out = vec![0u8; bw * bh];
+        for y in 0..bh {
+            let sy = (src_y + y as i32).clamp(0, h as i32 - 1) as usize;
+            for x in 0..bw {
+                let sx = (src_x + x as i32).clamp(0, w as i32 - 1) as usize;
+                out[y * bw + x] = src[sy * sstride + sx];
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn edge_emu_matches_the_definition() {
+        // 换实现（每块分配 + 逐像素 clamp → 栈 scratch + 三段切片）时，
+        // 只有「对着定义逐点比」能保证输出没变。四种块长 × 各种越界位置都要扫到：
+        // 全在框内、左/右越界、上/下越界、完全在外（贴同一行/列）。
+        let (w, h) = (32usize, 24usize);
+        let src: Vec<u8> = (0..w * h).map(|i| (i * 7 % 251) as u8).collect();
+        for &(bw, bh) in &[(17usize, 17usize), (9, 9)] {
+            for sx in -20..=(w as i32 + 4) {
+                for sy in -20..=(h as i32 + 4) {
+                    let want = direct_edge_emu(&src, w, sx, sy, bw, bh, w, h);
+                    let mut got = vec![0u8; bw * bh];
+                    edge_emu_into(&mut got, &src, w, sx, sy, bw, bh, w, h);
+                    assert_eq!(
+                        got, want,
+                        "{bw}×{bh} 在 ({sx},{sy}) 处与定义不一致"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 直接按定义写的半像素搬运 —— oracle（逐像素取源，就是被换掉的那一版）。
+    fn direct_put_pixels(
+        dst: &mut [u8],
+        dstride: usize,
+        dx: usize,
+        dy: usize,
+        src: &[u8],
+        sstride: usize,
+        sx: usize,
+        sy: usize,
+        w: usize,
+        h: usize,
+        dxy: usize,
+        no_rounding: bool,
+    ) {
+        let hx = dxy & 1 != 0;
+        let hy = dxy & 2 != 0;
+        let (r1, r2) = if no_rounding { (0u32, 1u32) } else { (1u32, 2u32) };
+        for y in 0..h {
+            for x in 0..w {
+                let p = |oy: usize, ox: usize| src[(sy + y + oy) * sstride + sx + x + ox] as u32;
+                let v = match (hx, hy) {
+                    (false, false) => p(0, 0),
+                    (true, false) => (p(0, 0) + p(0, 1) + r1) >> 1,
+                    (false, true) => (p(0, 0) + p(1, 0) + r1) >> 1,
+                    (true, true) => (p(0, 0) + p(0, 1) + p(1, 0) + p(1, 1) + r2) >> 2,
+                };
+                dst[(dy + y) * dstride + dx + x] = v as u8;
+            }
+        }
+    }
+
+    #[test]
+    fn put_pixels_matches_the_definition() {
+        // 四个相位 × 两种舍入 × 若干偏移，逐字节比 —— 这条钉住「输出逐字节不变」。
+        let (sw, sh) = (48usize, 48usize);
+        let src: Vec<u8> = (0..sw * sh).map(|i| (i * 13 % 253) as u8).collect();
+        let (w, h) = (16usize, 16usize);
+        let (dw, dh) = (24usize, 24usize);
+        for dxy in 0..4usize {
+            for no_rounding in [false, true] {
+                for &(sx, sy) in &[(0usize, 0usize), (1, 0), (0, 1), (1, 1), (8, 7), (31, 30)] {
+                    for &(dx, dy) in &[(0usize, 0usize), (3, 5)] {
+                        let mut want = vec![0u8; dw * dh];
+                        direct_put_pixels(
+                            &mut want, dw, dx, dy, &src, sw, sx, sy, w, h, dxy, no_rounding,
+                        );
+                        let mut got = vec![0u8; dw * dh];
+                        put_pixels(
+                            &mut got, dw, dx, dy, &src, sw, sx, sy, w, h, dxy, no_rounding,
+                        );
+                        assert_eq!(
+                            got, want,
+                            "dxy={dxy} no_rounding={no_rounding} 源({sx},{sy}) 目标({dx},{dy})"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
