@@ -548,6 +548,7 @@ impl Encoder {
             intra_mbs: 0,
             rl_intra: &rl_intra,
             rl_inter: &rl_inter,
+            me_cache: MeSadCache::new(),
         };
         for mby in 0..mb_h {
             for mbx in 0..mb_w {
@@ -757,6 +758,60 @@ fn intra_try(
 ///
 /// 单独抽一个结构是为了把「哪些量在宏块之间累积」说清楚 ——
 /// DC / AC 网格、MV 网格、重建缓冲，三样都是逐宏块推进、跨宏块可见的。
+/// 运动估计的**候选 SAD 记忆表**（直接映射 + 「代」标记）。
+///
+/// 同一个候选会被反复求值：菱形每走一步，新邻域与旧邻域重叠一半；三个起点各走一遍
+/// 又会互相覆盖；最后还有 ±2 补搜与半像素细化。而 SAD 只取决于 `(dx, dy)` 与参考帧，
+/// 所以记忆一次就够 —— **值逐位相同，只是不再重算**。
+///
+/// 「代」标记是拿来省掉清表的：每宏块 `gen += 1`，命中要求 `(dx, dy, gen)` 三者都对。
+/// 槽被别的候选占了（冲突）就当没命中，重算 —— 结果不变，只是少省一点。
+struct MeSadCache {
+    slots: Vec<(i32, i32, u32, u64)>,
+    gen: u32,
+}
+
+impl MeSadCache {
+    /// 256 槽（4 KB）：一个宏块真正访问的候选约一百个，命中率够高。
+    fn new() -> Self {
+        Self {
+            slots: vec![(0, 0, 0, 0); 256],
+            gen: 0,
+        }
+    }
+
+    #[inline]
+    fn slot(&self, dx: i32, dy: i32) -> usize {
+        let h = (dx as u32).wrapping_mul(0x9E37_79B1) ^ (dy as u32).wrapping_mul(0x85EB_CA77);
+        (h as usize) & (self.slots.len() - 1)
+    }
+
+    #[inline]
+    fn get(&self, dx: i32, dy: i32) -> Option<u64> {
+        let s = self.slots[self.slot(dx, dy)];
+        (s.0 == dx && s.1 == dy && s.2 == self.gen).then_some(s.3)
+    }
+
+    #[inline]
+    fn put(&mut self, dx: i32, dy: i32, sad: u64) {
+        let i = self.slot(dx, dy);
+        self.slots[i] = (dx, dy, self.gen, sad);
+    }
+
+    /// 换一代（每个宏块调一次）—— 比清 256 个槽便宜得多。
+    #[inline]
+    fn next_mb(&mut self) {
+        self.gen = self.gen.wrapping_add(1);
+        if self.gen == 0 {
+            // 回绕了：把标记清干净再从头数（几十万帧才碰一次，不值得更聪明）。
+            for s in self.slots.iter_mut() {
+                s.2 = 0;
+            }
+            self.gen = 1;
+        }
+    }
+}
+
 struct PState<'a> {
     refp: &'a Planes,
     /// 本帧的重建 —— 编完就是下一帧的参考。
@@ -781,6 +836,8 @@ struct PState<'a> {
     intra_mbs: usize,
     rl_intra: &'a RlTable,
     rl_inter: &'a RlTable,
+    /// 运动估计的候选 SAD 记忆表（见 `MeSadCache`）。
+    me_cache: MeSadCache,
 }
 
 impl PState<'_> {
@@ -826,22 +883,32 @@ impl PState<'_> {
     /// MV 不同 → 位流不同。所以它不是「同语义更快」：质量必须重新对账
     /// （**固定 qscale** 下比 PSNR 与体积 —— 开码率控制时不同的 MV 场会让控制器
     /// 落到不同的 qscale，比出来的差不干净）。三个起点就是为了把这一档差补回来。
-    fn motion_estimate(&self, mbx: usize, mby: usize, pred: (i32, i32)) -> (i32, i32) {
+    fn motion_estimate(&mut self, mbx: usize, mby: usize, pred: (i32, i32)) -> (i32, i32) {
         let (pw, ph) = (self.pw, self.refp.ph);
         let refp = self.refp;
+        // 复制成局部量：闭包要**可变借** `me_cache`，就不能再借 `self` 的别的字段。
+        let sy = self.sy;
         let mut cur = [0u8; 256];
         for r in 0..16usize {
             for c in 0..16usize {
-                cur[r * 16 + c] = self.sy[(mby * 16 + r) * self.pw + mbx * 16 + c];
+                cur[r * 16 + c] = sy[(mby * 16 + r) * pw + mbx * 16 + c];
             }
         }
         let mut tmp = [0u8; 256];
+        self.me_cache.next_mb();
+        let cache = &mut self.me_cache;
         let mut sad_of = |mv: (i32, i32)| -> u64 {
+            // 同一个候选会被反复求值（菱形每走一步新邻域与旧邻域重叠一半、三个起点
+            // 各走一遍、±2 补搜、半像素细化）—— 记忆一次就够：SAD 只取决于
+            // `(dx, dy)` 与参考帧，**值逐位相同**，只是不再重算。
+            if let Some(v) = cache.get(mv.0, mv.1) {
+                return v;
+            }
             let p = mc_params(mbx, mby, mv, pw, ph);
             // **整像素、且不用边缘复制**时，参考块就是参考帧里的一个 16×16 矩形：
             // 直接算 SAD，省掉「先 `mc_luma16` 拷进 `tmp` 再读出来」的两趟内存流量。
             // 值与原路径**逐位相同**（`dxy == 0` 时 `put_pixels` 就是纯拷贝）。
-            if !p.need_emu {
+            let acc = if !p.need_emu {
                 // 插值与 SAD **融合**：不再「先 `mc_luma16` 写进 `tmp`、再读出来求和」。
                 // 公式与 `put_pixels` 逐字相同（`NO_ROUNDING = false` → `r1 = 1, r2 = 2`），
                 // 所以**值逐位相同、输出逐字节不变** —— 只是省掉一趟写 + 一趟读。
@@ -886,13 +953,16 @@ impl PState<'_> {
                         }
                     }
                 }
-                return acc;
-            }
-            mc_luma16(&mut tmp, 16, 0, 0, refp, &p, NO_ROUNDING);
-            let mut acc = 0u64;
-            for i in 0..256usize {
-                acc += (cur[i] as i32 - tmp[i] as i32).unsigned_abs() as u64;
-            }
+                acc
+            } else {
+                mc_luma16(&mut tmp, 16, 0, 0, refp, &p, NO_ROUNDING);
+                let mut a = 0u64;
+                for i in 0..256usize {
+                    a += (cur[i] as i32 - tmp[i] as i32).unsigned_abs() as u64;
+                }
+                a
+            };
+            cache.put(mv.0, mv.1, acc);
             acc
         };
 
