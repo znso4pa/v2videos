@@ -250,7 +250,7 @@ fn ffmpeg_yuv(path: &Path, count: usize, w: u32, h: u32) -> Option<Vec<u8>> {
 /// V2V_ASF_SAMPLE=<样本> cargo test --release -p v2v-cli -- --ignored --nocapture
 /// ```
 #[test]
-#[ignore = "需要真样本与 ffmpeg，1080p 下较慢"]
+#[ignore = "需要真样本与 ffmpeg，高分辨率样本下较慢"]
 fn converts_real_sample_and_ffmpeg_agrees() {
     let src = match std::env::var("V2V_ASF_SAMPLE") {
         Ok(p) => p,
@@ -1039,7 +1039,7 @@ fn mp4_from_real_sample_keeps_audio_in_sync() {
 
     // ---- 音频：找最佳对齐偏移，必须落在 0 ----
     //
-    // ⚠️ 采样率与声道数**必须照源的来**（`elephant.asf` 是 8 kHz 单声道）。
+    // ⚠️ 采样率与声道数**必须照源的来**。
     // 写死 `-ac 2 -ar 44100` 会引入重采样器自己的群延迟，量出来是个假偏移 ——
     // 而且两边的 MSE 都是 0（内容逐位相同），只有偏移这一项能看出问题。
     let (ch, rate) = {

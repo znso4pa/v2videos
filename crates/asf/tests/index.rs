@@ -6,8 +6,8 @@
 //! `ffmpeg` 的 asf 解封装器在 seek 时会解析 Simple Index 并打调试日志：
 //!
 //! ```text
-//! [in#0/asf @ …] itime:0x989680, pct:2, ict:213
-//! [in#0/asf @ …] pktnum:69, pktct:1  pts: 3900
+//! [in#0/asf @ …] itime:0x989680, pct:2, ict:<条目数>
+//! [in#0/asf @ …] pktnum:<包号>, pktct:1  pts: <毫秒>
 //! ```
 //!
 //! 前三项就是索引头（时间间隔 / 最大包数 / 条目数），后面每行是一个**位置变了的**条目。

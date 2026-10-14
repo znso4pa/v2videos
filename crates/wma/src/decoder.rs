@@ -394,25 +394,25 @@ impl WmaDecoder {
         // ⚠️ 这是踩了很久的坑。`wma_decode_superframe` 里有这么两句：
         //
         // ```c
-        // if (avctx->block_align) buf_size = avctx->block_align;   // 1116 → 372
+        // if (avctx->block_align) buf_size = avctx->block_align;   // 截到 block_align
         // ...
-        // return buf_size;                                         // 返回 372
+        // return buf_size;                                         // 返回已消费长度
         // ```
         //
         // 而通用解码层（`decode.c` 的 `decode_simple_internal`）认这个返回值：
         //
         // ```c
-        // pkt->data += consumed;   // 剩下 744 字节留在 avci->in_pkt 里
+        // pkt->data += consumed;   // 剩下的字节留在 avci->in_pkt 里
         // pkt->size -= consumed;
         // ```
         //
-        // 于是同一个 ASF 载荷会被**连着喂进解码器 3 次**，每次 372 字节、各出一帧。
-        // 本样本 1116 = 3 × 372，一个载荷出 3 帧。
+        // 于是同一个 ASF 载荷会被**连着喂进解码器若干次**，每次 `block_align` 字节、
+        // 各出一帧 —— 一个载荷出「载荷长度 ÷ `block_align`」帧。
         //
-        // 曾经把载荷首字节 `0xE3` 读成「superframe 序号 14、帧数 3」，纯属巧合的
-        // 误判 —— `flags2 = 0x0001` 的 bit1 是 0，比特池根本没开，那个字节就是
-        // 普通帧数据的开头。判定实验：同一批字节灌进 WAV，`block_align=372`
-        // 出 2174 帧、`block_align=1116` 出 724 帧，且前者与 ASF 的 PCM **MD5 相同**。
+        // 曾经把载荷首字节读成「superframe 序号 14、帧数 3」，纯属巧合的误判
+        // —— 比特池根本没开，那个字节就是普通帧数据的开头。判定实验：把同一批
+        // 字节灌进 WAV 用两种 `block_align` 解，只有「截到 block_align」那种
+        // 与 ASF 出来的 PCM **MD5 相同**。
         if !p.use_bit_reservoir {
             let ba = p.block_align;
             let mut off = 0;

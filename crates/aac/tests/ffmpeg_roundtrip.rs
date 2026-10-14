@@ -903,22 +903,39 @@ fn wide_dynamic_range_signal_keeps_its_midrange() {
     }
     let dec = decode_aac(&frames, 1);
 
-    // ⚠️ **必须先对齐**：AAC 解码出来的样本比源**晚约 1024 个**（编码器的
-    // 延迟 + 首帧的 priming），而 `decode_aac` 不做补偿。直接逐样本比会
-    // 把「对不齐」量成 SNR —— 周期性信号上尤其惨（差一个采样点就全错）。
-    // 所以这里先粗搜、再逐样本细化。
-    let got = &dec[0];
-    let m = got.len().min(src.len());
+    let (snr, sh) = aligned_snr(&dec[0], &src);
+    println!("大动态范围信号（96k 单声道）：SNR {snr:.2} dB（对齐 {sh}）");
+    assert!(
+        snr > 12.0,
+        "SNR 只有 {snr:.2} dB —— 中频带被量化掉了（代价函数是不是又在拿掩蔽阈值当权重了？）"
+    );
+}
+
+/// 先对齐、再算 SNR，返回 `(SNR dB, 最佳延迟)`。
+///
+/// ⚠️ **必须先对齐**：AAC 解码出来的样本比源**晚约 1024 个**（编码器的延迟 +
+/// 首帧的 priming），而 `decode_aac` 不做补偿。直接逐样本比会把「对不齐」量成
+/// SNR —— 周期性信号上尤其惨（差一个采样点就全错，SNR 直接掉到 0 附近）。
+/// 所以先按 32 个样本粗搜、再逐样本细化。
+fn aligned_snr(got: &[f32], src: &[f32]) -> (f64, usize) {
+    // 两端各留一段给编码器延迟与收尾的渐变段。
+    const MARGIN: usize = 20000;
+
     let mse_at = |sh: usize| -> f64 {
-        let mut s = 0f64;
-        let mut c = 0u32;
-        for i in (20000..m - 20000).step_by(7) {
+        // 上界同时受 `got` 的剩余长度约束 —— 否则 `got` 比 `src` 短时会越界。
+        let hi = got.len().saturating_sub(sh).min(src.len());
+        if hi <= 2 * MARGIN {
+            return f64::MAX;
+        }
+        let (mut s, mut c) = (0f64, 0u32);
+        for i in (MARGIN..hi - MARGIN).step_by(7) {
             let d = f64::from(got[i + sh]) - f64::from(src[i]);
             s += d * d;
             c += 1;
         }
         s / f64::from(c.max(1))
     };
+
     let mut best = (f64::MAX, 0usize);
     for sh in (0..4096).step_by(32) {
         let v = mse_at(sh);
@@ -926,24 +943,89 @@ fn wide_dynamic_range_signal_keeps_its_midrange() {
             best = (v, sh);
         }
     }
-    let lo = best.1.saturating_sub(32);
-    for sh in lo..(best.1 + 32).min(4096) {
+    for sh in best.1.saturating_sub(32)..(best.1 + 32).min(4096) {
         let v = mse_at(sh);
         if v < best.0 {
             best = (v, sh);
         }
     }
+
     let sh = best.1;
+    let hi = got.len().saturating_sub(sh).min(src.len());
     let (mut se, mut sp) = (0f64, 0f64);
-    for i in 20000..m - 20000 {
+    for i in MARGIN..hi.saturating_sub(MARGIN) {
         let d = f64::from(got[i + sh]) - f64::from(src[i]);
         se += d * d;
         sp += f64::from(src[i]) * f64::from(src[i]);
     }
-    let snr = 10.0 * (sp / se.max(1e-9)).log10();
-    println!("大动态范围信号（96k 单声道）：SNR {snr:.2} dB（对齐 {sh}）");
+    (10.0 * (sp / se.max(1e-9)).log10(), sh)
+}
+
+/// **KBD 窗**：位流里的 `use_kb_window` 必须与编码端**实际用的窗**一致。
+///
+/// 这是位流里最容易「合法但错」的一位。解码端只拿它决定用哪张窗表，
+/// **不校验与内容是否一致** —— 所以写错了：ffmpeg 照样解得开、不报任何错、
+/// 帧数也对，只是它拿正弦窗去重建 KBD 窗编出来的系数。
+///
+/// 后果在重建公式里很直接：重叠区要满足
+/// `w_a[n]·w_s[n] + w_a[n+N]·w_s[n+N] = 1` 才能抵消时域混叠。
+/// 两端同系时这个式子对正弦和 KBD **都**成立（各自满足 `w²+w'²=1`）；
+/// **一错一配**就不成立 —— 重叠区多出一个随帧位置起伏的增益，
+/// 表现成帧边界的「呼吸」，而不是任何解码错误。
+///
+/// 所以判据**不能**是「ffmpeg 解得开」（写错也解得开），必须是
+/// **解码回来与原信号的 SNR**：同一份信号用两种窗各编一遍，两条 SNR
+/// 应当在同一量级。这条测试在修好之前是**红的**（KBD 那侧低 30+ dB）。
+#[test]
+fn kb_window_bit_matches_the_window_actually_used() {
+    if !has_ffmpeg() {
+        eprintln!("SKIP: PATH 上没有 ffmpeg");
+        return;
+    }
+    // ⚠️ 要够长：`aligned_snr` 两端各留 20000 个样本，信号比它短就整段都在
+    // 边距里，量出来是 `-inf`（看着像「编码器全坏了」，其实是测试太短）。
+    let total = SR as usize * 3;
+    let src = sine(total, 1);
+
+    let encode_with = |kb: bool| -> Vec<Vec<u8>> {
+        let mut e = Encoder::new(EncoderConfig {
+            channels: 1,
+            sample_rate: SR,
+            bitrate: 128_000,
+            threads: 1,
+            kb_window: kb,
+            ms_stereo: true,
+        })
+        .expect("建编码器");
+        let mut frames = Vec::new();
+        let mut i = 0usize;
+        while i < total {
+            let n = (total - i).min(1024);
+            let planes: Vec<Vec<f32>> = src.iter().map(|p| p[i..i + n].to_vec()).collect();
+            frames.push(e.encode_frame(&Frame { planes }).expect("编一帧"));
+            i += 1024;
+        }
+        frames
+    };
+
+    let (sine_db, sh_s) = aligned_snr(&decode_aac(&encode_with(false), 1)[0], &src[0]);
+    let (kb_db, sh_k) = aligned_snr(&decode_aac(&encode_with(true), 1)[0], &src[0]);
+    println!(
+        "同一份 440 Hz 正弦（128k 单声道）：正弦窗 {sine_db:.2} dB（对齐 {sh_s}）/ \
+         KBD 窗 {kb_db:.2} dB（对齐 {sh_k}）"
+    );
+
+    // ⚠️ 这个下限**不是判据**，只是防止「两边一起坏了还互相接近」。
+    // 绝对值是我们编码器在这类**稀疏频谱**上的真实水平（远低于 ffmpeg —— 同一个
+    // 正弦、同 128k，ffmpeg 解回来有 64 dB 量级），那是另一件事，别在这里查。
     assert!(
-        snr > 12.0,
-        "SNR 只有 {snr:.2} dB —— 中频带被量化掉了（代价函数是不是又在拿掩蔽阈值当权重了？）"
+        sine_db > 20.0,
+        "正弦窗这一侧的基线本身就不对（{sine_db:.2} dB）—— 先看别的测试，别在这儿找原因"
+    );
+    assert!(
+        kb_db >= sine_db - 6.0,
+        "KBD 窗比正弦窗低了 {:.2} dB（{kb_db:.2} vs {sine_db:.2}）—— \
+         位流里的 `use_kb_window` 与编码端实际用的窗不一致",
+        sine_db - kb_db
     );
 }
