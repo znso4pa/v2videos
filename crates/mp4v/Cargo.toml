@@ -1,6 +1,6 @@
 [package]
 name = "v2v-mp4v"
-description = "纯 Rust 的 MPEG-4 Part 2（mp4v）视频编码 —— 目前只做全 I 帧，无 C、无 FFI"
+description = "纯 Rust 的 MPEG-4 Part 2（mp4v）视频编码 —— I/P 帧 + 码率控制，无 C、无 FFI"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

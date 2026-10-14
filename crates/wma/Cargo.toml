@@ -1,6 +1,6 @@
 [package]
 name = "v2v-wma"
-description = "纯 Rust 的 WMA（v1/v2）解码 —— 无 C、无 FFI、零依赖"
+description = "纯 Rust 的 WMA（v1/v2）解码 —— 无 C、无 FFI"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
