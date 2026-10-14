@@ -1465,13 +1465,21 @@ fn band_is_zero(band: &[f32], sf: u8) -> bool {
 /// 先算好每带的 Bark 中心频率 —— 「邻近带」是按 Bark 距离算的，
 /// 不是按频带序号。低频的带很密（几十 Hz 一个）、高频很疏
 /// （一个带跨几千 Hz），按序号算会把高频的掩蔽扩散弄得过宽。
-#[allow(dead_code)] // 只服务 `masking_thresholds`（当前未使用）
-fn bark_of(swb: &[u16], sample_rate: u32) -> Vec<f32> {
+///
+/// ⚠️ **短窗必须按「单窗口」的划分算**：组的 `swb` 是「128 点划分 × 组内窗口数」
+/// （见 `encode_channel` 里建 `swbs` 的那段），而每条带对应的是**同一个**频率带
+/// 在组内各窗口的重复 —— 所以频率要把 `swb` 除回 `group_len`，尺度也要用单窗口的
+/// 系数个数（长窗 1024 / 短窗 128）。少了这一步，短窗的频率会算成 `gl` 倍，
+/// 掩蔽扩散整个错位（长窗 `group_len = 1`，两种算法等价）。
+#[allow(dead_code)] // 只服务 `masking_thresholds`
+fn bark_of(swb: &[u16], sample_rate: u32, group_len: usize, coefs_per_window: usize) -> Vec<f32> {
+    let gl = group_len.max(1) as f64;
+    let coefs = coefs_per_window.max(1) as f64;
     swb.windows(2)
         .map(|w| {
-            // 带的中心频率（Hz）。
-            let fc = (f64::from(w[0]) + f64::from(w[1])) * 0.5 * f64::from(sample_rate)
-                / (2.0 * LONG_LEN as f64);
+            // 带的中心频率（Hz），按**单窗口**的划分。
+            let fc = (f64::from(w[0]) + f64::from(w[1])) * 0.5 / gl * f64::from(sample_rate)
+                / (2.0 * coefs);
             // Bark 尺度的常用近似（Traunmüller 1990）：
             //   z = 26.81·f / (1960 + f) − 0.53
             (26.81 * fc / (1960.0 + fc) - 0.53) as f32
@@ -1501,12 +1509,19 @@ fn bark_of(swb: &[u16], sample_rate: u32) -> Vec<f32> {
 /// ⚠️ 这是个**简化模型**：不做 FFT 分析（直接用谱系数当掩蔽源）、
 /// 不含绝对听阈（安静段的阈值会偏乐观）。但它抓住了主要矛盾 ——
 /// 「强带掩蔽邻近带」。
-#[allow(dead_code)] // 当前未使用 —— 见 `band_cost` 的说明（当真音乐上有害）
-fn masking_thresholds(spec: &[f32], swb: &[u16], sample_rate: u32, _sf_floor: i32) -> Vec<f32> {
+#[allow(dead_code)] // 当前未使用 —— 见 `band_cost` 的说明（当真音乐上有害 + 逐带常数权重是 no-op）
+fn masking_thresholds(
+    spec: &[f32],
+    swb: &[u16],
+    sample_rate: u32,
+    _sf_floor: i32,
+    group_len: usize,
+) -> Vec<f32> {
     // `_sf_floor`（整帧的 sf 下界）在这里还用不上 —— 阈值只看源信号。
     // 留着签名是为了「将来把阈值抬到量化噪声下限」那条路不用改调用方。
     let n = swb.len() - 1;
-    let bark = bark_of(swb, sample_rate);
+    let coefs_per_window = spec.len() / group_len.max(1);
+    let bark = bark_of(swb, sample_rate, group_len, coefs_per_window);
 
     // 每带的能量（谱系数的平方和）。
     let energy: Vec<f64> = (0..n)
@@ -1540,16 +1555,32 @@ fn masking_thresholds(spec: &[f32], swb: &[u16], sample_rate: u32, _sf_floor: i3
         .collect()
 }
 
+/// 带缓存的 `band_cost`：命中就直接返回，没命中才算并记下。
+///
+/// 值**逐位相同**（同一帧里同一条带的谱系数不变），所以决策不会变 → 输出逐字节不变。
+#[inline]
+fn cached_band_cost(
+    cache: &mut BandCostCache,
+    gi: usize,
+    sfb: usize,
+    band: &[f32],
+    sf: u8,
+) -> (f32, u8) {
+    if let Some(v) = cache.get(gi, sfb, sf) {
+        return v;
+    }
+    let v = band_cost(band, sf, &mut cache.q_scratch);
+    cache.put(gi, sfb, sf, v);
+    v
+}
+
 /// 一个频带在给定 `sf` 下的 `(代价, 最优码本)`。
 ///
-/// ## 代价是**掩蔽归一化**的失真
+/// ## 代价是**纯平方失真**（这是当前实现）
 ///
 /// ```text
-///   代价 = Σ (误差² / 阈值²)
+///   代价 = Σ 误差²
 /// ```
-///
-/// 除以阈值让「听不见的误差」几乎不花代价、而「安静段里的误差」被放大。
-/// 阈值来自 `masking_thresholds`（邻带的掩蔽扩散）。
 ///
 /// ## ⚠️ 这里**故意没有 λ · 位数那一项**
 ///
@@ -1558,9 +1589,8 @@ fn masking_thresholds(spec: &[f32], swb: &[u16], sample_rate: u32, _sf_floor: i3
 /// —— 实测踩过，白忙一场（码率是目标的 3.4 倍）。
 ///
 /// **两者是正交的分工**：外层管「花多少位」，这里管「位花在哪」。
-/// 逐带选码本：**代价 = 平方失真**（不做掩蔽归一化）。
 ///
-/// ## ⚠️ 为什么把掩蔽阈值拿掉了（实测，不是偏好）
+/// ## ⚠️ 曾经除以掩蔽阈值²，已撤（实测，不是偏好）
 ///
 /// 曾经这里除以掩蔽阈值²（`dist / th²`，见 `masking_thresholds`）。在**粉噪声**
 /// 上它确实略好（效率 +8%，见 `quality_is_within_2db_of_ffmpeg` 的说明），
@@ -1597,27 +1627,24 @@ fn masking_thresholds(spec: &[f32], swb: &[u16], sample_rate: u32, _sf_floor: i3
 /// 这也解释了当初在粉噪声上量到的「+8% 效率」：那不是模型省下的位，
 /// 是**直接扔掉的频带**（粉噪声频谱平坦，扔几条听不出来）。
 ///
-/// **结论**：阈值不能当**权重**用。要用它得改成「按带分配比特」
-/// （让量化噪声落在阈值之下），而不是给失真乘一个系数。
-/// 带缓存的 `band_cost`：命中就直接返回，没命中才算并记下。
+/// ## 🚫 更根本的一条：**给失真乘一个逐带常数，按构造就不可能改变任何决策**
 ///
-/// 值**逐位相同**（同一帧里同一条带的谱系数不变），所以决策不会变 → 输出逐字节不变。
-#[inline]
-fn cached_band_cost(
-    cache: &mut BandCostCache,
-    gi: usize,
-    sfb: usize,
-    band: &[f32],
-    sf: u8,
-) -> (f32, u8) {
-    if let Some(v) = cache.get(gi, sfb, sf) {
-        return v;
-    }
-    let v = band_cost(band, sf, &mut cache.q_scratch);
-    cache.put(gi, sfb, sf, v);
-    v
-}
-
+/// `feat/aac-psy` 上试过「有界的比值权重」`w = clamp((E_带/阈值)^p, 1, W_MAX)`
+/// （权重恒 ≥ 1，只会加重可闻带的代价）—— 量出来**产物与改前逐字节相同**。
+/// 原因不是参数没调好，是数学上必然如此：
+///
+/// ```text
+///   argmin_sf ( w · dist(sf) )  ==  argmin_sf dist(sf)      （w > 0 且与 sf 无关）
+/// ```
+///
+/// 每带的 `w` 在**该带自己的候选之间是同一个常数**，所以它改变不了任何一条带的
+/// sf / 码本选择；而 sf 的选择又是逐带独立的（`prev_sf` 只提供**约束**、不参与比较），
+/// 于是整帧的决策、位数、外层偏移全都不变。
+///
+/// **要用掩蔽，权重必须和一个「率」项一起出现**（`w·dist + λ·位数`）——
+/// 只有那时它才会改变「这一带值不值得多花位」的权衡。也就是说：
+/// **心理声学模型得挂在率-失真分配（`feat/aac-rd-alloc` 那套 λ 机制）上，
+/// 单独挂在纯失真上等于没写。** 详见 TODO 的 `feat/aac-psy` 一节。
 fn band_cost(band: &[f32], sf: u8, qu: &mut Vec<i32>) -> (f32, u8) {
     // ---- 量化只算一次，11 本码本共用 ----
     //
