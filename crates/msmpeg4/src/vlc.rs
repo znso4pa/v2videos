@@ -54,15 +54,29 @@ impl Vlc {
 
     /// 从位流里解出一个符号（返回表下标）。
     pub fn decode(&self, r: &mut BitReader) -> Result<usize> {
+        self.decode_bits(|| r.bit().ok())
+            .ok_or_else(|| Error::Bad("invalid vlc code".into()))
+    }
+
+    /// 解一个符号，位从**调用方给的闭包**取 —— 不绑定具体的 `BitReader`。
+    ///
+    /// 存在的理由：`v2v-wma` 有它**自己的** `BitReader`（那边独立长出来的），
+    /// 而它的 VLC 解码原本是「逐位读 + **线性扫全表**」（`O(码长 × 项数)`；
+    /// 系数表 666~1000+ 项 —— `sample` 采样显示占了 WMA 解码的 **58%**）。
+    /// 把树留在这里、只暴露一个「给我下一位」的入口，那边就能复用同一棵树，
+    /// 不用把建树/走树的逻辑复刻第二遍（AGENTS.md 不变量 3）。
+    ///
+    /// 返回 `None` = 位流结束，或走到一个未定义的前缀。
+    pub fn decode_bits<F: FnMut() -> Option<u32>>(&self, mut next_bit: F) -> Option<usize> {
         let mut cur = 0usize;
         loop {
-            let bit = r.bit()? as usize;
+            let bit = next_bit()? as usize;
             let next = self.nodes[cur][bit];
             if next < 0 {
-                return Ok((-next - 1) as usize);
+                return Some((-next - 1) as usize);
             }
             if next == 0 {
-                return Err(Error::Bad("invalid vlc code"));
+                return None;
             }
             cur = next as usize;
         }

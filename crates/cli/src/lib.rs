@@ -847,6 +847,8 @@ fn convert_to_mp4(
     let audio_worker = std::thread::spawn(move || -> std::result::Result<(Vec<Pending>, usize), String> {
         let mut out: Vec<Pending> = Vec::new();
         let mut pending: Vec<Vec<f32>> = Vec::new();
+        // 每帧「攒够时的载荷序号」—— 见 `push_aac_pcm` 的说明。
+        let mut marks: Vec<usize> = Vec::new();
         let mut audio_points = 0usize;
         while let Ok((idx, pcm)) = rx_pcm.recv() {
             if let Some(enc) = aac_enc.as_mut() {
@@ -854,20 +856,21 @@ fn convert_to_mp4(
                 //
                 // 源 PCM 是「交织的小端 16 位」，AAC 编码器要的是
                 // 「每声道一条、f32、范围 ±32768」——所以要先拆开、归一。
-                push_aac_pcm(&mut pending, &pcm, a_point, a_channels);
-                let mut sub = 0usize;
+                push_aac_pcm(&mut pending, &mut marks, &pcm, a_point, a_channels, idx);
                 {
-                    let mut emit = |d: &[u8], dur: u32| {
+                    // ⚠️ key 的「样本序号」用 `emit` 传进来的那个（不是外层的 `idx`）：
+                    // 批量编码时一帧可能跨好几个载荷，用同一个 idx 会让 `mdat` 的
+                    // 交错顺序变掉 —— 而 `mdat` 是按写入调用顺序铺的。
+                    let mut emit = |d: &[u8], dur: u32, at: usize| {
                         out.push(Pending {
-                            key: (idx, sub),
+                            key: (at, 0),
                             kind: PendingKind::Audio {
                                 data: d.to_vec(),
                                 duration: dur,
                             },
                         });
-                        sub += 1;
                     };
-                    drain_aac_frames(enc, &mut pending, &mut emit, &mut audio_points)
+                    drain_aac_frames(enc, &mut pending, &mut marks, &mut emit, &mut audio_points)
                         .map_err(|e| e.to_string())?;
                 }
                 continue;
@@ -885,19 +888,17 @@ fn convert_to_mp4(
         }
         // 收尾：把 AAC 的尾巴（不足 1024 个采样点）补零编出去。
         if let Some(enc) = aac_enc.as_mut() {
-            let mut sub = 0usize;
             {
-                let mut emit = |d: &[u8], dur: u32| {
+                let mut emit = |d: &[u8], dur: u32, at: usize| {
                     out.push(Pending {
-                        key: (usize::MAX, sub),
+                        key: (at, 0),
                         kind: PendingKind::Audio {
                             data: d.to_vec(),
                             duration: dur,
                         },
                     });
-                    sub += 1;
                 };
-                flush_aac(enc, &mut pending, &mut emit, &mut audio_points)
+                flush_aac(enc, &mut pending, &mut marks, &mut emit, &mut audio_points)
                     .map_err(|e| e.to_string())?;
             }
         }
@@ -1105,7 +1106,14 @@ fn convert_to_mp4(
 ///
 /// 尾部不足一个采样点的字节直接丢掉 —— `plan.point` 是「一个采样点的字节数」，
 /// 只可能是 2 或 4，不会有半个点的残渣。
-fn push_aac_pcm(pending: &mut Vec<Vec<f32>>, pcm: &[u8], point: usize, channels: usize) {
+fn push_aac_pcm(
+    pending: &mut Vec<Vec<f32>>,
+    marks: &mut Vec<usize>,
+    pcm: &[u8],
+    point: usize,
+    channels: usize,
+    idx: usize,
+) {
     if pending.is_empty() {
         pending.resize(channels, Vec::new());
     }
@@ -1115,6 +1123,13 @@ fn push_aac_pcm(pending: &mut Vec<Vec<f32>>, pcm: &[u8], point: usize, channels:
             let v = i16::from_le_bytes([c[o], c[o + 1]]);
             p.push(f32::from(v));
         }
+    }
+    // ⚠️ **逐帧记「攒够时的载荷序号」**：`emit` 的 key 要用它才能和串行版的事件
+    // 顺序对齐（`mdat` 是按写入调用顺序铺的）。攒批之后一帧可能是在**更早**的
+    // 载荷就攒够的 —— 用「当前载荷」会让交错顺序漂掉。
+    let have = pending.first().map_or(0, |p| p.len());
+    while (marks.len() + 1) * AAC_FRAME_SAMPLES <= have {
+        marks.push(idx);
     }
 }
 
@@ -1131,23 +1146,40 @@ fn push_aac_pcm(pending: &mut Vec<Vec<f32>>, pcm: &[u8], point: usize, channels:
 fn drain_aac_frames(
     enc: &mut v2v_aac::Encoder,
     pending: &mut Vec<Vec<f32>>,
-    emit: &mut dyn FnMut(&[u8], u32),
+    marks: &mut Vec<usize>,
+    emit: &mut dyn FnMut(&[u8], u32, usize),
     audio_samples: &mut usize,
 ) -> Result<(), Error> {
+    /// 一批攒多少帧：够大才喂得饱 `encode_frames` 的线程（16 帧 ≈ 0.37 秒音频），
+    /// 又不至于让内存里堆太多 PCM。
+    const BATCH: usize = 16;
     loop {
-        let have = pending.first().map_or(0, |p| p.len());
-        if have < AAC_FRAME_SAMPLES {
+        let ready = marks.len().min(BATCH);
+        if ready == 0 {
             return Ok(());
         }
-        let planes: Vec<Vec<f32>> = pending
-            .iter_mut()
-            .map(|p| p.drain(..AAC_FRAME_SAMPLES).collect())
-            .collect();
-        let frame = enc.encode_frame(&v2v_aac::Frame { planes })?;
-        // AAC 一帧就是 1024 个采样点，时间基是采样率 —— 所以时长写 1024。
-        emit(&frame, AAC_FRAME_SAMPLES as u32);
-        // 计数用**输出侧的采样点数**（与 PCM 那条路同单位，报告里好对比）。
-        *audio_samples += AAC_FRAME_SAMPLES;
+        let mut frames: Vec<v2v_aac::Frame> = Vec::with_capacity(ready);
+        let mut at: Vec<usize> = Vec::with_capacity(ready);
+        for _ in 0..ready {
+            let planes: Vec<Vec<f32>> = pending
+                .iter_mut()
+                .map(|p| p.drain(..AAC_FRAME_SAMPLES).collect())
+                .collect();
+            frames.push(v2v_aac::Frame { planes });
+            at.push(marks.remove(0));
+        }
+        // ⚠️ `encode_frames` **按帧并行**（内部先预扫窗序列、再分块编）。
+        // 输出与逐帧 `encode_frame` **不是**逐字节相同：`plan_group` 的三级细化
+        // （12→3→1）是以「上一帧留下的 `sf_offset`」为锚的**近似搜索**，换锚点就
+        // 会落到不同格点 —— 实测 350 帧里差 2 帧、合计 14 字节（SNR 相同）。
+        // `v2v-aac` 的测试钉的是「帧数相同 + 每帧体积差 ≤ 16 字节」。
+        let streams = enc.encode_frames(&frames)?;
+        for (stream, idx) in streams.iter().zip(&at) {
+            // AAC 一帧就是 1024 个采样点，时间基是采样率 —— 所以时长写 1024。
+            emit(stream, AAC_FRAME_SAMPLES as u32, *idx);
+            // 计数用**输出侧的采样点数**（与 PCM 那条路同单位，报告里好对比）。
+            *audio_samples += AAC_FRAME_SAMPLES;
+        }
     }
 }
 
@@ -1158,7 +1190,8 @@ fn drain_aac_frames(
 fn flush_aac(
     enc: &mut v2v_aac::Encoder,
     pending: &mut Vec<Vec<f32>>,
-    emit: &mut dyn FnMut(&[u8], u32),
+    marks: &mut Vec<usize>,
+    emit: &mut dyn FnMut(&[u8], u32, usize),
     audio_samples: &mut usize,
 ) -> Result<(), Error> {
     let have = pending.first().map_or(0, |p| p.len());
@@ -1174,8 +1207,10 @@ fn flush_aac(
             v
         })
         .collect();
-    let frame = enc.encode_frame(&v2v_aac::Frame { planes })?;
-    emit(&frame, AAC_FRAME_SAMPLES as u32);
+    let streams = enc.encode_frames(&[v2v_aac::Frame { planes }])?;
+    // 尾巴排在所有样本之后 —— 串行版用 `usize::MAX` 作载荷序号，这里沿用。
+    marks.clear();
+    emit(&streams[0], AAC_FRAME_SAMPLES as u32, usize::MAX);
     *audio_samples += AAC_FRAME_SAMPLES;
     Ok(())
 }

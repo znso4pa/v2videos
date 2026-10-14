@@ -31,23 +31,38 @@ const HIGH_BAND_MAX_SIZE: usize = 16;
 const BLOCK_MIN_BITS: u32 = 7;
 const BLOCK_MAX_SIZE: usize = 2048;
 
-/// 一个 `(码长, 码字) → 符号` 的简单 VLC（逐位匹配；我们的量级用不着查表优化）。
+/// 一个 `(码长, 码字) → 符号` 的前缀码。
+///
+/// ## ⚠️ 这里曾经是「逐位读 + **线性扫全表**」
+///
+/// 旧版 `decode` 每一位都要 `entries.iter().find(..)` 扫一遍整张表：
+///
+/// ```text
+///   for len in 1..=max_len {
+///       code = (code << 1) | bit;
+///       entries.iter().find(|(l, c, _)| l == len && c == code)   // ← 每次都扫全表
+///   }
+/// ```
+///
+/// 复杂度 `O(码长 × 项数)`，而 WMA 的系数表有 **666~1000+ 项** ——
+/// `sample` 采样（整轨 208 秒）显示 `Vlc::decode` 一个人占了 WMA 解码的 **58%**
+/// （349/605 个样本）。
+///
+/// 现在内部直接用 `v2v-msmpeg4` 的**二叉树** `Vlc`（`O(码长)`）——
+/// 走树/建树的逻辑只有那一份，这里只做「表格式转换 + 位源适配」，
+/// 不把树复刻第二遍（AGENTS.md 不变量 3）。
 struct Vlc {
-    entries: Vec<(u8, u32, u32)>, // (len, code, symbol)
-    max_len: u8,
+    inner: v2v_msmpeg4::Vlc,
 }
 
 impl Vlc {
     fn from_codes(codes: &[(u32, u8)]) -> Self {
         // 注：码字**不需要**按位反转（试过，反转后「VLC 里没有这个码」——MSB 优先是对的）。
-        let mut entries: Vec<(u8, u32, u32)> = codes
-            .iter()
-            .enumerate()
-            .map(|(sym, &(code, len))| (len, code, sym as u32))
-            .collect();
-        let max_len = entries.iter().map(|e| e.0).max().unwrap_or(0);
-        entries.sort_by_key(|e| e.0);
-        Self { entries, max_len }
+        // 符号 = 数组下标（`Vlc::new` 的约定）。
+        let table: Vec<[u32; 2]> = codes.iter().map(|&(c, l)| [c, u32::from(l)]).collect();
+        Self {
+            inner: v2v_msmpeg4::Vlc::new(&table),
+        }
     }
 
     /// 由**码长**推规范 Huffman 码字 —— 严格照 ffmpeg 的 `ff_vlc_init_from_lengths`：
@@ -66,36 +81,32 @@ impl Vlc {
     ///    `ff_wma_hgain_hufftab` 的长度列是无序的（10,10,10,10,9,9,8,8,…），
     ///    排序发码会给出完全不同的码字。
     /// 2. 累加器是 **32 位定点**（`1 << (32-len)`），不是「读一位加一位」的整数递增。
+    ///
+    /// ⚠️ 与 `from_codes` 不同：这里的**符号是表里的第一列**（`(sym, len)`），
+    /// 不是数组下标 —— 所以要按 `sym` 铺进 `[[code, len]]` 那张表。
     fn from_lengths(lens: &[(i16, u8)]) -> Self {
+        let max_sym = lens.iter().map(|&(s, _)| s.max(0) as usize).max().unwrap_or(0);
+        let mut table = vec![[0u32; 2]; max_sym + 1];
         let mut code: u64 = 0;
-        let mut entries: Vec<(u8, u32, u32)> = Vec::with_capacity(lens.len());
-        let mut max_len = 0u8;
         for &(sym, len) in lens {
             if len == 0 {
                 continue;
             }
             let c = (code >> (32 - len as u32)) as u32;
-            entries.push((len, c, sym as u32));
-            max_len = max_len.max(len);
+            table[sym as usize] = [c, u32::from(len)];
             code += 1u64 << (32 - len as u32);
         }
-        Self { entries, max_len }
+        Self {
+            inner: v2v_msmpeg4::Vlc::new(&table),
+        }
     }
 
-    /// 逐位读、匹配（读越界返回 `Bad`）。
+    /// 走树解一个符号（位流结束或未定义前缀都返回 `Bad`）。
     fn decode(&self, r: &mut BitReader) -> Result<u32> {
-        let mut code = 0u32;
-        for len in 1..=self.max_len {
-            code = (code << 1) | r.bit()?;
-            if let Some(&(_, _, sym)) = self
-                .entries
-                .iter()
-                .find(|&&(l, c, _)| l == len && c == code)
-            {
-                return Ok(sym);
-            }
-        }
-        Err(Error::Bad("VLC 里没有这个码"))
+        self.inner
+            .decode_bits(|| r.bit().ok().map(u32::from))
+            .map(|sym| sym as u32)
+            .ok_or_else(|| Error::Bad("VLC 里没有这个码"))
     }
 }
 
