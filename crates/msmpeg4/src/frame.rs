@@ -897,6 +897,73 @@ pub fn mc_luma16(
     p.need_emu
 }
 
+/// 半像素插值 + SAD **融合**：`cur`（16×16 的当前宏块）与 `mv` 处的参考块比。
+///
+/// ⚠️ 公式与 `put_pixels` **逐字相同**（同一套舍入常数），所以值与
+/// 「先 `mc_luma16` 拷进缓冲、再逐像素求和」**逐位相同** —— 只是省掉一趟写 + 一趟读。
+/// 这条是运动估计的内层：`v2v-mp4v` 与 `v2v-msmpeg4` 两个编码器都靠它
+/// （同一份实现，不是各写一份）。
+///
+/// **越界（需要边缘复制）时不走融合那条路** —— 那种情况仍交给 `mc_luma16`
+/// （它要按边界钳位取像素），`tmp` 就是给它用的 16×16 缓冲。
+///
+/// ⚠️ 切片长度必须跟着**相位**走：横向半像素（`hx`）才多读一格（`src_x + 16`），
+/// 纵向半像素（`hy`）才碰下一行。`need_emu` 的边界正是按这个定的 ——
+/// 无条件多切一格会在「最后一行 + 最后一列」越界 panic。
+pub fn sad_luma16(
+    cur: &[u8; 256],
+    refp: &Planes,
+    p: &McParams,
+    no_rounding: bool,
+    tmp: &mut [u8; 256],
+) -> u64 {
+    if p.need_emu {
+        mc_luma16(tmp, 16, 0, 0, refp, p, no_rounding);
+        let mut acc = 0u64;
+        for i in 0..256usize {
+            acc += (cur[i] as i32 - tmp[i] as i32).unsigned_abs() as u64;
+        }
+        return acc;
+    }
+    let (r1, r2) = if no_rounding {
+        (0u32, 1u32)
+    } else {
+        (1u32, 2u32)
+    };
+    let pw = refp.pw;
+    let base = p.src_y as usize * pw + p.src_x as usize;
+    let (hx, hy) = (p.dxy & 1 != 0, p.dxy & 2 != 0);
+    let w = if hx { 17 } else { 16 };
+    let mut acc = 0u64;
+    if hy {
+        for r in 0..16usize {
+            let top = &refp.y[base + r * pw..base + r * pw + w];
+            let bot = &refp.y[base + (r + 1) * pw..base + (r + 1) * pw + w];
+            for c in 0..16usize {
+                let v = if hx {
+                    (top[c] as u32 + top[c + 1] as u32 + bot[c] as u32 + bot[c + 1] as u32 + r2) >> 2
+                } else {
+                    (top[c] as u32 + bot[c] as u32 + r1) >> 1
+                };
+                acc += (cur[r * 16 + c] as i32 - v as i32).unsigned_abs() as u64;
+            }
+        }
+    } else {
+        for r in 0..16usize {
+            let top = &refp.y[base + r * pw..base + r * pw + w];
+            for c in 0..16usize {
+                let v = if hx {
+                    (top[c] as u32 + top[c + 1] as u32 + r1) >> 1
+                } else {
+                    top[c] as u32
+                };
+                acc += (cur[r * 16 + c] as i32 - v as i32).unsigned_abs() as u64;
+            }
+        }
+    }
+    acc
+}
+
 /// 8×8 色度块的半像素搬运（`which`：0 = U，1 = V）。半像素相位由 `uvdxy` 表示。
 pub fn mc_chroma8(
     dest: &mut [u8],
@@ -1108,6 +1175,59 @@ mod tests {
                     (true, true) => (p(0, 0) + p(0, 1) + p(1, 0) + p(1, 1) + r2) >> 2,
                 };
                 dst[(dy + y) * dstride + dx + x] = v as u8;
+            }
+        }
+    }
+
+    #[test]
+    fn sad_luma16_matches_the_two_pass_path() {
+        // 融合版（插值 + SAD 一趟走完）必须与「先 `mc_luma16` 拷进缓冲、再逐像素
+        // 求和」**逐位相同** —— 判据是 `u64` 完全相等。扫四个相位 × 两种舍入 ×
+        // 若干位置，含越界（走边缘复制那条路）与贴着右/下边界的位置。
+        let (pw, ph) = (48usize, 48usize);
+        let mut refp = Planes::new(pw, ph);
+        let mut state = 0x1234_5678u32;
+        let mut next = || {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            (state >> 16) as u8
+        };
+        for v in refp.y.iter_mut() {
+            *v = next();
+        }
+        let mut cur = [0u8; 256];
+        for v in cur.iter_mut() {
+            *v = next();
+        }
+
+        let mut tmp = [0u8; 256];
+        for &no_rounding in &[false, true] {
+            for mbx in [0usize, 1, 2] {
+                for mby in [0usize, 1, 2] {
+                    for mv in [
+                        (-8i32, -8i32),
+                        (0, 0),
+                        (1, 0),
+                        (0, 1),
+                        (1, 1),
+                        (3, 5),
+                        (-3, 7),
+                        (15, 15),
+                    ] {
+                        let p = mc_params(mbx, mby, mv, pw, ph);
+                        let got = sad_luma16(&cur, &refp, &p, no_rounding, &mut tmp);
+                        // 参照：两趟（先搬后比）—— 就是被融合掉的那一版。
+                        let mut buf = [0u8; 256];
+                        mc_luma16(&mut buf, 16, 0, 0, &refp, &p, no_rounding);
+                        let mut want = 0u64;
+                        for i in 0..256usize {
+                            want += (cur[i] as i32 - buf[i] as i32).unsigned_abs() as u64;
+                        }
+                        assert_eq!(
+                            got, want,
+                            "mb({mbx},{mby}) mv{mv:?} no_rounding={no_rounding}"
+                        );
+                    }
+                }
             }
         }
     }

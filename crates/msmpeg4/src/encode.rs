@@ -28,7 +28,7 @@ use crate::block::RlTable;
 use crate::error::{Error, Result};
 use crate::fdct::{fdct, fdct_i};
 use crate::frame::{
-    mc_chroma8, mc_luma16, mc_mb, mc_params, pred_motion, Frame, Planes, ZIGZAG,
+    mc_chroma8, mc_luma16, mc_mb, mc_params, pred_motion, sad_luma16, Frame, Planes, ZIGZAG,
 };
 use crate::idct::{idct_add, idct_put};
 use crate::grid::Grid;
@@ -840,26 +840,27 @@ fn motion_estimate(
     }
     let mut tmp = [0u8; 256];
     let mut sad_of = |mv: (i32, i32)| -> u64 {
+        // 插值与 SAD **融合**（共享内核 `sad_luma16`）：省掉「先 `mc_luma16` 搬进
+        // 缓冲、再读出来求和」的两趟内存流量。公式与 `mc_luma16` 逐字相同 → 值逐位相同。
         let p = mc_params(mbx, mby, mv, pw, ph);
-        mc_luma16(&mut tmp, 16, 0, 0, refp, &p, no_rounding);
-        let mut acc = 0u64;
-        for i in 0..256usize {
-            acc += (cur[i] as i32 - tmp[i] as i32).unsigned_abs() as u64;
-        }
-        acc
+        sad_luma16(&cur, refp, &p, no_rounding, &mut tmp)
     };
 
     let mut best = (0i32, 0i32);
     let mut best_sad = sad_of(best);
-    let mut seen = std::collections::HashSet::new();
-    seen.insert(best);
-    // 整像素粗搜：两个中心各 ±4（预测的位置通常就在附近，(0,0) 覆盖静止场景）
-    for (cx, cy) in [(0i32, 0i32), (pred.0 >> 1, pred.1 >> 1)] {
+    // 整像素粗搜：两个中心各 ±4（预测的位置通常就在附近，(0,0) 覆盖静止场景）。
+    //
+    // 两个盒子重叠时**跳过**落在第一个盒子里的候选。旧版用一个
+    // `HashSet<(i32,i32)>` 去重 —— 实测那一个 `HashSet` 就占了整条 `.wmv` 链路的
+    // **12%**（每个候选一次 SipHash + 一次插入），而这里只要两次区间比较。
+    let c1 = (0i32, 0i32);
+    let c2 = (pred.0 >> 1, pred.1 >> 1);
+    for (i, (cx, cy)) in [c1, c2].into_iter().enumerate() {
         for dy in -4..=4i32 {
             for dx in -4..=4i32 {
                 let cand = (cx + dx, cy + dy);
-                if !seen.insert(cand) {
-                    continue;
+                if i == 1 && (cand.0 - c1.0).abs() <= 4 && (cand.1 - c1.1).abs() <= 4 {
+                    continue; // 已在第一个盒子里评过（值相同，重复评也不会改结果）
                 }
                 let s = sad_of(cand);
                 if s < best_sad {
