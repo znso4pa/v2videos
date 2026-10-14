@@ -920,8 +920,8 @@ pub fn sad_luma16(
     if p.need_emu {
         mc_luma16(tmp, 16, 0, 0, refp, p, no_rounding);
         let mut acc = 0u64;
-        for i in 0..256usize {
-            acc += (cur[i] as i32 - tmp[i] as i32).unsigned_abs() as u64;
+        for (a, b) in cur.iter().zip(tmp.iter()) {
+            acc += (*a as i32 - *b as i32).unsigned_abs() as u64;
         }
         return acc;
     }
@@ -933,31 +933,53 @@ pub fn sad_luma16(
     let pw = refp.pw;
     let base = p.src_y as usize * pw + p.src_x as usize;
     let (hx, hy) = (p.dxy & 1 != 0, p.dxy & 2 != 0);
-    let w = if hx { 17 } else { 16 };
     let mut acc = 0u64;
-    if hy {
-        for r in 0..16usize {
-            let top = &refp.y[base + r * pw..base + r * pw + w];
-            let bot = &refp.y[base + (r + 1) * pw..base + (r + 1) * pw + w];
-            for c in 0..16usize {
-                let v = if hx {
-                    (top[c] as u32 + top[c + 1] as u32 + bot[c] as u32 + bot[c + 1] as u32 + r2) >> 2
-                } else {
-                    (top[c] as u32 + bot[c] as u32 + r1) >> 1
-                };
-                acc += (cur[r * 16 + c] as i32 - v as i32).unsigned_abs() as u64;
+    // ⚠️ 四个相位**在行循环外**分开写。原来是把 `hx`/`hy` 的判断放在最内层，
+    // 每次索引 `top[c]`/`top[c+1]`/`bot[c]`/`bot[c+1]` —— 编译器无法证明
+    // `c + 1` 不越界，于是 256 次里每次都带边界检查；而且 `if hx` 在内层
+    // 会挡住向量化。分开之后用 `zip`/`windows(2)` 表达「正好 16 个」，
+    // 边界检查消失，内层变成可向量化的纯算术。
+    // **值必须逐位相同**：公式与舍入常数一个字没动。
+    match (hx, hy) {
+        (false, false) => {
+            for r in 0..16usize {
+                let top = &refp.y[base + r * pw..base + r * pw + 16];
+                let crow = &cur[r * 16..r * 16 + 16];
+                for (a, b) in crow.iter().zip(top) {
+                    acc += (*a as i32 - *b as i32).unsigned_abs() as u64;
+                }
             }
         }
-    } else {
-        for r in 0..16usize {
-            let top = &refp.y[base + r * pw..base + r * pw + w];
-            for c in 0..16usize {
-                let v = if hx {
-                    (top[c] as u32 + top[c + 1] as u32 + r1) >> 1
-                } else {
-                    top[c] as u32
-                };
-                acc += (cur[r * 16 + c] as i32 - v as i32).unsigned_abs() as u64;
+        (true, false) => {
+            for r in 0..16usize {
+                let top = &refp.y[base + r * pw..base + r * pw + 17];
+                let crow = &cur[r * 16..r * 16 + 16];
+                for (a, t) in crow.iter().zip(top.windows(2)) {
+                    let v = (t[0] as u32 + t[1] as u32 + r1) >> 1;
+                    acc += (*a as i32 - v as i32).unsigned_abs() as u64;
+                }
+            }
+        }
+        (false, true) => {
+            for r in 0..16usize {
+                let top = &refp.y[base + r * pw..base + r * pw + 16];
+                let bot = &refp.y[base + (r + 1) * pw..base + (r + 1) * pw + 16];
+                let crow = &cur[r * 16..r * 16 + 16];
+                for (a, (t, b)) in crow.iter().zip(top.iter().zip(bot)) {
+                    let v = (*t as u32 + *b as u32 + r1) >> 1;
+                    acc += (*a as i32 - v as i32).unsigned_abs() as u64;
+                }
+            }
+        }
+        (true, true) => {
+            for r in 0..16usize {
+                let top = &refp.y[base + r * pw..base + r * pw + 17];
+                let bot = &refp.y[base + (r + 1) * pw..base + (r + 1) * pw + 17];
+                let crow = &cur[r * 16..r * 16 + 16];
+                for (a, (t, b)) in crow.iter().zip(top.windows(2).zip(bot.windows(2))) {
+                    let v = (t[0] as u32 + t[1] as u32 + b[0] as u32 + b[1] as u32 + r2) >> 2;
+                    acc += (*a as i32 - v as i32).unsigned_abs() as u64;
+                }
             }
         }
     }
