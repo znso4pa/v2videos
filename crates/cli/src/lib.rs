@@ -807,17 +807,25 @@ fn convert_to_mp4(
     // 收齐后按这个键排序回放 —— 与串行版的事件顺序逐一对齐。
     let a_point = audio.as_ref().map_or(0, |a| a.point);
     let a_channels = src_audio.as_ref().map_or(0, |af| af.channels as usize);
+    // ---- 音频**两级流水线**：WMA 解码 → AAC 编码各占一个线程 ----
+    //
+    // 为什么拆：原来「WMA 解码 + AAC 编码」串在**同一个** worker 里，它的耗时是
+    // **两者之和**。视频侧并行到 8 线程之后已经跑到 ~0.24 s，音频这条 0.47 s
+    // 就成了 wall 的下界 —— 实测 `--pcm`（省掉 AAC 编码）wall 0.497 → **0.235**。
+    // 拆成两级之后音频那条变成 **max(解码, 编码)**，与视频侧并列：
+    // **wall = max(视频, 解码, 编码)**。
+    //
+    // ⚠️ **AAC 编码器是有状态的**（`sf_offset_prev` / `window_seq_prev` / 重叠历史），
+    // 所以第二级必须是**单线程顺序**的 —— 这里正是，不要把它也拆开。
     let (tx_audio, rx_audio) = std::sync::mpsc::channel::<(usize, Vec<u8>)>();
+    let (tx_pcm, rx_pcm) = std::sync::mpsc::channel::<(usize, Vec<u8>)>();
     let mut wma_dec = match audio.as_mut() {
         Some(a) => a.decoder.take(),
         None => None,
     };
     let mut skip_left = audio.as_ref().map_or(0, |a| a.skip);
-    let mut aac_enc = aac.take();
-    let audio_worker = std::thread::spawn(move || -> std::result::Result<(Vec<Pending>, usize), String> {
-        let mut out: Vec<Pending> = Vec::new();
-        let mut pending: Vec<Vec<f32>> = Vec::new();
-        let mut audio_points = 0usize;
+    // 第一级：WMA 解码（无编码器时就是 PCM 直通）+ 跳过编码器延迟。
+    let decode_worker = std::thread::spawn(move || -> std::result::Result<(), String> {
         while let Ok((idx, data)) = rx_audio.recv() {
             let mut pcm = match wma_dec.as_mut() {
                 Some(d) => wma_frame_to_pcm(d.decode_superframe(&data).map_err(|e| e.to_string())?),
@@ -828,6 +836,19 @@ fn convert_to_mp4(
                 pcm.drain(..drop);
                 skip_left -= drop / a_point;
             }
+            if tx_pcm.send((idx, pcm)).is_err() {
+                break; // 编码侧已退出（出错），由下面的 join 报出来
+            }
+        }
+        Ok(())
+    });
+    // 第二级：AAC 编码（或 PCM 直通时按采样点切块）。
+    let mut aac_enc = aac.take();
+    let audio_worker = std::thread::spawn(move || -> std::result::Result<(Vec<Pending>, usize), String> {
+        let mut out: Vec<Pending> = Vec::new();
+        let mut pending: Vec<Vec<f32>> = Vec::new();
+        let mut audio_points = 0usize;
+        while let Ok((idx, pcm)) = rx_pcm.recv() {
             if let Some(enc) = aac_enc.as_mut() {
                 // ---- AAC：攒够 1024 个采样点再编一帧 ----
                 //
@@ -1005,10 +1026,16 @@ fn convert_to_mp4(
 
     // 关掉发送端：worker 把剩下的样本处理完、编掉 AAC 的尾巴之后退出。
     drop(tx_audio);
+    // 解码线程退出 → 它的 `tx_pcm` 随之 drop → 编码线程收完尾巴后自然退出。
+    match decode_worker.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(Error::Io(std::io::Error::other(format!("音频解码线程：{e}")))),
+        Err(_) => return Err(Error::Io(std::io::Error::other("音频解码线程 panic"))),
+    }
     let (audio_events, audio_points) = match audio_worker.join() {
         Ok(Ok(v)) => v,
-        Ok(Err(e)) => return Err(Error::Io(std::io::Error::other(format!("音频线程：{e}")))),
-        Err(_) => return Err(Error::Io(std::io::Error::other("音频线程 panic"))),
+        Ok(Err(e)) => return Err(Error::Io(std::io::Error::other(format!("音频编码线程：{e}")))),
+        Err(_) => return Err(Error::Io(std::io::Error::other("音频编码线程 panic"))),
     };
 
     // 视频 worker 收尾：等全部退出，再把结果收齐（`orx.iter()` 在所有 `otx`
