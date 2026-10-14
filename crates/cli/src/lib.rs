@@ -590,6 +590,40 @@ enum PendingKind {
     },
 }
 
+/// 编**一个 GOP** 的帧，返回（载荷, 关键帧数, 码控统计）。
+///
+/// `all_i` 对应 `-g 0`：那条路上每一帧都是独立的 I 帧（见 `ConvertOptions` 的说明），
+/// 所以调 `encode_i_frame` 而不是 `encode_frame`（后者的 `0` 含义是「无 GOP、全 P」）。
+fn encode_items(
+    enc: &mut v2v_mp4v::Encoder,
+    items: Vec<(usize, Frame, u32)>,
+    all_i: bool,
+) -> std::result::Result<(Vec<Pending>, usize, (u64, u64)), String> {
+    let mut out = Vec::with_capacity(items.len());
+    let mut key_frames = 0usize;
+    for (idx, frame, duration) in items {
+        let stream = if all_i {
+            enc.encode_i_frame(&frame)
+        } else {
+            enc.encode_frame(&frame)
+        }
+        .map_err(|e| e.to_string())?;
+        // 关键帧位来自编码器 —— 全 I 帧时 `stss` 会被整个省掉。
+        if enc.last_key_frame {
+            key_frames += 1;
+        }
+        out.push(Pending {
+            key: (idx, 0),
+            kind: PendingKind::Video {
+                data: stream,
+                key_frame: enc.last_key_frame,
+                duration,
+            },
+        });
+    }
+    Ok((out, key_frames, enc.rate_control_stats().unwrap_or((0, 0))))
+}
+
 /// `.mp4`（MPEG-4 Part 2 in MP4）那条路。
 ///
 /// 与 `.wmv` 那条的三个实质差别：
@@ -660,8 +694,11 @@ fn convert_to_mp4(
         .unwrap_or(DEFAULT_FPS)
         .clamp(1, 120);
 
-    // ---- 视频编码器：MPEG-4 Part 2 ----
-    let mut enc = v2v_mp4v::Encoder::new(v2v_mp4v::EncoderConfig {
+    // ---- 视频编码器配置：MPEG-4 Part 2 ----
+    //
+    // 编码器**实例**在 worker 线程里建（见下面「视频 GOP 并行」）——
+    // 配置是 `Copy` 的，每个线程各拿一份。
+    let mp4v_cfg = v2v_mp4v::EncoderConfig {
         width: w,
         height: h,
         fps_num: fps,
@@ -669,7 +706,10 @@ fn convert_to_mp4(
         bitrate: opts.video_bitrate,
         keyframe_interval: opts.keyframe_interval,
         ..Default::default()
-    })?;
+    };
+    // `esds` 要的 DSI（VOS + 视觉对象 + VOL + 用户数据）与编码器**状态**无关，
+    // 用一个临时实例取一次就够 —— 编码器实例现在归 worker 线程所有。
+    let dsi = v2v_mp4v::Encoder::new(mp4v_cfg)?.decoder_specific_info();
 
     // ---- 封装器 ----
     //
@@ -680,7 +720,7 @@ fn convert_to_mp4(
         width: w as u16,
         height: h as u16,
         timescale: VTS,
-        decoder_specific_info: enc.decoder_specific_info(),
+        decoder_specific_info: dsi,
         avg_bitrate: 0,
     };
     // ---- 音频编码器（只在 `.mp4` + `Mp4Audio::Aac` 时建）----
@@ -843,12 +883,66 @@ fn convert_to_mp4(
         Ok((out, audio_points))
     });
 
+    // ---- 视频 worker 池：GOP 并行 ----
+    //
+    // ⚠️ **这条不是逐字节不变的**（与上面音频 worker 不同）：`mv_prev`（运动估计的
+    // 第三个起点）与码控的 `cur_qscale` 都**跨 GOP 延续**，按 GOP 并行就必须重置它们 ——
+    // 代价是每个 GOP 的第一个 P 帧少一个搜索起点、码控从头收敛。
+    // 所以**单线程（默认）仍沿用同一个编码器**、跨 GOP 连续，与老行为逐字节相同；
+    // 只有 `--threads > 1` 才每个 GOP 起一个全新编码器。
+    //
+    // GOP 边界与编码器内部的判据一致（`frames_since_i >= keyframe_interval`，
+    // 首帧恒 I）—— 所以按 `gop_len` 切出来的每一块，第一帧正好是 I 帧。
+    // `-g 0`（全 I 帧）时每帧独立，`gop_len = 1`。
+    let nthreads = opts.threads.max(1);
+    let all_i = opts.keyframe_interval == 0;
+    let gop_len = if all_i { 1 } else { opts.keyframe_interval };
+    // 有界通道：解码（主线程）领先编码（worker）最多 `2 * nthreads` 个 GOP，
+    // 解码帧就不会堆在内存里（一帧 320×240 的 YUV 是 115 KB）。
+    let (vtx, vrx) = std::sync::mpsc::sync_channel::<Vec<(usize, Frame, u32)>>(2 * nthreads);
+    let vrx = std::sync::Arc::new(std::sync::Mutex::new(vrx));
+    let (otx, orx) = std::sync::mpsc::channel::<(Vec<Pending>, usize, (u64, u64))>();
+    let mut vworkers = Vec::with_capacity(nthreads);
+    for _ in 0..nthreads {
+        let vrx = std::sync::Arc::clone(&vrx);
+        let otx = otx.clone();
+        let cfg = mp4v_cfg;
+        vworkers.push(std::thread::spawn(
+            move || -> std::result::Result<(), String> {
+                // 单线程时只建一次编码器，跨 GOP 连续（= 老行为）。
+                let mut keep = if nthreads == 1 {
+                    Some(v2v_mp4v::Encoder::new(cfg).map_err(|e| e.to_string())?)
+                } else {
+                    None
+                };
+                loop {
+                    let job = {
+                        let rx = vrx.lock().map_err(|e| e.to_string())?;
+                        rx.recv()
+                    };
+                    let Ok(items) = job else { break };
+                    let (out, kf, stats) = match keep.as_mut() {
+                        Some(enc) => encode_items(enc, items, all_i)?,
+                        None => {
+                            let mut enc = v2v_mp4v::Encoder::new(cfg).map_err(|e| e.to_string())?;
+                            encode_items(&mut enc, items, all_i)?
+                        }
+                    };
+                    otx.send((out, kf, stats)).map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            },
+        ));
+    }
+    drop(otx);
+
     // 上一帧的视频时间戳（毫秒）—— `stts` 写的是**真实间隔**。
     let mut prev_vts: Option<i64> = None;
     let mut last_dur = (VTS as f64 / fps as f64).round().max(1.0) as u32;
     let mut stop = false;
-    let mut video_events: Vec<Pending> = Vec::new();
     let mut sample_idx = 0usize;
+    // 攒够一个 GOP 就派给 worker。
+    let mut gop_buf: Vec<(usize, Frame, u32)> = Vec::with_capacity(gop_len);
 
     loop {
         let s = match queue.pop_front() {
@@ -887,26 +981,15 @@ fn convert_to_mp4(
         let frame = dec.decode(&s.data, w, h)?;
         // ⚠️ **`-g 0` 在 `.mp4` 这条路上就是「全 I 帧」** ——
         // 这条路的默认值是 0（每个 I 帧都独立可解，见 `ConvertOptions` 的说明），
-        // 所以不能直接调 `encode_frame`（在 `mp4v` 里 `0` 的含义是「无 GOP」，会编 P 帧、
-        // 而且第一个 P 帧会因为没有参考帧而报错）。
-        let stream = if opts.keyframe_interval == 0 {
-            enc.encode_i_frame(&frame)?
-        } else {
-            enc.encode_frame(&frame)?
-        };
-        // 关键帧位来自编码器 —— 全 I 帧时 `stss` 会被整个省掉。
-        if enc.last_key_frame {
-            key_frames += 1;
-        }
-        video_events.push(Pending {
-            key: (idx, 0),
-            kind: PendingKind::Video {
-                data: stream,
-                key_frame: enc.last_key_frame,
-                duration: last_dur,
-            },
-        });
+        // 所以 worker 那边不能直接调 `encode_frame`（在 `mp4v` 里 `0` 的含义是
+        // 「无 GOP」，会编 P 帧、而且第一个 P 帧会因为没有参考帧而报错）——
+        // `all_i` 就是为这个传进去的。
+        gop_buf.push((idx, frame, last_dur));
         frames += 1;
+        if gop_buf.len() >= gop_len {
+            vtx.send(std::mem::take(&mut gop_buf))
+                .map_err(|_| Error::Io(std::io::Error::other("视频线程提前退出")))?;
+        }
         if let Some(max) = opts.max_frames {
             if frames >= max {
                 stop = true;
@@ -914,6 +997,11 @@ fn convert_to_mp4(
             }
         }
     }
+    // 最后一块不满一个 GOP 也要发出去。
+    if !gop_buf.is_empty() {
+        vtx.send(gop_buf).map_err(|_| Error::Io(std::io::Error::other("视频线程提前退出")))?;
+    }
+    drop(vtx);
 
     // 关掉发送端：worker 把剩下的样本处理完、编掉 AAC 的尾巴之后退出。
     drop(tx_audio);
@@ -922,6 +1010,24 @@ fn convert_to_mp4(
         Ok(Err(e)) => return Err(Error::Io(std::io::Error::other(format!("音频线程：{e}")))),
         Err(_) => return Err(Error::Io(std::io::Error::other("音频线程 panic"))),
     };
+
+    // 视频 worker 收尾：等全部退出，再把结果收齐（`orx.iter()` 在所有 `otx`
+    // 都随线程一起 drop 之后自然结束）。
+    for wk in vworkers {
+        match wk.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(Error::Io(std::io::Error::other(format!("视频线程：{e}")))),
+            Err(_) => return Err(Error::Io(std::io::Error::other("视频线程 panic"))),
+        }
+    }
+    let mut video_events: Vec<Pending> = Vec::with_capacity(frames);
+    let mut rate_stats = (0u64, 0u64);
+    for (out, kf, st) in orx.iter() {
+        video_events.extend(out);
+        key_frames += kf;
+        rate_stats.0 += st.0;
+        rate_stats.1 += st.1;
+    }
 
     // ---- 按**原交错顺序**回放：`mdat` 的排布必须与串行版逐字节相同 ----
     let mut all: Vec<Pending> = Vec::with_capacity(video_events.len() + audio_events.len());
@@ -943,9 +1049,11 @@ fn convert_to_mp4(
     write_out(output, &mp4)?;
 
     // 码率控制开着时把**实际**码率报出去 —— 这是唯一能证明它生效的数。
-    let video_kbps = enc.rate_control_stats().and_then(|(n, bits)| {
+    // 多线程时每个 worker 各有一份统计，这里按 (帧数, 位数) 求和。
+    let video_kbps = {
+        let (n, bits) = rate_stats;
         (n > 0).then(|| bits as f64 / n as f64 * f64::from(fps) / 1000.0)
-    });
+    };
 
     Ok(ConvertReport {
         frames,
