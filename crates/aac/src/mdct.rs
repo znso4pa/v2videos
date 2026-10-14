@@ -22,14 +22,23 @@
 //! （`use_kb_window = 0`）—— 它不需要 Bessel 函数，且 AAC 里用得很普遍。
 //! KBD 的代码也留着（`kbd_window`），但默认不开。
 //!
-//! ## 为什么不用 FFT
+//! ## 为什么**改用了** FFT
 //!
-//! 直接按定义算是 O(N²)—— 对 1024 点来说是 100 万次乘加、每帧每通道。
-//! 44.1 kHz 一个声道的音频每秒 43 帧，也就是每秒 4300 万次乘加 —— 现代 CPU 上
-//! 这大约是几十毫秒，**可以接受**。换 FFT 会把这条链路变得难以对账，
-//! 而这条链路的价值就在于「每一步都能手算验证」。
+//! 第一版直接按定义算是 O(N²)（1024 点 = 每帧每声道 200 万次乘加），当时的判断是
+//! 「几十毫秒、可以接受」。**实测把这个判断推翻了**：把 `mdct` 短路掉，AAC 单编
+//! 20 秒从 13.85 s 掉到 3.0 s —— 它一个人占了整个编码的 **78%**。
+//!
+//! 现在走 `预旋转 → 2N 点 FFT → 后旋转 → 取实部 ×2`，一次变换只调 4 次
+//! `sin`/`cos`（两条相位都是线性的，旋转因子用切比雪夫递推生成，不建表）。
+//! 快 **4.9×**，而且**输出逐字节不变**（f64 的差异被 f32 舍入吸收）。
+//!
+//! 「难对账」这条担心的解法不是不换算法，而是**加一条直接按定义算的 oracle 测试**
+//! （`fast_mdct_matches_the_definition`）—— 换算法时只有它能把折叠/旋转/定标写错
+//! 当场抓住。FFT 本身搬去了共享内核 `v2v-msmpeg4`（见那边的 `fft.rs`）。
 
 use std::f64::consts::PI;
+
+use v2v_msmpeg4::fft_in_place;
 
 /// 长块的样本数（MDCT 输出点数）。
 pub const LONG_LEN: usize = 1024;
@@ -244,60 +253,6 @@ pub fn mdct(input: &[f32], out: &mut [f32]) {
     }
 }
 
-/// 原地 radix-2 复数 FFT（DIT，f64）。长度必须是 2 的幂。
-///
-/// 教科书版：位反转置换 + 逐级蝶形，每级现算 `half` 个旋转因子
-/// （`e^{-2πik/size}`）。**先要正确，再谈快** —— 曾经想把旋转因子换成递推，
-/// 结果跨 block 的状态没重置，`fast_mdct_matches_the_definition` 当场抓住
-/// （相对偏差 2e13）。
-fn fft_in_place(re: &mut [f64], im: &mut [f64]) {
-    let len = re.len();
-    debug_assert!(len.is_power_of_two());
-    debug_assert_eq!(len, im.len());
-
-    // 位反转置换
-    let mut j = 0usize;
-    for i in 1..len {
-        let mut bit = len >> 1;
-        while j & bit != 0 {
-            j ^= bit;
-            bit >>= 1;
-        }
-        j |= bit;
-        if i < j {
-            re.swap(i, j);
-            im.swap(i, j);
-        }
-    }
-
-    // 逐级蝶形
-    let mut size = 2usize;
-    while size <= len {
-        let half = size / 2;
-        let tw: Vec<(f64, f64)> = (0..half)
-            .map(|k| {
-                let a = -2.0 * PI * (k as f64) / (size as f64);
-                (a.cos(), a.sin())
-            })
-            .collect();
-        let mut start = 0usize;
-        while start < len {
-            for (k, &(w_re, w_im)) in tw.iter().enumerate() {
-                let a = start + k;
-                let b = a + half;
-                let tr = re[b] * w_re - im[b] * w_im;
-                let ti = re[b] * w_im + im[b] * w_re;
-                re[b] = re[a] - tr;
-                im[b] = im[a] - ti;
-                re[a] += tr;
-                im[a] += ti;
-            }
-            start += size;
-        }
-        size <<= 1;
-    }
-}
-
 /// 直接法的 IMDCT：`N → 2N`，**无归一化**。
 ///
 /// 与 `mdct` 互为逆（差一个整体常数因子，由 50% 重叠相加的窗处理）。
@@ -316,6 +271,10 @@ pub fn imdct(input: &[f32], out: &mut [f32]) {
         *o = (s * scale) as f32;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
 
     /// **FFT 版必须与「按定义直接算」逐点一致** —— 直接版（O(N²)）当 oracle。
     ///
@@ -351,10 +310,6 @@ pub fn imdct(input: &[f32], out: &mut [f32]) {
             assert!(rel < 1e-6, "n={n}：与定义的最大相对偏差 {rel:.3e}");
         }
     }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
 
     #[test]
     fn sine_window_satisfies_tdac() {

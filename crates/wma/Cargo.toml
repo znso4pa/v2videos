@@ -6,7 +6,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-# 无。纯 std。
+# IMDCT 的 FFT 走 msmpeg4 那边的**共享数值内核**（AGENTS.md 不变量 3：
+# 谁都要用的东西不许复刻第二份）—— 与 aac 的 MDCT 是同一个函数。
+v2v-msmpeg4 = { path = "../msmpeg4" }
 
 [dev-dependencies]
 # 集成测试要拿真样本的音频载荷（经 ASF 解封装）。
