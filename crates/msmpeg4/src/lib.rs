@@ -30,6 +30,7 @@ mod block;
 mod encode;
 mod error;
 mod fdct;
+mod fft;
 mod frame;
 mod grid;
 mod header;
@@ -46,6 +47,7 @@ pub use block::RlTable;
 pub use encode::{Encoder, EncoderConfig};
 pub use error::{Error, Result};
 pub use fdct::{fdct, fdct_i};
+pub use fft::fft_in_place;
 pub use frame::{
     decode_i_frame, mc_chroma8, mc_luma16, mc_mb, mc_params, mid_pred, AcPredRead, Decoder, Frame,
     McParams, Planes, Stats, ZIGZAG,

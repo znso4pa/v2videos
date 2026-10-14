@@ -21,6 +21,9 @@ use crate::params::WmaParams;
 use crate::tables::*;
 use crate::{Error, Result};
 
+// FFT 走共享数值内核（AGENTS.md 不变量 3：不许复刻第二份）。
+use v2v_msmpeg4::fft_in_place;
+
 const NB_LSP_COEFS: usize = 10;
 const LSP_POW_BITS: u32 = 7;
 const NOISE_TAB_SIZE: usize = 8192;
@@ -151,6 +154,10 @@ pub struct WmaDecoder {
     coefs: [Vec<f32>; 2],
     output: Vec<f32>,
     frame_out: [Vec<f32>; 2],
+
+    /// IMDCT 的 FFT scratch（复用，避免每块都分配）。长度 `2 · BLOCK_MAX_SIZE`。
+    imdct_re: Vec<f64>,
+    imdct_im: Vec<f64>,
 
     // ---- 比特池（superframe 跨包搬运）----
     /// 上一包没用完、留给下一包接着解的那半帧的字节。
@@ -370,6 +377,8 @@ impl WmaDecoder {
             coefs: [vec![0.0; BLOCK_MAX_SIZE], vec![0.0; BLOCK_MAX_SIZE]],
             output: vec![0.0; BLOCK_MAX_SIZE * 2],
             frame_out: [vec![0.0; BLOCK_MAX_SIZE * 2], vec![0.0; BLOCK_MAX_SIZE * 2]],
+            imdct_re: vec![0.0; BLOCK_MAX_SIZE * 2],
+            imdct_im: vec![0.0; BLOCK_MAX_SIZE * 2],
             last_superframe: Vec::new(),
             last_bitoffset: 0,
             superframe_index: 0,
@@ -827,43 +836,16 @@ impl WmaDecoder {
     /// 相反数 —— 实测：我们的输出与 ffmpeg 的 PCM 互相关正好是 **−1.0000**
     /// （完美反相、幅度与波形全对）。所以这里取负号，不是「调参」。
     ///
-    /// ## 余弦用**三项递推**生成，不在内层调 `cos()`
-    ///
-    /// `ang(i) = π/n·(k+0.5)·(i + 0.5 + n/2)` 对 `i` 是**等差**的
-    /// （`ang(i) = ang(0) + i·step`），所以整串余弦可以由切比雪夫递推生成：
-    ///
-    /// ```text
-    /// cos(θ + step) = 2·cos(step)·cos(θ) − cos(θ − step)
-    /// ```
-    ///
-    /// 每个样本 **2 乘 1 减**，替掉一次 libm 的 `cos()` —— 这不是微调：
-    /// 递推在 f64 下稳定（与平面旋转等价，误差 ~1e-12），而输出最后只取 f32
-    /// （精度 6e-8），所以值看不出差别。
+    /// 推导与代价见 `imdct_kernel`；这里只负责把解码器的缓冲递过去。
     fn imdct(&mut self, ch: usize) {
-        let l = self.block_len;
-        let n = l;
-        for v in self.output[..2 * l].iter_mut() {
-            *v = 0.0;
-        }
-        let nf = n as f64;
-        let half_plus = 0.5 + nf / 2.0;
-        for k in 0..l {
-            let c = self.coefs[ch][k];
-            if c == 0.0 {
-                continue;
-            }
-            let step = std::f64::consts::PI / nf * (k as f64 + 0.5);
-            let two_cos_step = 2.0 * step.cos();
-            let base = step * half_plus;
-            let mut prev = (base - step).cos();
-            let mut cur = base.cos();
-            for v in self.output[..2 * l].iter_mut() {
-                *v -= (f64::from(c) * cur) as f32;
-                let next = two_cos_step * cur - prev;
-                prev = cur;
-                cur = next;
-            }
-        }
+        let n = self.block_len;
+        let m = 2 * n;
+        imdct_kernel(
+            &self.coefs[ch][..n],
+            &mut self.output[..m],
+            &mut self.imdct_re[..m],
+            &mut self.imdct_im[..m],
+        );
     }
 
     /// 加窗并把这一块叠加到 `frame_out[ch][index..]`。
@@ -1050,6 +1032,123 @@ impl WmaDecoder {
     }
 }
 
+/// IMDCT 的内核（不含 `self`，便于单测直接对着「按定义算」对账）。
+///
+/// `coefs` 长 `n`（块长），`out` 长 `2n`，`re`/`im` 是长度 ≥ `2n` 的复用 scratch。
+///
+/// ## 定义（与第一版逐点等价，只换了算法）
+///
+/// ```text
+///   out[i] = −Σ_{k=0}^{n-1} coefs[k]·cos( π/n ·(k+0.5)·(i + 0.5 + n/2) ),   i = 0..2n−1
+/// ```
+///
+/// ## 为什么能走 FFT
+///
+/// **第一步：`2n` 个输出 = `n` 点 DCT-IV + 三段对称。**
+/// 令 `u[j] = Σ_k coefs[k]·cos(π/n·(j+0.5)(k+0.5))`（`j = 0..n−1`，就是 DCT-IV）。
+/// 把 `i + 0.5 + n/2` 写成 `(i + n/2) + 0.5`，立刻看出 `out[i] = −u(i + n/2)`
+/// （把 `u` 看成 `j` 的连续函数）；而 `u` 有两条对称性，都是一行能验的：
+///
+/// ```text
+///   u(−1−j) = u(j)        （余弦是偶函数）
+///   u(j+2n) = −u(j)       （相位差 2π(k+1/2) —— 正好差一个 π）
+/// ```
+///
+/// 用它们把 `i + n/2 ∈ [n/2, 5n/2)` 折回 `[0, n)`：
+///
+/// ```text
+///   i ∈ [0, n/2)     : out[i] = −u[i + n/2]
+///   i ∈ [n/2, 3n/2)  : out[i] = +u[3n/2 − 1 − i]
+///   i ∈ [3n/2, 2n)   : out[i] = +u[i − 3n/2]
+/// ```
+///
+/// **第二步：DCT-IV 走 FFT。** 把相位拆开（记 `m = 2n`）：
+///
+/// ```text
+///   π/n·(j+0.5)(k+0.5) = πk(2j+1)/m + π(2j+1)/(4n)
+///   ⇒  u[j] = Re{ e^{−iφ_j}·D[j] },   φ_j = π(2j+1)/(4n) = (j + 0.5)·π/m
+///       D = FFT_m(b),   b[k] = coefs[k]·e^{−iπk/m}（k ≥ n 补零）
+/// ```
+///
+/// `D[j] = Σ_k b[k]·e^{−2πijk/m}` 正好是 **`m` 点 FFT 的第 `j` 个 bin**（前 `n` 个）。
+/// 两条相位（预旋转的 `−πk/m`、后旋转的 `−φ_j`）**都是线性的**，所以旋转因子都用
+/// 切比雪夫递推生成 —— 一次变换只调 4 次 `sin`/`cos`，不建表。
+///
+/// ## 为什么值得换
+///
+/// 原来逐 `(k, i)` 是 **O(n²)**：`n = 2048` 时每块每声道 840 万次内层迭代
+/// （1024 点块也有 210 万次）。实测它一个人占了整条转码链路的 **32%**
+/// （`sample` 采样：`finish_block` 2007/6261，而 `finish_block` 的时间 99% 在它里面）。
+/// 现在是一次 `m` 点 FFT + `O(n)` 旋转，同一份输出。
+///
+/// ⚠️ **数值上不是逐位相同**：旧版每加一项就把部分和舍进 f32（2048 项 → 误差按随机
+/// 游走 ~3e-6 相对），新版在 f64 里累完只收一次（~1e-12）。落到 s16 的 PCM 上是个别
+/// 样本 **±1** —— 对 ffmpeg 的对账容差是 4，实测没变（见 `TODO.md`）。
+fn imdct_kernel(coefs: &[f32], out: &mut [f32], re: &mut [f64], im: &mut [f64]) {
+    let n = coefs.len();
+    let m = 2 * n;
+    debug_assert_eq!(out.len(), m);
+    debug_assert!(n.is_power_of_two(), "块长必须是 2 的幂（FFT 的要求）");
+    let pi = std::f64::consts::PI;
+
+    // ---- 预旋转 + 补零：b[k] = coefs[k]·e^{−iπk/m} ----
+    {
+        let step = pi / m as f64;
+        let two_cos = 2.0 * step.cos();
+        let mut prev = (-step).cos();
+        let mut cur = 1.0f64; // cos(0)
+        let mut prev_i = (-step).sin();
+        let mut cur_i = 0.0f64; // sin(0)
+        for k in 0..m {
+            let c = if k < n { f64::from(coefs[k]) } else { 0.0 };
+            re[k] = c * cur;
+            im[k] = -c * cur_i;
+            // cos(θ+step) = 2cos(step)cos(θ) − cos(θ−step)（sin 同理）
+            let next = two_cos * cur - prev;
+            prev = cur;
+            cur = next;
+            let next_i = two_cos * cur_i - prev_i;
+            prev_i = cur_i;
+            cur_i = next_i;
+        }
+    }
+
+    fft_in_place(re, im);
+
+    // ---- 后旋转：u[j] = Re{ e^{−iφ_j}·D[j] }，就地写回 `im` ----
+    {
+        let step = pi / m as f64;
+        let base = step * 0.5; // φ_0
+        let two_cos = 2.0 * step.cos();
+        let mut prev = (base - step).cos();
+        let mut cur = base.cos();
+        let mut prev_i = (base - step).sin();
+        let mut cur_i = base.sin();
+        for j in 0..n {
+            let (r, i2) = (re[j], im[j]);
+            im[j] = r * cur + i2 * cur_i;
+            let next = two_cos * cur - prev;
+            prev = cur;
+            cur = next;
+            let next_i = two_cos * cur_i - prev_i;
+            prev_i = cur_i;
+            cur_i = next_i;
+        }
+    }
+
+    // ---- 三段对称展开（`u` 现在在 `im[..n]`）----
+    let u = &im[..n];
+    for i in 0..n / 2 {
+        out[i] = -(u[i + n / 2] as f32);
+    }
+    for i in n / 2..3 * n / 2 {
+        out[i] = u[3 * n / 2 - 1 - i] as f32;
+    }
+    for i in 3 * n / 2..m {
+        out[i] = u[i - 3 * n / 2] as f32;
+    }
+}
+
 /// 指数值：`10^(exp / 16)`。
 ///
 /// ⚠️ ffmpeg 的表是 `pow_tab[i] = 10^((i-60)/16)`（156 项，第 60 项 = 1.0），
@@ -1132,4 +1231,58 @@ fn exponent_band_table(sample_rate: u32, a: usize) -> Option<Vec<usize>> {
     };
     let n = row[0] as usize;
     Some(row[1..1 + n].iter().map(|&v| v as usize).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 直接按定义算的 IMDCT —— oracle（O(n²)）。
+    ///
+    /// 与 `v2v-aac` 那边的 `fast_mdct_matches_the_definition` 是同一个套路：
+    /// 换算法（O(n²) → O(n log n)）时，只有它能把「折叠 / 旋转 / 定标写错」当场抓住。
+    fn direct_imdct(coefs: &[f32]) -> Vec<f32> {
+        let n = coefs.len();
+        let mut out = vec![0f32; 2 * n];
+        for (i, o) in out.iter_mut().enumerate() {
+            let mut s = 0f64;
+            for (k, &c) in coefs.iter().enumerate() {
+                let ang = std::f64::consts::PI / n as f64
+                    * (k as f64 + 0.5)
+                    * (i as f64 + 0.5 + n as f64 / 2.0);
+                s -= f64::from(c) * ang.cos();
+            }
+            *o = s as f32;
+        }
+        out
+    }
+
+    #[test]
+    fn fast_imdct_matches_the_definition() {
+        // 覆盖 WMA 真会用的块长：`BLOCK_MIN_BITS = 7` → 128，到 `frame_len` 上限 2048。
+        for &n in &[128usize, 512, 2048] {
+            let mut state = 0x5eed_1234u32;
+            let coefs: Vec<f32> = (0..n)
+                .map(|_| {
+                    state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                    ((state >> 16) as f32 / 32768.0 - 1.0) * 500.0
+                })
+                .collect();
+            let want = direct_imdct(&coefs);
+
+            let m = 2 * n;
+            let mut got = vec![0f32; m];
+            let mut re = vec![0f64; m];
+            let mut im = vec![0f64; m];
+            imdct_kernel(&coefs, &mut got, &mut re, &mut im);
+
+            let peak = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let worst = got
+                .iter()
+                .zip(&want)
+                .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+            let rel = f64::from(worst) / f64::from(peak.max(1e-30));
+            assert!(rel < 1e-6, "n={n}：与定义的最大相对偏差 {rel:.3e}");
+        }
+    }
 }
