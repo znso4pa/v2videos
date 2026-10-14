@@ -1581,9 +1581,19 @@ fn band_cost(band: &[f32], sf: u8, qu: &mut Vec<i32>) -> (f32, u8) {
     for (j, &c) in band.iter().enumerate() {
         qu[j] = quant_uncapped(c.abs(), q34v);
     }
+    // ---- 11 本码本只有 **6 个不同的封顶值**，而失真只取决于封顶值 ----
+    //
+    // `CB_MAXVAL` = `1,1,2,2,4,4,7,7,12,12,16`：同封顶值的那两本（1/2、3/4、5/6、
+    // 7/8、9/10）反量化值**完全相同**（都是 `±min(q, maxval)·iq`，与码本无关）→
+    // 失真逐位相同。按「平手取编号小」的规矩，取小的那本当代表即可：
+    // `[1, 3, 5, 7, 9, 11]` 六次。cb=11 是 escape（大系数走 13 位真实值），单独算。
+    //
+    // ⚠️ **不算位数** —— 旧版在这里把每本的位数也算了一遍（`bit_tab` 查表、无符号
+    // 码本的符号位计数、escape 的位数），而 `band_cost` 从来只看失真
+    // （`let (_bits, dist) = ...`）：位数是 `write_band` 写位流时自己算的。白算。
     let mut best: Option<(f32, u8)> = None;
-    for cb in 1..=11usize {
-        let (_bits, dist) = band_code(band, sf, cb, qu);
+    for cb in [1usize, 3, 5, 7, 9, CB_ESC] {
+        let dist = band_dist(band, sf, cb, qu);
         if best.is_none_or(|(bc, _)| dist < bc) {
             best = Some((dist, cb as u8));
         }
@@ -1597,14 +1607,18 @@ fn band_cost(band: &[f32], sf: u8, qu: &mut Vec<i32>) -> (f32, u8) {
     }
 }
 
-/// 用一个具体码本量化 + 编码一个频带，返回 `(位数, 平方失真)`。
+/// 一个频带在**某个码本的封顶值**下的平方失真（**不算位数**）。
 ///
-/// 这是**唯一**决定「解出来是什么」的地方 —— 编码和失真必须用同一套量化值，
-/// 否则「代价最小」选出来的那个 sf 解出来不是你以为的东西。
+/// 这是代价模型的核心：编码器按它选 `sf` 与码本，所以它必须与解码端算同一个值
+/// （见下面「符号要带」那条）。
 ///
-/// `qu` 是**不封顶**的量化值（`band_cost` 里一次算好、11 本码本共用）：
-/// 每个码本要的 `q` 就是 `qu[j].min(maxval)` —— 与各自重算逐位相同。
-fn band_code(band: &[f32], sf: u8, cb: usize, qu: &[i32]) -> (u32, f32) {
+/// ⚠️ **只算失真**：位数由 `write_band` 写位流时自己算 —— 旧版在这里也算了一遍
+/// （`bit_tab` 查表、无符号码本的符号位计数、escape 的位数），而 `band_cost`
+/// 从来只看失真（`let (_bits, dist) = ...`）。白算。
+///
+/// `qu` 是**不封顶**的量化值（`band_cost` 里一次算好、六次求值共用）：
+/// 每个封顶值要的 `q` 就是 `qu[j].min(maxval)` —— 与各自重算逐位相同。
+fn band_dist(band: &[f32], sf: u8, cb: usize, qu: &[i32]) -> f32 {
     let dim = CB_DIM[cb];
     // ⚠️ 前提：频带长度是**码本维度的整数倍**。AAC 的 swb 频带宽度都是 4 的倍数
     // （长窗、短窗都一样），所以真实调用方一定满足；但少了这条断言，
@@ -1613,13 +1627,13 @@ fn band_code(band: &[f32], sf: u8, cb: usize, qu: &[i32]) -> (u32, f32) {
     debug_assert_eq!(qu.len(), band.len());
     let maxval = i32::from(CB_MAXVAL[cb]);
     let unsigned = CB_UNSIGNED[cb];
-    let bit_tab = &tables::SPECTRAL_BITS[cb - 1];
     let size = tables::SPECTRAL_SIZE[cb - 1] as usize;
     let vecs = tables::CODEBOOK_VECTORS[cb - 1];
+    // ⚠️ `iq(sf)` **提到循环外**：它只跟 `sf` 有关（是个 `exp()`），
+    // 原来写在逐系数的循环里 —— 那是每个系数一次超越函数。
+    let iq_sf = f64::from(iq(sf));
 
-    let mut bits = 0u32;
     let mut dist = 0f32;
-
     for (ci, chunk) in band.chunks(dim).enumerate() {
         let q0 = ci * dim;
         // 量化这一组（`qu` 不封顶，各码本只差一个封顶）。
@@ -1637,44 +1651,23 @@ fn band_code(band: &[f32], sf: u8, cb: usize, qu: &[i32]) -> (u32, f32) {
         if curidx >= size {
             // 索引越界说明这一组量化超了码本能表示的范围 —— 用一个「必然不优」
             // 的极大代价把它排除掉（而不是 panic：穷举 sf 时会大量出现这种情况）。
-            return (u32::MAX / 2, f32::MAX / 2.0);
+            return f32::MAX / 2.0;
         }
-
-        let mut nbits = u32::from(bit_tab[curidx]);
-        // 无符号码本要**逐维**写符号位（非零才写）。
-        if unsigned {
-            for j in 0..dim {
-                if vecs[curidx * dim + j] != 0 {
-                    nbits += 1;
-                }
-            }
-        }
-        // escape 码本：矢量里 `64` 的位置要额外写。
-        //
-        // ⚠️ 那个「真实值」**位数一趟、反量化一趟都要用**（`escape_coef` 里有一次
-        // `quant_one`）—— 旧版算了两遍。这里每组只算一次。
+        // escape 码本：矢量里 `64` 的位置要用那 13 位的真实值（幅值）。
         let mut esc = [0i32; 4];
         if cb == CB_ESC {
             for j in 0..dim {
                 if vecs[curidx * dim + j] == 64 {
                     // `escape_coef` = 同一个量化值封顶到 8191（`2^13 - 1`）。
                     esc[j] = qu[q0 + j].min((1 << 13) - 1);
-                    nbits += escape_bits(esc[j]);
                 }
             }
         }
-        bits += nbits;
-
-        // 失真：用码本矢量反量化后的值与原值比。
-        //
-        // ⚠️ `iq(sf)` **提到循环外**：它只跟 `sf` 有关（是个 `exp()`），
-        // 原来写在逐系数的循环里 —— 那是每个系数一次超越函数。
-        let iq_sf = f64::from(iq(sf));
         for j in 0..dim {
             let v = f64::from(vecs[curidx * dim + j]);
-            // ⚠️ **符号要带**：escape 码本是无符号的，符号位由上面那条「逐维写符号」
-            // 单独发出（`write_band` 同款），解码端会把符号乘回去 —— 代价模型必须
-            // 与解码端算同一个值。
+            // ⚠️ **符号要带**：escape 码本是无符号的，符号位由「逐维写符号」单独发出
+            // （`write_band` 同款），解码端会把符号乘回去 —— 代价模型必须与解码端
+            // 算同一个值。
             //
             // 这里曾经漏掉 escape 那一路的符号（只写 `dequant_one(esc[j], sf)`，是个幅值），
             // 于是负系数的误差被估成 `(|c| + rec)²` 量级 —— 编码器**系统性避开 escape**，
@@ -1692,7 +1685,7 @@ fn band_code(band: &[f32], sf: u8, cb: usize, qu: &[i32]) -> (u32, f32) {
             dist += (d * d) as f32;
         }
     }
-    (bits, dist)
+    dist
 }
 
 /// escape 值的量化 —— 照 `aaccoder.c`：
@@ -1705,20 +1698,6 @@ fn band_code(band: &[f32], sf: u8, cb: usize, qu: &[i32]) -> (u32, f32) {
 /// 纯正弦那种稀疏频谱测不出来。实测在真样本整段转换上撞到的就是这个。
 fn escape_coef(a: f32, q34: f32) -> i32 {
     quant_one(a, q34, (1 << 13) - 1).min((1 << 13) - 1)
-}
-
-/// escape 序列占多少位（照 `aaccoder.c` 的 `put_bits` 数）。
-///
-/// `len = av_log2(coef)`；两个字段：`len - 4 + 1` 位的长度前缀 + `len` 位的值。
-///
-/// ⚠️ **没有 `len < 5` 的特例** —— ffmpeg 的编码端就是直算 `len - 4 + 1`。
-/// 我一开始给它加了个「`len <= 4` 就只写一个 0 位」的分支，那是**错的**：
-/// 解码端读到 0 个前导 1 会 `b += 4` 变成 4，然后去读 4 位低位，
-/// 而编码端只写了 1 位 —— 整条位流从这里开始错位。
-fn escape_bits(coef: i32) -> u32 {
-    let len = av_log2(coef);
-    debug_assert!(len >= 4, "escape 的 coef 至少 16（{coef}）");
-    (len - 4 + 1) + len
 }
 
 /// 写一个 escape 序列。
@@ -2082,6 +2061,23 @@ mod tests {
                 "第 {i} 帧：单声道下线程数不该影响输出"
             );
         }
+    }
+
+    /// escape 序列占多少位（照 `aaccoder.c` 的 `put_bits` 数）。
+    ///
+    /// `len = av_log2(coef)`；两个字段：`len - 4 + 1` 位的长度前缀 + `len` 位的值。
+    ///
+    /// ⚠️ **没有 `len < 5` 的特例** —— ffmpeg 的编码端就是直算 `len - 4 + 1`。
+    /// 我一开始给它加了个「`len <= 4` 就只写一个 0 位」的分支，那是**错的**：
+    /// 解码端读到 0 个前导 1 会 `b += 4` 变成 4，然后去读 4 位低位，
+    /// 而编码端只写了 1 位 —— 整条位流从这里开始错位。
+    ///
+    /// 生产代码里只有 oracle 需要它：`band_dist` 不算位数（位数由 `write_band` 在写
+    /// 位流时自己算），而参考实现要按老样子把位数也数一遍。
+    fn escape_bits(coef: i32) -> u32 {
+        let len = av_log2(coef);
+        debug_assert!(len >= 4, "escape 的 coef 至少 16（{coef}）");
+        (len - 4 + 1) + len
     }
 
     /// **优化前**的 `band_code`：每个码本**各自重算**量化。留在这里当 oracle。
