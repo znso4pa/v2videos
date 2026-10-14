@@ -71,8 +71,8 @@
 //! 所以每帧重建与跨帧复用**结果相同** —— 重建更省心，也就没有跨帧脏状态可错。
 
 use v2v_msmpeg4::{
-    fdct, fdct_i, idct_add, idct_put, mc_chroma8, mc_luma16, mc_mb, mc_params, mid_pred, BitWriter,
-    Error, Frame, Planes, Result, RlTable, ZIGZAG,
+    fdct, fdct_i, idct_add, idct_put, mc_chroma8, mc_luma16, mc_mb, mc_params, mid_pred,
+    sad_luma16, BitWriter, Error, Frame, Planes, Result, RlTable, ZIGZAG,
 };
 
 use crate::header::{
@@ -904,64 +904,10 @@ impl PState<'_> {
             if let Some(v) = cache.get(mv.0, mv.1) {
                 return v;
             }
+            // 插值与 SAD 的融合版住在共享内核里（`sad_luma16`）—— 与 MP43 编码器
+            // 用的是同一份，不是各写一份。
             let p = mc_params(mbx, mby, mv, pw, ph);
-            // **整像素、且不用边缘复制**时，参考块就是参考帧里的一个 16×16 矩形：
-            // 直接算 SAD，省掉「先 `mc_luma16` 拷进 `tmp` 再读出来」的两趟内存流量。
-            // 值与原路径**逐位相同**（`dxy == 0` 时 `put_pixels` 就是纯拷贝）。
-            let acc = if !p.need_emu {
-                // 插值与 SAD **融合**：不再「先 `mc_luma16` 写进 `tmp`、再读出来求和」。
-                // 公式与 `put_pixels` 逐字相同（`NO_ROUNDING = false` → `r1 = 1, r2 = 2`），
-                // 所以**值逐位相同、输出逐字节不变** —— 只是省掉一趟写 + 一趟读。
-                //
-                // ⚠️ 越界（`need_emu`）那条路仍然走 `mc_luma16`（它要边缘复制）。
-                let base = p.src_y as usize * pw + p.src_x as usize;
-                let (hx, hy) = (p.dxy & 1 != 0, p.dxy & 2 != 0);
-                let mut acc = 0u64;
-                // ⚠️ 切片长度必须跟着**相位**走：横向半像素（`hx`）才多读一格
-                // （`src_x + 16`），纵向半像素（`hy`）才碰下一行。`need_emu` 的边界
-                // 正是按这个定的 —— 无条件多切一格会在「最后一行 + 最后一列」越界 panic
-                // （踩过一次：整像素纵向时 `src_y + 16` 正好是平面末尾）。
-                let w = if hx { 17 } else { 16 };
-                if hy {
-                    for r in 0..16usize {
-                        let top = &refp.y[base + r * pw..base + r * pw + w];
-                        let bot = &refp.y[base + (r + 1) * pw..base + (r + 1) * pw + w];
-                        for c in 0..16usize {
-                            let v = if hx {
-                                (top[c] as u32
-                                    + top[c + 1] as u32
-                                    + bot[c] as u32
-                                    + bot[c + 1] as u32
-                                    + 2)
-                                    >> 2
-                            } else {
-                                (top[c] as u32 + bot[c] as u32 + 1) >> 1
-                            };
-                            acc += (cur[r * 16 + c] as i32 - v as i32).unsigned_abs() as u64;
-                        }
-                    }
-                } else {
-                    for r in 0..16usize {
-                        let top = &refp.y[base + r * pw..base + r * pw + w];
-                        for c in 0..16usize {
-                            let v = if hx {
-                                (top[c] as u32 + top[c + 1] as u32 + 1) >> 1
-                            } else {
-                                top[c] as u32
-                            };
-                            acc += (cur[r * 16 + c] as i32 - v as i32).unsigned_abs() as u64;
-                        }
-                    }
-                }
-                acc
-            } else {
-                mc_luma16(&mut tmp, 16, 0, 0, refp, &p, NO_ROUNDING);
-                let mut a = 0u64;
-                for i in 0..256usize {
-                    a += (cur[i] as i32 - tmp[i] as i32).unsigned_abs() as u64;
-                }
-                a
-            };
+            let acc = sad_luma16(&cur, refp, &p, NO_ROUNDING, &mut tmp);
             cache.put(mv.0, mv.1, acc);
             acc
         };
