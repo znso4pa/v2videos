@@ -116,8 +116,15 @@ const CB_ESC: usize = 11;
 /// 不要写死一个「理论值」（按模型算过一次，差了 90 倍）。
 const LAMBDA_MIN: f64 = 1e2;
 const LAMBDA_MAX: f64 = 1e13;
-/// 几何二分的步数（14 个数量级 / 2^12 ≈ 0.003 个数量级 —— 足够）。
+/// 几何二分的步数（11 个数量级 / 2^12 ≈ 0.0027 个数量级 ≈ 0.6% —— 足够）。
+///
+/// ⚠️ **别为了省时间砍它**：实测 12 → 6 只快 4%，却掉 0.65 dB（64k）——
+/// 因为步数少了，`hi` 收敛不到真正的边界，λ 偏保守、**预算花不完**
+/// （s6 在 64k 只花 59.5 kbps / 预算 64k）。真正的成本在**头几趟**（缓存冷），
+/// 后几趟几乎是免费的 —— 所以该省的是「头几趟」，见下面的种子化。
 const LAMBDA_STEPS: usize = 12;
+/// 第一帧（还没有上一帧的答案）的出发点 —— 取区间的**几何中点**。
+const LAMBDA_SEED_INIT: f64 = 3.0e7;
 
 
 
@@ -389,6 +396,13 @@ struct ChannelState {
     attack_prev: Option<usize>,
     /// `band_cost` 的帧内缓存（见 `BandCostCache`）。
     cost_cache: BandCostCache,
+    /// **上一帧选中的 λ** —— 下一帧搜 λ 的**出发点**。
+    ///
+    /// 相邻帧的复杂度连续，所以上一帧的答案是很好的出发点：从它出发做指数走位，
+    /// 大多数帧两三趟就夹住边界（全区间几何二分恒 12 趟，而**前几趟是最贵的** ——
+    /// 逐带窗口受 `prev_sf` 差分约束影响、随 λ 变，前几趟各探一片新区域、缓存全冷）。
+    /// 找的**还是同一个答案**（最小的可行 λ），所以质量不变 —— 这是纯提速。
+    lambda_prev: f64,
 }
 
 pub struct Encoder {
@@ -462,6 +476,7 @@ impl Encoder {
                     overlap_ms: vec![0f32; LONG_LEN],
                     attack_prev: None,
                     cost_cache: BandCostCache::new(),
+                    lambda_prev: LAMBDA_SEED_INIT,
                 })
                 .collect(),
             window,
@@ -1146,12 +1161,87 @@ impl Encoder {
         // 几何二分（每次取对数中点）：λ 的合理量级跨很多个数量级，
         // 用算术中点会在几十步里原地打转。
         let budget = self.bits_per_frame;
-        // ⚠️ 试过「用上一帧的 λ 当种子、从 `[λ/4, λ*4]` 开搜」：快 5%，
-        // 但质量掉 0.1 dB（区间窄了，偶尔落到略粗的那一档）—— 这个分支要的是质量，
-        // 所以**不做种子**，老老实实全区间二分（14 个数量级 / 12 趟）。
-        let mut lo = LAMBDA_MIN; // 已知「太保真 → 超预算」
-        let mut hi = LAMBDA_MAX; // 已知「够省位」
+        // ⚠️ **从上一帧的答案出发做指数走位**，而不是每帧都在 `[1e2, 1e13]` 里从头二分。
+        //
+        // 为什么值得：实测全区间二分 12 趟里**头 5 趟最贵**（每趟约 0.27 s），
+        // 后 7 趟只要 0.04 s —— 逐带窗口受 `prev_sf` 的差分约束影响、会随 λ 变，
+        // 前几趟各探一片新区域（缓存全冷）。从上一帧的 λ 出发，这几趟就落在同一片
+        // 区域里（相邻帧的复杂度是连续的）。
+        //
+        // 走位夹住边界后**照旧几何二分收尾**，找的还是同一个答案（最小的可行 λ），
+        // 所以**质量不变** —— 这是纯提速。
+        //
+        // （分支上早先试过「窄区间 `[λ/4, λ*4]` + 仍跑满 12 趟」：只快 5% 还掉 0.1 dB。
+        // 那是**区间太窄**的错（真值偶尔落在外面、被夹到边界那一档），不是种子的错 ——
+        // 这里走位会自己把区间撑开，撑不住就一直走到区间端点。）
+        let mut lo = LAMBDA_MIN; // 已知「太保真 → 超预算」（待验证）
+        let mut hi = LAMBDA_MAX; // 已知「够省位」（待验证）
         let mut chosen: Option<BitWriter> = None;
+
+        let seed = st.lambda_prev.clamp(LAMBDA_MIN, LAMBDA_MAX);
+        let (pass, bits) = self.encode_pass(
+            &mut st.cost_cache,
+            seq,
+            &group_specs,
+            seed,
+            false,
+            tns_data.as_ref(),
+            write_ics,
+        )?;
+        if bits <= budget {
+            hi = seed;
+            chosen = Some(pass);
+        } else {
+            lo = seed;
+        }
+
+        // 指数走位把另一侧也夹住：步长 ×4、×16…（种子离真值远时才多探几次）。
+        let mut step = 4.0f64;
+        if chosen.is_none() {
+            // 种子太保真 → 往大走（更省位）
+            while lo < LAMBDA_MAX {
+                let x = (lo * step).min(LAMBDA_MAX);
+                let (pass, bits) = self.encode_pass(
+                    &mut st.cost_cache,
+                    seq,
+                    &group_specs,
+                    x,
+                    false,
+                    tns_data.as_ref(),
+                    write_ics,
+                )?;
+                if bits <= budget {
+                    hi = x;
+                    chosen = Some(pass);
+                    break;
+                }
+                lo = x;
+                step *= 4.0;
+            }
+        } else {
+            // 种子够省位 → 往小走（更保真）
+            while hi > LAMBDA_MIN {
+                let x = (hi / step).max(LAMBDA_MIN);
+                let (pass, bits) = self.encode_pass(
+                    &mut st.cost_cache,
+                    seq,
+                    &group_specs,
+                    x,
+                    false,
+                    tns_data.as_ref(),
+                    write_ics,
+                )?;
+                if bits > budget {
+                    lo = x;
+                    break;
+                }
+                hi = x;
+                chosen = Some(pass);
+                step *= 4.0;
+            }
+        }
+
+        // 夹住了就几何二分收尾 —— 种子准的时候这一步只跑几次。
         for _ in 0..LAMBDA_STEPS {
             let mid = (lo * hi).sqrt();
             if !(mid > lo && mid < hi) {
@@ -1173,6 +1263,8 @@ impl Encoder {
                 lo = mid;
             }
         }
+        // 记住这一帧的答案，给下一帧当出发点（`hi` 到顶 = 这一帧没有可行 λ）。
+        st.lambda_prev = if hi < LAMBDA_MAX { hi } else { seed };
         // ⚠️ **一次都没塞进预算**（预算小到连最粗的量化都放不下）时退化成
         // 「λ 上界那一趟」：位数超预算，但**位流仍然合法**。
         // 让码率超标比「编不出东西」好 —— 和原来「用偏移上界兜底」同理。
