@@ -669,6 +669,8 @@ impl Encoder {
     ) -> crate::Result<Vec<(BitWriter, bool)>> {
         let n = self.cfg.channels as usize;
         let threads = self.cfg.threads.min(n).max(1);
+        // 这一帧的总预算，按**每个声道需要多少**分下去（不是平均分）。
+        let budgets = channel_budgets(coded, self.bits_per_frame * n as u32);
 
         // ---- 重叠历史：**两套都往下更新**，再挑出本帧要用的那一套 ----
         //
@@ -703,6 +705,7 @@ impl Encoder {
                     plan,
                     ch,
                     write_ics,
+                    budgets[ch],
                 )?;
                 out.push((w, short));
             }
@@ -720,12 +723,13 @@ impl Encoder {
         let (r0, r1) = std::thread::scope(|scope| {
             let h = scope.spawn(|| {
                 let mut w = BitWriter::new();
-                let short = self.encode_channel(&mut a[0], &mut w, p0, h0, plan, 0, write_ics)?;
+                let short =
+                    self.encode_channel(&mut a[0], &mut w, p0, h0, plan, 0, write_ics, budgets[0])?;
                 Ok::<_, Error>((w, short))
             });
             let mut w1 = BitWriter::new();
             let r1 = self
-                .encode_channel(&mut b[0], &mut w1, p1, h1, plan, 1, write_ics)
+                .encode_channel(&mut b[0], &mut w1, p1, h1, plan, 1, write_ics, budgets[1])
                 .map(|short| (w1, short));
             (h.join(), r1)
         });
@@ -1019,6 +1023,7 @@ impl Encoder {
         plan: &WindowPlan,
         ch: usize,
         write_ics: bool,
+        budget: u32,
     ) -> crate::Result<bool> {
         // ---- 1. 攒 2N 个样本 → 开窗 → MDCT ----
         //
@@ -1168,7 +1173,6 @@ impl Encoder {
         //
         // 几何二分（每次取对数中点）：λ 的合理量级跨很多个数量级，
         // 用算术中点会在几十步里原地打转。
-        let budget = self.bits_per_frame;
         // ⚠️ **从上一帧的答案出发做指数走位**，而不是每帧都在 `[1e2, 1e13]` 里从头二分。
         //
         // 为什么值得：实测全区间二分 12 趟里**头 5 趟最贵**（每趟约 0.27 s），
@@ -1310,6 +1314,60 @@ impl Encoder {
         w.append(&pass);
         Ok(short)
     }
+}
+
+/// 一个声道「需要多少位」的**廉价估计**：`Σ|c|^0.75`。
+///
+/// 用 `x^0.75` 而不是能量（`x²`）或绝对值：`x^0.75` 正好是量化器作用的那一维
+/// （`quant_one` 就是这个），所以它比能量更贴近「要花多少位」—— 能量会被最大的
+/// 那几个系数主导，而位数是**对数**域的。两次硬件开方、一个系数一次，
+/// 相对后面每帧几万次码本查表可以忽略。
+fn channel_mass(x: &[f32]) -> f64 {
+    x.iter()
+        .map(|&c| {
+            let a = f64::from(c).abs();
+            let r = a.sqrt();
+            r * r.sqrt()
+        })
+        .sum()
+}
+
+/// 把这一帧的总预算**按每个声道需要多少**分下去，而不是平均分。
+///
+/// ## 为什么不能平均分（实测）
+///
+/// M/S 立体声下两个声道的**信息量差得很远**。最极端的是「单声道源复制成两轨」
+/// （老 `.wmv` 里很常见）：`S = (L−R)/2 = 0`，它一位都用不上 —— 可平均分还是
+/// 把它那一半扣着，于是**总码率只能到目标的一半**。
+///
+/// 同一份素材、目标 384k：平均分只花掉 171 kbps（45%）、SNR 21.17 dB；
+/// 把预算加倍（等于让 `M` 拿到全部）之后花掉 388 kbps、SNR **34.97 dB**。
+///
+/// 真音乐上两个声道本来就都用满 ~99%，所以这个改动对它**基本中性**
+/// （实测 320k / 384k / 768k 三个点上的差别在 0.05 dB 以内）。
+///
+/// ## 保底
+///
+/// 每个声道至少分到 `FLOOR × 最重的那个声道` 的量 —— 不给任何声道分 0：
+/// `S` 哪怕一模一样也还要写几十位的头。
+fn channel_budgets(coded: &[Vec<f32>], total: u32) -> Vec<u32> {
+    let n = coded.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let masses: Vec<f64> = coded.iter().map(|c| channel_mass(c)).collect();
+    let max = masses.iter().cloned().fold(0.0f64, f64::max);
+    if !(max > 0.0) {
+        // 整帧全静音：平均分（怎么分都一样）。
+        return vec![total / n as u32; n];
+    }
+    const FLOOR: f64 = 0.05;
+    let weights: Vec<f64> = masses.iter().map(|&m| m + FLOOR * max).collect();
+    let sum: f64 = weights.iter().sum();
+    weights
+        .iter()
+        .map(|&w| ((f64::from(total) * w / sum).max(1.0)) as u32)
+        .collect()
 }
 
 /// **瞬态攻击检测**：返回攻击落在哪个子块（`None` = 没有攻击）。
