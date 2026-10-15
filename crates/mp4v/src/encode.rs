@@ -18,7 +18,8 @@
 //! ## I 帧的处理顺序（每一步的顺序都是语法的一部分，不能换）
 //!
 //! ```text
-//! 1. 6 个块各做正向 DCT → 量化（DC 用 dc_scale，AC 用 H.263 的 qmul/qadd）
+//! 1. 6 个块各做正向 DCT → 量化（DC 用 dc_scale；AC 按 `quant_type`：
+//!    H.263 平坦步长 / MPEG 逐系数矩阵，见 `Quant`）
 //! 2. **先**把 6 个块的 DC 预测全部算完（`ff_mpeg4_pred_dc`）—— 它会**就地更新** DC 网格，
 //!    而块 1/2/3 要读块 0 刚写进去的值，所以必须按 n = 0,1,2,3,4,5 顺序走
 //! 3. AC 预测（可选，见下）—— 同样按 n 顺序走，因为块 1 要读块 0 的 ac_val
@@ -133,6 +134,10 @@ pub struct EncoderConfig {
     pub bitrate: Option<u32>,
     /// 要不要逐宏块试 AC 预测（见模块文档）。默认开。
     pub ac_pred: bool,
+    /// VOL 的 `quant_type`（见 `Quant`）。默认**开** —— 实测同码率下
+    /// PSNR 持平而 SSIM / XPSNR / VMAF 都更高（默认矩阵就是对比敏感度曲线：
+    /// 高频粗量化，人眼看不出来）。关掉退回 H.263 的平坦步长。
+    pub mpeg_quant: bool,
     /// **周期 I 帧间隔**（帧数）。`0` = 只首帧是 I（默认，与「全 I 帧」行为一致）。
     ///
     /// 开着的意义：P 帧只参考前一帧，误差会累积（漂移）；周期 I 帧还能让播放器 seek。
@@ -155,6 +160,7 @@ impl Default for EncoderConfig {
             qscale: 4,
             bitrate: None,
             ac_pred: true,
+            mpeg_quant: true,
             keyframe_interval: 0,
             low_delay: true,
             profile_and_level: PROFILE_SIMPLE_LEVEL1,
@@ -349,6 +355,7 @@ impl Encoder {
                 height: self.cfg.height,
                 fps_num: self.cfg.fps_num,
                 low_delay: self.cfg.low_delay,
+                mpeg_quant: self.cfg.mpeg_quant,
             },
         );
     }
@@ -393,9 +400,7 @@ impl Encoder {
         let (py, pu, pv) = pad_planes(frame, pw, ph);
 
         let qscale = self.cur_qscale;
-        let q = i32::from(qscale);
-        let qmul = q << 1;
-        let qadd = (q - 1) | 1;
+        let quant = Quant::new(qscale, self.cfg.mpeg_quant);
         let y_dc_scale = i32::from(tables::Y_DC_SCALE[qscale as usize]);
         let c_dc_scale = i32::from(tables::C_DC_SCALE[qscale as usize]);
 
@@ -439,7 +444,7 @@ impl Encoder {
                     let (plane, stride, px, py) = block_at(&py, &pu, &pv, pw, mbx, mby, n);
                     let mut coeff = [0i32; 64];
                     fdct(&plane[py * stride + px..], stride, &mut coeff);
-                    quantize_block(&mut coeff, n, qmul, qadd, y_dc_scale, c_dc_scale);
+                    quantize_block(&mut coeff, n, &quant, y_dc_scale, c_dc_scale);
                     *slot = coeff;
                 }
 
@@ -469,7 +474,7 @@ impl Encoder {
 
                 // ---- 6. 重建（AC 预测不影响重建 —— 解码端会把预测加回来）----
                 reconstruct_intra(
-                    &mut cur, mbx, mby, &blocks, qmul, qadd, y_dc_scale, c_dc_scale,
+                    &mut cur, mbx, mby, &blocks, &quant, y_dc_scale, c_dc_scale,
                 );
             }
         }
@@ -497,8 +502,7 @@ impl Encoder {
         let (sy, su, sv) = pad_planes(frame, pw, ph);
 
         let qscale = self.cur_qscale;
-        let q = i32::from(qscale);
-        let (qmul, qadd) = (q << 1, (q - 1) | 1);
+        let quant = Quant::new(qscale, self.cfg.mpeg_quant);
         let y_dc_scale = i32::from(tables::Y_DC_SCALE[qscale as usize]);
         let c_dc_scale = i32::from(tables::C_DC_SCALE[qscale as usize]);
 
@@ -536,8 +540,7 @@ impl Encoder {
             pw,
             mb_w,
             mb_h,
-            qmul,
-            qadd,
+            quant,
             y_dc_scale,
             c_dc_scale,
             use_ac_pred: self.cfg.ac_pred,
@@ -822,8 +825,8 @@ struct PState<'a> {
     pw: usize,
     mb_w: usize,
     mb_h: usize,
-    qmul: i32,
-    qadd: i32,
+    /// 本帧的量化规则（含逐系数步长）。
+    quant: Quant,
     y_dc_scale: i32,
     c_dc_scale: i32,
     use_ac_pred: bool,
@@ -1026,8 +1029,7 @@ impl PState<'_> {
             quantize_block(
                 &mut coeff,
                 n,
-                self.qmul,
-                self.qadd,
+                &self.quant,
                 self.y_dc_scale,
                 self.c_dc_scale,
             );
@@ -1097,7 +1099,7 @@ impl PState<'_> {
             let mut coef = [0i32; 64];
             fdct_i(&res, 8, &mut coef);
             for (k, v) in coef.iter().enumerate() {
-                slot[k] = quantize_ac(*v, self.qmul, self.qadd);
+                slot[k] = self.quant.quantize(k, *v, false);
             }
         }
         let cbp_i = inter_cbp(&qb);
@@ -1143,8 +1145,7 @@ impl PState<'_> {
                 mbx,
                 mby,
                 &ib,
-                self.qmul,
-                self.qadd,
+                &self.quant,
                 self.y_dc_scale,
                 self.c_dc_scale,
             );
@@ -1165,7 +1166,7 @@ impl PState<'_> {
             } else {
                 self.mv[mby * self.mb_w + mbx] = mv;
                 mc_mb(&mut self.cur, self.refp, mbx, mby, mv, NO_ROUNDING);
-                reconstruct_inter(&mut self.cur, mbx, mby, &qb, self.qmul, self.qadd);
+                reconstruct_inter(&mut self.cur, mbx, mby, &qb, &self.quant);
             }
         }
         Ok(())
@@ -1204,14 +1205,130 @@ fn recon_at(cur: &mut Planes, n: usize, mbx: usize, mby: usize) -> (&mut [u8], u
     }
 }
 
-/// 反量化（帧内 AC 与帧间通用）：`level > 0 → level*qmul + qadd`，反之减。
-fn dequant(level: i32, qmul: i32, qadd: i32) -> i16 {
-    if level > 0 {
-        (level * qmul + qadd) as i16
-    } else if level < 0 {
-        (level * qmul - qadd) as i16
-    } else {
-        0
+/// 量化/反量化的规则 —— 对应 VOL 里的 `quant_type`。
+///
+/// - **H.263**（`quant_type = 0`）：平坦步长，`qmul = 2q`、`qadd = (q-1)|1`，
+///   反量化是 `level*qmul ± qadd`（与 MP43 同一个式子）。
+/// - **MPEG**（`quant_type = 1`）：逐系数乘**规范默认矩阵**
+///   （`tables::DEFAULT_INTRA_MATRIX` / `DEFAULT_INTER_MATRIX`，自然序）：
+///   帧内 `(|level|·2q·W) >> 4`、帧间 `((2|level|+1)·2q·W) >> 5`。
+///   两者都是「先取绝对值、截断（算术右移）、最后补符号」——
+///   与 ffmpeg 的 `dct_unquantize_mpeg2_*` 逐位一致。
+///
+/// 帧内 DC 两种量化都用 `dc_scale`（解码端 `block[0] *= dc_scale`），由调用方单独处理。
+///
+/// ## ⚠️ 帧间的**失配控制**（MPEG 量化独有）
+///
+/// 把 64 个反量化值求和（初值 −1），是奇数就把**下标 63** 的最低位翻一下。
+/// 解码端的 `dct_unquantize_mpeg2_inter_c` 无条件做这一步，我们少做一次，
+/// 重建就每块差一位 —— P 帧会一帧帧累积成漂移。
+///
+/// ## 为什么这一项值得做（实测，见 TODO）
+///
+/// 默认矩阵就是一条对比敏感度曲线（高频步长最大到低频的 5 倍），
+/// 同码率下 PSNR 持平而 SSIM / XPSNR / VMAF 都更高。它属于「权重在**单元内部**
+/// 逐频率变化」那一类 —— 不受「逐块常数加权是 no-op」那条结论的限制。
+pub(crate) struct Quant {
+    mpeg: bool,
+    /// H.263 的两个常数（MPEG 时不用）。
+    qmul: i32,
+    qadd: i32,
+    /// 逐系数步长 `2q·W[k]`（自然序）。MPEG 时用。
+    intra_step: [i32; 64],
+    inter_step: [i32; 64],
+}
+
+impl Quant {
+    fn new(qscale: u8, mpeg: bool) -> Self {
+        let q = i32::from(qscale);
+        let mut intra_step = [0i32; 64];
+        let mut inter_step = [0i32; 64];
+        for k in 0..64 {
+            intra_step[k] = 2 * q * i32::from(tables::DEFAULT_INTRA_MATRIX[k]);
+            inter_step[k] = 2 * q * i32::from(tables::DEFAULT_INTER_MATRIX[k]);
+        }
+        Self {
+            mpeg,
+            qmul: q << 1,
+            qadd: (q - 1) | 1,
+            intra_step,
+            inter_step,
+        }
+    }
+
+    fn step(&self, k: usize, intra: bool) -> i32 {
+        if intra {
+            self.intra_step[k]
+        } else {
+            self.inter_step[k]
+        }
+    }
+
+    /// 反量化一个 AC（帧间含下标 0）系数。`k` 是**自然序**下标。
+    fn dequant(&self, k: usize, level: i32, intra: bool) -> i32 {
+        if level == 0 {
+            return 0;
+        }
+        if !self.mpeg {
+            return if level > 0 {
+                level * self.qmul + self.qadd
+            } else {
+                level * self.qmul - self.qadd
+            };
+        }
+        let step = self.step(k, intra);
+        let v = if intra {
+            (level.abs() * step) >> 4
+        } else {
+            ((2 * level.abs() + 1) * step) >> 5
+        };
+        if level < 0 {
+            -v
+        } else {
+            v
+        }
+    }
+
+    /// `dequant` 的逆：取让重建值离 `f` 最近的 `level`。
+    fn quantize(&self, k: usize, f: i32, intra: bool) -> i32 {
+        if f == 0 {
+            return 0;
+        }
+        if !self.mpeg {
+            // 与旧路逐位相同（`quantize_ac`）。
+            return if f > 0 {
+                div_round(f - self.qadd, self.qmul).max(0)
+            } else {
+                div_round(f + self.qadd, self.qmul).min(0)
+            };
+        }
+        let step = self.step(k, intra);
+        let v = if intra {
+            // 帧内：重建电平在 `step/16` 的整数倍上 —— 四舍五入到最近的。
+            div_round(f.abs() * 16, step)
+        } else {
+            // 帧间：重建电平在 `step/32` 的**奇数**倍上（`(2|level|+1)`），
+            // 所以最近的合法电平是 `round((|f|·32/step − 1)/2)`，
+            // 也就是下面这个整数式（`step` 那一项就是那个 −1）。
+            div_round(f.abs() * 32 - step, 2 * step).max(0)
+        };
+        if f < 0 {
+            -v
+        } else {
+            v
+        }
+    }
+
+    /// 帧间块的失配控制（只有 `quant_type = 1` 做，见结构体文档）。
+    fn mismatch_control(&self, rb: &mut [i16; 64]) {
+        if !self.mpeg {
+            return;
+        }
+        let mut sum = -1i32;
+        for v in rb.iter() {
+            sum += i32::from(*v);
+        }
+        rb[63] ^= (sum & 1) as i16;
     }
 }
 
@@ -1223,8 +1340,7 @@ fn reconstruct_intra(
     mbx: usize,
     mby: usize,
     blocks: &[[i32; 64]; 6],
-    qmul: i32,
-    qadd: i32,
+    quant: &Quant,
     y_dc_scale: i32,
     c_dc_scale: i32,
 ) {
@@ -1233,7 +1349,7 @@ fn reconstruct_intra(
         let mut rb = [0i16; 64];
         rb[0] = (blocks[n][0] * scale) as i16;
         for k in 1..64 {
-            rb[k] = dequant(blocks[n][k], qmul, qadd);
+            rb[k] = quant.dequant(k, blocks[n][k], true) as i16;
         }
         let (plane, stride) = recon_at(cur, n, mbx, mby);
         idct_put(&mut rb, plane, stride);
@@ -1246,14 +1362,14 @@ fn reconstruct_inter(
     mbx: usize,
     mby: usize,
     blocks: &[[i32; 64]; 6],
-    qmul: i32,
-    qadd: i32,
+    quant: &Quant,
 ) {
     for n in 0..6 {
         let mut rb = [0i16; 64];
         for (k, slot) in rb.iter_mut().enumerate() {
-            *slot = dequant(blocks[n][k], qmul, qadd);
+            *slot = quant.dequant(k, blocks[n][k], false) as i16;
         }
+        quant.mismatch_control(&mut rb);
         let (plane, stride) = recon_at(cur, n, mbx, mby);
         idct_add(&mut rb, plane, stride);
     }
@@ -1272,21 +1388,20 @@ fn has_ac(block: &[i32; 64], scan: &[u8; 64]) -> bool {
 ///   解码端 `block[0] *= dc_scale` 再进 IDCT（`mpegvideo.c:210`），
 ///   而我们的 `fdct` 给的是 `F(0,0) = 8 × 均值`，所以 `level = 8×均值 / dc_scale`
 ///   正好还原 —— `dc_scale` 最小是 8，`level` 落在 `[0, 255]`。
-/// - **AC**：H.263 量化，`level` 使 `level*qmul ± qadd` 最接近 `F`。
-///   和 MP43 是同一个式子（`qmul = 2*qscale`、`qadd = (qscale-1)|1`），
-///   差别只在 MP43 把 level 限制在 8 位 escape 内，MPEG-4 的 ESC3 是 12 位、不用管。
+///   **两种 `quant_type` 都一样**（MPEG 量化的帧内 DC 也走 `dc_scale`）。
+/// - **AC**：按 `quant` 的规则取 `level`（H.263 平坦步长 / MPEG 逐系数矩阵）。
+///   两种都不必管 escape 上限：MPEG-4 的 ESC3 是 12 位。
 fn quantize_block(
     coeff: &mut [i32; 64],
     n: usize,
-    qmul: i32,
-    qadd: i32,
+    quant: &Quant,
     y_dc_scale: i32,
     c_dc_scale: i32,
 ) {
     let dc_scale = if n < 4 { y_dc_scale } else { c_dc_scale };
     coeff[0] = div_round(coeff[0], dc_scale);
-    for c in coeff.iter_mut().skip(1) {
-        *c = quantize_ac(*c, qmul, qadd);
+    for (k, c) in coeff.iter_mut().enumerate().skip(1) {
+        *c = quant.quantize(k, *c, true);
     }
 }
 
@@ -1297,17 +1412,6 @@ fn div_round(a: i32, b: i32) -> i32 {
         (a + b / 2) / b
     } else {
         -((-a + b / 2) / b)
-    }
-}
-
-/// 反量化的逆：`level` 使 `level*qmul ± qadd` 最接近 `f`。
-fn quantize_ac(f: i32, qmul: i32, qadd: i32) -> i32 {
-    if f > 0 {
-        div_round(f - qadd, qmul).max(0)
-    } else if f < 0 {
-        div_round(f + qadd, qmul).min(0)
-    } else {
-        0
     }
 }
 
@@ -1843,6 +1947,7 @@ mod tests {
     #[test]
     fn quantize_ac_inverts_the_h263_dequant() {
         // 解码端：`level > 0 ? level*qmul + qadd : level*qmul - qadd`
+        let quant = Quant::new(4, false);
         let (qmul, qadd) = (2 * 4, (4 - 1) | 1);
         for level in [-20i32, -3, -1, 0, 1, 3, 20] {
             let f = if level > 0 {
@@ -1852,11 +1957,103 @@ mod tests {
             } else {
                 0
             };
-            assert_eq!(quantize_ac(f, qmul, qadd), level, "level {level} 没还原");
+            assert_eq!(quant.quantize(3, f, true), level, "level {level} 没还原");
         }
         // 落在两个 level 之间时取最近的
-        assert_eq!(quantize_ac(qmul + qadd - 1, qmul, qadd), 1);
-        assert_eq!(quantize_ac(qmul + qadd - 4, qmul, qadd), 1); // 还在上半区
+        assert_eq!(quant.quantize(3, qmul + qadd - 1, true), 1);
+        assert_eq!(quant.quantize(3, qmul + qadd - 4, true), 1); // 还在上半区
+    }
+
+    #[test]
+    fn mpeg_quant_round_trips_through_its_own_dequant() {
+        // 两套规则各自的「量化 → 反量化」自洽性：重建值必须落在半个步长之内。
+        // 顺带印证帧间是**奇数倍**电平（`2|level|+1`）、帧内是整数倍。
+        for qscale in [1u8, 4, 12, 31] {
+            let quant = Quant::new(qscale, true);
+            for k in [0usize, 1, 5, 20, 63] {
+                for f in [-900i32, -137, -8, 0, 7, 138, 901] {
+                    for intra in [true, false] {
+                        let level = quant.quantize(k, f, intra);
+                        let back = quant.dequant(k, level, intra);
+                        let step = quant.step(k, intra);
+                        // 帧内步长 `step/16`、帧间 `step/32`，取宽松的一侧比较
+                        let tol = step / 16 + 1;
+                        assert!(
+                            (back - f).abs() <= tol,
+                            "q={qscale} k={k} intra={intra} f={f} level={level} back={back}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mpeg_inter_reconstruction_levels_are_odd_multiples() {
+        // 帧间：`dequant(L) == ((2L+1)·step) >> 5`，L=0 是唯一的例外
+        // （解码端 `if (level)` 跳过零 → 0 就是 0，**不是** `step>>5`）。
+        // 电平落在奇数倍上意味着死区是「半个电平」，抄错会整块偏半步。
+        let quant = Quant::new(4, true);
+        for k in [0usize, 1, 40] {
+            let step = quant.step(k, false);
+            assert_eq!(quant.dequant(k, 0, false), 0, "level==0 就是 0");
+            for level in 1..6i32 {
+                assert_eq!(
+                    quant.dequant(k, level, false),
+                    ((2 * level + 1) * step) >> 5
+                );
+                assert_eq!(
+                    quant.dequant(k, -level, false),
+                    -(((2 * level + 1) * step) >> 5)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mpeg_intra_dequant_is_matrix_scaled() {
+        // 帧内：`(|level|·2q·W) >> 4` —— 高频的步长比低频大（W 从 8 涨到 45）。
+        let quant = Quant::new(6, true);
+        for level in [1i32, -1, 7, -7] {
+            for k in [1usize, 63] {
+                let step = quant.step(k, true);
+                let want = (level.abs() * step) >> 4;
+                let want = if level < 0 { -want } else { want };
+                assert_eq!(quant.dequant(k, level, true), want, "k={k} level={level}");
+            }
+        }
+        // 高频步长必须比低频粗 —— 这就是「感知」那一半
+        assert!(quant.step(63, true) > quant.step(1, true));
+        assert!(quant.step(63, false) > quant.step(0, false));
+    }
+
+    #[test]
+    fn mismatch_control_flips_only_the_lsb_of_the_last_coefficient() {
+        // 解码端 `dct_unquantize_mpeg2_inter_c`：`sum` **初值 −1**，累加 64 个反量化值，
+        // `sum & 1` 时翻下标 63 的最低位 —— 换成「64 个值之和」的说法就是：
+        // 和为**偶数**时翻（−1 把奇偶反了过来）。不做这一步，重建每块差一位、P 帧累积漂移。
+        let off = Quant::new(6, false);
+        let on = Quant::new(6, true);
+
+        // ① 和为偶数（2 + 4 = 6）→ 翻；H.263 不翻
+        let mut even = [0i16; 64];
+        even[1] = 2;
+        even[63] = 4;
+        let mut a = even;
+        on.mismatch_control(&mut a);
+        assert_eq!(a[63], even[63] ^ 1, "和为偶数要翻最低位");
+        assert_eq!(&a[..63], &even[..63], "只许动下标 63");
+        let mut b = even;
+        off.mismatch_control(&mut b);
+        assert_eq!(b, even, "H.263 没有失配控制");
+
+        // ② 和为奇数（2 + 15 = 17）→ 不翻
+        let mut odd = [0i16; 64];
+        odd[1] = 2;
+        odd[2] = 15;
+        let mut c = odd;
+        on.mismatch_control(&mut c);
+        assert_eq!(c, odd, "和为奇数不动");
     }
 
     #[test]

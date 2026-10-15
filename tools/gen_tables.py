@@ -320,6 +320,19 @@ def gen_mp4v():
     o.flat("Y_DC_SCALE", "u8", flat(md, "ff_mpeg4_y_dc_scale_table"), 32)
     o.flat("C_DC_SCALE", "u8", flat(md, "ff_mpeg4_c_dc_scale_table"), 32)
 
+    # ── MPEG 量化的默认矩阵（`quant_type = 1` 用）───────────────────────────
+    # **自然序**（按频率坐标，不是扫描序）：ffmpeg 的反量化按
+    # `intra_scantable.permutated[i]` 取 `intra_matrix[...]`，与装载时的
+    # `intra_matrix[idct_permutation[i]] = default[i]` 配对之后，正好是
+    # 「扫描序第 i 个系数用 `default[zigzag_direct[i]]`」—— 下标就是自然序。
+    # 自检：这两张表按行主序是**单调递增**的（每行每列都涨）；按扫描序读会变成锯齿状。
+    o.flat(
+        "DEFAULT_INTRA_MATRIX", "u16", flat(md, "ff_mpeg4_default_intra_matrix"), 16
+    )
+    o.flat(
+        "DEFAULT_INTER_MATRIX", "u16", flat(md, "ff_mpeg4_default_non_intra_matrix"), 16
+    )
+
     # ── 系数 RL ────────────────────────────────────────────────────────────
     # 帧内：`ff_mpeg4_rl_intra`（n=103, last=67）。帧内 DC 单独走上面的 DC 表，
     # 所以这张表从**扫描序第 1 个**开始用。

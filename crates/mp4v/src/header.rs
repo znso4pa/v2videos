@@ -96,6 +96,12 @@ pub struct VolParams {
     /// `vop_time_increment_resolution`，取帧率的分子（25 fps → 25）。
     pub fps_num: u32,
     pub low_delay: bool,
+    /// `quant_type`：`false` = H.263 量化（平坦步长），
+    /// `true` = MPEG 量化（**逐系数乘规范默认矩阵**，见 `encode::Quant`）。
+    ///
+    /// ⚠️ 两者的**反量化规则完全不同**（帧间还多一个失配控制），编解码两侧必须一致 ——
+    /// 只改这一位而不同时改量化器，解出来是一片雪花。
+    pub mpeg_quant: bool,
 }
 
 /// 视频对象层头（`00 00 01 00` + `00 00 01 20` + 位域）。
@@ -142,7 +148,14 @@ pub fn write_vol(w: &mut BitWriter, p: &VolParams) {
     w.put(1, 1); // obmc_disable = 1
     w.put(0, 1); // sprite_enable = 0（verid == 1 时只有 1 位）
     w.put(0, 1); // not_8_bit = 0
-    w.put(0, 1); // quant_type = 0（H.263 量化，不是 MPEG 量化矩阵）
+    w.put(u32::from(p.mpeg_quant), 1); // quant_type
+    if p.mpeg_quant {
+        // 两张矩阵都**不传** —— 用规范默认的那对（`DEFAULT_INTRA_MATRIX`
+        // / `DEFAULT_INTER_MATRIX`）。ffmpeg 的编码器也只置 `quant_type`：
+        // 少 ~130 字节的载荷，产物与它对齐。
+        w.put(0, 1); // load_intra_quant_mat
+        w.put(0, 1); // load_non_intra_quant_mat
+    }
 
     w.put(1, 1); // complexity_estimation_disable = 1
     w.put(0, 1); // resync_marker_disable = 0（见模块文档：写 0 但仍不插 marker）
