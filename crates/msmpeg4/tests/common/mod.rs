@@ -5,6 +5,12 @@
 
 #![allow(dead_code)] // 共用工具箱：每个测试目标只用到其中一部分
 
+/// 变异模糊测试的共用件（rng / 四个算子 / 轮次驱动）。
+///
+/// 别的 crate 的 `tests/fuzz.rs` 用 `#[path]` 直接引 `common/mutate.rs`
+/// 那**一个文件**，不引整个 `common`（那边还依赖 `v2v-asf`）。
+pub mod mutate;
+
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;

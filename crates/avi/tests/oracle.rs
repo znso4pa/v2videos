@@ -14,35 +14,12 @@ use std::process::Command;
 
 use v2v_avi::{AviDemuxer, StreamKind};
 
-// ==================== 手写 AVI 的工具 ====================
+mod common;
 
-fn u32le(v: &mut Vec<u8>, x: u32) {
-    v.extend_from_slice(&x.to_le_bytes());
-}
-fn u16le(v: &mut Vec<u8>, x: u16) {
-    v.extend_from_slice(&x.to_le_bytes());
-}
-fn cc(v: &mut Vec<u8>, s: &[u8; 4]) {
-    v.extend_from_slice(s);
-}
-
-fn chunk(id: &[u8; 4], body: &[u8]) -> Vec<u8> {
-    let mut v = Vec::new();
-    cc(&mut v, id);
-    u32le(&mut v, body.len() as u32);
-    v.extend_from_slice(body);
-    if body.len() % 2 == 1 {
-        v.push(0);
-    }
-    v
-}
-
-fn list(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
-    let mut inner = Vec::new();
-    cc(&mut inner, kind);
-    inner.extend_from_slice(body);
-    chunk(b"LIST", &inner)
-}
+// 手写 AVI 的原语住 `tests/common/mod.rs` —— 与 `fuzz.rs` 共用一份。
+// 本文件里剩下的两个构造器是**为各自的断言定制**的（奇数长度补齐、空槽不产样本、
+// `idx1` 偏移的精确值），所以留在原地：合并会把断言弄糊。
+use common::{cc, chunk, list, u16le, u32le};
 
 /// 一个 16×16、MP43、30fps、3 帧的最小 AVI；帧 0 是关键帧。
 fn handmade_avi() -> Vec<u8> {
