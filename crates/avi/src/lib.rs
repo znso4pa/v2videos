@@ -126,6 +126,20 @@ impl<R: Read + Seek> AviDemuxer<R> {
                     let body = data + 4;
                     match &kind {
                         b"hdrl" => {
+                            // ⚠️ `sz` 是**文件里读来的**，`LIST` 的内容是
+                            // `kind`（4 字节）+ body，所以 body = `sz - 4`。
+                            // `sz < 4` 的 LIST 是坏的，**必须挡在这里**：
+                            //
+                            // - debug：`sz - 4` 直接下溢 panic（模糊测试第 658 轮
+                            //   把 `hdrl` 的长度字段改成 0 就撞出来了）
+                            // - release：溢出检查关着，`sz - 4` 会绕成一个天文数字，
+                            //   接着 `vec![0u8; 那个数]` **分配失败直接 abort** ——
+                            //   比 panic 还狠，连 catch 的机会都没有
+                            //
+                            // 所以这**不是**「防御性编程」，是修一个真实的崩溃。
+                            if sz < 4 {
+                                return Err(Error::Bad("LIST 块的长度小于 kind 字段（4 字节）"));
+                            }
                             let buf = read_vec(&mut reader, (sz - 4) as usize)?;
                             parse_hdrl(&buf, &mut streams, &mut rates)?;
                         }
