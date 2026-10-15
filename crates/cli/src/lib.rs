@@ -43,6 +43,28 @@ pub use v2v_avi::AviDemuxer;
 pub use v2v_container::{AudioFormat, Sample};
 pub use v2v_msmpeg4::{Decoder, Encoder, EncoderConfig, Frame, Version};
 
+/// 认 FourCC → 版本，**只放逐像素对账过的版本进来**。
+///
+/// ⚠️ 解码器内部已经认五种版本，但经过**逐帧对 ffmpeg 逐像素 0 差**验证的只有：
+///
+/// | 版本 | 状态 |
+/// |---|---|
+/// | `MP43`（V3） | ✅ 多份真样本逐帧 0 差 |
+/// | `WMV1` | ✅ 四份真样本逐帧 0 差 |
+/// | `MP41` / `MP42` | ❌ 帧头按版本分叉了，但 **MB 层还没写**（要 H.263 的 MCBPC 表 + `v2_*` 两张私有表） |
+/// | `WMV2` | ❌ 帧头与 MB 层是另一套（ffmpeg 里在 `wmv2dec.c`） |
+///
+/// 宁可明确拒绝，也不能静默产出错误画面 —— 那比不支持糟得多。
+fn verified_version(fourcc: u32) -> Result<Version, Error> {
+    match Version::from_fourcc(fourcc) {
+        Some(v @ (Version::V3 | Version::Wmv1)) => Ok(v),
+        _ => Err(Error::Unsupported(format!(
+            "输入视频是 {}，本工具目前只解 MP43 与 WMV1（MP41/MP42/WMV2/WMV3 在接）",
+            v2v_asf::fourcc_string(fourcc)
+        ))),
+    }
+}
+
 /// MP43 的 FourCC（`.wmv` 输出用的编码）。
 pub const MP43: u32 = u32::from_le_bytes(*b"MP43");
 
@@ -360,19 +382,7 @@ fn convert_to_asf(
     let (vnum, w, h, fourcc) = demux
         .video_stream()
         .ok_or_else(|| Error::Unsupported("文件里没有视频轨（或没有格式信息）".into()))?;
-    // ⚠️ **只放已验证的版本进来**。
-    //
-    // 解码器内部已经认五种版本，但**只有 MP43（V3）经过逐像素对账**。
-    // WMV1 的 I 帧已经能逐像素对上，P 帧还差一处（见 TODO）；
-    // MP41/MP42/WMV1/WMV2 的 MB 层与帧头虽已按版本分叉，但**没有验证过**。
-    //
-    // 宁可明确拒绝，也不能静默产出错误画面 —— 那比不支持糟得多。
-    let version = Version::from_fourcc(fourcc).filter(|v| *v == Version::V3).ok_or_else(|| {
-        Error::Unsupported(format!(
-            "输入视频是 {}，本工具目前只解 MP43（其余 MS-MPEG-4 版本在接）",
-            v2v_asf::fourcc_string(fourcc)
-        ))
-    })?;
+    let version = verified_version(fourcc)?;
 
     let mut dec = Decoder::with_version(version);
     let mut enc = Encoder::new(EncoderConfig {
@@ -658,13 +668,7 @@ fn convert_to_mp4(
     let (vnum, w, h, fourcc) = demux
         .video_stream()
         .ok_or_else(|| Error::Unsupported("文件里没有视频轨（或没有格式信息）".into()))?;
-    // 同 `convert_to_wmv`：只放已验证的版本进来。
-    let version = Version::from_fourcc(fourcc).filter(|v| *v == Version::V3).ok_or_else(|| {
-        Error::Unsupported(format!(
-            "输入视频是 {}，本工具目前只解 MP43（其余 MS-MPEG-4 版本在接）",
-            v2v_asf::fourcc_string(fourcc)
-        ))
-    })?;
+    let version = verified_version(fourcc)?;
 
     // 源里那条音频轨的格式（有没有音频、采样率多少）—— 封装器的 `stsd` 要用。
     let src_audio = demux.audio_stream().map(|(_, af)| af);
