@@ -567,7 +567,23 @@ impl Decoder {
                             }
                             // ac_pred 为真时**不用 zig-zag**，改用水平/垂直交替扫描
                             // （dc_pred_dir 0=取左 → 垂直扫描；1=取上 → 水平扫描）。
-                            let scan: &[u8; 64] = if ac_pred {
+                            //
+                            // ⚠️ **整套扫描表按版本换**：WMV1/WMV2 用的是
+                            // `ff_wmv1_scantable[0..3]`，**不是** MPEG-4/H.263 那套。
+                            // 换错的表现很阴：符号个数、位流位置、结构全对，
+                            // 只有**系数落错位置** —— 于是「没有漂移却值不对」。
+                            let scan: &[u8; 64] = if self.version.is_wmv() {
+                                // [0] 帧间 / [1] 帧内默认 / [2] ac_pred 水平 / [3] ac_pred 垂直
+                                if ac_pred {
+                                    if dir == 0 {
+                                        &tables::SCAN[3]
+                                    } else {
+                                        &tables::SCAN[2]
+                                    }
+                                } else {
+                                    &tables::SCAN[1]
+                                }
+                            } else if ac_pred {
                                 if dir == 0 {
                                     &tables::V_SCAN
                                 } else {
@@ -626,7 +642,9 @@ impl Decoder {
                             -1,
                             &mut ac_ctx,
                         )? {
-                            block[ZIGZAG[i] as usize] = lv;
+                            let scan: &[u8; 64] =
+                                if self.version.is_wmv() { &tables::SCAN[0] } else { &ZIGZAG };
+                            block[scan[i] as usize] = lv;
                         }
                         // ---- 帧间**不再**反量化 ----
                         // 帧间的反量化**只做一次**，而且在 RL 表里就做完了（表按 qscale 分档）。
@@ -660,6 +678,7 @@ impl Decoder {
                 }
             }
         }
+
 
         // ---- I 帧尾部可能有 17 位的 ext header（fps 5 + bit_rate 11 + flipflop_rounding 1）----
         // 只在 I 帧做这件事，且只在剩余位数落在 `[17, 25)` 时读；
