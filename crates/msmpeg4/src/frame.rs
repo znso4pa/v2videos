@@ -179,6 +179,65 @@ impl Default for Decoder {
     }
 }
 
+/// **建一次就够的码表树**。
+///
+/// ⚠️ 存在的理由：`Vlc::new` / `RlTable::new` 原来在**每帧开头**都重建一遍，
+/// 而它们的内容**只取决于静态码表**、与帧数据无关。采样显示 `Vlc::new` 一项
+/// 就独占**整个解码的 19%** —— 纯粹的白干（MV 那张更亏：先每帧造一个
+/// 1100 项的 `Vec`，再拿它建树）。
+///
+/// 树是只读的，所以放 `OnceLock` 里全局共享。
+struct DecodeTables {
+    /// I 帧的宏块类型表。
+    mb_intra: Vlc,
+    /// P 帧的宏块类型表。
+    mb_non_intra: Vlc,
+    /// `DC[dc_table_index][0=亮度 / 1=色度]`。
+    dc: [[Vlc; 2]; 2],
+    /// `MV0` / `MV1`。
+    mv: [Vlc; 2],
+    /// 六张 RL 表（`for_standard` 的 0..5）。
+    rl: [RlTable; 6],
+}
+
+impl DecodeTables {
+    fn get() -> &'static Self {
+        static T: std::sync::OnceLock<DecodeTables> = std::sync::OnceLock::new();
+        T.get_or_init(|| {
+            let vlc = |t: &'static [[u32; 2]]| Vlc::new(t);
+            // MV 的两张表在 `tables` 里是 `(code, len)` 分开存的，先并成 `[u32; 2]`。
+            let mv = |code: &'static [u16], len: &'static [u8]| {
+                let pairs: Vec<[u32; 2]> = code
+                    .iter()
+                    .zip(len.iter())
+                    .map(|(&c, &l)| [c as u32, l as u32])
+                    .collect();
+                Vlc::new(&pairs)
+            };
+            DecodeTables {
+                mb_intra: vlc(&tables::MB_INTRA),
+                mb_non_intra: vlc(&tables::MB_NON_INTRA),
+                dc: [
+                    [vlc(&tables::DC[0][0]), vlc(&tables::DC[0][1])],
+                    [vlc(&tables::DC[1][0]), vlc(&tables::DC[1][1])],
+                ],
+                mv: [
+                    mv(&tables::MV0_CODE, &tables::MV0_LEN),
+                    mv(&tables::MV1_CODE, &tables::MV1_LEN),
+                ],
+                rl: [
+                    RlTable::for_standard(0).expect("RL 表 0"),
+                    RlTable::for_standard(1).expect("RL 表 1"),
+                    RlTable::for_standard(2).expect("RL 表 2"),
+                    RlTable::for_standard(3).expect("RL 表 3"),
+                    RlTable::for_standard(4).expect("RL 表 4"),
+                    RlTable::for_standard(5).expect("RL 表 5"),
+                ],
+            }
+        })
+    }
+}
+
 impl Decoder {
     pub fn new() -> Self {
         Self::with_version(Version::default())
@@ -236,6 +295,7 @@ impl Decoder {
             qscale: header.qscale,
             esc3_level_length: 0,
             esc3_run_length: 0,
+            out: Vec::new(),
         };
 
         self.frames += 1;
@@ -287,46 +347,23 @@ impl Decoder {
         // ⚠️ **六张全建**，而不是只建这一帧要用的那三张：WMV1 的 `per_mb_rl_table`
         // 允许**每个宏块换一套表**（下标在宏块里读），所以下标必须可变。
         // 建表的代价是每张 ~190 次循环，六张 ≈ 1000 次 —— 相对一帧的解码可忽略。
-        let rl_tables: [RlTable; 6] = [
-            RlTable::for_standard(0)?,
-            RlTable::for_standard(1)?,
-            RlTable::for_standard(2)?,
-            RlTable::for_standard(3)?,
-            RlTable::for_standard(4)?,
-            RlTable::for_standard(5)?,
-        ];
+        let t = DecodeTables::get();
+        let rl_tables = &t.rl;
         // 本帧当前的三个下标 —— 会被 `per_mb_rl_table` 逐宏块改写（就地延续，与 ffmpeg 同）。
         let mut rl_luma_i = header.rl_table_index as usize;
         let mut rl_chroma_i = 3 + header.rl_chroma_table_index as usize;
         let mut rl_inter_i = 3 + header.rl_table_index as usize;
-        let mb_intra_vlc = Vlc::new(&tables::MB_INTRA);
-        let mb_non_intra_vlc = Vlc::new(&tables::MB_NON_INTRA);
-        let dc_vlc = Vlc::new(&tables::DC[header.dc_table_index as usize][0]);
-        let dc_vlc_c = Vlc::new(&tables::DC[header.dc_table_index as usize][1]);
-
-        // MV VLC：两张表各 1100 个码（1099 真值 + 1 escape）。
+        let mb_intra_vlc = &t.mb_intra;
+        let mb_non_intra_vlc = &t.mb_non_intra;
+        let dc_vlc = &t.dc[header.dc_table_index as usize][0];
+        let dc_vlc_c = &t.dc[header.dc_table_index as usize][1];
         let mv_i = header.mv_table_index as usize;
-        let (mv_code, mv_len, mv_x, mv_y) = if mv_i == 0 {
-            (
-                &tables::MV0_CODE[..],
-                &tables::MV0_LEN[..],
-                &tables::MV0_X[..],
-                &tables::MV0_Y[..],
-            )
+        let mv_vlc = &t.mv[mv_i];
+        let (mv_x, mv_y) = if mv_i == 0 {
+            (&tables::MV0_X[..], &tables::MV0_Y[..])
         } else {
-            (
-                &tables::MV1_CODE[..],
-                &tables::MV1_LEN[..],
-                &tables::MV1_X[..],
-                &tables::MV1_Y[..],
-            )
+            (&tables::MV1_X[..], &tables::MV1_Y[..])
         };
-        let mv_pairs: Vec<[u32; 2]> = mv_code
-            .iter()
-            .zip(mv_len.iter())
-            .map(|(&c, &l)| [c as u32, l as u32])
-            .collect();
-        let mv_vlc = Vlc::new(&mv_pairs);
 
         // 平面（按宏块对齐分配，最后再裁）
         let pw = mb_w * 16;
@@ -593,7 +630,7 @@ impl Decoder {
                                 &ZIGZAG
                             };
                             let rl = if luma { &rl_tables[rl_luma_i] } else { &rl_tables[rl_chroma_i] };
-                            for (i, lv) in rl.decode_ac(
+                            rl.decode_ac(
                                 &mut r,
                                 1,
                                 0,
@@ -604,7 +641,8 @@ impl Decoder {
                                 self.version.intra_run_diff(),
                                 0,
                                 &mut ac_ctx,
-                            )? {
+                            )?;
+                            for &(i, lv) in &ac_ctx.out {
                                 block[scan[i] as usize] = lv;
                             }
                         }
@@ -634,16 +672,17 @@ impl Decoder {
                         if !coded_flag {
                             continue; // `block_last_index[n] = -1`：不加残差
                         }
-                        for (i, lv) in rl_tables[rl_inter_i].decode_ac(
+                        rl_tables[rl_inter_i].decode_ac(
                             &mut r,
                             qmul,
                             qadd,
                             self.version.inter_run_diff(),
                             -1,
                             &mut ac_ctx,
-                        )? {
-                            let scan: &[u8; 64] =
-                                if self.version.is_wmv() { &tables::SCAN[0] } else { &ZIGZAG };
+                        )?;
+                        let scan: &[u8; 64] =
+                            if self.version.is_wmv() { &tables::SCAN[0] } else { &ZIGZAG };
+                        for &(i, lv) in &ac_ctx.out {
                             block[scan[i] as usize] = lv;
                         }
                         // ---- 帧间**不再**反量化 ----
@@ -678,6 +717,7 @@ impl Decoder {
                 }
             }
         }
+
 
 
         // ---- I 帧尾部可能有 17 位的 ext header（fps 5 + bit_rate 11 + flipflop_rounding 1）----
