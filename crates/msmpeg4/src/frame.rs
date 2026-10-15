@@ -198,6 +198,24 @@ struct DecodeTables {
     mv: [Vlc; 2],
     /// 六张 RL 表（`for_standard` 的 0..5）。
     rl: [RlTable; 6],
+    /// **V2 私有的**两张宏块类型表。
+    ///
+    /// ⚠️ 这两张与下面四张 H.263 的**已经建好但还没有人读** —— MP41/MP42 的帧头
+    /// 按版本分叉了，MB 层还没写（见 README 的能力矩阵）。表先备着，读它们的代码
+    /// 一落地就能直接用；在那之前 `allow(dead_code)` 是为了保住「编译零警告」。
+    #[allow(dead_code)]
+    v2_mb_type: Vlc,
+    #[allow(dead_code)]
+    v2_intra_cbpc: Vlc,
+    /// **V1 用的 H.263** 那四张（MCBPC 两张 + CBPY + MV）。理由同上。
+    #[allow(dead_code)]
+    h263_intra_mcbpc: Vlc,
+    #[allow(dead_code)]
+    h263_inter_mcbpc: Vlc,
+    #[allow(dead_code)]
+    h263_cbpy: Vlc,
+    #[allow(dead_code)]
+    h263_mv: Vlc,
 }
 
 impl DecodeTables {
@@ -205,6 +223,20 @@ impl DecodeTables {
         static T: std::sync::OnceLock<DecodeTables> = std::sync::OnceLock::new();
         T.get_or_init(|| {
             let vlc = |t: &'static [[u32; 2]]| Vlc::new(t);
+            // H.263 那几张在表里是 `[u8; 2]`，先并成 `[u32; 2]`。
+            let vlc_u8 = |t: &'static [[u8; 2]]| {
+                let pairs: Vec<[u32; 2]> = t.iter().map(|&[c, l]| [c as u32, l as u32]).collect();
+                Vlc::new(&pairs)
+            };
+            // MCBPC 是「两张平行数组」：code[] 与 bits[]。
+            let mcbpc = |code: &'static [u8], bits: &'static [u8]| {
+                let pairs: Vec<[u32; 2]> = code
+                    .iter()
+                    .zip(bits.iter())
+                    .map(|(&c, &l)| [c as u32, l as u32])
+                    .collect();
+                Vlc::new(&pairs)
+            };
             // MV 的两张表在 `tables` 里是 `(code, len)` 分开存的，先并成 `[u32; 2]`。
             let mv = |code: &'static [u16], len: &'static [u8]| {
                 let pairs: Vec<[u32; 2]> = code
@@ -225,6 +257,18 @@ impl DecodeTables {
                     mv(&tables::MV0_CODE, &tables::MV0_LEN),
                     mv(&tables::MV1_CODE, &tables::MV1_LEN),
                 ],
+                v2_mb_type: vlc(&tables::V2_MB_TYPE),
+                v2_intra_cbpc: vlc(&tables::V2_INTRA_CBCPC),
+                h263_intra_mcbpc: mcbpc(
+                    &tables::H263_INTRA_MCBPC_CODE,
+                    &tables::H263_INTRA_MCBPC_BITS,
+                ),
+                h263_inter_mcbpc: mcbpc(
+                    &tables::H263_INTER_MCBPC_CODE,
+                    &tables::H263_INTER_MCBPC_BITS,
+                ),
+                h263_cbpy: vlc_u8(&tables::H263_CBPY),
+                h263_mv: vlc_u8(&tables::H263_MV),
                 rl: [
                     RlTable::for_standard(0).expect("RL 表 0"),
                     RlTable::for_standard(1).expect("RL 表 1"),
