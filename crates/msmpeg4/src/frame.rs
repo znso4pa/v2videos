@@ -38,7 +38,7 @@ use crate::block::RlTable;
 use crate::error::{Error, Result};
 use crate::grid::Grid;
 use crate::block::AcCtx;
-use crate::header::{parse_frame_header, HeaderState, PictureType};
+use crate::header::{decode012 as v2v_msmpeg4_decode012, parse_frame_header, HeaderState, PictureType};
 use crate::version::Version;
 use crate::idct::{idct_add, idct_put};
 use crate::predict::{ac_predict, coded_block_predict, dc_predict, AcVal};
@@ -283,9 +283,22 @@ impl Decoder {
 
         // 系数表：帧内用 `rl_table_index`（亮度）/ `3 + rl_chroma_table_index`（色度）；
         // 帧间一律 `3 + rl_table_index`。
-        let rl_luma = RlTable::for_standard(header.rl_table_index as usize)?;
-        let rl_chroma = RlTable::for_standard(3 + header.rl_chroma_table_index as usize)?;
-        let rl_inter = RlTable::for_standard(3 + header.rl_table_index as usize)?;
+        //
+        // ⚠️ **六张全建**，而不是只建这一帧要用的那三张：WMV1 的 `per_mb_rl_table`
+        // 允许**每个宏块换一套表**（下标在宏块里读），所以下标必须可变。
+        // 建表的代价是每张 ~190 次循环，六张 ≈ 1000 次 —— 相对一帧的解码可忽略。
+        let rl_tables: [RlTable; 6] = [
+            RlTable::for_standard(0)?,
+            RlTable::for_standard(1)?,
+            RlTable::for_standard(2)?,
+            RlTable::for_standard(3)?,
+            RlTable::for_standard(4)?,
+            RlTable::for_standard(5)?,
+        ];
+        // 本帧当前的三个下标 —— 会被 `per_mb_rl_table` 逐宏块改写（就地延续，与 ffmpeg 同）。
+        let mut rl_luma_i = header.rl_table_index as usize;
+        let mut rl_chroma_i = 3 + header.rl_chroma_table_index as usize;
+        let mut rl_inter_i = 3 + header.rl_table_index as usize;
         let mb_intra_vlc = Vlc::new(&tables::MB_INTRA);
         let mb_non_intra_vlc = Vlc::new(&tables::MB_NON_INTRA);
         let dc_vlc = Vlc::new(&tables::DC[header.dc_table_index as usize][0]);
@@ -394,6 +407,15 @@ impl Decoder {
                         self.stats.mb_inter_coded += 1;
                     }
                     if !mb_intra {
+                        // WMV1 的 `per_mb_rl_table`：**每个带系数的宏块自带 RL 表下标**。
+                        // 帧间这条在**运动之前**读（帧内那条在 `ac_pred` 之后）——
+                        // 位置不一样，读错地方整帧就散了。
+                        if header.per_mb_rl_table && cbp != 0 {
+                            let t = v2v_msmpeg4_decode012(&mut r)? as usize;
+                            rl_luma_i = t;
+                            rl_chroma_i = 3 + t;
+                            rl_inter_i = 3 + t;
+                        }
                         let pred = pred_motion(&mv_grid, mbx, mby, first_slice_line);
                         mv = decode_motion(&mut r, &mv_vlc, mv_x, mv_y, pred)?;
                     } else {
@@ -407,6 +429,13 @@ impl Decoder {
                                 value: ac_pred,
                                 coded: cbp != 0,
                             });
+                        }
+                        // 帧内这条在 `ac_pred` **之后**读（见帧间那条的说明）。
+                        if header.per_mb_rl_table && cbp != 0 {
+                            let t = v2v_msmpeg4_decode012(&mut r)? as usize;
+                            rl_luma_i = t;
+                            rl_chroma_i = 3 + t;
+                            rl_inter_i = 3 + t;
                         }
                     }
                 } else {
@@ -433,6 +462,12 @@ impl Decoder {
                     cbp = cbp_v;
                     let bit_pos = r.bit_pos();
                     ac_pred = r.bit()? != 0;
+                    if header.per_mb_rl_table && cbp != 0 {
+                        let t = v2v_msmpeg4_decode012(&mut r)? as usize;
+                        rl_luma_i = t;
+                        rl_chroma_i = 3 + t;
+                        rl_inter_i = 3 + t;
+                    }
                     if self.trace_ac_pred {
                         self.ac_pred_reads.push(AcPredRead {
                             mbx,
@@ -509,7 +544,10 @@ impl Decoder {
                         let mut b = dc_grid.data[xy - 1 - dc_grid.w] as i32;
                         let mut c = dc_grid.data[xy - dc_grid.w] as i32;
                         // 片的第一行、且 n 的 bit1 为 0 → 上方不可用
-                        if first_slice_line && (n & 2) == 0 {
+                        // ⚠️ 版本门：只有 `version < WMV1`（V1/V2/V3）才在片首行清 b/c。
+                        // WMV1/WMV2 不清 —— 它们用上一行的 DC，这是 ffmpeg 里那处
+                        // `s->msmpeg4_version < MSMP4_WMV1` 条件。
+                        if first_slice_line && (n & 2) == 0 && !self.version.is_wmv() {
                             b = 1024;
                             c = 1024;
                         }
@@ -538,8 +576,19 @@ impl Decoder {
                             } else {
                                 &ZIGZAG
                             };
-                            let rl = if luma { &rl_luma } else { &rl_chroma };
-                            for (i, lv) in rl.decode_ac(&mut r, 1, 0, 0, 0, &mut ac_ctx)? {
+                            let rl = if luma { &rl_tables[rl_luma_i] } else { &rl_tables[rl_chroma_i] };
+                            for (i, lv) in rl.decode_ac(
+                                &mut r,
+                                1,
+                                0,
+                                // ⚠️ 帧内的 run_diff **也按版本**：
+                                // WMV1/WMV2 是 1、V1/V2/V3 是 0。它只影响**第二 escape**，
+                                // 所以底本里没有第二 escape 的帧（比如干净的 I 帧）
+                                // 会「看着全对」，错误只在有第二 escape 的帧上冒出来。
+                                self.version.intra_run_diff(),
+                                0,
+                                &mut ac_ctx,
+                            )? {
                                 block[scan[i] as usize] = lv;
                             }
                         }
@@ -569,7 +618,7 @@ impl Decoder {
                         if !coded_flag {
                             continue; // `block_last_index[n] = -1`：不加残差
                         }
-                        for (i, lv) in rl_inter.decode_ac(
+                        for (i, lv) in rl_tables[rl_inter_i].decode_ac(
                             &mut r,
                             qmul,
                             qadd,
@@ -615,13 +664,23 @@ impl Decoder {
         // ---- I 帧尾部可能有 17 位的 ext header（fps 5 + bit_rate 11 + flipflop_rounding 1）----
         // 只在 I 帧做这件事，且只在剩余位数落在 `[17, 25)` 时读；
         // 否则 `flipflop_rounding = 0`。它决定**后面那些 P 帧**的半像素取整方式。
+        //
+        // ⚠️ **只有 `version < WMV1` 才在帧尾读**（ffmpeg 的 `h263dec.c` 里那处
+        // `msmpeg4_version < MSMP4_WMV1`）。WMV1 的那一份在**帧头里**已经读过了
+        // （见 `header.rs` 的 `parse_frame_header`）—— 在这里再读一遍会把帧尾
+        // 那几个字节当成 ext header，凭空翻转 `flipflop_rounding`，
+        // 于是**后面所有 P 帧**的半像素取整方式全错。
         if !is_p {
-            let left = data.len() as i64 * 8 - r.bit_pos() as i64;
-            self.flipflop_rounding = if (17..25).contains(&left) {
-                r.skip(16)?; // fps(5) + bit_rate(11)
-                r.bit()? != 0
+            self.flipflop_rounding = if self.version.is_wmv() {
+                header.flipflop_rounding
             } else {
-                false
+                let left = data.len() as i64 * 8 - r.bit_pos() as i64;
+                if (17..25).contains(&left) {
+                    r.skip(16)?; // fps(5) + bit_rate(11)
+                    r.bit()? != 0
+                } else {
+                    false
+                }
             };
         }
 
