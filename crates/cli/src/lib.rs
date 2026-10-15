@@ -1150,9 +1150,12 @@ fn drain_aac_frames(
     emit: &mut dyn FnMut(&[u8], u32, usize),
     audio_samples: &mut usize,
 ) -> Result<(), Error> {
-    /// 一批攒多少帧：够大才喂得饱 `encode_frames` 的线程（16 帧 ≈ 0.37 秒音频），
-    /// 又不至于让内存里堆太多 PCM。
-    const BATCH: usize = 16;
+    /// 一批攒多少帧。
+    ///
+    /// ⚠️ **块要长**：`encode_frames` 把批按连续区间切给各线程，而**每个块的首帧
+    /// 只能冷启动**偏移搜索（拿不到上一帧的种子）—— 块越长，冷启动的占比越低。
+    /// 64 帧 ≈ 1.5 秒音频、内存里最多堆 64 × 2 × 1024 × 4 B = 512 KB PCM，可以接受。
+    const BATCH: usize = 64;
     loop {
         let ready = marks.len().min(BATCH);
         if ready == 0 {

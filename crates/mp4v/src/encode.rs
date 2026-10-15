@@ -1113,12 +1113,29 @@ impl PState<'_> {
         }
 
         // ---------- 帧内候选（会改 DC / AC 网格，先拍快照）----------
-        let dc_snap = self.dc.snap(mbx, mby);
-        let ac_snap = self.ac.snap(mbx, mby);
-        let (ib, idc_diff, idir, iac_pred, wi2) = self.intra_candidate(mbx, mby)?;
+        //
+        // ⚠️ **`skip` 时整段不做**：这时 `wi` 只有那一个 `1` 位，而帧内候选至少要写
+        // 一个宏块类型（`wi2.bit_pos() >= 1`），所以 `wi2.bit_pos() < wi.bit_pos()`
+        // **恒不成立** —— 帧内不可能赢。这不是启发式，是 `bit_pos()` 上的恒等式。
+        //
+        // 省下的是 6 个块的 `fdct` + 量化 + 写位流（外加 DC/AC 预测），
+        // 而「跳过」的代价只是少写一次 DC/AC 网格 —— 那本来就只在帧内赢时才有用，
+        // 帧间分支里那两句 `restore` 正是它的逆操作。输出**逐字节不变**。
+        let intra = if skip {
+            None
+        } else {
+            let dc_snap = self.dc.snap(mbx, mby);
+            let ac_snap = self.ac.snap(mbx, mby);
+            let (ib, _dc_diff, _dir, _ac_pred, wi2) = self.intra_candidate(mbx, mby)?;
+            Some((dc_snap, ac_snap, ib, wi2))
+        };
 
         // ---------- 定胜负 ----------
-        if wi2.bit_pos() < wi.bit_pos() {
+        let intra_wins = intra
+            .as_ref()
+            .is_some_and(|(_, _, _, wi2)| wi2.bit_pos() < wi.bit_pos());
+        if intra_wins {
+            let (_, _, ib, wi2) = intra.expect("`intra_wins` 已经保证它是 `Some`");
             // 帧内赢了：DC / AC 网格保留（`intra_candidate` 已经写进去了）。
             w.append(&wi2);
             reconstruct_intra(
@@ -1134,12 +1151,13 @@ impl PState<'_> {
             // 帧内宏块在 MV 网格上留 (0,0) —— 与解码端一致（它不给帧内宏块写 motion_val）。
             self.mv[mby * self.mb_w + mbx] = (0, 0);
             self.intra_mbs += 1;
-            let _ = (idc_diff, idir, iac_pred);
         } else {
             // 帧间赢了：还原网格（= 清成 1024 / 0，等价于解码端的
-            // `ff_clean_intra_table_entries`）。
-            self.dc.restore(mbx, mby, &dc_snap);
-            self.ac.restore(mbx, mby, &ac_snap);
+            // `ff_clean_intra_table_entries`）。`skip` 时网格根本没被动过，不用还原。
+            if let Some((dc_snap, ac_snap, _, _)) = &intra {
+                self.dc.restore(mbx, mby, dc_snap);
+                self.ac.restore(mbx, mby, ac_snap);
+            }
             w.append(&wi);
             if skip {
                 self.mv[mby * self.mb_w + mbx] = (0, 0);

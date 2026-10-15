@@ -326,9 +326,12 @@ impl WindowPlan {
 
 /// 一帧的**跨帧语义状态** —— 只有这四项会影响输出。
 ///
-/// 其余字段（`cost_cache`、`sf_offset_prev`）只影响**速度**：
-/// 缓存本来就是帧内缓存（每帧开头 `reset`），搜索种子只决定从哪儿开始探、
-/// 不决定答案。所以「按帧并行」时每帧只要拿到这四项就够了（见 `encode_frames`）。
+/// `cost_cache` 只影响**速度**（它本来就是帧内缓存，每帧开头 `reset`）。
+///
+/// ⚠️ `sf_offset_prev` 则**也影响结果**：偏移搜索是近似搜索、锚在这个种子上
+/// （详见字段自身的说明）。所以 `to_chans` 把它设成固定初值 = 批量路径**每帧都
+/// 从冷种子开始**，既丢掉了热启动、也让结果与逐帧路径差一点点。
+/// 要「逐字节相同」就得让搜索与种子无关 —— 那是另一件事，现在没做。
 #[derive(Clone)]
 struct FrameState {
     /// 每个声道：上一帧的 coded 样本（按**本帧**要编的域取用）。
@@ -815,9 +818,19 @@ impl Encoder {
                 let states = &states;
                 handles.push(scope.spawn(move || -> crate::Result<Vec<(usize, Vec<u8>, bool)>> {
                     let mut v = Vec::with_capacity(part.len());
+                    // ⚠️ **一份 `ChannelState` 在块内复用**（不是每帧一份）：
+                    // `apply_to` 只覆盖那四项语义状态，**保留 `sf_offset_prev` 与
+                    // `cost_cache`** —— 于是块内第 2 帧起就拿到了上一帧的搜索种子。
+                    //
+                    // 这不是微调：种子决定偏移搜索的**起点**，冷启动（`to_chans`）
+                    // 时指数搜索要从 `SF_OFFSET_SEED_INIT` 一路探到真值（实测 6–8 趟），
+                    // 而热启动只要 2–4 趟；每多一趟就多扫一遍全帧的带（`plan_group`），
+                    // 那是整个链路最大的单项开销。块首帧仍是冷启动 —— 所以**块要长**。
+                    let mut chans = states[base].to_chans();
                     for (j, frame) in part.iter().enumerate() {
-                        // 每帧一份**独立**的 `ChannelState`（缓存空着，帧内自己填）。
-                        let mut chans = states[base + j].to_chans();
+                        if j > 0 {
+                            states[base + j].apply_to(&mut chans);
+                        }
                         let (bytes, short) = this.encode_frame_inner(frame, &mut chans)?;
                         v.push((base + j, bytes, short));
                     }
