@@ -5,9 +5,13 @@
 
 ```bash
 python3 tools/gen_wma_tables.py \
-    --src /tmp/ffsize/ffmpeg-7.1/libavcodec \
+    --src <你自己的 ffmpeg 源码>/libavcodec \
     --out crates/wma/src/tables.rs
 ```
+
+⚠️ `--src` 的**默认值是作者的本地路径**（`/tmp/ffsize/ffmpeg-7.1/libavcodec`），
+第三方 clone 里不存在。自己准备一份 FFmpeg 7.1 源码（<https://ffmpeg.org/download.html>），
+用 `--src` 指过去。
 
 ## 抽哪些、为什么
 
@@ -159,7 +163,12 @@ def kraft_sum(lens: list[int]) -> float:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--src", default="/tmp/ffsize/ffmpeg-7.1/libavcodec", help="ffmpeg libavcodec 目录")
+    ap.add_argument(
+        "--src",
+        default="/tmp/ffsize/ffmpeg-7.1/libavcodec",
+        help="ffmpeg 的 libavcodec 目录。⚠️ 默认值是**作者的本地路径**，" 
+             "第三方 clone 里不存在 —— 自己下一份 FFmpeg 源码再用这个参数指过来",
+    )
     ap.add_argument("--out", default="crates/wma/src/tables.rs")
     ap.add_argument(
         "--aactab",

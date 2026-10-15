@@ -12,6 +12,11 @@ python3 tools/gen_notice.py [ffmpeg_src_dir]
 ```
 
 默认源目录 `/tmp/ffsize/ffmpeg-7.1`（与三个表生成器一致）。
+⚠️ **默认源目录 `/tmp/ffsize/ffmpeg-7.1` 是作者的本地路径**，第三方 clone 里不存在。
+自己准备一份 FFmpeg 7.1 源码（`https://ffmpeg.org/download.html`），然后：
+- 前三个脚本：把路径作为**第一个参数**传进去；
+- `gen_wma_tables.py`：用 `--src <ffmpeg>/libavcodec`。
+
 """
 
 import os
