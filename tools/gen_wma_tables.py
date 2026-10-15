@@ -33,6 +33,8 @@ import re
 import sys
 from pathlib import Path
 
+from ffmpeg_src import copyright_lines
+
 NB_LSP_COEFS = 10
 
 
@@ -172,11 +174,34 @@ def main() -> int:
     aactab = strip_comments(aactab_path.read_text()) if aactab_path.is_file() else ""
     wma_freqs = strip_comments((src_dir / "wma_freqs.c").read_text())
 
+    # 源文件清单 + 各自文件头里的版权行 —— **原样读出，不手抄**（见 tools/ffmpeg_src.py）。
+    # `aactab.c` 只提供指数 VLC 那一张表，所以只有真的读到它才算来源。
+    src_files = ["wmadata.h", "wma_freqs.c"] + (["aactab.c"] if aactab else [])
+    attrib = []
+    for name in src_files:
+        attrib.append(f"//! `{name}`")
+        lines = copyright_lines(str(src_dir / name))
+        attrib.extend(f"//!     {line}" for line in lines)
+        if not lines:
+            attrib.append("//!     （该文件头没有版权行）")
+
     out = []
     out.append("//! WMA 解码用的码表 —— **由 tools/gen_wma_tables.py 从 ffmpeg 的数据文件生成**。")
     out.append("//!")
     out.append("//! 别手改这个文件：改生成器再重新生成。")
     out.append("//! 出处与理由见 `tools/gen_wma_tables.py` 的文档（含 Kraft 和自检）。")
+    out.append("//!")
+    out.append("//! ## 许可")
+    out.append("//!")
+    out.append("//! 本文件的数据取自 FFmpeg 7.1（LGPL-2.1-or-later）的这几个文件，")
+    out.append("//! 以及它们的版权声明（由生成器从源文件原样读出）：")
+    out.append("//!")
+    out.append("//! ```text")
+    out.extend(attrib)
+    out.append("//! ```")
+    out.append("//!")
+    out.append("//! 与本仓的许可一致，整个仓库统一按 LGPL-2.1-or-later 使用。")
+    out.append("//! 详见 README 的「许可证」一节与根目录的 `NOTICE`。")
     out.append("")
     out.append("#![allow(clippy::all)]")
     out.append("")

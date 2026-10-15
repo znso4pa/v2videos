@@ -2,6 +2,24 @@
 //!
 //! 别手改这个文件：改生成器再重新生成。
 //! 出处与理由见 `tools/gen_wma_tables.py` 的文档（含 Kraft 和自检）。
+//!
+//! ## 许可
+//!
+//! 本文件的数据取自 FFmpeg 7.1（LGPL-2.1-or-later）的这几个文件，
+//! 以及它们的版权声明（由生成器从源文件原样读出）：
+//!
+//! ```text
+//! `wmadata.h`
+//!     copyright (c) 2002 The FFmpeg Project
+//! `wma_freqs.c`
+//!     （该文件头没有版权行）
+//! `aactab.c`
+//!     Copyright (c) 2005-2006 Oded Shimon ( ods15 ods15 dyndns org )
+//!     Copyright (c) 2006-2007 Maxim Gavrilov ( maxim.gavrilov gmail com )
+//! ```
+//!
+//! 与本仓的许可一致，整个仓库统一按 LGPL-2.1-or-later 使用。
+//! 详见 README 的「许可证」一节与根目录的 `NOTICE`。
 
 #![allow(clippy::all)]
 

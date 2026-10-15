@@ -27,14 +27,17 @@ import os
 import re
 import sys
 
+from ffmpeg_src import copyright_lines
+
 DEFAULT_SRC = "/tmp/ffsize/ffmpeg-7.1"
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 args = [a for a in sys.argv[1:] if not a.startswith("-")]
 SRC = args[0] if args else DEFAULT_SRC
 
-# 两边共用的来源文件（写进生成文件的头注释，方便日后核对）
-SOURCES = "msmpeg4data.c / msmpeg4_vc1_data.c / mpeg4data.h / h263data.c / mpegvideodata.c"
+# 每个产出**自己**衍生自哪几个文件 —— 写进头注释，也是版权声明的依据。
+MSMPEG4_SOURCES = ["msmpeg4data.c", "msmpeg4_vc1_data.c"]
+MP4V_SOURCES = ["h263data.c", "mpeg4data.h", "mpegvideodata.c"]
 
 
 def read(path):
@@ -122,7 +125,19 @@ class Out:
         return "".join(self.buf)
 
 
-def header(title, extra=""):
+def attribution(sources):
+    """源文件清单 + 各自文件头里的版权行 —— **原样读出，不手抄**（见 `tools/ffmpeg_src.py`）。"""
+    out = []
+    for name in sources:
+        out.append(f"//! `{name}`")
+        lines = copyright_lines(f"{SRC}/libavcodec/{name}")
+        out.extend(f"//!     {line}" for line in lines)
+        if not lines:
+            out.append("//!     （该文件头没有版权行）")
+    return "".join(line + "\n" for line in out)
+
+
+def header(title, sources, extra=""):
     return (
         f"//! {title}\n"
         "//!\n"
@@ -135,11 +150,15 @@ def header(title, extra=""):
         "//!\n"
         "//! ## 许可\n"
         "//!\n"
-        "//! 生成器读的是 FFmpeg 7.1 的 `libavcodec/` 下这些文件（LGPL-2.1-or-later）：\n"
-        + "".join(f"//! {line}\n" for line in SOURCES.split(" / "))
-        + "//!\n"
+        "//! 本文件的数据取自 FFmpeg 7.1（LGPL-2.1-or-later）的这几个文件，\n"
+        "//! 以及它们的版权声明（由生成器从源文件原样读出）：\n"
+        "//!\n"
+        "//! ```text\n"
+        + attribution(sources)
+        + "//! ```\n"
+        "//!\n"
         "//! 与本仓的许可一致，整个仓库统一按 LGPL-2.1-or-later 使用。\n"
-        "//! 详见 README 的「许可证」一节。\n"
+        "//! 详见 README 的「许可证」一节与根目录的 `NOTICE`。\n"
         "//!\n"
         "//! 换一个数据源（规范附录、或别的宽松许可实现）即可整体替换 —— 生成器已就位，\n"
         "//! 且表本身与实现无关。\n"
@@ -156,6 +175,7 @@ def gen_msmpeg4():
     o.w(
         header(
             "MS-MPEG-4（MP43）解码需要的 VLC / 反量化表。",
+            MSMPEG4_SOURCES,
             "//!\n"
             "//! 这些表是 **MP43 自用**的：宏块类型表 `MB_INTRA` / `MB_NON_INTRA`、\n"
             "//! 三套 escape 的 RL 表、以及 WMV1 的 DC 缩放表。**MPEG-4 Part 2 不能用**，\n"
@@ -251,6 +271,7 @@ def gen_mp4v():
     o.w(
         header(
             "MPEG-4 Part 2（`mp4v`）编解码需要的表。",
+            MP4V_SOURCES,
             "//!\n"
             "//! 与 `crates/msmpeg4/src/tables.rs` 的区别：那边是 MP43 的私有表\n"
             "//! （`MB_INTRA` / `MB_NON_INTRA`、三套 escape 的 RL 表、WMV1 的 DC 缩放），\n"

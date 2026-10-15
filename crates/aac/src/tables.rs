@@ -9,9 +9,19 @@
 //!
 //! ## 许可
 //!
-//! 生成器读的是 FFmpeg 7.1 的 `libavcodec/aactab.c` 与 `aacenctab.h`
-//! （LGPL-2.1-or-later）—— 与本仓的许可一致，整个仓库统一按 LGPL-2.1-or-later 使用。
-//! 详见 README 的「许可证」一节。
+//! 本文件的数据取自 FFmpeg 7.1（LGPL-2.1-or-later）的这几个文件，
+//! 以及它们的版权声明（由生成器从源文件原样读出）：
+//!
+//! ```text
+//! `aactab.c`
+//!     Copyright (c) 2005-2006 Oded Shimon ( ods15 ods15 dyndns org )
+//!     Copyright (c) 2006-2007 Maxim Gavrilov ( maxim.gavrilov gmail com )
+//! `aacenctab.h`
+//!     Copyright (c) 2015 Rostislav Pehlivanov ( atomnuker gmail com )
+//! ```
+//!
+//! 与本仓的许可一致，整个仓库统一按 LGPL-2.1-or-later 使用。
+//! 详见 README 的「许可证」一节与根目录的 `NOTICE`。
 //!
 //! ## 与 `crates/msmpeg4` / `crates/mp4v` 的表的关系
 //!

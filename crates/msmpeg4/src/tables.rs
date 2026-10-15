@@ -9,15 +9,22 @@
 //!
 //! ## 许可
 //!
-//! 生成器读的是 FFmpeg 7.1 的 `libavcodec/` 下这些文件（LGPL-2.1-or-later）：
-//! msmpeg4data.c
-//! msmpeg4_vc1_data.c
-//! mpeg4data.h
-//! h263data.c
-//! mpegvideodata.c
+//! 本文件的数据取自 FFmpeg 7.1（LGPL-2.1-or-later）的这几个文件，
+//! 以及它们的版权声明（由生成器从源文件原样读出）：
+//!
+//! ```text
+//! `msmpeg4data.c`
+//!     copyright (c) 2001 Fabrice Bellard
+//!     copyright (c) 2002-2004 Michael Niedermayer <michaelni@gmx.at>
+//!     msmpeg4v1 & v2 stuff by Michael Niedermayer <michaelni@gmx.at>
+//! `msmpeg4_vc1_data.c`
+//!     Copyright (c) 2001 Fabrice Bellard
+//!     Copyright (c) 2002-2004 Michael Niedermayer <michaelni@gmx.at>
+//!     msmpeg4v1 & v2 stuff by Michael Niedermayer <michaelni@gmx.at>
+//! ```
 //!
 //! 与本仓的许可一致，整个仓库统一按 LGPL-2.1-or-later 使用。
-//! 详见 README 的「许可证」一节。
+//! 详见 README 的「许可证」一节与根目录的 `NOTICE`。
 //!
 //! 换一个数据源（规范附录、或别的宽松许可实现）即可整体替换 —— 生成器已就位，
 //! 且表本身与实现无关。
