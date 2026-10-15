@@ -117,6 +117,10 @@ fn psnr(a: &Frame, b: &Frame) -> f64 {
 
 #[test]
 fn encodes_ip_sequence_both_decoders_agree() {
+    if !common::has_ffmpeg() {
+        eprintln!("SKIP: PATH 上没有 ffmpeg / ffprobe");
+        return;
+    }
     let (w, h) = (320u32, 240u32);
     let frames = moving_sequence(w, h, 5);
     let qscale = 8u8;
@@ -147,6 +151,10 @@ fn encodes_ip_sequence_both_decoders_agree() {
 /// P 帧的 PSNR 应该明显更差。这条测试防的是「ME 写了但没起作用」。
 #[test]
 fn motion_estimation_actually_helps() {
+    if !common::has_ffmpeg() {
+        eprintln!("SKIP: PATH 上没有 ffmpeg / ffprobe");
+        return;
+    }
     let (w, h) = (320u32, 240u32);
     let frames = moving_sequence(w, h, 4);
     let qscale = 8u8;
@@ -254,6 +262,10 @@ fn static_scene_collapses_to_skips() {
 /// 帧内/帧间判决应该让帧内宏块接管，画质不崩、ffmpeg 仍然解得开。
 #[test]
 fn scene_cut_falls_back_to_intra_macroblocks() {
+    if !common::has_ffmpeg() {
+        eprintln!("SKIP: PATH 上没有 ffmpeg / ffprobe");
+        return;
+    }
     let (w, h) = (320u32, 240u32);
 
     // 0: 移动序列的 I 帧；1: 正常预测帧；2: **完全不同的画面**（切换）；

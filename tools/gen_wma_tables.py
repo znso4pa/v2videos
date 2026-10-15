@@ -5,9 +5,13 @@
 
 ```bash
 python3 tools/gen_wma_tables.py \
-    --src /tmp/ffsize/ffmpeg-7.1/libavcodec \
+    --src <你自己的 ffmpeg 源码>/libavcodec \
     --out crates/wma/src/tables.rs
 ```
+
+⚠️ `--src` 的**默认值是作者的本地路径**（`/tmp/ffsize/ffmpeg-7.1/libavcodec`），
+第三方 clone 里不存在。自己准备一份 FFmpeg 7.1 源码（<https://ffmpeg.org/download.html>），
+用 `--src` 指过去。
 
 ## 抽哪些、为什么
 
@@ -32,6 +36,8 @@ import argparse
 import re
 import sys
 from pathlib import Path
+
+from ffmpeg_src import copyright_lines
 
 NB_LSP_COEFS = 10
 
@@ -157,7 +163,12 @@ def kraft_sum(lens: list[int]) -> float:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--src", default="/tmp/ffsize/ffmpeg-7.1/libavcodec", help="ffmpeg libavcodec 目录")
+    ap.add_argument(
+        "--src",
+        default="/tmp/ffsize/ffmpeg-7.1/libavcodec",
+        help="ffmpeg 的 libavcodec 目录。⚠️ 默认值是**作者的本地路径**，" 
+             "第三方 clone 里不存在 —— 自己下一份 FFmpeg 源码再用这个参数指过来",
+    )
     ap.add_argument("--out", default="crates/wma/src/tables.rs")
     ap.add_argument(
         "--aactab",
@@ -172,11 +183,34 @@ def main() -> int:
     aactab = strip_comments(aactab_path.read_text()) if aactab_path.is_file() else ""
     wma_freqs = strip_comments((src_dir / "wma_freqs.c").read_text())
 
+    # 源文件清单 + 各自文件头里的版权行 —— **原样读出，不手抄**（见 tools/ffmpeg_src.py）。
+    # `aactab.c` 只提供指数 VLC 那一张表，所以只有真的读到它才算来源。
+    src_files = ["wmadata.h", "wma_freqs.c"] + (["aactab.c"] if aactab else [])
+    attrib = []
+    for name in src_files:
+        attrib.append(f"//! `{name}`")
+        lines = copyright_lines(str(src_dir / name))
+        attrib.extend(f"//!     {line}" for line in lines)
+        if not lines:
+            attrib.append("//!     （该文件头没有版权行）")
+
     out = []
     out.append("//! WMA 解码用的码表 —— **由 tools/gen_wma_tables.py 从 ffmpeg 的数据文件生成**。")
     out.append("//!")
     out.append("//! 别手改这个文件：改生成器再重新生成。")
     out.append("//! 出处与理由见 `tools/gen_wma_tables.py` 的文档（含 Kraft 和自检）。")
+    out.append("//!")
+    out.append("//! ## 许可")
+    out.append("//!")
+    out.append("//! 本文件的数据取自 FFmpeg 7.1（LGPL-2.1-or-later）的这几个文件，")
+    out.append("//! 以及它们的版权声明（由生成器从源文件原样读出）：")
+    out.append("//!")
+    out.append("//! ```text")
+    out.extend(attrib)
+    out.append("//! ```")
+    out.append("//!")
+    out.append("//! 与本仓的许可一致，整个仓库统一按 LGPL-2.1-or-later 使用。")
+    out.append("//! 详见 README 的「许可证」一节与根目录的 `NOTICE`。")
     out.append("")
     out.append("#![allow(clippy::all)]")
     out.append("")

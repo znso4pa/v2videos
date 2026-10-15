@@ -13,6 +13,11 @@
 用法：
     python3 tools/gen_aac_tables.py [ffmpeg_src_dir]
 
+
+⚠️ **默认源目录 `/tmp/ffsize/ffmpeg-7.1` 是作者的本地路径**，第三方 clone 里不存在。
+自己准备一份 FFmpeg 7.1 源码（`https://ffmpeg.org/download.html`），然后：
+- 前三个脚本：把路径作为**第一个参数**传进去；
+- `gen_wma_tables.py`：用 `--src <ffmpeg>/libavcodec`。
 写 `crates/aac/src/tables.rs`。表来自 `libavcodec/aactab.c` 与
 `libavcodec/aacenctab.h`。
 """
@@ -20,6 +25,8 @@
 import os
 import re
 import sys
+
+from ffmpeg_src import copyright_lines
 
 DEFAULT_SRC = "/tmp/ffsize/ffmpeg-7.1"
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -111,7 +118,24 @@ class Out:
         return "".join(self.buf)
 
 
-HEADER = """//! AAC-LC 编码需要的 Huffman 码表与频带表。
+SOURCES = ["aactab.c", "aacenctab.h"]
+
+
+def attribution():
+    """源文件清单 + 各自文件头里的版权行 —— **原样读出，不手抄**（见 `tools/ffmpeg_src.py`）。"""
+    out = []
+    for name in SOURCES:
+        out.append(f"//! `{name}`")
+        lines = copyright_lines(f"{SRC}/libavcodec/{name}")
+        out.extend(f"//!     {line}" for line in lines)
+        if not lines:
+            out.append("//!     （该文件头没有版权行）")
+    return "".join(line + "\n" for line in out)
+
+
+def header():
+    return (
+        """//! AAC-LC 编码需要的 Huffman 码表与频带表。
 //!
 //! **本文件由 `tools/gen_aac_tables.py` 生成，不要手改。**
 //!
@@ -122,9 +146,16 @@ HEADER = """//! AAC-LC 编码需要的 Huffman 码表与频带表。
 //!
 //! ## 许可
 //!
-//! 生成器读的是 FFmpeg 7.1 的 `libavcodec/aactab.c` 与 `aacenctab.h`
-//! （LGPL-2.1-or-later）—— 与本仓的许可一致，整个仓库统一按 LGPL-2.1-or-later 使用。
-//! 详见 README 的「许可证」一节。
+//! 本文件的数据取自 FFmpeg 7.1（LGPL-2.1-or-later）的这几个文件，
+//! 以及它们的版权声明（由生成器从源文件原样读出）：
+//!
+//! ```text
+"""
+        + attribution()
+        + """//! ```
+//!
+//! 与本仓的许可一致，整个仓库统一按 LGPL-2.1-or-later 使用。
+//! 详见 README 的「许可证」一节与根目录的 `NOTICE`。
 //!
 //! ## 与 `crates/msmpeg4` / `crates/mp4v` 的表的关系
 //!
@@ -133,6 +164,7 @@ HEADER = """//! AAC-LC 编码需要的 Huffman 码表与频带表。
 //! #![allow(dead_code, clippy::all)]
 
 """
+    )
 
 
 def gen():
@@ -144,7 +176,7 @@ def gen():
         return [nums(g) for g in re.findall(r"\{\s*([^{}]*?)\s*\}", body(text, var))]
 
     o = Out()
-    o.w(HEADER)
+    o.w(header())
 
     # ── 频谱 Huffman ────────────────────────────────────────────────────────
     # 频谱 Huffman：11 本码本，每本最多 289 个码字（`ff_aac_spectral_sizes`）。

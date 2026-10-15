@@ -10,6 +10,10 @@ Cargo.lock
 *.so
 *.dylib
 
+# Python 字节码缓存（tools/ 下的脚本会被 import）
+__pycache__/
+*.pyc
+
 # 编辑器 / 系统
 .DS_Store
 .idea/
@@ -25,3 +29,4 @@ TODO.md
 
 # 会话记忆 / 工作数据（本地，含夹具出处等不入库的信息）
 .workbuddy-ai/
+testing/

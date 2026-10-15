@@ -86,7 +86,9 @@ cargo run -p v2v-cli -- convert --mp4 -g 12 in.wmv -o out/  # .mp4：mp4v + AAC
 | `V2V_WMA_SAMPLE`         | WMA 解码出的 PCM 对 `ffmpeg`（wma）                    |
 | `V2V_AUDIO_SAMPLE`       | 音频直通整文件对账（cli，标了 `#[ignore]`）                    |
 | `V2V_MP4_REF` / `V2V_MP4_PCM` | MP4 封装逐 box 对 `ffmpeg` 产的参考件（mp4）              |
+| `V2V_MP4_OUT` / `V2V_MP4_OUT_AV` | 上面那两条把我们的产物**落到哪个路径**（不设就落 `/tmp/v2v_ours*.mp4`） |
 | `V2V_MAX_FRAMES` / `V2V_PFRAME_MAP` | 限量跑 / 逐帧定位（msmpeg4 调试用）                        |
+| `V2V_FUZZ_ROUNDS`        | 模糊测试的轮数（见下；不设就用各局自己的默认）                          |
 
 ```bash
 # 例：带样本跑全套；最重的是 #[ignore] 那一层
@@ -95,6 +97,29 @@ V2V_ASF_SAMPLE='/path/a.wmv:/path/b.asf' cargo test --workspace -j 4 -- --ignore
 
 ⚠️ **「`cargo test` 全绿」≠「对账过了」** —— 没设环境变量时那些对账测试只是 **SKIP 了**。
 动了编解码 / 容器，必须自己带上样本再跑一遍（见「完成任务前」）。
+
+### 变异模糊测试（`crates/*/tests/fuzz.rs`）
+
+**零样本、零 ffmpeg、纯内存** —— 所以它在 CI 里也真跑，不是「SKIP 了」。
+五个目标各一局：MP43 解码 / WMA 解码 / ASF 解封装 / AVI 解封装 / MP4 封装。
+判据是「**允许 `Err`，禁止 `panic`**」—— 解码器吃的是别人的字节，
+一条 panic 会把整个转换流程带走。
+
+```bash
+cargo test --workspace -j 4                          # 轻局：几百轮，秒级
+V2V_FUZZ_ROUNDS=30000 cargo test --release -j 4 --workspace -- --ignored --nocapture   # 重局
+```
+
+⚠️ **两个坑，改这些测试之前先读**（都踩过）：
+
+- **底本会退化，退化的模糊测试是假绿。** MP43 那局一开始用平缓渐变当底本，
+  编出来的 P 帧只有 3 字节（整帧一个 skip 宏块）——「几百轮全绿」其实只测了帧头。
+  所以每局都有「底本质量断言」：底本自己先解一遍、通路先验一遍。
+- **「没报错」不等于「解进去了」。** `decode_superframe` 对攒位的包返回 `Ok(vec![])`，
+  于是「几千轮没报错」可能是「几千轮什么都没解」。所以 WMA 那局数的是
+  **真的产出了多少帧**，不是「多少轮没报错」。
+
+变异算子只有一份（`crates/msmpeg4/tests/common/mutate.rs`），其余各局用 `#[path]` 引它。
 
 ## 🖥️ 构建资源纪律（**动手前先看表** —— 这台机器很吃紧）
 

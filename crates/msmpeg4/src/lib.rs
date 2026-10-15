@@ -19,7 +19,9 @@
 //!   **ffmpeg 解得开**，且两个解码器逐像素一致
 //! - ✅ P 帧编码：运动估计（整像素粗搜 + 半像素细化）+ 帧间残差 + skip；
 //!   **帧内/帧间判决** —— 画面切换时帧内宏块自动接管
-//! - ⏳ ASF 写
+//!
+//! ASF 封装**不在这个 crate 里**，见 `v2v-asf`（本 crate 只管裸 MP43 帧）。
+//! 编出来的也只是 **MP43（v3）**，不是 WMV9/VC-1 —— 原因见 README 的能力矩阵。
 //!
 //! 实现按 H.263 / MPEG-4 Part 2 的语法写，**不链 ffmpeg、不引依赖** ——
 //! ffmpeg 只当**交叉验证的 oracle**（测试里解同一条流、逐像素对账），不进产物。
@@ -39,11 +41,12 @@ mod predict;
 pub mod tables;
 #[cfg(test)]
 mod testbit;
+mod version;
 mod vlc;
 
 pub use bitreader::BitReader;
 pub use bitwriter::BitWriter;
-pub use block::RlTable;
+pub use block::{AcCtx, RlTable};
 pub use encode::{Encoder, EncoderConfig};
 pub use error::{Error, Result};
 pub use fdct::{fdct, fdct_i};
@@ -52,7 +55,11 @@ pub use frame::{
     decode_i_frame, mc_chroma8, mc_luma16, mc_mb, mc_params, mid_pred, sad_luma16, AcPredRead,
     Decoder, Frame, McParams, Planes, Stats, ZIGZAG,
 };
-pub use header::{decode012, parse_frame_header, FrameHeader, PictureType};
+pub use header::{
+    decode012, parse_frame_header, FrameHeader, HeaderState, PictureType, II_BITRATE,
+    MBAC_BITRATE,
+};
+pub use version::Version;
 pub use idct::{idct_add, idct_put};
 pub use predict::{ac_predict, coded_block_predict, dc_predict, AcVal};
 pub use vlc::Vlc;

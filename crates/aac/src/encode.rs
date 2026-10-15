@@ -1,4 +1,4 @@
-//! AAC-LC 编码器（长窗、单/双声道、无 TNS/PNS/IS/MS）。
+//! AAC-LC 编码器（长/短窗 + 过渡窗、单/双声道、M/S 立体声、TNS；**无 PNS / IS**）。
 //!
 //! ## 一帧的处理顺序
 //!
@@ -143,11 +143,16 @@ pub struct EncoderConfig {
     /// 是不是已经在并行转几个文件、也不知道这是不是 Android 上被系统限流的后台任务。
     /// 库自己起线程 = 把「什么时候发热、什么时候抢 CPU」的决定权从调用方拿走了。
     ///
-    /// ## 当前只有「声道并行」
+    /// ## 两条并行路径
     ///
-    /// 双声道时两个声道各占一个线程：**总工作量不变**（只是让两个核同时干），
-    /// 而且**输出逐字节相同**。所以它不是「拿算力换延迟」，是可以放心开的那一类。
-    /// 线程数会被**封顶到声道数** —— 单声道时给多少都是 1。
+    /// 1. **帧并行**（`encode_frames`，批量接口）—— 把一批帧按连续区间切给各线程，
+    ///    总工作量不变、核越多越快，是主要的提速来源（逐帧接口用不上这条）。
+    /// 2. **声道并行**（`encode_frame` / 帧并行内部）—— 双声道时两个声道各占一个
+    ///    线程，**输出逐字节相同**。
+    ///
+    /// 帧并行的输出**不是**逐字节相同（原因见 `encode_frames` 的说明：`sf_offset`
+    /// 是近似搜索的锚点）。两条路径的线程数都**封顶到可用并行度** ——
+    /// 单声道给多少都是 1、一批 4 帧给 8 个线程也只起 4 个。
     ///
     /// ## ⚠️ 调用方要自己保证不在主线程上等
     ///
@@ -215,50 +220,180 @@ impl AudioSpecificConfig {
 /// 分组必须两个声道一致 —— 决策得提到 `encode_frame` 里**联合**做，不能各声道各决定。
 /// 单声道就用自己那一份。
 struct WindowPlan {
-    /// 本帧用不用短窗（`EIGHT_SHORT_SEQUENCE`）。
-    short: bool,
+    /// 本帧的窗序列（`ONLY_LONG` / `LONG_START` / `EIGHT_SHORT` / `LONG_STOP`）。
+    ///
+    /// ⚠️ **不能只有「长/短」两态**：长 ↔ 短之间必须走过渡窗，否则相邻两帧的窗
+    /// 在重叠区不互补 —— 见 `decide_sequence` 与 `mdct::long_start_window`。
+    seq: WindowSequence,
     /// 分组长度（长窗恒 `[1]`）。
     group_lens: Vec<usize>,
     /// 每个声道本帧的攻击（要写回 `ChannelState::attack_prev`）。
     attacks: Vec<Option<usize>>,
 }
 
+/// **窗序列状态机**（照 `ffmpeg` 的 `psy_3gpp_window`，`aacpsy.c:443-463`）。
+///
+/// ```text
+///   ONLY_LONG   + 攻击 → LONG_START   （本帧仍是长窗，但尾巴给短窗让位）
+///   ONLY_LONG   + 无   → ONLY_LONG
+///   LONG_START  + 任意 → EIGHT_SHORT  （过渡窗已发，下一帧必须是短窗）
+///   LONG_STOP   + 攻击 → LONG_START
+///   LONG_STOP   + 无   → ONLY_LONG
+///   EIGHT_SHORT + 攻击 → EIGHT_SHORT  （继续短窗）
+///   EIGHT_SHORT + 无   → LONG_STOP    （本帧仍是长窗，但头给上一帧的短窗让位）
+/// ```
+///
+/// ## 为什么不能长↔短直接跳（实测）
+///
+/// MDCT 的完美重建要求**相邻两帧的窗在重叠区互补**（`w_a² + w_b² = 1`）。
+/// 长配长、短配短都天然满足，**长配短不满足**：长窗前半是上升的 `lwindow`，
+/// 而短窗帧两头是零 —— `[0, 448)` 那一段没有任何东西与长窗相加。
+///
+/// 帧对齐的 MDCT 域归因（真音乐 8 秒 @1 Mbps，逐帧与源比）：
+///
+/// | 帧类别 | 帧数占比 | 总误差占比 | 帧 SNR 中位 |
+/// |---|---|---|---|
+/// | 短窗 | 13.1% | 23.2% | 18.3 dB |
+/// | **紧跟短窗之后的长窗** | **6.0%** | **55.9%** | **11.7 dB** |
+/// | 紧邻短窗之前的长窗 | 6.0% | 15.2% | 15.2 dB |
+/// | 孤立的长窗 | 75.0% | **5.7%** | **69.0 dB** |
+///
+/// 孤立长窗只占 5.7% 的误差 —— 说明**长窗那条路本身是好的**，坏的是切换。
+fn decide_sequence(
+    attack: Option<usize>,
+    prev_attack: Option<usize>,
+    prev: WindowSequence,
+) -> (WindowSequence, Vec<usize>) {
+    match prev {
+        WindowSequence::OnlyLong => {
+            if attack.is_some() {
+                (WindowSequence::LongStart, vec![1])
+            } else {
+                (WindowSequence::OnlyLong, vec![1])
+            }
+        }
+        WindowSequence::LongStart => {
+            // 过渡窗已经发出去，本帧必然是短窗。攻击位置用上一帧记下来的那个
+            // （本帧不一定还有攻击 —— 但那不重要，短窗覆盖的正是上一帧的攻击）。
+            let pos = attack.or(prev_attack).unwrap_or(8);
+            (WindowSequence::EightShort, group_lengths(WINDOW_GROUPING[pos]))
+        }
+        WindowSequence::LongStop => {
+            if attack.is_some() {
+                (WindowSequence::LongStart, vec![1])
+            } else {
+                (WindowSequence::OnlyLong, vec![1])
+            }
+        }
+        WindowSequence::EightShort => {
+            if let Some(pos) = attack {
+                (WindowSequence::EightShort, group_lengths(WINDOW_GROUPING[pos]))
+            } else {
+                (WindowSequence::LongStop, vec![1])
+            }
+        }
+    }
+}
+
 impl WindowPlan {
     /// 一个声道的窗决策（单声道走这条）。
-    fn for_one(attack: Option<usize>, prev_attack: Option<usize>) -> Self {
-        let short = attack.is_some() || prev_attack.is_some();
-        let attack_pos = attack.or(prev_attack).unwrap_or(8);
-        let group_lens = if short {
-            group_lengths(WINDOW_GROUPING[attack_pos])
-        } else {
-            vec![1]
-        };
+    fn for_one(attack: Option<usize>, prev_attack: Option<usize>, prev: WindowSequence) -> Self {
+        let (seq, group_lens) = decide_sequence(attack, prev_attack, prev);
         Self {
-            short,
+            seq,
             group_lens,
             attacks: vec![attack],
         }
     }
 
-    /// **双声道联合**的窗决策：只要**任一**声道（本帧或上一帧）有攻击就用短窗，
+    /// **双声道联合**的窗决策：只要**任一**声道有攻击就算有攻击，
     /// 分组位置取两个声道里**最早**的那个攻击。
-    fn for_pair(attacks: &[Option<usize>], prev: &[Option<usize>]) -> Self {
-        let short = (0..attacks.len()).any(|ch| attacks[ch].is_some() || prev[ch].is_some());
-        let attack_pos = (0..attacks.len())
-            .filter_map(|ch| attacks[ch].or(prev[ch]))
-            .min()
-            .unwrap_or(8);
-        let group_lens = if short {
-            group_lengths(WINDOW_GROUPING[attack_pos])
-        } else {
-            vec![1]
-        };
+    fn for_pair(
+        attacks: &[Option<usize>],
+        prev: &[Option<usize>],
+        prev_seq: WindowSequence,
+    ) -> Self {
+        let attack = attacks.iter().copied().flatten().min();
+        let prev_attack = prev.iter().copied().flatten().min();
+        let (seq, group_lens) = decide_sequence(attack, prev_attack, prev_seq);
         Self {
-            short,
+            seq,
             group_lens,
             attacks: attacks.to_vec(),
         }
     }
+}
+
+/// 一帧的**跨帧语义状态** —— 只有这四项会影响输出。
+///
+/// `cost_cache` 只影响**速度**（它本来就是帧内缓存，每帧开头 `reset`）。
+///
+/// ⚠️ `sf_offset_prev` 则**也影响结果**：偏移搜索是近似搜索、锚在这个种子上
+/// （详见字段自身的说明）。所以 `to_chans` 把它设成固定初值 = 批量路径**每帧都
+/// 从冷种子开始**，既丢掉了热启动、也让结果与逐帧路径差一点点。
+/// 要「逐字节相同」就得让搜索与种子无关 —— 那是另一件事，现在没做。
+#[derive(Clone)]
+struct FrameState {
+    /// 每个声道：上一帧的 coded 样本（按**本帧**要编的域取用）。
+    overlap: Vec<Vec<f32>>,
+    /// 每个声道：上一帧的 **M/S 域** coded 样本。
+    overlap_ms: Vec<Vec<f32>>,
+    /// 上一帧每个声道的攻击（窗序列状态机的分组定位用）。
+    attack_prev: Vec<Option<usize>>,
+    /// 上一帧实际发出的窗序列（状态机的输入）。
+    window_seq_prev: WindowSequence,
+}
+
+impl FrameState {
+    fn from_chans(chans: &[ChannelState]) -> Self {
+        Self {
+            overlap: chans.iter().map(|c| c.overlap.clone()).collect(),
+            overlap_ms: chans.iter().map(|c| c.overlap_ms.clone()).collect(),
+            attack_prev: chans.iter().map(|c| c.attack_prev).collect(),
+            window_seq_prev: chans[0].window_seq_prev,
+        }
+    }
+
+    /// 铺成一份**独立的** `ChannelState`（缓存是空的 —— 帧内会自己填）。
+    fn to_chans(&self) -> Vec<ChannelState> {
+        self.overlap
+            .iter()
+            .zip(&self.overlap_ms)
+            .zip(&self.attack_prev)
+            .map(|((ov, ovm), atk)| ChannelState {
+                overlap: ov.clone(),
+                overlap_ms: ovm.clone(),
+                attack_prev: *atk,
+                window_seq_prev: self.window_seq_prev,
+                cost_cache: BandCostCache::new(),
+                sf_offset_prev: SF_OFFSET_SEED_INIT,
+            })
+            .collect()
+    }
+
+    /// 把语义状态写回已有的 `ChannelState`（保留它们的缓存与搜索种子）。
+    fn apply_to(&self, chans: &mut [ChannelState]) {
+        for (ch, st) in chans.iter_mut().enumerate() {
+            st.overlap.clone_from(&self.overlap[ch]);
+            st.overlap_ms.clone_from(&self.overlap_ms[ch]);
+            st.attack_prev = self.attack_prev[ch];
+            st.window_seq_prev = self.window_seq_prev;
+        }
+    }
+}
+
+/// 一帧的**预扫结果** —— 编它需要的一切，不含编码器自己的缓存。
+///
+/// `prepare_frame` 产出它（并把跨帧状态推进一步），`encode_frame_inner` 消费它。
+/// 按帧并行时，预扫与编码被拆成两步，中间夹着并行（见 `encode_frames`）。
+struct PreparedFrame {
+    /// 本帧实际要编的信号（M/S 时就是 M/S，否则是原始 L/R）。
+    coded: Vec<Vec<f32>>,
+    /// MDCT 的左半（上一帧的 coded，按**本帧**的域取）。
+    hist: Vec<Vec<f32>>,
+    /// 窗序列与分组。
+    plan: WindowPlan,
+    use_ms: bool,
 }
 
 /// 把一个声道的这一帧推进它的重叠历史（AAC 是 50% 重叠，左半就是上一帧）。
@@ -381,21 +516,24 @@ struct ChannelState {
     overlap_ms: Vec<f32>,
     /// 「上一帧的攻击落在哪个子块」（`None` = 没有攻击）。
     ///
-    /// 短窗的覆盖区是 `buf[448..1600]`（见 `encode_channel`），换算到**本帧样本**
-    /// 就是 `[-576, +576)`：所以一帧里的攻击落在**前 ~576 个样本**（子块 0..=4）
-    /// 时本帧要用短窗；落在**后 448 个样本**（子块 5..=7）时，攻击其实落在
-    /// **下一帧**的窗口覆盖区里 —— 于是本帧发 `LONG_START`、下一帧发短窗。
-    ///
-    /// ⚠️ 这个「前/后」的划分是**不需要前瞻**就能决定 `LONG_START` 的关键：
-    /// 「下一帧会不会是短窗」由**本帧自己的后段攻击**决定，而它是本帧已知的。
+    /// 只用来给**分组**定位：`EIGHT_SHORT` 帧拿它查 `WINDOW_GROUPING`，
+    /// 把攻击所在的那个窗口单独分一组（见 `decide_sequence`）。
+    /// 短窗的覆盖区是 `buf[448..1600]`，换算到**本帧样本**就是 `[-576, +576)`。
     attack_prev: Option<usize>,
+    /// 上一帧实际发出的**窗序列** —— 本帧的窗序列状态机拿它决定过渡态
+    /// （见 `decide_sequence`）。初值 `ONLY_LONG`（第一帧之前没有短窗）。
+    window_seq_prev: WindowSequence,
     /// `band_cost` 的帧内缓存（见 `BandCostCache`）。
     cost_cache: BandCostCache,
     /// **上一帧选中的 `sf_offset`** —— 下一帧搜偏移时的**种子**。
     ///
     /// 相邻帧的谱形状是连续的，所以上一帧的答案是很好的出发点：从它出发做
     /// 指数搜索，绝大多数帧 2–4 趟就收敛（固定区间二分恒 7 趟）。
-    /// **找的还是同一个答案**（最小的可行偏移），所以输出逐字节不变。
+    ///
+    /// ⚠️ 它**不只是种子**：`plan_group` 的三级细化（12→3→1）是**近似搜索**、
+    /// 锚在这个偏移上，所以换种子会落到不同的格点、给出**略微不同**的码率分配
+    /// （不是「同一个答案」—— 早期这里写错过，实测真音乐 350 帧里 2 帧差
+    /// 14 字节）。改这里要知道自己在动**结果**，不只是动速度。
     sf_offset_prev: i32,
 }
 
@@ -403,8 +541,12 @@ pub struct Encoder {
     cfg: EncoderConfig,
     /// 每声道一份可变状态。`threads >= 2` 时两个声道各在一个线程里动自己那份。
     chans: Vec<ChannelState>,
-    /// 长窗的开窗表（`2N` 长）。
+    /// **长窗**的开窗表（`2N` 长）。
     window: Vec<f32>,
+    /// **过渡窗**（长 ↔ 短）。没有它们就只能长↔短直接跳变、重叠区不互补
+    /// —— 见 `mdct::long_start_window` 与 `decide_sequence`。
+    window_long_start: Vec<f32>,
+    window_long_stop: Vec<f32>,
     /// 采样率索引（TNS 的几张表按它索引）。
     sr_idx: usize,
     /// 已经编过多少帧 —— 用来交替「这一帧有没有上一帧的右半」。
@@ -457,6 +599,10 @@ impl Encoder {
         // 短窗与长窗**同系**：编码端写 `use_kb_window` 是每个 ics_info 一个位，
         // 简化起见长短窗永远同系（解码端只拿它决定用哪张窗表，不校验一致性）。
         let window_short = crate::mdct::short_window(cfg.kb_window);
+        // 过渡窗（长 ↔ 短）—— 形状与解码端的 `LONG_START` / `LONG_STOP` 合成窗
+        // 成对，构造性判据见 `mdct::transition_windows_are_complementary`。
+        let window_long_start = crate::mdct::long_start_window(&window, &window_short);
+        let window_long_stop = crate::mdct::long_stop_window(&window, &window_short);
         // 每帧的位数预算。`bitrate` 是**目标**不是保证 —— 编码器靠
         // 「二分搜整帧 sf 偏移」逼近它（见 `encode_channel`）。
         let frames_per_sec = f64::from(cfg.sample_rate) / LONG_LEN as f64;
@@ -469,11 +615,14 @@ impl Encoder {
                     overlap: vec![0f32; LONG_LEN],
                     overlap_ms: vec![0f32; LONG_LEN],
                     attack_prev: None,
+                    window_seq_prev: WindowSequence::OnlyLong,
                     cost_cache: BandCostCache::new(),
                     sf_offset_prev: SF_OFFSET_SEED_INIT,
                 })
                 .collect(),
             window,
+            window_long_start,
+            window_long_stop,
             sr_idx: sr_idx as usize,
             frame_index: 0,
             swb,
@@ -515,20 +664,27 @@ impl Encoder {
     /// `frame.planes[i]` 长度必须是 1024（或更短 —— 短了补 0，最后一帧用得上）。
     /// 返回一个裸 AAC 帧（不含 ADTS 头，MP4 里也不需要）。
     pub fn encode_frame(&mut self, frame: &Frame) -> crate::Result<Vec<u8>> {
-        if frame.planes.len() != self.cfg.channels as usize {
-            return Err(Error::Bad("声道数与配置不一致"));
-        }
-        for p in &frame.planes {
-            if p.len() > LONG_LEN {
-                return Err(Error::Bad("一帧超过 1024 个样本"));
-            }
-        }
-
-        let mut w = BitWriter::new();
-        let is_stereo = self.cfg.channels == 2;
-        let mut any_short = false;
-
         let mut chans = std::mem::take(&mut self.chans);
+        let r = self.encode_frame_inner(frame, &mut chans);
+        self.chans = chans;
+        let (bytes, short) = r?;
+        if short {
+            self.short_frames += 1;
+        }
+        self.frame_index += 1;
+        Ok(bytes)
+    }
+
+    /// 算一帧「要编什么、怎么编」，并把**跨帧状态**往下推一步。
+    ///
+    /// 决策逻辑（M/S 选择、窗序列状态机、重叠历史的推进）只有这一份 ——
+    /// `encode_frame_inner` 直接用它，`encode_frames` 的预扫也用它（只是不编码）。
+    ///
+    /// ⚠️ 它会**修改 `chans`**（推进 `overlap*` / `attack_prev` / `window_seq_prev`），
+    /// 所以调用方要么把 `chans` 用完就丢（预扫），要么紧接着编码（逐帧）。
+    fn prepare_frame(&self, frame: &Frame, chans: &mut [ChannelState]) -> PreparedFrame {
+        let n = self.cfg.channels as usize;
+        let is_stereo = self.cfg.channels == 2;
 
         // ---- M/S 立体声：逐帧决策，决定本帧**实际要编的信号** ----
         //
@@ -546,12 +702,11 @@ impl Encoder {
                 l.iter().zip(r).map(|(a, b)| (a - b) * 0.5).collect(),
             ]
         });
-        let use_ms = ms_planes.is_some()
-            && use_midside(&frame.planes[0], &frame.planes[1]);
-        let coded: &[Vec<f32>] = if use_ms {
-            ms_planes.as_ref().expect("use_ms 蕴含 ms_planes")
-        } else {
-            &frame.planes
+        let use_ms =
+            ms_planes.is_some() && use_midside(&frame.planes[0], &frame.planes[1]);
+        let coded: Vec<Vec<f32>> = match (&ms_planes, use_ms) {
+            (Some(ms), true) => ms.clone(),
+            _ => frame.planes.clone(),
         };
 
         // ---- 窗决策（双声道**联合**，因为要共用一份 `ics_info`）----
@@ -559,10 +714,186 @@ impl Encoder {
         let plan = if is_stereo {
             let attacks: Vec<Option<usize>> = coded.iter().map(|p| detect_attack(p)).collect();
             let prev: Vec<Option<usize>> = chans.iter().map(|c| c.attack_prev).collect();
-            WindowPlan::for_pair(&attacks, &prev)
+            WindowPlan::for_pair(&attacks, &prev, chans[0].window_seq_prev)
         } else {
-            WindowPlan::for_one(detect_attack(&coded[0]), chans[0].attack_prev)
+            WindowPlan::for_one(
+                detect_attack(&coded[0]),
+                chans[0].attack_prev,
+                chans[0].window_seq_prev,
+            )
         };
+
+        // ---- 重叠历史与跨帧状态：**读旧值、写新值** ----
+        //
+        // 先取本帧要用的那一套（按 `use_ms`），再把**两套都**往下推进 ——
+        // 下一帧可能换域，而 MDCT 的 TDAC 要求「上一帧那一半」是**同一个域**的信号。
+        let hist: Vec<Vec<f32>> = (0..n)
+            .map(|ch| {
+                if use_ms {
+                    chans[ch].overlap_ms.clone()
+                } else {
+                    chans[ch].overlap.clone()
+                }
+            })
+            .collect();
+        for ch in 0..n {
+            push_history(&mut chans[ch].overlap, &coded[ch]);
+            if let Some(ms) = ms_planes.as_deref() {
+                push_history(&mut chans[ch].overlap_ms, &ms[ch]);
+            }
+            // 下一帧的窗序列状态机要看这两项。
+            chans[ch].attack_prev = plan.attacks[ch];
+            chans[ch].window_seq_prev = plan.seq;
+        }
+
+        PreparedFrame {
+            coded,
+            hist,
+            plan,
+            use_ms,
+        }
+    }
+
+    /// **按帧并行**地编一整批（线程数取 `cfg.threads`）。
+    ///
+    /// ## 为什么能并行（以及为什么必须「先预扫」）
+    ///
+    /// AAC-LC 逐帧独立，**唯一的例外是窗序列** —— `decide_sequence` 的状态机
+    /// 要看上一帧实际发的序列。其余状态都不是障碍：`cost_cache` 本来就是帧内
+    /// 缓存、重叠历史就是**上一帧的 coded 样本**（可以直接算出来）。
+    ///
+    /// ⚠️ `sf_offset_prev` 看着也像「只影响从哪儿开始探」，其实**不是**：
+    /// `plan_group` 的三级细化（12→3→1）是**近似搜索**、锚在「上一帧留下的偏移」
+    /// 上，换锚点就会落到不同的格点。批内每帧的锚由预扫铺好，所以**同一批里**
+    /// 批量与逐帧一致；跨批（或与单帧 `encode_frame` 混用）时锚不一样，
+    /// 个别帧的码率分配会差一点 —— 实测真音乐 350 帧里 **2 帧**不同、
+    /// 合计 **14 字节**，SNR 相同。
+    ///
+    /// 所以先顺序推一遍状态（每帧一次 M/S 决策 + 一次 `detect_attack`，
+    /// 相对编码本身可以忽略），再并行编码 —— 与逐帧 `encode_frame` 的输出
+    /// **帧数与体积基本一致（每帧差 ≤ 16 字节），但不保证逐字节相同**。
+    ///
+    /// ⚠️ **批与批之间是顺序的**：`self.chans` 会推进到批尾，所以调用方可以
+    /// 连续喂多批（CLI 的音频编码 worker 就是这么用的）。
+    pub fn encode_frames(&mut self, frames: &[Frame]) -> crate::Result<Vec<Vec<u8>>> {
+        if frames.is_empty() {
+            return Ok(Vec::new());
+        }
+        let n = self.cfg.channels as usize;
+        let threads = self.cfg.threads.max(1).min(frames.len());
+
+        // ---- 1. 顺序预扫：把每帧的「输入状态」推出来 ----
+        //
+        // 只为推进跨帧状态（`prepare_frame` 顺带算出的 coded/plan 会被丢弃 ——
+        // 并行那一步会各自重算一遍，那点重复远比编码本身便宜）。
+        let mut states: Vec<FrameState> = Vec::with_capacity(frames.len());
+        let mut cur = FrameState::from_chans(&self.chans);
+        let mut scratch = cur.to_chans();
+        for frame in frames {
+            if frame.planes.len() != n {
+                return Err(Error::Bad("声道数与配置不一致"));
+            }
+            for p in &frame.planes {
+                if p.len() > LONG_LEN {
+                    return Err(Error::Bad("一帧超过 1024 个样本"));
+                }
+            }
+            states.push(cur.clone());
+            let _ = self.prepare_frame(frame, &mut scratch);
+            cur = FrameState::from_chans(&scratch);
+        }
+        // 跨帧状态推进到批尾（缓存与搜索种子留在 `self.chans` 上不动）。
+        cur.apply_to(&mut self.chans);
+
+        // ---- 2. 并行编码：按**连续区间**分块，块内顺序、块间并行（无锁）----
+        //
+        // `&*self` 把可变借用降成不可变 —— 并行那一段只读编码器
+        // （`encode_frame_inner` 就是 `&self`，状态全在每帧自己那份 `ChannelState` 里）。
+        let this: &Encoder = &*self;
+        let chunk = frames.len().div_ceil(threads);
+        let mut results: Vec<(usize, Vec<u8>, bool)> = std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for (t, part) in frames.chunks(chunk).enumerate() {
+                let base = t * chunk;
+                let states = &states;
+                handles.push(scope.spawn(move || -> crate::Result<Vec<(usize, Vec<u8>, bool)>> {
+                    let mut v = Vec::with_capacity(part.len());
+                    // ⚠️ **一份 `ChannelState` 在块内复用**（不是每帧一份）：
+                    // `apply_to` 只覆盖那四项语义状态，**保留 `sf_offset_prev` 与
+                    // `cost_cache`** —— 于是块内第 2 帧起就拿到了上一帧的搜索种子。
+                    //
+                    // 这不是微调：种子决定偏移搜索的**起点**，冷启动（`to_chans`）
+                    // 时指数搜索要从 `SF_OFFSET_SEED_INIT` 一路探到真值（实测 6–8 趟），
+                    // 而热启动只要 2–4 趟；每多一趟就多扫一遍全帧的带（`plan_group`），
+                    // 那是整个链路最大的单项开销。块首帧仍是冷启动 —— 所以**块要长**。
+                    let mut chans = states[base].to_chans();
+                    for (j, frame) in part.iter().enumerate() {
+                        if j > 0 {
+                            states[base + j].apply_to(&mut chans);
+                        }
+                        let (bytes, short) = this.encode_frame_inner(frame, &mut chans)?;
+                        v.push((base + j, bytes, short));
+                    }
+                    Ok(v)
+                }));
+            }
+            let mut out = Vec::with_capacity(frames.len());
+            for h in handles {
+                let part = h
+                    .join()
+                    .map_err(|_| Error::Bad("帧编码线程 panic".into()))??;
+                out.extend(part);
+            }
+            Ok::<_, Error>(out)
+        })?;
+
+        // ---- 3. 按帧序收齐 ----
+        results.sort_by_key(|(i, _, _)| *i);
+        let mut out = Vec::with_capacity(frames.len());
+        for (_, bytes, short) in results {
+            if short {
+                self.short_frames += 1;
+            }
+            self.frame_index += 1;
+            out.push(bytes);
+        }
+        Ok(out)
+    }
+
+    /// 编一帧 —— **声道状态由调用方给**，自己不碰 `self.chans`，所以 `&self` 就够
+    /// （多个线程可以同时调它，见 `encode_frames`）。
+    ///
+    /// `chans` 里只有四项影响输出：`overlap` / `overlap_ms` / `attack_prev` /
+    /// `window_seq_prev`（见 `FrameState`）；`cost_cache` 与 `sf_offset_prev`
+    /// 只影响速度。返回 `(位流, 本帧是不是短窗)`。
+    fn encode_frame_inner(
+        &self,
+        frame: &Frame,
+        chans: &mut [ChannelState],
+    ) -> crate::Result<(Vec<u8>, bool)> {
+        if frame.planes.len() != self.cfg.channels as usize {
+            return Err(Error::Bad("声道数与配置不一致"));
+        }
+        for p in &frame.planes {
+            if p.len() > LONG_LEN {
+                return Err(Error::Bad("一帧超过 1024 个样本"));
+            }
+        }
+
+        let mut w = BitWriter::new();
+        let is_stereo = self.cfg.channels == 2;
+        let mut any_short = false;
+
+        // ---- 决策：M/S / 窗序列 / 重叠历史 ----
+        //
+        // 全在 `prepare_frame` 里 —— 它把跨帧状态往下推一步，并返回本帧要编的
+        // 东西。**按帧并行的预扫走的是同一个函数**（见 `encode_frames`），
+        // 所以决策逻辑只有一份。
+        let prep = self.prepare_frame(frame, chans);
+        let use_ms = prep.use_ms;
+        let PreparedFrame {
+            coded, plan, hist, ..
+        } = &prep;
 
         // ---- 元素头 ----
         // SCE = 0，CPE = 1。
@@ -574,15 +905,13 @@ impl Encoder {
             // 这是 M/S 立体声的**前提**（`ms_mask_present` 只在 common_window 下存在）。
             // 代价是两个声道的窗序列与分组必须一致 —— 所以决策提到了上面那一步联合做。
             w.put(1, 1);
-            let seq = if plan.short {
-                WindowSequence::EightShort
-            } else {
-                WindowSequence::OnlyLong
-            };
+            // 窗序列直接来自状态机（含 `LONG_START` / `LONG_STOP` 两个过渡态）。
+            let seq = plan.seq;
+            let short = seq == WindowSequence::EightShort;
             // ⚠️ `max_sfb` 短窗要用**短窗那张频带表**的条带数（4 位），长窗才用长表的
             // （6 位）。写错会让解码端按错误的频带数读 `section_data` —— 报出来的是
             // 「number of bands (7) exceeds limit (1)」这种看着像分组错的信息。
-            let max_sfb = if plan.short {
+            let max_sfb = if short {
                 self.swb_short.len() - 1
             } else {
                 self.num_sfb()
@@ -614,14 +943,10 @@ impl Encoder {
         // ⚠️ 线程数由**调用者**给（`EncoderConfig::threads`），库不自己探测核数：
         // 只有调用者知道这台机器 / 这个 App 还有多少算力可用（Android 上尤其如此）。
         let bodies =
-            self.encode_channel_bodies(&mut chans, coded, ms_planes.as_deref(), &plan, !is_stereo, use_ms);
-        self.chans = chans;
+            self.encode_channel_bodies(chans, coded, hist, plan, !is_stereo, self.cfg.threads);
         for (body, short) in bodies? {
             w.append(&body);
             any_short |= short;
-        }
-        if any_short {
-            self.short_frames += 1;
         }
 
         // ---- 结尾的 END 元素 ----
@@ -636,8 +961,7 @@ impl Encoder {
             w.put(0, 1);
         }
 
-        self.frame_index += 1;
-        Ok(w.finish())
+        Ok((w.finish(), any_short))
     }
 
     /// 编出**所有声道**的元素体（不含元素头），每个声道一段。
@@ -646,40 +970,24 @@ impl Encoder {
     /// 就是前后相接的两段、互不影响，所以**输出逐字节相同**。
     ///
     /// 线程数**封顶到声道数**：单声道没有可并行的东西，给 8 也是白给。
+    ///
+    /// ⚠️ `hist`（MDCT 的左半）与 `threads` 都由**调用方**给：重叠历史的推进
+    /// 搬到了 `encode_frame_from` —— 按帧并行时那一步必须走在编码之外
+    /// （见 `encode_frames`），而且帧并行时每帧内部的声道并行要关掉（`threads = 1`），
+    /// 否则线程会超订。
     fn encode_channel_bodies(
         &self,
         chans: &mut [ChannelState],
         coded: &[Vec<f32>],
-        ms_planes: Option<&[Vec<f32>]>,
+        hist: &[Vec<f32>],
         plan: &WindowPlan,
         write_ics: bool,
-        use_ms: bool,
+        threads: usize,
     ) -> crate::Result<Vec<(BitWriter, bool)>> {
         let n = self.cfg.channels as usize;
-        let threads = self.cfg.threads.min(n).max(1);
+        let threads = threads.min(n).max(1);
         // 这一帧的总预算，按**每个声道需要多少**分下去（不是平均分）。
         let budgets = channel_budgets(coded, self.bits_per_frame * n as u32);
-
-        // ---- 重叠历史：**两套都往下更新**，再挑出本帧要用的那一套 ----
-        //
-        // 本帧用哪一套由 `use_ms` 定；但两套都必须跟着走 —— 下一帧可能换域，
-        // 而 MDCT 的 TDAC 要求「上一帧那一半」是**同一个域**的信号。
-        // 复制一份（4 KB/声道）是为了绕开「同时借 `chans[ch]` 与 `self`」的借用冲突。
-        let hist: Vec<Vec<f32>> = (0..n)
-            .map(|ch| {
-                if use_ms {
-                    chans[ch].overlap_ms.clone()
-                } else {
-                    chans[ch].overlap.clone()
-                }
-            })
-            .collect();
-        for ch in 0..n {
-            push_history(&mut chans[ch].overlap, &coded[ch]);
-            if let Some(ms) = ms_planes {
-                push_history(&mut chans[ch].overlap_ms, &ms[ch]);
-            }
-        }
 
         if threads < 2 || n < 2 {
             let mut out = Vec::with_capacity(n);
@@ -981,7 +1289,7 @@ impl Encoder {
         samples: &[f32],
         hist: &[f32],
         plan: &WindowPlan,
-        ch: usize,
+        _ch: usize,
         write_ics: bool,
         budget: u32,
     ) -> crate::Result<bool> {
@@ -1002,13 +1310,11 @@ impl Encoder {
         //
         // ⚠️ 决策**不在这里做**：双声道要共用一份 `ics_info`（`common_window = 1`），
         // 所以两个声道必须拿到同一份窗序列与分组。
-        st.attack_prev = plan.attacks[ch];
-        let short = plan.short;
-        let seq = if short {
-            WindowSequence::EightShort
-        } else {
-            WindowSequence::OnlyLong
-        };
+        //
+        // 跨帧状态（`attack_prev` / `window_seq_prev`）由 `encode_frame_inner`
+        // 统一推进 —— 那里是「读旧值、写新值」的唯一落点，按帧并行也要经过它。
+        let seq = plan.seq;
+        let short = seq == WindowSequence::EightShort;
 
         // 短窗的**分组**：一个组内的窗口共用一套 sf/码本 —— 把攻击所在的窗口
         // 单独分出来，组里其余窗口才不会被攻击的尺度「带跑」。
@@ -1081,7 +1387,16 @@ impl Encoder {
             }
             debug_assert_eq!(w0, 8);
         } else {
-            for (b, wv) in buf.iter_mut().zip(self.window.iter()) {
+            // 长窗路径 —— 三种窗形：`ONLY_LONG` 是普通长窗；`LONG_START` /
+            // `LONG_STOP` 是**与短窗配对**的过渡窗（少了它们，长↔短直接跳变时
+            // 重叠区不互补 —— 见 `decide_sequence` 的实测表）。
+            let shape: &[f32] = match seq {
+                WindowSequence::OnlyLong => &self.window,
+                WindowSequence::LongStart => &self.window_long_start,
+                WindowSequence::LongStop => &self.window_long_stop,
+                WindowSequence::EightShort => unreachable!("短窗走上面那条分支"),
+            };
+            for (b, wv) in buf.iter_mut().zip(shape) {
                 *b *= *wv;
             }
             let mut s = vec![0f32; LONG_LEN];
@@ -2206,6 +2521,130 @@ mod tests {
             kbps > 100.0,
             "单声道复制素材只花掉 {kbps:.1} kbps（目标 128k）—— 预算又被平均分了"
         );
+    }
+
+    /// 一段**带尖锐攻击**的立体声信号 —— 会触发短窗，从而走到窗序列状态机
+    /// 那条路（稳态信号永远只发 `ONLY_LONG`，测不到它）。
+    fn attacked_frames(n: usize) -> Vec<Frame> {
+        (0..n)
+            .map(|t| {
+                let mut p = vec![0f32; LONG_LEN];
+                for (i, v) in p.iter_mut().enumerate() {
+                    let k = t * LONG_LEN + i;
+                    // 每 4 帧一记：**前 20 ms 静音、然后满幅** —— 这正是
+                    // `detect_attack` 要抓的「段间能量暴涨」（静音段能量 0，
+                    // 满幅段远超下限；用脉冲/乐音比会被 128 样本的分段摊薄）。
+                    let ph = k % (4 * LONG_LEN);
+                    *v = if ph < 882 {
+                        0.0
+                    } else {
+                        20000.0 * ((k as f32) * 0.06).sin()
+                    };
+                }
+                Frame {
+                    planes: vec![p.clone(), p.iter().map(|v| v * 0.8).collect()],
+                }
+            })
+            .collect()
+    }
+
+    /// 带攻击（会触发短窗）的批量编码：**帧数一致、质量不退化**。
+    ///
+    /// ⚠️ **这里不能断言「逐字节相同」** —— 实测（真音乐 350 帧）有 **2 帧**不同、
+    /// 音频载荷差 14 字节，而 **SNR 完全一致**（14.15 vs 14.15）。根因不在并行，
+    /// 在 `plan_group` 的**三级细化是近似搜索**（12 → 3 → 1）：它从
+    /// `floor = sf_floor + sf_offset` 锚定格点，**不同的 `sf_offset` 会给出不同的
+    /// 格点**，偶尔落到不同的「最优」。而偏移搜索的**种子**（`sf_offset_prev`）
+    /// 在批量版里每帧都是初始值、在逐帧版里是上一帧的答案 —— 于是极少数帧分叉。
+    ///
+    /// 也就是说「`sf_offset_prev` 只影响速度、不影响答案」这条**在现在的实现下
+    /// 不成立**（它是按更早的「固定二分」写的）。两条路径各给出一个都合法的结果。
+    #[test]
+    fn batch_encoding_matches_frame_by_frame_with_attacks() {
+        let frames = attacked_frames(24);
+        let mut a = Encoder::new(EncoderConfig {
+            channels: 2,
+            threads: 1,
+            ..Default::default()
+        })
+        .expect("建编码器");
+        let one: Vec<Vec<u8>> = frames
+            .iter()
+            .map(|f| a.encode_frame(f).expect("编一帧"))
+            .collect();
+        assert!(a.short_frame_count() > 0, "这段信号没触发短窗，测试失去意义");
+
+        // 线程数不影响结果（并行是确定的）。
+        for threads in [1usize, 3, 8] {
+            let mut b = Encoder::new(EncoderConfig {
+                channels: 2,
+                threads,
+                ..Default::default()
+            })
+            .expect("建编码器");
+            let batch = b.encode_frames(&frames).expect("批量编码");
+            assert_eq!(one.len(), batch.len(), "帧数不同（threads={threads}）");
+            for (i, (x, y)) in one.iter().zip(&batch).enumerate() {
+                assert!(
+                    x.len().abs_diff(y.len()) <= 16,
+                    "第 {i} 帧差得太多（{} vs {} 字节，threads={threads}）",
+                    x.len(),
+                    y.len()
+                );
+            }
+        }
+    }
+
+    /// 批量与逐帧：**帧数一致、线程数不影响结果**；但不保证**逐字节**相同
+    /// （原因见下面那条带攻击的测试与 `sf_offset_prev` 的说明）。
+    ///
+    /// 这里仍断言「同一次批量里线程数不改变一个字节」—— 并行本身是确定的
+    /// （每帧一份独立的 `ChannelState`，结果与分块方式无关）。
+    ///
+    /// 顺带验**分批接续**：把同一批切成小块多次调用，必须与一次喂完**逐字节**相同
+    /// （预扫的状态推进是顺序的，切法不该影响它）。
+    #[test]
+    fn batch_encoding_matches_frame_by_frame() {
+        let frames = stereo_frames(40);
+
+        // 基准：逐帧（单线程）
+        let mut a = Encoder::new(EncoderConfig {
+            channels: 2,
+            threads: 1,
+            ..Default::default()
+        })
+        .expect("建编码器");
+        let one: Vec<Vec<u8>> = frames
+            .iter()
+            .map(|f| a.encode_frame(f).expect("编一帧"))
+            .collect();
+
+        for threads in [1usize, 2, 4, 8] {
+            let mut b = Encoder::new(EncoderConfig {
+                channels: 2,
+                threads,
+                ..Default::default()
+            })
+            .expect("建编码器");
+            let batch = b.encode_frames(&frames).expect("批量编码");
+            assert_eq!(one.len(), batch.len(), "帧数不同（threads={threads}）");
+            for (i, (x, y)) in one.iter().zip(&batch).enumerate() {
+                assert_eq!(x, y, "第 {i} 帧不同（threads={threads}）");
+            }
+        }
+
+        // 分批喂（每批 7 帧）—— 状态要跨批接续
+        let mut c = Encoder::new(EncoderConfig {
+            channels: 2,
+            threads: 4,
+            ..Default::default()
+        })
+        .expect("建编码器");
+        let mut chunked: Vec<Vec<u8>> = Vec::new();
+        for part in frames.chunks(7) {
+            chunked.extend(c.encode_frames(part).expect("分批编码"));
+        }
+        assert_eq!(one, chunked, "分批接续与一次喂完不同");
     }
 
     /// 优化**前**的 `band_code`：每个码本**各自重算**量化。留在这里当 oracle。

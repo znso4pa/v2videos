@@ -18,7 +18,7 @@ use std::process::{Child, ChildStdout, Command, Stdio};
 mod common;
 
 use common::{all_video_frames, compare, ffmpeg_frames, first_video_frames, sample, sample_list, unique_temp, yuv420p_frame_len, wrap_single_frame_avi};
-use v2v_msmpeg4::{decode_i_frame, parse_frame_header, Decoder, PictureType};
+use v2v_msmpeg4::{decode_i_frame, parse_frame_header, Decoder, PictureType, Version};
 
 /// 对**一个**样本做逐帧对账（`V2V_ASF_SAMPLE` 里 `:` 分隔的每个样本都跑一遍）。
 #[test]
@@ -35,16 +35,19 @@ fn p_frames_match_ffmpeg() {
 }
 
 fn check_p_frames(path: &str) {
-    // 这条对账只对 **MP43**（v3）有意义：WMV1/WMV2 的帧头与宏块语法不同，
-    // 我们还没实现（见 TODO）。别的 codec 的样本直接跳过，别把「没实现」
-    // 伪装成「对不上」。
-    if let Some((_w, _h, fourcc)) = common::video_fourcc(path) {
-        let name = v2v_asf::fourcc_string(fourcc);
-        if name != "MP43" {
-            eprintln!("SKIP: 视频是 {name}，本对账只针对 MP43");
+    // 按容器的 FourCC 选**版本** —— 帧头与系数解码都按版本分叉，
+    // 拿 V3 去解 WMV1 只会得到「对不上」这种假失败。
+    // 认不出的 codec 直接跳过，别把「没实现」伪装成「对不上」。
+    let version = match common::video_fourcc(path).and_then(|(_, _, fc)| Version::from_fourcc(fc)) {
+        Some(v) => v,
+        None => {
+            let name = common::video_fourcc(path)
+                .map(|(_, _, fc)| v2v_asf::fourcc_string(fc))
+                .unwrap_or_else(|| "?".into());
+            eprintln!("SKIP: 视频是 {name}，不是 MS-MPEG-4 家族（本对账只覆盖 MP41/42/43 + WMV1/2）");
             return;
         }
-    }
+    };
     let (samples, w, h) = match all_video_frames(path) {
         Some(v) => v,
         None => {
@@ -69,7 +72,7 @@ fn check_p_frames(path: &str) {
     );
 
     // 逐帧解码。**不提前 assert** —— 一次跑完把所有帧的差异都打出来，好定位。
-    let mut dec = Decoder::new();
+    let mut dec = Decoder::with_version(version);
     let mut results = Vec::new();
     let mut decoded = Vec::new();
     for i in 0..want {
@@ -457,7 +460,7 @@ fn ac_prediction_path_matches_ffmpeg_when_forced_on() {
     for (idx, f) in samples.iter().enumerate() {
         // 只挑 **I 帧**（能单独解）且**有内容**的 —— 纯色帧 CBP 全 0、邻块 AC 也全 0，
         // 翻了位看不出变化，测不到东西。
-        let Ok((hdr, _)) = parse_frame_header(f, mw, mh) else {
+        let Ok((hdr, _)) = parse_frame_header(f, mw, mh, v2v_msmpeg4::Version::V3, &mut Default::default()) else {
             continue;
         };
         if hdr.picture_type != PictureType::I {

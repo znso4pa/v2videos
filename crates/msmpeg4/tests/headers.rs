@@ -54,7 +54,7 @@ fn frame_headers_agree_with_the_container() {
         if s.stream != video_number {
             continue;
         }
-        let (h, used) = parse_frame_header(&s.data, mb_w, mb_h).expect("帧头必须能解析");
+        let (h, used) = parse_frame_header(&s.data, mb_w, mb_h, v2v_msmpeg4::Version::V3, &mut Default::default()).expect("帧头必须能解析");
         assert!(used > 0 && used <= 8 * s.data.len());
         if !(1..=31).contains(&h.qscale) {
             bad_qscale += 1;

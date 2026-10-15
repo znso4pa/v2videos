@@ -225,7 +225,7 @@ fn frame_header_roundtrip_all_qscale_and_types() {
             }
             let mut data = w.finish();
             data.extend_from_slice(&[0, 0, 0]);
-            let (h, used) = parse_frame_header(&data, 16, 16).unwrap();
+            let (h, used) = parse_frame_header(&data, 16, 16, v2v_msmpeg4::Version::V3, &mut Default::default()).unwrap();
             assert_eq!(h.qscale, q as u8);
             assert_eq!(h.picture_type, pict);
             let want = if pict == PictureType::I { 15 } else { 11 };

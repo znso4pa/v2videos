@@ -86,7 +86,9 @@ fn encodes_i_frames_both_decoders_agree_on() {
 
     let mut checked = 0usize;
     for (idx, bytes) in samples.iter().enumerate() {
-        let Ok((hdr, _)) = parse_frame_header(bytes, mw, mh) else {
+        let Ok((hdr, _)) =
+            parse_frame_header(bytes, mw, mh, v2v_msmpeg4::Version::V3, &mut Default::default())
+        else {
             continue;
         };
         if hdr.picture_type != PictureType::I {

@@ -15,6 +15,7 @@
 //! 帧内 0、帧间 1，只作用在第二 escape 的 run 上。
 
 use crate::bitreader::BitReader;
+use crate::version::Version;
 use crate::error::{Error, Result};
 use crate::tables;
 use crate::vlc::Vlc;
@@ -171,10 +172,12 @@ impl RlTable {
 
     /// 从 `i` 开始解一串系数，写入 `block`（已按扫描序展开到自然序由调用方做）。
     ///
-    /// `run_diff`：帧内传 0、帧间传 1 —— 它只加在**第二 escape** 的 run 上。
+    /// `run_diff`：它只加在**第二 escape** 的 run 上。取值**按版本不同**：
+    /// 帧内 = `version.intra_run_diff()`、帧间 = `version.inter_run_diff()`
+    /// （见 `Version` 的说明 —— 注意帧间那一条是「**只有 V2 是 0**」）。
     ///
-    /// 返回 `(扫描序下标, level)` 列表；`block[scan_idx]` 由调用方按 `scan` 落位，
-    /// 这里直接返回列表，避免把扫描表耦合进来。
+    /// 结果写进 `ctx.out`（`(扫描序下标, level)` 列表）—— 调用方按 `scan` 落位，
+    /// 这里不把扫描表耦合进来。**复用 `ctx.out` 的容量**，不每块新建 `Vec`。
     pub fn decode_ac(
         &self,
         r: &mut BitReader,
@@ -182,8 +185,10 @@ impl RlTable {
         qadd: i32,
         run_diff: i32,
         start_i: i32,
-    ) -> Result<Vec<(usize, i16)>> {
-        let mut out = Vec::new();
+        ctx: &mut AcCtx,
+    ) -> Result<()> {
+        let out = &mut ctx.out;
+        out.clear();
         let mut i = start_i;
 
         loop {
@@ -206,8 +211,56 @@ impl RlTable {
                     let lv = (lvl2 / qmul).clamp(0, 63) as usize;
                     i += run2 + self.max_run[li][lv] as i32 + run_diff;
                     level = lvl2;
+                } else if ctx.version.is_wmv() {
+                    // 第三 escape（**WMV1/WMV2 的变长版**）
+                    //
+                    // ⚠️ 「level 用几位、run 用几位」**一帧只读一次**，之后同一帧里的
+                    // 第三 escape 全部沿用（`esc3_level_length` 在帧头解析的末尾归零）。
+                    // 所以这段必须跨块、跨宏块保持状态 —— 当成无状态写会从第二个
+                    // 第三 escape 起全体错位。
+                    let last = r.bit()? != 0;
+                    if ctx.esc3_level_length == 0 {
+                        let ll = if ctx.qscale < 8 {
+                            // 码率低时频谱稀疏，长度用 3 位直接给，0 是转义。
+                            let v = r.u(3)?;
+                            if v == 0 {
+                                8 + r.u(1)?
+                            } else {
+                                v
+                            }
+                        } else {
+                            // 高 qscale：一元码，读到 1 为止（上限 8）。
+                            //
+                            // ⚠️ **不要再补一次 skip**：ffmpeg 那边用的是 `SHOW_UBITS`
+                            // （**不消费**）来测位，所以它循环之后要显式 `SKIP_BITS(1)`
+                            // 把那个终止的 1 吃掉。这里换成 `r.bit()`（**消费**）之后，
+                            // 那一步就多余了 —— 多读一位会让**整个帧从此错位**，
+                            // 症状是后面所有块莫名其妙地错，离根因很远。
+                            let mut v = 2u32;
+                            while v < 8 && r.bit()? == 0 {
+                                v += 1;
+                            }
+                            v
+                        };
+                        ctx.esc3_level_length = ll;
+                        ctx.esc3_run_length = r.u(2)? + 3;
+                    }
+                    let raw_run = r.u(ctx.esc3_run_length)? as i32;
+                    let sign = r.bit()? != 0;
+                    let mag = r.u(ctx.esc3_level_length)? as i32;
+                    let l = if sign { -mag } else { mag };
+                    level = if l > 0 {
+                        l * qmul + qadd
+                    } else {
+                        l * qmul - qadd
+                    };
+                    i += raw_run + 1;
+                    if last {
+                        i += 192;
+                    }
+                    needs_sign = false;
                 } else {
-                    // 第三 escape：last(1) + run(6) + level（有符号 8 位）
+                    // 第三 escape（**V1/V2/V3 的定长版**）：last(1) + run(6) + level（有符号 8 位）
                     let last = r.bit()? != 0;
                     let raw_run = r.u(6)? as i32;
                     let l = (r.u(8)? as u8) as i8 as i32;
@@ -241,8 +294,28 @@ impl RlTable {
             out.push((i as usize, level as i16));
         }
 
-        Ok(out)
+        Ok(())
     }
+}
+
+/// 解系数时的**版本相关上下文** —— 由调用方跨块持有。
+///
+/// 之所以要带着走：WMV1/WMV2 的第三 escape 长度**在帧内粘住**（见 `decode_ac`），
+/// 一帧里第一次遇到时才读，之后所有块沿用。调用方（`Decoder`）每帧把它归零一次。
+#[derive(Debug, Clone, Default)]
+pub struct AcCtx {
+    pub version: Version,
+    /// 当前帧的 `qscale` —— 决定第三 escape 的长度前缀怎么读（`< 8` 与 `>= 8` 两条路）。
+    pub qscale: u8,
+    /// 第三 escape 的 level 位宽（0 = 这一帧还没遇到过第三 escape）。
+    pub esc3_level_length: u32,
+    /// 第三 escape 的 run 位宽。
+    pub esc3_run_length: u32,
+    /// 解系数落位用的 scratch —— **跨块复用**，每帧只分配一次。
+    ///
+    /// ⚠️ 原来 `decode_ac` 每块 `return Vec<(usize, i16)>`：一个宏块 6 个块、
+    /// 一帧几百个宏块 —— 采样显示 **malloc/free 占整个解码的 8%**，全是白扔的。
+    pub out: Vec<(usize, i16)>,
 }
 
 #[cfg(test)]
@@ -285,7 +358,9 @@ mod tests {
         data.extend_from_slice(&[0, 0]);
 
         let mut r = BitReader::new(&data);
-        let out = t.decode_ac(&mut r, 1, 0, 0, 0).unwrap();
+        let mut cx = AcCtx::default();
+        t.decode_ac(&mut r, 1, 0, 0, 0, &mut cx).unwrap();
+        let out = cx.out.clone();
         assert_eq!(out.len(), 2);
         // run 打包为 `table_run + 1`，所以 run=0 的符号落在扫描位 1（0 是直流）。
         assert_eq!(out[0], (1, 1));
@@ -312,7 +387,9 @@ mod tests {
         let data = w.finish();
 
         let mut r = BitReader::new(&data);
-        let out = t.decode_ac(&mut r, 1, 0, 0, 0).unwrap();
+        let mut cx = AcCtx::default();
+        t.decode_ac(&mut r, 1, 0, 0, 0, &mut cx).unwrap();
+        let out = cx.out.clone();
         // i = 0 + run(5) + 1 = 6，last → i += 192 → 198 → >62 → 198-192 = 6
         assert_eq!(out.len(), 1);
         assert_eq!(out[0], (6, 7));
@@ -339,11 +416,15 @@ mod tests {
 
         // 帧内：qmul=1, qadd=0
         let mut r = BitReader::new(&data);
-        let out = t.decode_ac(&mut r, 1, 0, 0, 0).unwrap();
+        let mut cx = AcCtx::default();
+        t.decode_ac(&mut r, 1, 0, 0, 0, &mut cx).unwrap();
+        let out = cx.out.clone();
         assert_eq!(out[0], (1, -1));
         // 帧间：qmul=2*qscale(=4), qadd=(qscale-1)|1(=1)
         let mut r = BitReader::new(&data);
-        let out = t.decode_ac(&mut r, 4, 1, 0, 0).unwrap();
+        let mut cx = AcCtx::default();
+        t.decode_ac(&mut r, 4, 1, 0, 0, &mut cx).unwrap();
+        let out = cx.out.clone();
         assert_eq!(out[0], (1, -4 - 1)); // -1*4 - 1
     }
 
@@ -370,9 +451,13 @@ mod tests {
         let data = w.finish();
 
         let mut r = BitReader::new(&data);
-        let intra = t.decode_ac(&mut r, 1, 0, 0, 0).unwrap();
+        let mut ci = AcCtx::default();
+        t.decode_ac(&mut r, 1, 0, 0, 0, &mut ci).unwrap();
+        let intra = ci.out.clone();
         let mut r = BitReader::new(&data);
-        let inter = t.decode_ac(&mut r, 1, 0, 1, 0).unwrap();
+        let mut c2 = AcCtx::default();
+        t.decode_ac(&mut r, 1, 0, 1, 0, &mut c2).unwrap();
+        let inter = c2.out.clone();
 
         assert_eq!(intra.len(), 2);
         assert_eq!(inter.len(), 2);

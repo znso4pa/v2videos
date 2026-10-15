@@ -37,7 +37,9 @@ use crate::bitreader::BitReader;
 use crate::block::RlTable;
 use crate::error::{Error, Result};
 use crate::grid::Grid;
-use crate::header::{parse_frame_header, PictureType};
+use crate::block::AcCtx;
+use crate::header::{decode012 as v2v_msmpeg4_decode012, parse_frame_header, HeaderState, PictureType};
+use crate::version::Version;
 use crate::idct::{idct_add, idct_put};
 use crate::predict::{ac_predict, coded_block_predict, dc_predict, AcVal};
 use crate::tables;
@@ -151,6 +153,10 @@ pub struct AcPredRead {
 /// - `no_rounding` —— 它由 `flipflop_rounding` 逐帧翻转，而 `flipflop_rounding`
 ///   只从 **I 帧尾部**的 ext header 里读。所以「只看这一帧」是解不出来的。
 pub struct Decoder {
+    /// 位流的**版本**（MP41/42/43 / WMV1/2）。它决定帧头、MB 层与系数解码的分支。
+    version: Version,
+    /// 帧头解析的跨帧状态（WMV1 的码率要用）。
+    hdr_state: HeaderState,
     /// 上一帧的内部（宏块对齐、未裁剪）平面。
     prev: Option<Planes>,
     /// `no_rounding`：半像素 MC 用不用带舍入的平均。
@@ -173,9 +179,78 @@ impl Default for Decoder {
     }
 }
 
+/// **建一次就够的码表树**。
+///
+/// ⚠️ 存在的理由：`Vlc::new` / `RlTable::new` 原来在**每帧开头**都重建一遍，
+/// 而它们的内容**只取决于静态码表**、与帧数据无关。采样显示 `Vlc::new` 一项
+/// 就独占**整个解码的 19%** —— 纯粹的白干（MV 那张更亏：先每帧造一个
+/// 1100 项的 `Vec`，再拿它建树）。
+///
+/// 树是只读的，所以放 `OnceLock` 里全局共享。
+struct DecodeTables {
+    /// I 帧的宏块类型表。
+    mb_intra: Vlc,
+    /// P 帧的宏块类型表。
+    mb_non_intra: Vlc,
+    /// `DC[dc_table_index][0=亮度 / 1=色度]`。
+    dc: [[Vlc; 2]; 2],
+    /// `MV0` / `MV1`。
+    mv: [Vlc; 2],
+    /// 六张 RL 表（`for_standard` 的 0..5）。
+    rl: [RlTable; 6],
+}
+
+impl DecodeTables {
+    fn get() -> &'static Self {
+        static T: std::sync::OnceLock<DecodeTables> = std::sync::OnceLock::new();
+        T.get_or_init(|| {
+            let vlc = |t: &'static [[u32; 2]]| Vlc::new(t);
+            // MV 的两张表在 `tables` 里是 `(code, len)` 分开存的，先并成 `[u32; 2]`。
+            let mv = |code: &'static [u16], len: &'static [u8]| {
+                let pairs: Vec<[u32; 2]> = code
+                    .iter()
+                    .zip(len.iter())
+                    .map(|(&c, &l)| [c as u32, l as u32])
+                    .collect();
+                Vlc::new(&pairs)
+            };
+            DecodeTables {
+                mb_intra: vlc(&tables::MB_INTRA),
+                mb_non_intra: vlc(&tables::MB_NON_INTRA),
+                dc: [
+                    [vlc(&tables::DC[0][0]), vlc(&tables::DC[0][1])],
+                    [vlc(&tables::DC[1][0]), vlc(&tables::DC[1][1])],
+                ],
+                mv: [
+                    mv(&tables::MV0_CODE, &tables::MV0_LEN),
+                    mv(&tables::MV1_CODE, &tables::MV1_LEN),
+                ],
+                rl: [
+                    RlTable::for_standard(0).expect("RL 表 0"),
+                    RlTable::for_standard(1).expect("RL 表 1"),
+                    RlTable::for_standard(2).expect("RL 表 2"),
+                    RlTable::for_standard(3).expect("RL 表 3"),
+                    RlTable::for_standard(4).expect("RL 表 4"),
+                    RlTable::for_standard(5).expect("RL 表 5"),
+                ],
+            }
+        })
+    }
+}
+
 impl Decoder {
     pub fn new() -> Self {
+        Self::with_version(Version::default())
+    }
+
+    /// 指定**版本**的解码器。
+    ///
+    /// 版本是**流**的属性（来自容器里的 FourCC），不是帧的属性 ——
+    /// 所以它在构造时定，之后每帧沿用。
+    pub fn with_version(version: Version) -> Self {
         Self {
+            version,
+            hdr_state: HeaderState::default(),
             prev: None,
             no_rounding: false,
             flipflop_rounding: false,
@@ -206,8 +281,22 @@ impl Decoder {
     pub fn decode(&mut self, data: &[u8], width: u32, height: u32) -> Result<Frame> {
         let mb_w = width.div_ceil(16) as usize;
         let mb_h = height.div_ceil(16) as usize;
-        let (header, used_bits) = parse_frame_header(data, mb_w as u32, mb_h as u32)?;
+        let (header, used_bits) =
+            parse_frame_header(data, mb_w as u32, mb_h as u32, self.version, &mut self.hdr_state)?;
         let is_p = header.picture_type == PictureType::P;
+
+        // ---- 系数解码的版本相关上下文 ----
+        //
+        // ⚠️ WMV1/WMV2 的第三 escape 长度**在帧内粘住**（一帧里第一次遇到时才读），
+        // 所以它必须活在**帧**这一层，不能放进每块的循环里。
+        // ffmpeg 在帧头解析的末尾把它归零 —— 这里等价于每帧新建一个。
+        let mut ac_ctx = AcCtx {
+            version: self.version,
+            qscale: header.qscale,
+            esc3_level_length: 0,
+            esc3_run_length: 0,
+            out: Vec::new(),
+        };
 
         self.frames += 1;
         self.ac_pred_reads.clear();
@@ -254,37 +343,27 @@ impl Decoder {
 
         // 系数表：帧内用 `rl_table_index`（亮度）/ `3 + rl_chroma_table_index`（色度）；
         // 帧间一律 `3 + rl_table_index`。
-        let rl_luma = RlTable::for_standard(header.rl_table_index as usize)?;
-        let rl_chroma = RlTable::for_standard(3 + header.rl_chroma_table_index as usize)?;
-        let rl_inter = RlTable::for_standard(3 + header.rl_table_index as usize)?;
-        let mb_intra_vlc = Vlc::new(&tables::MB_INTRA);
-        let mb_non_intra_vlc = Vlc::new(&tables::MB_NON_INTRA);
-        let dc_vlc = Vlc::new(&tables::DC[header.dc_table_index as usize][0]);
-        let dc_vlc_c = Vlc::new(&tables::DC[header.dc_table_index as usize][1]);
-
-        // MV VLC：两张表各 1100 个码（1099 真值 + 1 escape）。
+        //
+        // ⚠️ **六张全建**，而不是只建这一帧要用的那三张：WMV1 的 `per_mb_rl_table`
+        // 允许**每个宏块换一套表**（下标在宏块里读），所以下标必须可变。
+        // 建表的代价是每张 ~190 次循环，六张 ≈ 1000 次 —— 相对一帧的解码可忽略。
+        let t = DecodeTables::get();
+        let rl_tables = &t.rl;
+        // 本帧当前的三个下标 —— 会被 `per_mb_rl_table` 逐宏块改写（就地延续，与 ffmpeg 同）。
+        let mut rl_luma_i = header.rl_table_index as usize;
+        let mut rl_chroma_i = 3 + header.rl_chroma_table_index as usize;
+        let mut rl_inter_i = 3 + header.rl_table_index as usize;
+        let mb_intra_vlc = &t.mb_intra;
+        let mb_non_intra_vlc = &t.mb_non_intra;
+        let dc_vlc = &t.dc[header.dc_table_index as usize][0];
+        let dc_vlc_c = &t.dc[header.dc_table_index as usize][1];
         let mv_i = header.mv_table_index as usize;
-        let (mv_code, mv_len, mv_x, mv_y) = if mv_i == 0 {
-            (
-                &tables::MV0_CODE[..],
-                &tables::MV0_LEN[..],
-                &tables::MV0_X[..],
-                &tables::MV0_Y[..],
-            )
+        let mv_vlc = &t.mv[mv_i];
+        let (mv_x, mv_y) = if mv_i == 0 {
+            (&tables::MV0_X[..], &tables::MV0_Y[..])
         } else {
-            (
-                &tables::MV1_CODE[..],
-                &tables::MV1_LEN[..],
-                &tables::MV1_X[..],
-                &tables::MV1_Y[..],
-            )
+            (&tables::MV1_X[..], &tables::MV1_Y[..])
         };
-        let mv_pairs: Vec<[u32; 2]> = mv_code
-            .iter()
-            .zip(mv_len.iter())
-            .map(|(&c, &l)| [c as u32, l as u32])
-            .collect();
-        let mv_vlc = Vlc::new(&mv_pairs);
 
         // 平面（按宏块对齐分配，最后再裁）
         let pw = mb_w * 16;
@@ -365,6 +444,15 @@ impl Decoder {
                         self.stats.mb_inter_coded += 1;
                     }
                     if !mb_intra {
+                        // WMV1 的 `per_mb_rl_table`：**每个带系数的宏块自带 RL 表下标**。
+                        // 帧间这条在**运动之前**读（帧内那条在 `ac_pred` 之后）——
+                        // 位置不一样，读错地方整帧就散了。
+                        if header.per_mb_rl_table && cbp != 0 {
+                            let t = v2v_msmpeg4_decode012(&mut r)? as usize;
+                            rl_luma_i = t;
+                            rl_chroma_i = 3 + t;
+                            rl_inter_i = 3 + t;
+                        }
                         let pred = pred_motion(&mv_grid, mbx, mby, first_slice_line);
                         mv = decode_motion(&mut r, &mv_vlc, mv_x, mv_y, pred)?;
                     } else {
@@ -378,6 +466,13 @@ impl Decoder {
                                 value: ac_pred,
                                 coded: cbp != 0,
                             });
+                        }
+                        // 帧内这条在 `ac_pred` **之后**读（见帧间那条的说明）。
+                        if header.per_mb_rl_table && cbp != 0 {
+                            let t = v2v_msmpeg4_decode012(&mut r)? as usize;
+                            rl_luma_i = t;
+                            rl_chroma_i = 3 + t;
+                            rl_inter_i = 3 + t;
                         }
                     }
                 } else {
@@ -404,6 +499,12 @@ impl Decoder {
                     cbp = cbp_v;
                     let bit_pos = r.bit_pos();
                     ac_pred = r.bit()? != 0;
+                    if header.per_mb_rl_table && cbp != 0 {
+                        let t = v2v_msmpeg4_decode012(&mut r)? as usize;
+                        rl_luma_i = t;
+                        rl_chroma_i = 3 + t;
+                        rl_inter_i = 3 + t;
+                    }
                     if self.trace_ac_pred {
                         self.ac_pred_reads.push(AcPredRead {
                             mbx,
@@ -480,7 +581,10 @@ impl Decoder {
                         let mut b = dc_grid.data[xy - 1 - dc_grid.w] as i32;
                         let mut c = dc_grid.data[xy - dc_grid.w] as i32;
                         // 片的第一行、且 n 的 bit1 为 0 → 上方不可用
-                        if first_slice_line && (n & 2) == 0 {
+                        // ⚠️ 版本门：只有 `version < WMV1`（V1/V2/V3）才在片首行清 b/c。
+                        // WMV1/WMV2 不清 —— 它们用上一行的 DC，这是 ffmpeg 里那处
+                        // `s->msmpeg4_version < MSMP4_WMV1` 条件。
+                        if first_slice_line && (n & 2) == 0 && !self.version.is_wmv() {
                             b = 1024;
                             c = 1024;
                         }
@@ -500,7 +604,23 @@ impl Decoder {
                             }
                             // ac_pred 为真时**不用 zig-zag**，改用水平/垂直交替扫描
                             // （dc_pred_dir 0=取左 → 垂直扫描；1=取上 → 水平扫描）。
-                            let scan: &[u8; 64] = if ac_pred {
+                            //
+                            // ⚠️ **整套扫描表按版本换**：WMV1/WMV2 用的是
+                            // `ff_wmv1_scantable[0..3]`，**不是** MPEG-4/H.263 那套。
+                            // 换错的表现很阴：符号个数、位流位置、结构全对，
+                            // 只有**系数落错位置** —— 于是「没有漂移却值不对」。
+                            let scan: &[u8; 64] = if self.version.is_wmv() {
+                                // [0] 帧间 / [1] 帧内默认 / [2] ac_pred 水平 / [3] ac_pred 垂直
+                                if ac_pred {
+                                    if dir == 0 {
+                                        &tables::SCAN[3]
+                                    } else {
+                                        &tables::SCAN[2]
+                                    }
+                                } else {
+                                    &tables::SCAN[1]
+                                }
+                            } else if ac_pred {
                                 if dir == 0 {
                                     &tables::V_SCAN
                                 } else {
@@ -509,8 +629,20 @@ impl Decoder {
                             } else {
                                 &ZIGZAG
                             };
-                            let rl = if luma { &rl_luma } else { &rl_chroma };
-                            for (i, lv) in rl.decode_ac(&mut r, 1, 0, 0, 0)? {
+                            let rl = if luma { &rl_tables[rl_luma_i] } else { &rl_tables[rl_chroma_i] };
+                            rl.decode_ac(
+                                &mut r,
+                                1,
+                                0,
+                                // ⚠️ 帧内的 run_diff **也按版本**：
+                                // WMV1/WMV2 是 1、V1/V2/V3 是 0。它只影响**第二 escape**，
+                                // 所以底本里没有第二 escape 的帧（比如干净的 I 帧）
+                                // 会「看着全对」，错误只在有第二 escape 的帧上冒出来。
+                                self.version.intra_run_diff(),
+                                0,
+                                &mut ac_ctx,
+                            )?;
+                            for &(i, lv) in &ac_ctx.out {
                                 block[scan[i] as usize] = lv;
                             }
                         }
@@ -540,8 +672,18 @@ impl Decoder {
                         if !coded_flag {
                             continue; // `block_last_index[n] = -1`：不加残差
                         }
-                        for (i, lv) in rl_inter.decode_ac(&mut r, qmul, qadd, 1, -1)? {
-                            block[ZIGZAG[i] as usize] = lv;
+                        rl_tables[rl_inter_i].decode_ac(
+                            &mut r,
+                            qmul,
+                            qadd,
+                            self.version.inter_run_diff(),
+                            -1,
+                            &mut ac_ctx,
+                        )?;
+                        let scan: &[u8; 64] =
+                            if self.version.is_wmv() { &tables::SCAN[0] } else { &ZIGZAG };
+                        for &(i, lv) in &ac_ctx.out {
+                            block[scan[i] as usize] = lv;
                         }
                         // ---- 帧间**不再**反量化 ----
                         // 帧间的反量化**只做一次**，而且在 RL 表里就做完了（表按 qscale 分档）。
@@ -576,16 +718,28 @@ impl Decoder {
             }
         }
 
+
+
         // ---- I 帧尾部可能有 17 位的 ext header（fps 5 + bit_rate 11 + flipflop_rounding 1）----
         // 只在 I 帧做这件事，且只在剩余位数落在 `[17, 25)` 时读；
         // 否则 `flipflop_rounding = 0`。它决定**后面那些 P 帧**的半像素取整方式。
+        //
+        // ⚠️ **只有 `version < WMV1` 才在帧尾读**（ffmpeg 的 `h263dec.c` 里那处
+        // `msmpeg4_version < MSMP4_WMV1`）。WMV1 的那一份在**帧头里**已经读过了
+        // （见 `header.rs` 的 `parse_frame_header`）—— 在这里再读一遍会把帧尾
+        // 那几个字节当成 ext header，凭空翻转 `flipflop_rounding`，
+        // 于是**后面所有 P 帧**的半像素取整方式全错。
         if !is_p {
-            let left = data.len() as i64 * 8 - r.bit_pos() as i64;
-            self.flipflop_rounding = if (17..25).contains(&left) {
-                r.skip(16)?; // fps(5) + bit_rate(11)
-                r.bit()? != 0
+            self.flipflop_rounding = if self.version.is_wmv() {
+                header.flipflop_rounding
             } else {
-                false
+                let left = data.len() as i64 * 8 - r.bit_pos() as i64;
+                if (17..25).contains(&left) {
+                    r.skip(16)?; // fps(5) + bit_rate(11)
+                    r.bit()? != 0
+                } else {
+                    false
+                }
             };
         }
 
@@ -622,7 +776,7 @@ fn crop(src: &[u8], sw: usize, cw: usize, ch: usize) -> Vec<u8> {
 /// 解一帧 **I 帧**（一次性，不带参考帧）。P 帧请用 `Decoder`。
 pub fn decode_i_frame(data: &[u8], width: u32, height: u32) -> Result<Frame> {
     let (mb_w, mb_h) = (width.div_ceil(16) as u32, height.div_ceil(16) as u32);
-    let (header, _) = parse_frame_header(data, mb_w, mb_h)?;
+    let (header, _) = parse_frame_header(data, mb_w, mb_h, Version::V3, &mut HeaderState::default())?;
     if header.picture_type != PictureType::I {
         return Err(Error::Unsupported("decode_i_frame 只支持 I 帧".into()));
     }
@@ -920,8 +1074,8 @@ pub fn sad_luma16(
     if p.need_emu {
         mc_luma16(tmp, 16, 0, 0, refp, p, no_rounding);
         let mut acc = 0u64;
-        for i in 0..256usize {
-            acc += (cur[i] as i32 - tmp[i] as i32).unsigned_abs() as u64;
+        for (a, b) in cur.iter().zip(tmp.iter()) {
+            acc += (*a as i32 - *b as i32).unsigned_abs() as u64;
         }
         return acc;
     }
@@ -933,31 +1087,53 @@ pub fn sad_luma16(
     let pw = refp.pw;
     let base = p.src_y as usize * pw + p.src_x as usize;
     let (hx, hy) = (p.dxy & 1 != 0, p.dxy & 2 != 0);
-    let w = if hx { 17 } else { 16 };
     let mut acc = 0u64;
-    if hy {
-        for r in 0..16usize {
-            let top = &refp.y[base + r * pw..base + r * pw + w];
-            let bot = &refp.y[base + (r + 1) * pw..base + (r + 1) * pw + w];
-            for c in 0..16usize {
-                let v = if hx {
-                    (top[c] as u32 + top[c + 1] as u32 + bot[c] as u32 + bot[c + 1] as u32 + r2) >> 2
-                } else {
-                    (top[c] as u32 + bot[c] as u32 + r1) >> 1
-                };
-                acc += (cur[r * 16 + c] as i32 - v as i32).unsigned_abs() as u64;
+    // ⚠️ 四个相位**在行循环外**分开写。原来是把 `hx`/`hy` 的判断放在最内层，
+    // 每次索引 `top[c]`/`top[c+1]`/`bot[c]`/`bot[c+1]` —— 编译器无法证明
+    // `c + 1` 不越界，于是 256 次里每次都带边界检查；而且 `if hx` 在内层
+    // 会挡住向量化。分开之后用 `zip`/`windows(2)` 表达「正好 16 个」，
+    // 边界检查消失，内层变成可向量化的纯算术。
+    // **值必须逐位相同**：公式与舍入常数一个字没动。
+    match (hx, hy) {
+        (false, false) => {
+            for r in 0..16usize {
+                let top = &refp.y[base + r * pw..base + r * pw + 16];
+                let crow = &cur[r * 16..r * 16 + 16];
+                for (a, b) in crow.iter().zip(top) {
+                    acc += (*a as i32 - *b as i32).unsigned_abs() as u64;
+                }
             }
         }
-    } else {
-        for r in 0..16usize {
-            let top = &refp.y[base + r * pw..base + r * pw + w];
-            for c in 0..16usize {
-                let v = if hx {
-                    (top[c] as u32 + top[c + 1] as u32 + r1) >> 1
-                } else {
-                    top[c] as u32
-                };
-                acc += (cur[r * 16 + c] as i32 - v as i32).unsigned_abs() as u64;
+        (true, false) => {
+            for r in 0..16usize {
+                let top = &refp.y[base + r * pw..base + r * pw + 17];
+                let crow = &cur[r * 16..r * 16 + 16];
+                for (a, t) in crow.iter().zip(top.windows(2)) {
+                    let v = (t[0] as u32 + t[1] as u32 + r1) >> 1;
+                    acc += (*a as i32 - v as i32).unsigned_abs() as u64;
+                }
+            }
+        }
+        (false, true) => {
+            for r in 0..16usize {
+                let top = &refp.y[base + r * pw..base + r * pw + 16];
+                let bot = &refp.y[base + (r + 1) * pw..base + (r + 1) * pw + 16];
+                let crow = &cur[r * 16..r * 16 + 16];
+                for (a, (t, b)) in crow.iter().zip(top.iter().zip(bot)) {
+                    let v = (*t as u32 + *b as u32 + r1) >> 1;
+                    acc += (*a as i32 - v as i32).unsigned_abs() as u64;
+                }
+            }
+        }
+        (true, true) => {
+            for r in 0..16usize {
+                let top = &refp.y[base + r * pw..base + r * pw + 17];
+                let bot = &refp.y[base + (r + 1) * pw..base + (r + 1) * pw + 17];
+                let crow = &cur[r * 16..r * 16 + 16];
+                for (a, (t, b)) in crow.iter().zip(top.windows(2).zip(bot.windows(2))) {
+                    let v = (t[0] as u32 + t[1] as u32 + b[0] as u32 + b[1] as u32 + r2) >> 2;
+                    acc += (*a as i32 - v as i32).unsigned_abs() as u64;
+                }
             }
         }
     }

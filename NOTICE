@@ -1,0 +1,86 @@
+v2video —— 第三方代码与数据来源
+==================================
+
+本仓以 **LGPL-2.1-or-later** 发布（全文见 [LICENSE](LICENSE)）。
+本文件列出**不是本仓原创**的部分、它们的来源、以及上游的版权声明 ——
+依 LGPL-2.1 §4(a)「保留版权声明与许可声明」的要求。
+
+⚠️ **本文件由 `tools/gen_notice.py` 生成，不要手改。**
+里面的版权行是生成器从上游源文件**原样读出**的（见 `tools/ffmpeg_src.py`），
+与 `crates/*/src/tables.rs` 文件头里写的是同一批字符串。
+
+
+一、从 FFmpeg 的数据文件读出的码表
+----------------------------------
+
+下面这些 Rust 源文件是**生成的**（文件头都标了「不要手改」），
+数据由 `tools/` 下的生成器从 FFmpeg 7.1 的 `libavcodec/` 读出：
+
+    crates/msmpeg4/src/tables.rs
+        ← tools/gen_tables.py
+    crates/mp4v/src/tables.rs
+        ← tools/gen_tables.py
+    crates/aac/src/tables.rs
+        ← tools/gen_aac_tables.py
+    crates/wma/src/tables.rs
+        ← tools/gen_wma_tables.py
+
+这些表是 H.263 / MPEG-4 Part 2 / MPEG-4 Audio / WMA 的**格式定义**
+（编解码器规格的一部分），不是某个实现的私有数据；
+生成器只做「读出来 + 排版」，不做任何推导。
+换一个数据源（规范附录，或别的宽松许可实现）即可整体替换 —— 生成器就是为此留的。
+
+上游文件与它们的版权声明：
+
+    libavcodec/msmpeg4data.c
+        copyright (c) 2001 Fabrice Bellard
+        copyright (c) 2002-2004 Michael Niedermayer <michaelni@gmx.at>
+        msmpeg4v1 & v2 stuff by Michael Niedermayer <michaelni@gmx.at>
+
+    libavcodec/msmpeg4_vc1_data.c
+        Copyright (c) 2001 Fabrice Bellard
+        Copyright (c) 2002-2004 Michael Niedermayer <michaelni@gmx.at>
+        msmpeg4v1 & v2 stuff by Michael Niedermayer <michaelni@gmx.at>
+
+    libavcodec/h263data.c
+        （该文件头没有版权行 —— 它是纯数据文件，只有 LGPL 许可块）
+
+    libavcodec/mpeg4data.h
+        copyright (c) 2000,2001 Fabrice Bellard
+        copyright (c) 2002-2004 Michael Niedermayer <michaelni@gmx.at>
+
+    libavcodec/mpegvideodata.c
+        （该文件头没有版权行 —— 它是纯数据文件，只有 LGPL 许可块）
+
+    libavcodec/aactab.c
+        Copyright (c) 2005-2006 Oded Shimon ( ods15 ods15 dyndns org )
+        Copyright (c) 2006-2007 Maxim Gavrilov ( maxim.gavrilov gmail com )
+
+    libavcodec/aacenctab.h
+        Copyright (c) 2015 Rostislav Pehlivanov ( atomnuker gmail com )
+
+    libavcodec/wmadata.h
+        copyright (c) 2002 The FFmpeg Project
+
+    libavcodec/wma_freqs.c
+        （该文件头没有版权行 —— 它是纯数据文件，只有 LGPL 许可块）
+
+
+二、许可证
+----------------------------------
+
+FFmpeg 以 **GNU Lesser General Public License, version 2.1 or later** 发布。
+LGPL-2.1 全文见本仓的 [LICENSE](LICENSE) —— 与本仓用的是同一份文本。
+
+    FFmpeg 项目主页：https://ffmpeg.org/
+    源码下载：      https://ffmpeg.org/download.html
+    本仓生成表时读的是 FFmpeg 7.1。
+
+
+三、其余部分
+----------------------------------
+
+除上面列出的生成码表之外，本仓的代码是自研的，没有链接任何第三方库
+（`Cargo.lock` 里只有本仓自己的包）。编解码器的**算法**来自公开规范
+（ITU-T H.263、ISO/IEC 14496-2、ISO/IEC 14496-3、ASF 规范），
+不是从任何实现逐行翻译的。

@@ -167,9 +167,10 @@ fn idct_pass(block: &mut [i16; 64]) -> [[i32; 8]; 8] {
 /// `block` 是**反量化后**的系数（扫描序已还原到自然序）。
 pub fn idct_put(block: &mut [i16; 64], dest: &mut [u8], stride: usize) {
     let cols = idct_pass(block);
-    for x in 0..8 {
-        for y in 0..8 {
-            dest[y * stride + x] = clip(cols[x][y]);
+    // 行外层 + 行切片，理由同 `idct_add`。
+    for (y, row) in dest.chunks_mut(stride).take(8).enumerate() {
+        for (x, px) in row[..8].iter_mut().enumerate() {
+            *px = clip(cols[x][y]);
         }
     }
 }
@@ -179,10 +180,12 @@ pub fn idct_put(block: &mut [i16; 64], dest: &mut [u8], stride: usize) {
 /// 即 `dest = clip(dest + (x >> COL_SHIFT))`。
 pub fn idct_add(block: &mut [i16; 64], dest: &mut [u8], stride: usize) {
     let cols = idct_pass(block);
-    for x in 0..8 {
-        for y in 0..8 {
-            let cur = dest[y * stride + x] as i32;
-            dest[y * stride + x] = (cur + cols[x][y]).clamp(0, 255) as u8;
+    // ⚠️ **行外层 + 行切片**：`dest[y * stride + x]` 用计算下标写，每个像素
+    // 都要过一次边界检查，而且 8 个像素跨 8 行（`stride` 是 320/368 这种）。
+    // 换成行切片之后检查提到循环外，写是连续的 —— 值一个不差。
+    for (y, row) in dest.chunks_mut(stride).take(8).enumerate() {
+        for (x, px) in row[..8].iter_mut().enumerate() {
+            *px = (*px as i32 + cols[x][y]).clamp(0, 255) as u8;
         }
     }
 }
