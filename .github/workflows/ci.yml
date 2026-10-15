@@ -5,12 +5,9 @@ on:
     branches: [main]
   pull_request:
 
-# 这里**故意不设**那些 `V2V_*` 样本变量。
-#
-# 真样本一律不入库（版权 + 体积，见 AGENTS.md），对账测试按设计去读环境变量、
-# 缺样本就打 `SKIP …` 并通过 —— 所以 CI 跑的正是「不依赖样本」的那一层。
-# 带真样本的对账（逐帧对 ffmpeg / 逐 box 对 ffprobe）由人手工跑，
-# 那是发布前的动作，不是每次提交的动作。
+# 这里**故意不设**那些 `V2V_*` 样本变量：真样本一律不入库（版权 + 体积，见 AGENTS.md），
+# 对账测试按设计去读环境变量、缺样本就打 `SKIP …` 并通过。
+# 带真样本的整轨对账（逐帧对 ffmpeg / 逐 box 对 ffprobe）由人手工跑，那是发布前的动作。
 jobs:
   test:
     name: test (${{ matrix.os }})
@@ -19,7 +16,23 @@ jobs:
       # 一个平台挂了也要看到另一个的结果 —— 两个平台失败的原因经常不一样。
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          # ⚠️ **只在 Linux 上装 ffmpeg**，两个理由：
+          #
+          # 1. **CI 的 runner 默认没有 ffmpeg**。少了它，那些「用合成帧、不需要真样本」
+          #    的对账测试会整片 `SKIP` —— 那样的「绿」只证明「编译过了 + 不依赖工具的
+          #    那部分过了」，证明力很弱。装上它，`mp4v` 的编→ffmpeg 解往返、
+          #    `msmpeg4` 的 I/P 序列交叉验证才真的跑起来（这些**不需要样本**，
+          #    所以 CI 跑得动）。
+          # 2. macOS 那边走 `brew install ffmpeg` 要几分钟（依赖一大串），
+          #    而 oracle 测试与平台无关 —— macOS 这个 job 的职责是**可移植性**
+          #    （换链接器、换 std），不是重复验一遍 oracle。
+          #
+          # 所以两个 job 的分工是：**Linux 验语义，macOS 验可移植**。
+          - os: ubuntu-latest
+            ffmpeg: true
+          - os: macos-latest
+            ffmpeg: false
     steps:
       - uses: actions/checkout@v4
 
@@ -29,13 +42,24 @@ jobs:
       - name: 工具链版本
         run: rustc --version && cargo --version
 
+      - name: 装 ffmpeg（只 Linux）
+        if: matrix.ffmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          ffmpeg -version | head -1
+          ffprobe -version | head -1
+
       # ⚠️ `-j 4`：与本地一致（AGENTS.md 的「构建资源纪律」）。
       # runner 核少，但限并发不会有害，而且能让本地与 CI 的构建条件尽量一致。
       - name: 构建（零警告是本仓的硬要求）
         run: cargo build -j 4
 
+      # ⚠️ `--no-fail-fast`：默认一个测试目标挂了就**不再跑后面的**，
+      # 于是「修一个、推一次、又发现下一个」要来回好几轮。实测过一次：
+      # 默认跑法只暴露了 7 条失败，加了这个参数才看到还有另外 3 条。
       - name: 测试
-        run: cargo test --workspace -j 4
+        run: cargo test --workspace -j 4 --no-fail-fast
 
 # 不加 `cargo fmt`：仓里没有 `rustfmt.toml`，3 万行按默认风格重排会炸出一片
 # 与本次改动无关的 diff。要加得先单独一轮把全仓格式化，那是另一件事。

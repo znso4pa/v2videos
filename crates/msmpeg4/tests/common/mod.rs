@@ -226,6 +226,27 @@ pub fn first_video_frames(path: &str, n: usize) -> Option<(Vec<Vec<u8>>, u32, u3
 /// 固定 `-idct 2`（C 版 `simple_idct`），且**必须放在 `-i` 之前** —— 放后面 ffmpeg
 /// 不报错、不警告、直接静默忽略，会让人误以为「已钉在 C 版」。
 /// `-fps_mode passthrough` 同理必加，否则帧号与样本对不上。
+/// `ffmpeg` / `ffprobe` 在不在 `PATH` 上。
+///
+/// ⚠️ 这个守卫**是必须的，不是保险**：CI（GitHub runner）上**没有装 ffmpeg**，
+/// 少了它那些「用合成帧、不需要真样本」的测试会直接 panic ——
+/// 而仓规是「缺外部依赖就打个 `SKIP` 并通过」。
+///
+/// （`ffmpeg_frames` 那种「起不来就返回 `None`」的写法够用了；
+/// 这个函数是给「先要判断、再决定走哪条路」的测试用的。）
+pub fn has_ffmpeg() -> bool {
+    let ok = |bin: &str| {
+        std::process::Command::new(bin)
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    ok("ffmpeg") && ok("ffprobe")
+}
+
 pub fn ffmpeg_frames(path: &str, count: usize, w: u32, h: u32) -> Option<Vec<Vec<u8>>> {
     let out = Command::new("ffmpeg")
         .args([

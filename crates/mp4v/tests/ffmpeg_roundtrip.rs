@@ -116,6 +116,27 @@ fn frame_bytes(f: &Frame) -> Vec<u8> {
 
 // ==================== ffmpeg 帮手 ====================
 
+/// `ffmpeg` / `ffprobe` 在不在 `PATH` 上。
+///
+/// ⚠️ 这个守卫**是必须的，不是保险**：CI（GitHub runner）上**没有装 ffmpeg**，
+/// 少了它整个文件会在 CI 里炸 —— 实测 7 条测试全红、两个平台都是。
+/// 仓规是「缺外部依赖就打个 `SKIP` 并通过」，不能靠 `expect` 崩。
+///
+/// （与 `crates/aac/tests/ffmpeg_roundtrip.rs::has_ffmpeg` 同一套写法。
+/// 两个 crate 各自持有一份：集成测试之间没有共享模块，而这十行不值得为它造一个。）
+fn has_ffmpeg() -> bool {
+    let ok = |bin: &str| {
+        Command::new(bin)
+            .arg("-version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    ok("ffmpeg") && ok("ffprobe")
+}
+
 fn ffmpeg(args: &[&str], stdin_data: Option<&[u8]>) -> (bool, Vec<u8>, String) {
     let mut cmd = Command::new("ffmpeg");
     cmd.args(args)
@@ -197,6 +218,10 @@ fn encode_raw_es(cfg: EncoderConfig, frames: &[Frame]) -> (Vec<u8>, Vec<Vec<u8>>
 
 #[test]
 fn ffmpeg_decodes_our_elementary_stream() {
+    if !has_ffmpeg() {
+        eprintln!("SKIP: PATH 上没有 ffmpeg / ffprobe");
+        return;
+    }
     let frames: Vec<Frame> = (0..FRAMES).map(test_frame).collect();
     let cfg = EncoderConfig {
         width: W,
@@ -232,6 +257,10 @@ fn ffmpeg_decodes_our_elementary_stream() {
 
 #[test]
 fn quality_is_in_the_same_league_as_ffmpeg() {
+    if !has_ffmpeg() {
+        eprintln!("SKIP: PATH 上没有 ffmpeg / ffprobe");
+        return;
+    }
     let frames: Vec<Frame> = (0..FRAMES).map(test_frame).collect();
     let cfg = EncoderConfig {
         width: W,
@@ -295,6 +324,10 @@ fn quality_is_in_the_same_league_as_ffmpeg() {
 
 #[test]
 fn vol_survives_the_trip_into_an_mp4_esds() {
+    if !has_ffmpeg() {
+        eprintln!("SKIP: PATH 上没有 ffmpeg / ffprobe");
+        return;
+    }
     use v2v_mp4::{Mp4Muxer, VideoTrack};
 
     let frames: Vec<Frame> = (0..FRAMES).map(test_frame).collect();
@@ -423,6 +456,10 @@ fn low_motion_frame(t: usize) -> Frame {
 /// 所以要顺带断言「帧间宏块确实占了多数」。
 #[test]
 fn p_frames_cut_the_bitrate_without_breaking_the_stream() {
+    if !has_ffmpeg() {
+        eprintln!("SKIP: PATH 上没有 ffmpeg / ffprobe");
+        return;
+    }
     let frames: Vec<Frame> = (0..FRAMES).map(test_frame).collect();
 
     // 全 I 帧（基准）
@@ -514,6 +551,10 @@ fn p_frames_cut_the_bitrate_without_breaking_the_stream() {
 /// 在「P 帧全部退化成帧内宏块」时**照样能过**。
 #[test]
 fn p_frames_compress_a_low_motion_sequence() {
+    if !has_ffmpeg() {
+        eprintln!("SKIP: PATH 上没有 ffmpeg / ffprobe");
+        return;
+    }
     let frames: Vec<Frame> = (0..FRAMES).map(low_motion_frame).collect();
 
     let base = EncoderConfig {
@@ -630,6 +671,10 @@ fn p_frames_actually_use_inter_macroblocks() {
 /// 上一条测试已经做了这件事。这里补的是**逐帧**版本的诊断输出，方便定位出问题的是哪一帧。
 #[test]
 fn every_p_frame_stays_within_tolerance() {
+    if !has_ffmpeg() {
+        eprintln!("SKIP: PATH 上没有 ffmpeg / ffprobe");
+        return;
+    }
     let frames: Vec<Frame> = (0..FRAMES).map(test_frame).collect();
     let (es, _) = encode_raw_es(
         EncoderConfig {
@@ -752,6 +797,10 @@ fn rate_control_lands_near_the_target() {
 /// 码率控制编出来的流 ffmpeg 也要解得开 —— qscale 逐帧变会动 VOP 头，值得钉一下。
 #[test]
 fn ffmpeg_decodes_a_rate_controlled_stream() {
+    if !has_ffmpeg() {
+        eprintln!("SKIP: PATH 上没有 ffmpeg / ffprobe");
+        return;
+    }
     let frames: Vec<Frame> = (0..20).map(test_frame).collect();
     let cfg = EncoderConfig {
         width: W,
