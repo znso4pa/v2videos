@@ -295,7 +295,6 @@ impl Decoder {
             qscale: header.qscale,
             esc3_level_length: 0,
             esc3_run_length: 0,
-            out: Vec::new(),
         };
 
         self.frames += 1;
@@ -640,11 +639,10 @@ impl Decoder {
                                 // 会「看着全对」，错误只在有第二 escape 的帧上冒出来。
                                 self.version.intra_run_diff(),
                                 0,
+                                &mut block,
+                                scan,
                                 &mut ac_ctx,
                             )?;
-                            for &(i, lv) in &ac_ctx.out {
-                                block[scan[i] as usize] = lv;
-                            }
                         }
 
                         // ---- AC 预测 ----
@@ -672,19 +670,18 @@ impl Decoder {
                         if !coded_flag {
                             continue; // `block_last_index[n] = -1`：不加残差
                         }
+                        let scan: &[u8; 64] =
+                            if self.version.is_wmv() { &tables::SCAN[0] } else { &ZIGZAG };
                         rl_tables[rl_inter_i].decode_ac(
                             &mut r,
                             qmul,
                             qadd,
                             self.version.inter_run_diff(),
                             -1,
+                            &mut block,
+                            scan,
                             &mut ac_ctx,
                         )?;
-                        let scan: &[u8; 64] =
-                            if self.version.is_wmv() { &tables::SCAN[0] } else { &ZIGZAG };
-                        for &(i, lv) in &ac_ctx.out {
-                            block[scan[i] as usize] = lv;
-                        }
                         // ---- 帧间**不再**反量化 ----
                         // 帧间的反量化**只做一次**，而且在 RL 表里就做完了（表按 qscale 分档）。
                         // 所以 `decode_ac(qmul, qadd, …)` 出来的就是**最终系数**，直接进 idct_add。
