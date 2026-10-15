@@ -457,7 +457,7 @@ fn ac_prediction_path_matches_ffmpeg_when_forced_on() {
     for (idx, f) in samples.iter().enumerate() {
         // 只挑 **I 帧**（能单独解）且**有内容**的 —— 纯色帧 CBP 全 0、邻块 AC 也全 0，
         // 翻了位看不出变化，测不到东西。
-        let Ok((hdr, _)) = parse_frame_header(f, mw, mh) else {
+        let Ok((hdr, _)) = parse_frame_header(f, mw, mh, v2v_msmpeg4::Version::V3, &mut Default::default()) else {
             continue;
         };
         if hdr.picture_type != PictureType::I {

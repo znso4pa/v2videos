@@ -48,7 +48,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .collect::<Vec<_>>()
                 .join(" ");
         }
-        match parse_frame_header(&s.data, mb_w, mb_h) {
+        match parse_frame_header(&s.data, mb_w, mb_h, v2v_msmpeg4::Version::V3, &mut Default::default()) {
             Ok((h, _)) => {
                 match h.picture_type {
                     PictureType::I => i_frames += 1,

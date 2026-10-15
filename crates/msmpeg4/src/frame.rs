@@ -37,7 +37,9 @@ use crate::bitreader::BitReader;
 use crate::block::RlTable;
 use crate::error::{Error, Result};
 use crate::grid::Grid;
-use crate::header::{parse_frame_header, PictureType};
+use crate::block::AcCtx;
+use crate::header::{parse_frame_header, HeaderState, PictureType};
+use crate::version::Version;
 use crate::idct::{idct_add, idct_put};
 use crate::predict::{ac_predict, coded_block_predict, dc_predict, AcVal};
 use crate::tables;
@@ -151,6 +153,10 @@ pub struct AcPredRead {
 /// - `no_rounding` —— 它由 `flipflop_rounding` 逐帧翻转，而 `flipflop_rounding`
 ///   只从 **I 帧尾部**的 ext header 里读。所以「只看这一帧」是解不出来的。
 pub struct Decoder {
+    /// 位流的**版本**（MP41/42/43 / WMV1/2）。它决定帧头、MB 层与系数解码的分支。
+    version: Version,
+    /// 帧头解析的跨帧状态（WMV1 的码率要用）。
+    hdr_state: HeaderState,
     /// 上一帧的内部（宏块对齐、未裁剪）平面。
     prev: Option<Planes>,
     /// `no_rounding`：半像素 MC 用不用带舍入的平均。
@@ -175,7 +181,17 @@ impl Default for Decoder {
 
 impl Decoder {
     pub fn new() -> Self {
+        Self::with_version(Version::default())
+    }
+
+    /// 指定**版本**的解码器。
+    ///
+    /// 版本是**流**的属性（来自容器里的 FourCC），不是帧的属性 ——
+    /// 所以它在构造时定，之后每帧沿用。
+    pub fn with_version(version: Version) -> Self {
         Self {
+            version,
+            hdr_state: HeaderState::default(),
             prev: None,
             no_rounding: false,
             flipflop_rounding: false,
@@ -206,8 +222,21 @@ impl Decoder {
     pub fn decode(&mut self, data: &[u8], width: u32, height: u32) -> Result<Frame> {
         let mb_w = width.div_ceil(16) as usize;
         let mb_h = height.div_ceil(16) as usize;
-        let (header, used_bits) = parse_frame_header(data, mb_w as u32, mb_h as u32)?;
+        let (header, used_bits) =
+            parse_frame_header(data, mb_w as u32, mb_h as u32, self.version, &mut self.hdr_state)?;
         let is_p = header.picture_type == PictureType::P;
+
+        // ---- 系数解码的版本相关上下文 ----
+        //
+        // ⚠️ WMV1/WMV2 的第三 escape 长度**在帧内粘住**（一帧里第一次遇到时才读），
+        // 所以它必须活在**帧**这一层，不能放进每块的循环里。
+        // ffmpeg 在帧头解析的末尾把它归零 —— 这里等价于每帧新建一个。
+        let mut ac_ctx = AcCtx {
+            version: self.version,
+            qscale: header.qscale,
+            esc3_level_length: 0,
+            esc3_run_length: 0,
+        };
 
         self.frames += 1;
         self.ac_pred_reads.clear();
@@ -510,7 +539,7 @@ impl Decoder {
                                 &ZIGZAG
                             };
                             let rl = if luma { &rl_luma } else { &rl_chroma };
-                            for (i, lv) in rl.decode_ac(&mut r, 1, 0, 0, 0)? {
+                            for (i, lv) in rl.decode_ac(&mut r, 1, 0, 0, 0, &mut ac_ctx)? {
                                 block[scan[i] as usize] = lv;
                             }
                         }
@@ -540,7 +569,14 @@ impl Decoder {
                         if !coded_flag {
                             continue; // `block_last_index[n] = -1`：不加残差
                         }
-                        for (i, lv) in rl_inter.decode_ac(&mut r, qmul, qadd, 1, -1)? {
+                        for (i, lv) in rl_inter.decode_ac(
+                            &mut r,
+                            qmul,
+                            qadd,
+                            self.version.inter_run_diff(),
+                            -1,
+                            &mut ac_ctx,
+                        )? {
                             block[ZIGZAG[i] as usize] = lv;
                         }
                         // ---- 帧间**不再**反量化 ----
@@ -622,7 +658,7 @@ fn crop(src: &[u8], sw: usize, cw: usize, ch: usize) -> Vec<u8> {
 /// 解一帧 **I 帧**（一次性，不带参考帧）。P 帧请用 `Decoder`。
 pub fn decode_i_frame(data: &[u8], width: u32, height: u32) -> Result<Frame> {
     let (mb_w, mb_h) = (width.div_ceil(16) as u32, height.div_ceil(16) as u32);
-    let (header, _) = parse_frame_header(data, mb_w, mb_h)?;
+    let (header, _) = parse_frame_header(data, mb_w, mb_h, Version::V3, &mut HeaderState::default())?;
     if header.picture_type != PictureType::I {
         return Err(Error::Unsupported("decode_i_frame 只支持 I 帧".into()));
     }
