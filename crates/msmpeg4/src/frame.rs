@@ -327,10 +327,26 @@ impl Decoder {
         }
         let no_rounding = self.no_rounding;
 
-        // DC 缩放表：**MP43 的亮度用 `OLD_Y_DC_SCALE`，不是 `Y_DC_SCALE`** ——
-        // 后者是 WMV1/WMV2 的表；拿它解 MP43 会让 qscale >= 5 的帧整体偏暗（实测踩过）。
+        // ---- DC 缩放表：**按版本选**（ffmpeg 的 `ff_msmpeg4_common_init`）----
+        //
+        // | 版本        | 亮度                            | 色度                            |
+        // |------------|--------------------------------|--------------------------------|
+        // | V1 / V2     | 默认（MPEG-1 那套）                | 默认                            |
+        // | V3          | `ff_old_ff_y_dc_scale_table`（见下） | `ff_wmv1_c_dc_scale_table`      |
+        // | WMV1 / WMV2 | `ff_wmv1_y_dc_scale_table`      | `ff_wmv1_c_dc_scale_table`      |
+        //
+        // ⚠️ 亮度那两张**在 `qscale >= 5` 时不同**（`<= 4` 都是 8）：`OLD_Y` 在 q=5 是 10、
+        // `Y`（WMV1 的）是 8。所以拿错表的表现是**「低 qscale 的帧碰巧全对、高 qscale 的帧
+        // 整片错」** —— 而且只在有帧内宏块的帧上冒出来，排查时极易被当成别的问题。
+        //
+        // V3 用 `OLD_Y` 是因为 MP43 走 `workaround_bugs` 的 autodetect（实测对着真样本
+        // 逐像素验证过）；WMV1/WMV2 则明确用 wmv1 那张。色度两边都是 wmv1 的。
         let q = header.qscale as usize;
-        let y_dc_scale = tables::OLD_Y_DC_SCALE[q] as i32;
+        let y_dc_scale = if self.version.is_wmv() {
+            tables::Y_DC_SCALE[q] as i32
+        } else {
+            tables::OLD_Y_DC_SCALE[q] as i32
+        };
         let c_dc_scale = tables::C_DC_SCALE[q] as i32;
         let slice_height = header.slice_height.max(1) as usize;
 
@@ -590,7 +606,7 @@ impl Decoder {
                         a = (a + scale / 2) / scale;
                         b = (b + scale / 2) / scale;
                         c = (c + scale / 2) / scale;
-                        let (pred, dir) = dc_predict(a, b, c);
+                        let (pred, dir) = dc_predict(a, b, c, self.version);
                         level += pred;
                         dc_grid.data[xy] = (level * scale) as i16;
 

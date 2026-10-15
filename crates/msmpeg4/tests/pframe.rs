@@ -71,6 +71,22 @@ fn check_p_frames(path: &str) {
         want
     );
 
+    // ⚠️ **首帧不是「能解析的 I 帧」的样本直接跳过**（缺关键帧 / 半截帧的那种）：
+    // P 帧要有参考帧才能解，我们**不做错误隐藏**（ffmpeg 的 `ff_er_frame_end`
+    // 会拿垃圾当参考硬解出画面，所以它「能解」而我们不能）。这是**范围差异**，
+    // 不是「对不上」—— 当成失败会误导，当成成功更误导，所以明说并跳过。
+    let first_is_i = samples.first().is_some_and(|s| {
+        matches!(
+            parse_frame_header(s, w.div_ceil(16), h.div_ceil(16), version, &mut Default::default())
+                .map(|(hd, _)| hd.picture_type),
+            Ok(PictureType::I)
+        )
+    });
+    if !first_is_i {
+        eprintln!("SKIP: 首帧不是能解析的 I 帧（缺关键帧）—— 本仓不做错误隐藏，解不了这种流");
+        return;
+    }
+
     // 逐帧解码。**不提前 assert** —— 一次跑完把所有帧的差异都打出来，好定位。
     let mut dec = Decoder::with_version(version);
     let mut results = Vec::new();

@@ -27,6 +27,7 @@ use crate::bitwriter::BitWriter;
 use crate::block::RlTable;
 use crate::error::{Error, Result};
 use crate::fdct::{fdct, fdct_i};
+use crate::version::Version;
 use crate::frame::{
     mc_chroma8, mc_luma16, mc_mb, mc_params, pred_motion, sad_luma16, Frame, Planes, ZIGZAG,
 };
@@ -699,7 +700,7 @@ fn write_intra_blocks(
         a = (a + scale / 2) / scale;
         b = (b + scale / 2) / scale;
         c = (c + scale / 2) / scale;
-        let (pred, _dir) = dc_predict(a, b, c);
+        let (pred, _dir) = dc_predict(a, b, c, Version::V3);
 
         let total = qb[n][0];
         dc_grid.data[xy] = (total * scale) as i16;
