@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# 这里**故意不设**那些 `V2V_*` 样本变量。
+#
+# 真样本一律不入库（版权 + 体积，见 AGENTS.md），对账测试按设计去读环境变量、
+# 缺样本就打 `SKIP …` 并通过 —— 所以 CI 跑的正是「不依赖样本」的那一层。
+# 带真样本的对账（逐帧对 ffmpeg / 逐 box 对 ffprobe）由人手工跑，
+# 那是发布前的动作，不是每次提交的动作。
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # 一个平台挂了也要看到另一个的结果 —— 两个平台失败的原因经常不一样。
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # 用最新的 stable，不钉版本：本仓用了 `Option::is_none_or`（1.82 起）这类
+      # 比较新的 std API，而 runner 镜像自带的 Rust 版本不一定跟得上。
+      - uses: dtolnay/rust-toolchain@stable
+      - name: 工具链版本
+        run: rustc --version && cargo --version
+
+      # ⚠️ `-j 4`：与本地一致（AGENTS.md 的「构建资源纪律」）。
+      # runner 核少，但限并发不会有害，而且能让本地与 CI 的构建条件尽量一致。
+      - name: 构建（零警告是本仓的硬要求）
+        run: cargo build -j 4
+
+      - name: 测试
+        run: cargo test --workspace -j 4
+
+# 不加 `cargo fmt`：仓里没有 `rustfmt.toml`，3 万行按默认风格重排会炸出一片
+# 与本次改动无关的 diff。要加得先单独一轮把全仓格式化，那是另一件事。
