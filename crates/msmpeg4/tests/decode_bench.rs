@@ -10,6 +10,10 @@
 //!   量的时候请用**整份样本**，别用 `V2V_BENCH_FRAMES` 截几百帧（那样进程启动就占了大头）。
 //! - 取 `V2V_BENCH_REPS` 次里**最快**的一次（默认 3）—— 机器上有别的负载时，
 //!   最小值最接近「没有争抢」的那个数
+//! - ⚠️ **两边都减掉「解 1 帧」的那次**：ffmpeg 每跑一次要付**进程启动**
+//!   （20–30 ms），帧少的样本里它占了大半 —— 不减掉的话，153 帧的样本会算出
+//!   「我们快 4 倍」这种纯属分母灌水的数。减掉之后是**纯解码吞吐**的对比，
+//!   长样本上它与原始比值一致，短样本上才第一次有意义
 //!
 //! 为什么要单列这一张表：**解码速度是这条链路唯一还没量过的一环**。
 //! 编码那边有 `bench.sh`（端到端），但解码混在里面看不见。
@@ -50,6 +54,8 @@ fn ours(path: &str, limit: usize, reps: usize) -> Option<(usize, f64)> {
 }
 
 /// 解 ffmpeg 那一侧：返回最快一次用的秒数。
+///
+/// `limit == 1` 就是量「进程启动 + 一帧」，调用方拿它去减 —— 见模块头那条说明。
 fn ffmpeg(path: &str, limit: usize, reps: usize) -> Option<f64> {
     let mut best = f64::INFINITY;
     for _ in 0..reps {
@@ -96,8 +102,10 @@ fn decode_speed_vs_ffmpeg() {
         .unwrap_or(3);
 
     println!();
-    println!("| 样本 | 编码 | 尺寸 | 帧数 | 我们 s | ffmpeg s | 倍数 | 我们 ms/帧 | ffmpeg ms/帧 |");
-    println!("|---|---|---|---|---|---|---|---|---|");
+    println!(
+        "| 样本 | 编码 | 尺寸 | 帧数 | 我们 s | ffmpeg s | 原始倍数 | 我们 ms/帧 | ffmpeg ms/帧 | **去启动倍数** |"
+    );
+    println!("|---|---|---|---|---|---|---|---|---|---|");
 
     for p in &paths {
         let name = std::path::Path::new(p)
@@ -116,16 +124,25 @@ fn decode_speed_vs_ffmpeg() {
             eprintln!("SKIP: ffmpeg 解不了 {name}");
             continue;
         };
-        // ⚠️ 帧数少时 ffmpeg 那一侧被**进程启动**（~20-30 ms）主导，比值没有意义 ——
-        // 标出来，别让人拿它当结论。
-        let shaky = if n < 500 { " ⚠️帧少" } else { "" };
+        // 「解 1 帧」那一趟 = 启动开销 + 一帧；两边都减掉它，剩下的才是纯解码。
+        let (Some((_, our1)), Some(ff1)) = (ours(p, 1, reps), ffmpeg(p, 1, reps)) else {
+            eprintln!("SKIP: {name} 连 1 帧都量不了");
+            continue;
+        };
+        let our_pure = (our_s - our1).max(1e-9);
+        let ff_pure = (ff_s - ff1).max(1e-9);
         println!(
-            "| `{name}` | {codec} | {w}×{h} | {n}{shaky} | {our_s:.3} | {ff_s:.3} | **{:.2}×** | {:.2} | {:.2} |",
+            "| `{name}` | {codec} | {w}×{h} | {n} | {our_s:.3} | {ff_s:.3} | {:.2}× | {:.2} | {:.2} | **{:.2}×** |",
             our_s / ff_s,
             our_s * 1000.0 / n as f64,
             ff_s * 1000.0 / n as f64,
+            our_pure / ff_pure,
         );
     }
     println!();
-    eprintln!("（两边都含解封装、都单线程、都只解视频；取 {reps} 次里最快的一次）");
+    eprintln!(
+        "（两边都含解封装、都单线程、都只解视频；取 {reps} 次里最快的一次）\n\
+         （「原始倍数」含进程启动，「**去启动倍数**」= (我们 N 帧 − 我们 1 帧) / (ffmpeg N 帧 − ffmpeg 1 帧)——\
+         帧少的样本只看后者）"
+    );
 }
