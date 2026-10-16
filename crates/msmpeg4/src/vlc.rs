@@ -13,7 +13,17 @@ pub struct Vlc {
     nodes: Vec<[i32; 2]>,
     /// 原表（编码侧要按符号反查 `(code, len)`）。
     table: Vec<[u32; 2]>,
+    /// **快表**：偷看 `FAST_BITS` 位直接得 `(符号 << 5) | 码长`；`0` = 码长超过
+    /// `FAST_BITS`（或未定义）→ 退回走树。
+    ///
+    /// 为什么要它：走树是**逐位**的（一次符号 10~15 位 = 十几次内存取 + 移位），
+    /// 采样里这条路径占整条解码的**三成**（WMV2 那份样本）。一次查表换掉它。
+    fast: Vec<u32>,
 }
+
+/// 快表的位宽。取 9 与 ffmpeg 的 `*_VLC_BITS` 同档：大多数符号一次命中，
+/// 表也就 2 KB。
+const FAST_BITS: u32 = 9;
 
 impl Vlc {
     /// `table[i] = [code, len]`；`len == 0` 的项视为未用（跳过）。
@@ -41,9 +51,23 @@ impl Vlc {
                 }
             }
         }
+        // 快表：每个「码长 ≤ FAST_BITS」的符号，把它前缀覆盖的所有下标都填上
+        // （低位的任意组合都是同一个符号）。
+        let mut fast = vec![0u32; 1 << FAST_BITS];
+        for (sym, &[code, len]) in table.iter().enumerate() {
+            if len == 0 || len > FAST_BITS {
+                continue;
+            }
+            let entry = ((sym as u32) << 5) | len;
+            let base = (code << (FAST_BITS - len)) as usize;
+            for slot in fast[base..base + (1 << (FAST_BITS - len))].iter_mut() {
+                *slot = entry;
+            }
+        }
         Self {
             nodes,
             table: table.to_vec(),
+            fast,
         }
     }
 
@@ -53,7 +77,17 @@ impl Vlc {
     }
 
     /// 从位流里解出一个符号（返回表下标）。
+    ///
+    /// 快路径 = 偷看 `FAST_BITS` 位查表（大多数符号一次命中）；长码或位不够
+    /// 时退回逐位走树 —— 两条路给出**同一个**符号，判据是解码逐像素 0 差。
     pub fn decode(&self, r: &mut BitReader) -> Result<usize> {
+        if r.bits_left() >= FAST_BITS as usize {
+            let e = self.fast[r.peek_u16(FAST_BITS) as usize];
+            if e != 0 {
+                r.skip(e & 0x1f)?;
+                return Ok((e >> 5) as usize);
+            }
+        }
         self.decode_bits(|| r.bit().ok())
             .ok_or_else(|| Error::Bad("invalid vlc code".into()))
     }

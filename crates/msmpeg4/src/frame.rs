@@ -1333,30 +1333,39 @@ fn put_pixels(
         let top = &src[base..base + sw];
         let dbase = (dy + y) * dstride + dx;
         let d = &mut dst[dbase..dbase + w];
+        // ⚠️ 三个平均分支都写成 `zip`/`windows(2)` 的形态（「正好 w 个」由类型保证，
+        // 内层是纯算术）—— 与 `sad_luma16`/`mspel8_v` 同一套写法。
+        // 逐像素的公式与舍入常数一个字没动。
         match (hx, hy) {
-            (false, false) => d.copy_from_slice(&top[..w]),
+            // ⚠️ 不用 `copy_from_slice`：w = 8/16 这种小尺寸它会变成一次真的
+            // `memcpy` 调用（实测 `memmove` 占 MP43 解码的 8%）。`zip` 循环
+            // 让 LLVM 内联成几条向量指令。
+            (false, false) => {
+                for (slot, v) in d.iter_mut().zip(top.iter()) {
+                    *slot = *v;
+                }
+            }
             (true, false) => {
-                for x in 0..w {
-                    d[x] = ((top[x] as u32 + top[x + 1] as u32 + r1) >> 1) as u8;
+                for (slot, (a, b)) in d.iter_mut().zip(top.iter().zip(top[1..].iter())) {
+                    *slot = ((*a as u32 + *b as u32 + r1) >> 1) as u8;
                 }
             }
             (false, true) => {
                 let bbase = (sy + y + 1) * sstride + sx;
                 let bot = &src[bbase..bbase + sw];
-                for x in 0..w {
-                    d[x] = ((top[x] as u32 + bot[x] as u32 + r1) >> 1) as u8;
+                for (slot, (a, b)) in d.iter_mut().zip(top.iter().zip(bot.iter())) {
+                    *slot = ((*a as u32 + *b as u32 + r1) >> 1) as u8;
                 }
             }
             (true, true) => {
                 let bbase = (sy + y + 1) * sstride + sx;
                 let bot = &src[bbase..bbase + sw];
-                for x in 0..w {
-                    d[x] = ((top[x] as u32
-                        + top[x + 1] as u32
-                        + bot[x] as u32
-                        + bot[x + 1] as u32
-                        + r2)
-                        >> 2) as u8;
+                for (slot, (t, b)) in d
+                    .iter_mut()
+                    .zip(top.windows(2).zip(bot.windows(2)))
+                {
+                    *slot = ((t[0] as u32 + t[1] as u32 + b[0] as u32 + b[1] as u32 + r2) >> 2)
+                        as u8;
                 }
             }
         }
@@ -1688,15 +1697,22 @@ fn mspel8_v(
     sy: usize,
     w: usize,
 ) {
-    for x in 0..w {
-        for y in 0..8 {
-            let p = (sy + y) * sstride + sx + x;
-            let up = src[p - sstride] as i32;
-            let mid = src[p] as i32;
-            let down = src[p + sstride] as i32;
-            let down2 = src[p + 2 * sstride] as i32;
-            let v = 9 * (mid + down) - (up + down2) + 8;
-            dst[y * dstride + x] = (v >> 4).clamp(0, 255) as u8;
+    // ⚠️ **行在外层**：公式是「同一列的上下四行」，很自然写成列在外层 ——
+    // 但那样每次读写都跨行（步长 = 行距），编译器没法向量化。
+    // 换成行在外层、内层按 `w` 个连续字节走（`zip` 表达「正好 w 个」），
+    // 内层就是纯算术 —— 与 `mspel8_h`/`put_pixels` 同一套写法。
+    // **值逐位相同**：公式与舍入常数一个字没动。
+    for y in 0..8usize {
+        let up = &src[(sy + y - 1) * sstride + sx..][..w];
+        let mid = &src[(sy + y) * sstride + sx..][..w];
+        let down = &src[(sy + y + 1) * sstride + sx..][..w];
+        let down2 = &src[(sy + y + 2) * sstride + sx..][..w];
+        let d = &mut dst[y * dstride..y * dstride + w];
+        for (i, slot) in d.iter_mut().enumerate() {
+            let v = 9 * (mid[i] as i32 + down[i] as i32)
+                - (up[i] as i32 + down2[i] as i32)
+                + 8;
+            *slot = (v >> 4).clamp(0, 255) as u8;
         }
     }
 }
@@ -1723,7 +1739,9 @@ fn mspel_put_pixels(
             for y in 0..8 {
                 let s = &src[(sy + y) * sstride + sx..][..8];
                 let d = &mut dst[(dy + y) * dstride + dx..][..8];
-                d.copy_from_slice(s);
+                for (slot, v) in d.iter_mut().zip(s.iter()) {
+                    *slot = *v;
+                }
             }
         }
         // mc10 / mc20 / mc30：只有横向半像素。
@@ -1745,7 +1763,9 @@ fn mspel_put_pixels(
             mspel8_v(&mut half_v, 8, src, sstride, sx, sy, 8);
             for y in 0..8 {
                 let d = &mut dst[(dy + y) * dstride + dx..][..8];
-                d.copy_from_slice(&half_v[y * 8..y * 8 + 8]);
+                for (slot, v) in d.iter_mut().zip(half_v[y * 8..y * 8 + 8].iter()) {
+                    *slot = *v;
+                }
             }
         }
         // mc12 / mc22 / mc32：横竖都有。

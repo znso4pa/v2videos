@@ -89,12 +89,10 @@ fn clip(v: i32) -> u8 {
 /// `put` 与 `add` 的唯一差别就在最后一步怎么用这些值 —— 前面（含列方向的 bias
 /// `(1 << (COL_SHIFT-1))/W4` = 32）完全一样，所以两趟共用这一个函数。
 fn idct_pass(block: &mut [i16; 64]) -> [[i32; 8]; 8] {
-    // 行
+    // 行（**原地**：原来每行先拷进临时数组、算完再拷回去 —— 每块 16 次 16 字节拷贝）
     for y in 0..8 {
-        let mut row = [0i16; 8];
-        row.copy_from_slice(&block[y * 8..y * 8 + 8]);
-        idct_row(&mut row);
-        block[y * 8..y * 8 + 8].copy_from_slice(&row);
+        let row: &mut [i16; 8] = (&mut block[y * 8..y * 8 + 8]).try_into().unwrap();
+        idct_row(row);
     }
 
     // 列
