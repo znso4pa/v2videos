@@ -946,17 +946,32 @@ fn motion_estimate(
             cur = best;
         }
     }
-    // 细化一：最优周围 ±1.5 像素，**按 1 像素粒度**（半像素步长 2）
-    let base = best;
-    for dy in (-3..=3i32).step_by(2) {
-        for dx in (-3..=3i32).step_by(2) {
-            let cand = clamp2((base.0 + dx, base.1 + dy));
-            let s = sad_of(cand, best_sad);
-            if s < best_sad {
-                best_sad = s;
-                best = cand;
+    // 细化一：**八邻域步进**（半像素步长 2 = 1 像素粒度），走到不再改善。
+    //
+    // 原来是最优周围 ±1.5 像素的一个 4×4 固定网格（16 个候选）。改成八邻域步进：
+    // 候选更少，而且**覆盖对角线**（4 邻域菱形不覆盖 (±2,±2)，那正是固定网格多出来的那几个）。
+    let mut cur = best;
+    for _ in 0..DIAMOND_STEPS {
+        let base = cur;
+        let mut improved = false;
+        for dy in [-2i32, 0, 2] {
+            for dx in [-2i32, 0, 2] {
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+                let cand = clamp2((base.0 + dx, base.1 + dy));
+                let s = sad_of(cand, best_sad);
+                if s < best_sad {
+                    best_sad = s;
+                    best = cand;
+                    improved = true;
+                }
             }
         }
+        if !improved {
+            break;
+        }
+        cur = best;
     }
     // 细化二：±0.5 像素收尾
     let base = best;
