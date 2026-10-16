@@ -22,11 +22,14 @@ mod common;
 use common::{all_video_frames, compare, ffmpeg_frames, sample_list, video_extra};
 use v2v_msmpeg4::{Decoder, Error, Version, Wmv2Flags, Wmv2Frame};
 
+/// 每个样本比几帧。`V2V_MAX_FRAMES=0` = **整段**（别写成「比 0 帧」——
+/// 那样 `want` 会是 0，ffmpeg 那条路起不来，于是打出一句**误导的**
+/// 「SKIP: 没有可用的 ffmpeg」，看着像环境缺 ffmpeg）。
 fn max_frames() -> usize {
-    std::env::var("V2V_MAX_FRAMES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(24)
+    match std::env::var("V2V_MAX_FRAMES").ok().and_then(|v| v.parse().ok()) {
+        Some(0) | None => usize::MAX,
+        Some(n) => n,
+    }
 }
 
 #[test]
@@ -79,9 +82,18 @@ fn check(path: &str) {
         }
     };
     let want = samples.len().min(max_frames());
+    if want == 0 {
+        eprintln!("SKIP: 这一份没有视频帧");
+        return;
+    }
     let refs = match ffmpeg_frames(path, want, w, h) {
         Some(v) => v,
         None => {
+            // 区分「没装 ffmpeg」与「ffmpeg 解得出来但我们解得不一样」——
+            // 后者是**真问题**，别拿 SKIP 盖过去。
+            if common::has_ffmpeg() {
+                panic!("{path}: ffmpeg 起得来但没给出 {want} 帧参考（帧序/帧数对不上？）");
+            }
             eprintln!("SKIP: 没有可用的 ffmpeg");
             return;
         }

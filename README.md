@@ -24,7 +24,7 @@ crates/
   container 各容器共用的数据模型（流 / 格式 / 样本）—— 零依赖
   asf      ASF（.wmv / .wma）解封装 + **封装** —— 纯 std
   avi      AVI（RIFF）解封装
-  msmpeg4  MS-MPEG-4 v3（MP43）/ WMV1 / WMV2 解码（I / P）+ MP43 编码（I / P，含运动估计与帧内/帧间判决）
+  msmpeg4  MS-MPEG-4 v3（MP43）/ WMV1 / WMV2 解码（I / P + **IntraX8**）+ MP43 编码（I / P，含运动估计与帧内/帧间判决）
            **兼共享数值内核**：位读写器 / FDCT / IDCT / FFT / VLC 表 —— mp4v、aac、wma 都从这里取
   wma      WMA v1/v2 音频解码（帧头 / LSP 指数 / 系数 / IMDCT）
   vc1      VC-1（**WMV3**）解码：Simple/Main profile、渐进、I/P —— 目前只到**帧头 + 位平面**
@@ -38,6 +38,7 @@ tools/
   gen_aac_tables.py AAC 的 Huffman 码表 / 频带表
   gen_wma_tables.py WMA 解码的码表 / 频率表
   gen_vc1_tables.py VC-1 的位平面 VLC / 量化表 / 枚举常量（`vc1data.c`、`vc1_vlc_data.h`）
+  gen_intrax8_tables.py IntraX8 的 AC/DC/方向码表与量化矩阵（`intrax8huf.h` 等）
   ffmpeg_src.py     从上游文件头**原样抽出**版权行（各生成器共用，见 NOTICE）
   gen_notice.py     生成根目录的 NOTICE
 ```
@@ -45,7 +46,7 @@ tools/
 ⚠️ **各生成器的默认源目录 `/tmp/ffsize/ffmpeg-7.1` 是作者的本地路径**，
 第三方 clone 里不存在。要重新生成表，先自己准备一份 FFmpeg 7.1 源码
 （<https://ffmpeg.org/download.html>），再用参数指过去：
-前四个是**位置参数**（`python3 tools/gen_tables.py <ffmpeg 源码目录>`），
+各生成器都是**位置参数**（`python3 tools/gen_tables.py <ffmpeg 源码目录>`），
 `gen_wma_tables.py` 用 `--src <ffmpeg>/libavcodec`。
 
 ## 构建与测试
@@ -73,7 +74,7 @@ V2V_ASF_SAMPLE=/path/to/sample.wmv cargo test --release -- --ignored
 | 链路分段     | 做到了什么                                                                                                       | 怎么算验证过                                                                                          |
 | -------- | ----------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
 | **解封装**  | ASF / WMV（`v2v-asf`）、AVI（`v2v-avi`）                                                                         | 与 `ffprobe` 逐字段对：轨道、尺寸、包数、关键帧数                                                                  |
-| **解码**   | MS-MPEG-4 v3（**MP43**）、**WMV1**（WMV7）与 **WMV2**（WMV8）：I 帧 + P 帧（skip、MV 预测、半像素运动补偿、帧间残差）。三版共用骨架，**分叉在帧头与几处版本常量**上：`pict_type` 位宽、ext header 的位置、变长/定长的第三 escape、`ff_wmv1_scantable` 那套扫描表、DC 预测的平手方向与缩放（`scale != 8` 时走 `FASTDIV`，对负数**向下取整**）。**WMV2 另有一整套**：逐宏块 skip 表（4 种粒度）、按 qscale 挑的 CBP 表、`mspel` 四抽头半像素 + 逐宏块 `hshift`、**ABT**（4×8 / 8×4，含自己的扫描表与第二个半块）、**环路滤波**（逐宏块就地滤，skip 宏块也要滤） | 与 `ffmpeg` **逐像素**对：MP43 / WMV1 / WMV2 各自的真样本**每一帧最大差 0**（WMV2 三份样本共 1782 帧；含 `mspel`、ABT、环路滤波、边缘复制那些分支） |
+| **解码**   | MS-MPEG-4 v3（**MP43**）、**WMV1**（WMV7）与 **WMV2**（WMV8）：I 帧 + P 帧（skip、MV 预测、半像素运动补偿、帧间残差）。三版共用骨架，**分叉在帧头与几处版本常量**上：`pict_type` 位宽、ext header 的位置、变长/定长的第三 escape、`ff_wmv1_scantable` 那套扫描表、DC 预测的平手方向与缩放（`scale != 8` 时走 `FASTDIV`，对负数**向下取整**）。**WMV2 另有一整套**：逐宏块 skip 表（4 种粒度）、按 qscale 挑的 CBP 表、`mspel` 四抽头半像素 + 逐宏块 `hshift`、**ABT**（4×8 / 8×4，含自己的扫描表与第二个半块）、**环路滤波**（逐宏块就地滤，skip 宏块也要滤）、以及 **IntraX8**（`j_type` —— 一个按 8×8 块走的内帧子解码器：12 种空间预测 + 自己的环路滤波 + 自己的熵编码，`extradata` 的能力位置位时**每个 I 帧**都归它） | 与 `ffmpeg` **逐像素**对：MP43 / WMV1 / WMV2 各自的真样本**每一帧最大差 0**（WMV2 四份样本共 **21321 帧**，其中 **126 帧走 IntraX8**；含 `mspel`、ABT、环路滤波、边缘复制那些分支） |
 | **解码**   | **VC-1 / WMV3**（`v2v-vc1`）：**序列头 + 帧头 + 位平面**（7 种编码 + 差分算子）。范围限定 **Main profile / 渐进 / I-P**；Advanced profile、B 帧、隔行明确报错 | 对 `ffmpeg -debug pict` 的逐帧日志：真样本 1920×1080 **3719 帧的 `pict_type` 与两张位平面 `(imode, invert)` 全同**（位平面紧跟帧头标量，差一位就变形 ⇒ 位游标一位不差）。**宏块层还没写，所以还不出像素** |
 | **编码**   | MP43 **I 帧 + P 帧**：正向 DCT + 量化 + DC / RL 熵编码、运动估计（整像素粗搜 + 半像素细化）、skip 宏块                                    | 编出来的 I+P 序列交给 `ffmpeg` 解，与自己的解码器**逐像素一致**                                                       |
 | **编码**   | MPEG-4 Part 2（`v2v-mp4v`）**I 帧 + P 帧**：DC / AC 预测（逐宏块比位数择优）、运动估计（**三起点菱形搜索 + 时间预测**，半像素细化）、中值 MV 预测、skip 宏块、逐宏块帧内/帧间判决；`--video-bitrate` 时**逐帧调 qscale** 的码率控制 | 编出来的流交给 `ffmpeg` 解，真样本 **44.8 dB**（同 qscale 下 ffmpeg 自己的 mpeg4 是 43.6 dB）；**视频载荷比全 I 帧小 2.3 倍**；码率控制实测命中目标（371→373、621→618 kbps） |
@@ -99,8 +100,7 @@ v2v convert --mp4 -g 12 in.wmv -o out/
 自己读不回来。WMA 同理。所以 `.wmv → .mp4` 这条路上视频必须过一遍 MPEG-4 Part 2 编码器，  
 音频必须解成 PCM 再重编码（默认 AAC，`--pcm` 则是原封不动的 `sowt`）。
 
-**还没做（解码侧）**：**WMV9 / VC-1 的宏块层**（`v2v-vc1` 现在只到**帧头 + 位平面**，
-见下一段）、WMV2 里的 **IntraX8**（`j_type`，那是另一个内帧编解码器，遇到就明确报错并停下）。
+**还没做（解码侧）**：**WMV9 / VC-1 的宏块层**（`v2v-vc1` 现在只到**帧头 + 位平面**，见下一段）。
 MP41 / MP42 的帧头已经按版本分叉了，但 MB 层还没写
 （要走 H.263 的 MCBPC 表）—— 输入被明确拒绝，不会静默出错。
 
@@ -245,7 +245,7 @@ AAC 编码器**低码率已经反超 ffmpeg**（64k：**7.94 vs 6.37 dB**），�
 | ------------------------ | --------- | --------- | ---------------------------------------------------------------------------- |
 | **MP43**（MS-MPEG-4 v3）   | ✅ I / P   | ✅ I / P   | 这是 `.wmv` 的主编码。解码有 AC 预测那条路（ffmpeg 编的流里 `ac_pred` 恒 0，靠翻位测试覆盖）                 |
 | **WMV1**（WMV7）           | ✅ I / P   | ❌         | 与 MP43 共用 MB 层，分叉在帧头、扫描表、DC 预测/缩放表（见「状态」那行）。**不做错误隐藏** —— 首帧不是 I 帧的流直接报错，ffmpeg 会拿垃圾当参考硬解 |
-| **WMV2**（WMV8）           | ✅ I / P   | ❌         | 帧头与 MB 层是另一套（`wmv2dec.c`）。比 WMV1 多：`parse_mb_skip`（4 种跳帧类型）、按 qscale 挑的 CBP 表、`mspel` 四抽头半像素 + `hshift`、**ABT**（4×8 / 8×4）、**环路滤波**、它自己那份 8×8 IDCT。`j_type` 走的 **IntraX8**（一个独立的内帧编解码器）**没做** —— 遇到就明确报错 |
+| **WMV2**（WMV8）           | ✅ I/P + IntraX8 | ❌         | 帧头与 MB 层是另一套（`wmv2dec.c`）。比 WMV1 多：`parse_mb_skip`（4 种跳帧类型）、按 qscale 挑的 CBP 表、`mspel` 四抽头半像素 + `hshift`、**ABT**（4×8 / 8×4）、**环路滤波**、它自己那份 8×8 IDCT，以及 **IntraX8**（`j_type`，按 8×8 块走的内帧子解码器，WMV2 与 VC-1 共用 —— 见 `intrax8.rs`） |
 | **WMV9 / VC-1**          | 🚧 帧头      | ❌         | **ffmpeg 里根本没有 VC-1/wmv3 编码器**（只有解码器），想要 WMV9 得另找路子。解码侧 `v2v-vc1` 已落地**序列头 + 帧头 + 位平面**（Main profile / 渐进 / I/P，3719 帧逐帧对齐 `ffmpeg -debug pict`）；**宏块层及以下还没写**，所以还不能出像素 |
 | **MPEG-4 Part 2**（`mp4v`） | ❌         | ✅ I / P   | 解码不做（进 MP4 之后交给播放器）。编码缺 B 帧、8×8 运动补偿、`dquant`、resync marker、数据分割             |
 | **H.264 / AVC**          | ❌         | ❌         | 不在范围内（LGPL 侧链不了 x264，见「许可证」）                                                  |
@@ -295,7 +295,7 @@ cargo run --release -p v2v-cli -- convert --mp4 --video-bitrate 500k <输入.wmv
 两者的线程数都封顶到可用并行度。
 
 **输入编码**：`MP43`、`WMV1`（WMV7）与 `WMV2`（WMV8）—— 其余 MS-MPEG-4 版本会**明确报错
-且不留输出文件**，不会静默按错的语法解。（WMV2 的 `j_type` 走 IntraX8 那一帧同样明确报错。）
+且不留输出文件**，不会静默按错的语法解。
 `--video-bitrate` 只对 `.mp4` 有效：给了它就按目标码率**逐帧调 qscale**（`-q` 退化成起步值），
 转完会报**实际**码率；不传就还是按固定的 `-q` 编。
 
