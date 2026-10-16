@@ -326,7 +326,25 @@ fn every_frame_of_the_whole_sample_matches_ffmpeg() {
         // 「我们和 ffmpeg 的帧数一致」这件事由 `extra == 0` 覆盖（上面已经数过 ffmpeg 那边
         // 还剩几帧）。**不要**在这里写死样本的帧数 —— 那是「从某个样本量出来的数字」，
         // 等于把夹具出处写进公开历史，而且换个样本就会红。
-        assert_eq!(extra, 0, "ffmpeg 比我们多 {extra} 帧 —— 解封装漏帧了");
+        //
+        // ⚠️ 例外：**截断的样本**（头里声明的大小 > 实际字节数）会少一个残缺尾包 ——
+        // 那是设计行为（不完整的包直接丢），ffmpeg 却会把那一帧也吐出来。这时只放宽
+        // **帧数**这一条：上面 767 帧的逐帧比对仍然是硬判据（实测最大差 0）。
+        // 别让它把设计行为报成「解封装漏帧」—— 那会把人引去查解封装。
+        let truncated = common::declared_file_size(&path)
+            .zip(std::fs::metadata(&path).ok().map(|m| m.len()))
+            .is_some_and(|(declared, actual)| declared > actual);
+        if truncated {
+            eprintln!(
+                "⚠️ 样本被截断：ffmpeg 多出 {extra} 帧（残缺尾包按设计丢）—— 逐帧比对仍然全对"
+            );
+            assert!(
+                extra <= 1,
+                "截断样本最多只该少 1 个尾包，ffmpeg 多出 {extra} 帧 —— 解封装漏帧了"
+            );
+        } else {
+            assert_eq!(extra, 0, "ffmpeg 比我们多 {extra} 帧 —— 解封装漏帧了");
+        }
     }
 
     // ---- 通路覆盖 ----

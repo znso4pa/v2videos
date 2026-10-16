@@ -236,6 +236,13 @@ pub fn decoder_for(
     }
 }
 
+/// ASF 头里**声明**的文件大小（字节）。与实际长度比一下就知道样本是否**被截断** ——
+/// 截断样本会少一个残缺尾包（设计行为），别把由此产生的计数差报成漏帧。
+pub fn declared_file_size(path: &str) -> Option<u64> {
+    let d = AsfDemuxer::new(BufReader::new(File::open(path).ok()?)).ok()?;
+    Some(d.info().file_size)
+}
+
 /// 样本视频轨的**版本 + extradata**；认不出 FourCC 给 `None`（调用方打 SKIP）。
 pub fn version_and_extra(path: &str) -> Option<(v2v_msmpeg4::Version, Vec<u8>)> {
     Some((video_version(path)?, video_extra(path).unwrap_or_default()))
