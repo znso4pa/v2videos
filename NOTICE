@@ -24,10 +24,12 @@ v2video —— 第三方代码与数据来源
         ← tools/gen_aac_tables.py
     crates/wma/src/tables.rs
         ← tools/gen_wma_tables.py
+    crates/msmpeg4/src/intrax8_tables.rs
+        ← tools/gen_intrax8_tables.py
     crates/vc1/src/tables.rs
         ← tools/gen_vc1_tables.py
 
-这些表是 H.263 / MPEG-4 Part 2 / MPEG-4 Audio / WMA / VC-1 的**格式定义**
+这些表是 H.263 / MPEG-4 Part 2 / MPEG-4 Audio / WMA / VC-1 / IntraX8 的**格式定义**
 （编解码器规格的一部分），不是某个实现的私有数据；
 生成器只做「读出来 + 排版」，不做任何推导。
 换一个数据源（规范附录，或别的宽松许可实现）即可整体替换 —— 生成器就是为此留的。
@@ -65,6 +67,15 @@ v2video —— 第三方代码与数据来源
         copyright (c) 2002 The FFmpeg Project
 
     libavcodec/wma_freqs.c
+        （该文件头没有版权行 —— 它是纯数据文件，只有 LGPL 许可块）
+
+    libavcodec/intrax8huf.h
+        （该文件头没有版权行 —— 它是纯数据文件，只有 LGPL 许可块）
+
+    libavcodec/intrax8.c
+        （该文件头没有版权行 —— 它是纯数据文件，只有 LGPL 许可块）
+
+    libavcodec/intrax8dsp.c
         （该文件头没有版权行 —— 它是纯数据文件，只有 LGPL 许可块）
 
     libavcodec/vc1data.c
