@@ -108,14 +108,16 @@ pub const CB_RANGE: [u8; 12] = [0, 3, 3, 3, 3, 9, 9, 8, 8, 13, 13, 17];
 /// 只有第 11 本是 escape 码本（`ESC_BT`）。
 const CB_ESC: usize = 11;
 
-/// `sf_offset` 的搜索上界（含）。
-///
-/// 够粗了：偏移每 +4 让量化精度翻一倍，+120 相当于把每带的 sf 抬到几乎全零带；
-/// 再往上位数不再降（全零带的位数是常数）。
-const MAX_SF_OFFSET: i32 = 120;
+/// λ 的指数搜索上界，**单位是 1/8**：`λ = 2^(k/8)`，`k ∈ [0, 208]`。
+const MAX_LAMBDA_K8: i32 = 280;
+/// λ 指数搜索的初始种子（`2^(96/8) = 2^12 ≈ 4e3`）。
+const LAMBDA_K8_SEED_INIT: i32 = 160;
+/// `λ = 2^(k/8)`（`k` 是 1/8 为单位的整数指数）。
+fn lambda_of(k8: i32) -> f32 {
+    (2.0f32).powf(k8 as f32 / 8.0)
+}
 
 /// 第一帧（还没有上一帧的答案）的搜索种子 —— 取区间中点。
-const SF_OFFSET_SEED_INIT: i32 = MAX_SF_OFFSET / 2;
 
 /// 编码配置。
 #[derive(Debug, Clone, Copy)]
@@ -150,7 +152,7 @@ pub struct EncoderConfig {
     /// 2. **声道并行**（`encode_frame` / 帧并行内部）—— 双声道时两个声道各占一个
     ///    线程，**输出逐字节相同**。
     ///
-    /// 帧并行的输出**不是**逐字节相同（原因见 `encode_frames` 的说明：`sf_offset`
+    /// 帧并行的输出**不是**逐字节相同（原因见 `encode_frames` 的说明：`lambda`
     /// 是近似搜索的锚点）。两条路径的线程数都**封顶到可用并行度** ——
     /// 单声道给多少都是 1、一批 4 帧给 8 个线程也只起 4 个。
     ///
@@ -328,7 +330,7 @@ impl WindowPlan {
 ///
 /// `cost_cache` 只影响**速度**（它本来就是帧内缓存，每帧开头 `reset`）。
 ///
-/// ⚠️ `sf_offset_prev` 则**也影响结果**：偏移搜索是近似搜索、锚在这个种子上
+/// ⚠️ `lambda_k8_prev` 则**也影响结果**：偏移搜索是近似搜索、锚在这个种子上
 /// （详见字段自身的说明）。所以 `to_chans` 把它设成固定初值 = 批量路径**每帧都
 /// 从冷种子开始**，既丢掉了热启动、也让结果与逐帧路径差一点点。
 /// 要「逐字节相同」就得让搜索与种子无关 —— 那是另一件事，现在没做。
@@ -366,7 +368,7 @@ impl FrameState {
                 attack_prev: *atk,
                 window_seq_prev: self.window_seq_prev,
                 cost_cache: BandCostCache::new(),
-                sf_offset_prev: SF_OFFSET_SEED_INIT,
+                lambda_k8_prev: LAMBDA_K8_SEED_INIT,
             })
             .collect()
     }
@@ -459,22 +461,6 @@ struct BandCostCache {
 /// 「这一格还没算过」的哨兵 —— 真码本只到 11，所以 `0xFF` 安全。
 const NO_CB: u8 = 0xFF;
 
-/// 逐带 RD 的 λ 斜率：`λ = RD_LAMBDA_K · sf_offset²`（失真/位数的兑换率）。
-///
-/// ## ⚠️ 现在是 `0.0`：这条「λ 挂偏移」的耦合路走不通（量过了，别再试同一条）
-///
-/// 让 λ 跟着偏移走是想复用外层「位数 ≤ 预算」的搜索（偏移本来就是粗细旋钮），
-/// 但实测 `K ∈ {0, 1, 10, 100}` 结果**完全一样**（13.85/13.86 dB、码率也不动）——
-/// RD 项根本没参与决策。两个原因：
-///
-/// 1. **量级**：sf 加一档失真 ×1.41（步长 ∝ `2^(sf/4)`），位数只变几点 —— 要顶动一档
-///    λ 得在 `1e3~1e4`，而按「失真/位数」估出来是几十（差 1~2 个数量级）。
-/// 2. **耦合本身是死的**：λ 一旦大到能顶动一档，偏移只要 > 0 就同时抬下界 + 给大 λ →
-///    位数直接崩到预算以下，搜索只能退回偏移 0 —— 粗细旋钮变成**二值**的。
-///
-/// **正路**（见 TODO 第八轮）：下界交还给「不裁剪」、由 λ 自己二分（对数网格 `2^k`），
-/// 偏移这个旋钮退场。在那之前这里保持 `0.0` —— 行为与旧路**逐字节相同**（md5 已对）。
-const RD_LAMBDA_K: f32 = 0.0;
 
 impl BandCostCache {
     fn new() -> Self {
@@ -544,7 +530,7 @@ struct ChannelState {
     window_seq_prev: WindowSequence,
     /// `band_cost` 的帧内缓存（见 `BandCostCache`）。
     cost_cache: BandCostCache,
-    /// **上一帧选中的 `sf_offset`** —— 下一帧搜偏移时的**种子**。
+    /// **上一帧选中的 `lambda`** —— 下一帧搜偏移时的**种子**。
     ///
     /// 相邻帧的谱形状是连续的，所以上一帧的答案是很好的出发点：从它出发做
     /// 指数搜索，绝大多数帧 2–4 趟就收敛（固定区间二分恒 7 趟）。
@@ -553,7 +539,7 @@ struct ChannelState {
     /// 锚在这个偏移上，所以换种子会落到不同的格点、给出**略微不同**的码率分配
     /// （不是「同一个答案」—— 早期这里写错过，实测真音乐 350 帧里 2 帧差
     /// 14 字节）。改这里要知道自己在动**结果**，不只是动速度。
-    sf_offset_prev: i32,
+    lambda_k8_prev: i32,
 }
 
 pub struct Encoder {
@@ -636,7 +622,7 @@ impl Encoder {
                     attack_prev: None,
                     window_seq_prev: WindowSequence::OnlyLong,
                     cost_cache: BandCostCache::new(),
-                    sf_offset_prev: SF_OFFSET_SEED_INIT,
+                    lambda_k8_prev: LAMBDA_K8_SEED_INIT,
                 })
                 .collect(),
             window,
@@ -781,7 +767,7 @@ impl Encoder {
     /// 要看上一帧实际发的序列。其余状态都不是障碍：`cost_cache` 本来就是帧内
     /// 缓存、重叠历史就是**上一帧的 coded 样本**（可以直接算出来）。
     ///
-    /// ⚠️ `sf_offset_prev` 看着也像「只影响从哪儿开始探」，其实**不是**：
+    /// ⚠️ `lambda_k8_prev` 看着也像「只影响从哪儿开始探」，其实**不是**：
     /// `plan_group` 的三级细化（12→3→1）是**近似搜索**、锚在「上一帧留下的偏移」
     /// 上，换锚点就会落到不同的格点。批内每帧的锚由预扫铺好，所以**同一批里**
     /// 批量与逐帧一致；跨批（或与单帧 `encode_frame` 混用）时锚不一样，
@@ -838,11 +824,11 @@ impl Encoder {
                 handles.push(scope.spawn(move || -> crate::Result<Vec<(usize, Vec<u8>, bool)>> {
                     let mut v = Vec::with_capacity(part.len());
                     // ⚠️ **一份 `ChannelState` 在块内复用**（不是每帧一份）：
-                    // `apply_to` 只覆盖那四项语义状态，**保留 `sf_offset_prev` 与
+                    // `apply_to` 只覆盖那四项语义状态，**保留 `lambda_k8_prev` 与
                     // `cost_cache`** —— 于是块内第 2 帧起就拿到了上一帧的搜索种子。
                     //
                     // 这不是微调：种子决定偏移搜索的**起点**，冷启动（`to_chans`）
-                    // 时指数搜索要从 `SF_OFFSET_SEED_INIT` 一路探到真值（实测 6–8 趟），
+                    // 时指数搜索要从 `LAMBDA_K8_SEED_INIT` 一路探到真值（实测 6–8 趟），
                     // 而热启动只要 2–4 趟；每多一趟就多扫一遍全帧的带（`plan_group`），
                     // 那是整个链路最大的单项开销。块首帧仍是冷启动 —— 所以**块要长**。
                     let mut chans = states[base].to_chans();
@@ -883,7 +869,7 @@ impl Encoder {
     /// （多个线程可以同时调它，见 `encode_frames`）。
     ///
     /// `chans` 里只有四项影响输出：`overlap` / `overlap_ms` / `attack_prev` /
-    /// `window_seq_prev`（见 `FrameState`）；`cost_cache` 与 `sf_offset_prev`
+    /// `window_seq_prev`（见 `FrameState`）；`cost_cache` 与 `lambda_k8_prev`
     /// 只影响速度。返回 `(位流, 本帧是不是短窗)`。
     fn encode_frame_inner(
         &self,
@@ -1068,7 +1054,7 @@ impl Encoder {
         spec: &'a [f32],
         swb: &'a [u16],
         sf_floor: i32,
-        sf_offset: i32,
+        lambda: f32,
         prev_sf: &mut Option<i32>,
     ) -> GroupPlan<'a> {
         let max_sfb = swb.len() - 1;
@@ -1088,11 +1074,8 @@ impl Encoder {
             // ⚠️ 三个都必要：下界保证峰值不被裁；差分约束是位流硬要求；
             // `0..=255` 是 `sf` 自己的位宽。**偏移只抬下界** ——
             // 若把上界也压低，会挡住「该带本来想用更粗的 sf」的合法选择。
-            let floor = (sf_floor + sf_offset).clamp(0, 255);
-            // 逐带 RD 的 λ：由**偏移**单调映射（`RD_LAMBDA_K · offset²`，offset = 0 时 λ = 0
-            // 就退回「纯失真」）。偏移同时管着下界与 λ —— 这是这一刀的简化，
-            // 真正的版本该把下界交还给「不裁剪」、由 λ 单独控制粗细（见 TODO）。
-            let lam = RD_LAMBDA_K * (sf_offset * sf_offset) as f32;
+            let floor = sf_floor.clamp(0, 255);
+            let lam = lambda;
             let (lo_sf, hi_sf) = match *prev_sf {
                 Some(p) => (
                     floor.max(p - SCALE_MAX_DIFF).clamp(0, 255),
@@ -1249,7 +1232,7 @@ impl Encoder {
         Ok((w, bits))
     }
 
-    /// **编一「趟」**：给定整帧 `sf_offset`，给每个窗口组选 sf/码本、写出完整的
+    /// **编一「趟」**：给定整帧 `lambda`，给每个窗口组选 sf/码本、写出完整的
     /// 通道元素体，返回 `(位流, 位数)`。
     ///
     /// ## 为什么要有「趟」这个概念
@@ -1274,14 +1257,14 @@ impl Encoder {
         seq: WindowSequence,
         group_specs: &[(&[f32], &[u16], usize)],
         sf_floor: i32,
-        sf_offset: i32,
+        lambda: f32,
         tns_data: Option<&Tns>,
         write_ics: bool,
     ) -> crate::Result<(BitWriter, u32)> {
         let mut prev_sf: Option<i32> = None;
         let mut plans: Vec<GroupPlan<'_>> = Vec::with_capacity(group_specs.len());
         for (gi, &(spec, swb, _)) in group_specs.iter().enumerate() {
-            plans.push(self.plan_group(cache, gi, spec, swb, sf_floor, sf_offset, &mut prev_sf));
+            plans.push(self.plan_group(cache, gi, spec, swb, sf_floor, lambda, &mut prev_sf));
         }
         let lens: Vec<usize> = group_specs.iter().map(|&(_, _, l)| l).collect();
         self.write_pass(seq, &plans, &lens, tns_data, write_ics)
@@ -1306,7 +1289,7 @@ impl Encoder {
     /// **先把元素头写进正式位流，再把二分选中的那一趟整段接上去**。
     ///
     /// 换句话说 `encode_pass` 的「趟」= 通道元素体，元素头归这里管。
-    /// 这个分界是刻意的：元素头（`ID_SCE` + 标签）跟 `sf_offset` 无关，
+    /// 这个分界是刻意的：元素头（`ID_SCE` + 标签）跟 `lambda` 无关，
     /// 让每趟都带一遍只是白算计数的次数。
     fn encode_channel(
         &self,
@@ -1482,13 +1465,13 @@ impl Encoder {
         // 找的**还是同一个答案**，所以位流逐字节不变 —— 这是纯提速，不改语义。
         //
         // 括号约定：`lo` = 已知**不可行**的最大偏移（`-1` = 还不知道），
-        // `hi` = 已知**可行**的最小偏移（`MAX_SF_OFFSET + 1` = 还不知道）。
-        let seed = st.sf_offset_prev.clamp(0, MAX_SF_OFFSET);
+        // `hi` = 已知**可行**的最小偏移（`MAX_LAMBDA_K8 + 1` = 还不知道）。
+        let seed = st.lambda_k8_prev.clamp(0, MAX_LAMBDA_K8);
         let mut chosen: Option<BitWriter> = None;
         let mut lo: i32 = -1;
-        let mut hi: i32 = MAX_SF_OFFSET + 1;
+        let mut hi: i32 = MAX_LAMBDA_K8 + 1;
         let (pass, bits) =
-            self.encode_pass(&mut st.cost_cache, seq, &group_specs, sf_floor, seed, tns_data.as_ref(), write_ics)?;
+            self.encode_pass(&mut st.cost_cache, seq, &group_specs, sf_floor, lambda_of(seed), tns_data.as_ref(), write_ics)?;
         if bits <= budget {
             hi = seed;
             chosen = Some(pass);
@@ -1499,10 +1482,10 @@ impl Encoder {
         // 指数搜索把另一侧也夹住：步长 1、2、4…（真值离种子远时才多探几次）。
         let mut step = 1i32;
         if chosen.is_none() {
-            while lo < MAX_SF_OFFSET {
-                let o = (lo + step).min(MAX_SF_OFFSET);
+            while lo < MAX_LAMBDA_K8 {
+                let o = (lo + step).min(MAX_LAMBDA_K8);
                 let (pass, bits) =
-                    self.encode_pass(&mut st.cost_cache, seq, &group_specs, sf_floor, o, tns_data.as_ref(), write_ics)?;
+                    self.encode_pass(&mut st.cost_cache, seq, &group_specs, sf_floor, lambda_of(o), tns_data.as_ref(), write_ics)?;
                 if bits <= budget {
                     hi = o;
                     chosen = Some(pass);
@@ -1515,7 +1498,7 @@ impl Encoder {
             while hi > 0 {
                 let o = (hi - step).max(0);
                 let (pass, bits) =
-                    self.encode_pass(&mut st.cost_cache, seq, &group_specs, sf_floor, o, tns_data.as_ref(), write_ics)?;
+                    self.encode_pass(&mut st.cost_cache, seq, &group_specs, sf_floor, lambda_of(o), tns_data.as_ref(), write_ics)?;
                 if bits > budget {
                     lo = o;
                     break;
@@ -1530,7 +1513,7 @@ impl Encoder {
         while lo + 1 < hi {
             let mid = (lo + hi) / 2;
             let (pass, bits) =
-                self.encode_pass(&mut st.cost_cache, seq, &group_specs, sf_floor, mid, tns_data.as_ref(), write_ics)?;
+                self.encode_pass(&mut st.cost_cache, seq, &group_specs, sf_floor, lambda_of(mid), tns_data.as_ref(), write_ics)?;
             if bits <= budget {
                 hi = mid;
                 chosen = Some(pass);
@@ -1539,7 +1522,7 @@ impl Encoder {
             }
         }
         // 记住这一帧的答案，给下一帧当种子（`hi` 超界 = 这一帧没有任何可行偏移）。
-        st.sf_offset_prev = if hi <= MAX_SF_OFFSET { hi } else { seed };
+        st.lambda_k8_prev = if hi <= MAX_LAMBDA_K8 { hi } else { seed };
 
         // ⚠️ **一趟都不够省**时（预算小到连最粗的量化都塞不下）退化成
         // 「用偏移上界那一趟」：位数超预算，但**位流仍然合法**。
@@ -1547,7 +1530,7 @@ impl Encoder {
         let pass = match chosen {
             Some(p) => p,
             None => {
-                self.encode_pass(&mut st.cost_cache, seq, &group_specs, sf_floor, MAX_SF_OFFSET, tns_data.as_ref(), write_ics)?
+                self.encode_pass(&mut st.cost_cache, seq, &group_specs, sf_floor, lambda_of(MAX_LAMBDA_K8), tns_data.as_ref(), write_ics)?
                     .0
             }
         };
@@ -2693,11 +2676,11 @@ mod tests {
     /// ⚠️ **这里不能断言「逐字节相同」** —— 实测（真音乐 350 帧）有 **2 帧**不同、
     /// 音频载荷差 14 字节，而 **SNR 完全一致**（14.15 vs 14.15）。根因不在并行，
     /// 在 `plan_group` 的**三级细化是近似搜索**（12 → 3 → 1）：它从
-    /// `floor = sf_floor + sf_offset` 锚定格点，**不同的 `sf_offset` 会给出不同的
-    /// 格点**，偶尔落到不同的「最优」。而偏移搜索的**种子**（`sf_offset_prev`）
+    /// `floor = sf_floor + lambda` 锚定格点，**不同的 `lambda` 会给出不同的
+    /// 格点**，偶尔落到不同的「最优」。而偏移搜索的**种子**（`lambda_k8_prev`）
     /// 在批量版里每帧都是初始值、在逐帧版里是上一帧的答案 —— 于是极少数帧分叉。
     ///
-    /// 也就是说「`sf_offset_prev` 只影响速度、不影响答案」这条**在现在的实现下
+    /// 也就是说「`lambda_k8_prev` 只影响速度、不影响答案」这条**在现在的实现下
     /// 不成立**（它是按更早的「固定二分」写的）。两条路径各给出一个都合法的结果。
     #[test]
     fn batch_encoding_matches_frame_by_frame_with_attacks() {
@@ -2736,7 +2719,7 @@ mod tests {
     }
 
     /// 批量与逐帧：**帧数一致、线程数不影响结果**；但不保证**逐字节**相同
-    /// （原因见下面那条带攻击的测试与 `sf_offset_prev` 的说明）。
+    /// （原因见下面那条带攻击的测试与 `lambda_k8_prev` 的说明）。
     ///
     /// 这里仍断言「同一次批量里线程数不改变一个字节」—— 并行本身是确定的
     /// （每帧一份独立的 `ChannelState`，结果与分块方式无关）。
