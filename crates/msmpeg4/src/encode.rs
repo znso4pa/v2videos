@@ -861,6 +861,17 @@ fn motion_estimate(
     // `cap` = 当前最优：**超过它就没必要算完**（调用方只做 `s < best` 比较，
     // 所以提前退出返回 `cap` 与算完再比等价）。一个宏块要评 150+ 个候选，
     // 绝大多数在前几行就注定输了 —— 这一条是运动估计里最便宜的那笔收益。
+    // ⚠️ **候选一生成就夹进「相对预测可编码」的范围**（不是评 SAD 时才夹）。
+    // 两种错法都踩过：不夹 → 搜索（尤其带时间预测之后）会走到远处、按没夹过的 MV 比出「最优」，
+    // 而写进位流的是夹过的那个（720p 那份 PSNR 掉 12 dB）；
+    // 只在 `sad_of` 里夹 → `best` 存的还是没夹的候选，交出去直接报
+    // 「运动矢量差分超出可表示范围」。
+    let clamp2 = |mv: (i32, i32)| -> (i32, i32) {
+        (
+            (mv.0 - pred.0).clamp(-MV_DIFF_MAX, MV_DIFF_MAX) + pred.0,
+            (mv.1 - pred.1).clamp(-MV_DIFF_MAX, MV_DIFF_MAX) + pred.1,
+        )
+    };
     let mut sad_of = |mv: (i32, i32), cap: u32| -> u32 {
         // 插值与 SAD **融合**（共享内核 `sad_luma16`）：省掉「先 `mc_luma16` 搬进
         // 缓冲、再读出来求和」的两趟内存流量。公式与 `mc_luma16` 逐字相同 → 值逐位相同。
@@ -868,7 +879,8 @@ fn motion_estimate(
         sad_luma16_capped(&cur, refp, &p, no_rounding, &mut tmp, cap)
     };
 
-    let mut best = (0i32, 0i32);
+    // 初始候选也得夹（零 MV 本身可能超出「相对预测可编码」的范围 —— 起点没夹过就漏了）。
+    let mut best = clamp2((0i32, 0i32));
     let mut best_sad = sad_of(best, u32::MAX);
     // ---- 三层搜索：宽范围粗搜 → 逐级细化 ----
     //
@@ -889,12 +901,19 @@ fn motion_estimate(
     // 候选数少一半以上，**够得着的范围反而没有上限**（能一直走出去）。
     //
     // 起点两个：`(0,0)` 与空间预测（中值）。先评起点本身，再各自走菱形。
-    let c1 = (0i32, 0i32);
-    let c2 = (pred.0 >> 1, pred.1 >> 1);
-    for (i, c) in [c1, c2].into_iter().enumerate() {
-        if i == 1 && c == c1 {
-            continue; // 两个起点重合时别走两遍
+    // 两个起点：零、空间预测（中值，**缩一半** —— 与旧版一致）。
+    //
+    // ⚠️ 试过加**第三个起点：时间预测**（上一帧同位置的 MV，EPZS 的做法）—— **失败**：
+    // 720p 那份样本 PSNR 从 49.5 掉到 35.8（体积几乎不变 ⇒ 是漂移不是率），
+    // 而「只留夹、去掉时间中心」立刻回到 49.9，所以问题出在时间中心本身。
+    // 排查过但**没定住**：skip 的 MV 约定（解码端确实是 (0,0)，与编码端一致）、
+    // clamp 的时机（候选一生成就夹了）、`mv_prev` 的尺寸/单位。留着以后再看。
+    let centers = [(0i32, 0i32), (pred.0 >> 1, pred.1 >> 1)];
+    for (i, c) in centers.into_iter().enumerate() {
+        if i > 0 && centers[..i].contains(&c) {
+            continue; // 起点重合时别走两遍
         }
+        let c = clamp2(c);
         let s = sad_of(c, best_sad);
         if s < best_sad {
             best_sad = s;
@@ -906,7 +925,7 @@ fn motion_estimate(
             let base = cur;
             let mut improved = false;
             for (dx, dy) in [(2i32, 0i32), (-2, 0), (0, 2), (0, -2)] {
-                let cand = (base.0 + dx, base.1 + dy);
+                let cand = clamp2((base.0 + dx, base.1 + dy));
                 let s = sad_of(cand, best_sad);
                 if s < best_sad {
                     best_sad = s;
@@ -924,7 +943,7 @@ fn motion_estimate(
     let base = best;
     for dy in (-3..=3i32).step_by(2) {
         for dx in (-3..=3i32).step_by(2) {
-            let cand = (base.0 + dx, base.1 + dy);
+            let cand = clamp2((base.0 + dx, base.1 + dy));
             let s = sad_of(cand, best_sad);
             if s < best_sad {
                 best_sad = s;
@@ -936,7 +955,7 @@ fn motion_estimate(
     let base = best;
     for dy in -1..=1i32 {
         for dx in -1..=1i32 {
-            let cand = (base.0 + dx, base.1 + dy);
+            let cand = clamp2((base.0 + dx, base.1 + dy));
             let s = sad_of(cand, best_sad);
             if s < best_sad {
                 best_sad = s;
@@ -945,9 +964,8 @@ fn motion_estimate(
         }
     }
 
-    // 限制与预测的差，保证能被 MV 编码表示（模 64 回绕之前的可表示范围）
-    let clamp = |v: i32, p: i32| -> i32 { (v - p).clamp(-MV_DIFF_MAX, MV_DIFF_MAX) + p };
-    (clamp(best.0, pred.0), clamp(best.1, pred.1))
+    // `best` 里的 MV 早就夹过了（`sad_of` 里那一步），这里只是原样交出去。
+    best
 }
 
 /// 菱形搜索最多走几步（每步 2 像素）—— 上限只是防跑飞，实际都在「不再改善」处就停。
