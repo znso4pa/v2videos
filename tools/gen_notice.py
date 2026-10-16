@@ -32,12 +32,13 @@ SRC = args[0] if args else DEFAULT_SRC
 
 FFMPEG_VERSION = "7.1"
 
-# (生成器, 产出, [上游文件...]) —— 与三个生成器里各自的来源清单一致。
+# (生成器, 产出, [上游文件...]) —— 与各生成器里自己的来源清单一致。
 OUTPUTS = [
     ("tools/gen_tables.py", "crates/msmpeg4/src/tables.rs", ["msmpeg4data.c", "msmpeg4_vc1_data.c"]),
     ("tools/gen_tables.py", "crates/mp4v/src/tables.rs", ["h263data.c", "mpeg4data.h", "mpegvideodata.c"]),
     ("tools/gen_aac_tables.py", "crates/aac/src/tables.rs", ["aactab.c", "aacenctab.h"]),
     ("tools/gen_wma_tables.py", "crates/wma/src/tables.rs", ["wmadata.h", "wma_freqs.c", "aactab.c"]),
+    ("tools/gen_vc1_tables.py", "crates/vc1/src/tables.rs", ["vc1data.c", "vc1_vlc_data.h", "vc1.h", "vc1_common.h"]),
 ]
 
 
@@ -67,7 +68,7 @@ def main():
         w(f"    {dst}")
         w(f"        ← {gen}")
     w("")
-    w("这些表是 H.263 / MPEG-4 Part 2 / MPEG-4 Audio / WMA 的**格式定义**")
+    w("这些表是 H.263 / MPEG-4 Part 2 / MPEG-4 Audio / WMA / VC-1 的**格式定义**")
     w("（编解码器规格的一部分），不是某个实现的私有数据；")
     w("生成器只做「读出来 + 排版」，不做任何推导。")
     w("换一个数据源（规范附录，或别的宽松许可实现）即可整体替换 —— 生成器就是为此留的。")

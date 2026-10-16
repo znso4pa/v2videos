@@ -27,6 +27,7 @@ crates/
   msmpeg4  MS-MPEG-4 v3（MP43）/ WMV1 / WMV2 解码（I / P）+ MP43 编码（I / P，含运动估计与帧内/帧间判决）
            **兼共享数值内核**：位读写器 / FDCT / IDCT / FFT / VLC 表 —— mp4v、aac、wma 都从这里取
   wma      WMA v1/v2 音频解码（帧头 / LSP 指数 / 系数 / IMDCT）
+  vc1      VC-1（**WMV3**）解码：Simple/Main profile、渐进、I/P —— 目前只到**帧头 + 位平面**
   mp4v     MPEG-4 Part 2（mp4v）**编码**：I / P + 码率控制
   aac      **AAC-LC 编码**：MDCT（长/短窗）+ TNS + Huffman 码本 + 码率控制
   mp4      MP4 / ISOBMFF **封装**（ftyp / mdat / moov；音频 AAC 或 PCM）
@@ -36,14 +37,15 @@ tools/
   check_tables.py   用**第二个独立来源**核对 msmpeg4 的表
   gen_aac_tables.py AAC 的 Huffman 码表 / 频带表
   gen_wma_tables.py WMA 解码的码表 / 频率表
-  ffmpeg_src.py     从上游文件头**原样抽出**版权行（三个生成器共用，见 NOTICE）
+  gen_vc1_tables.py VC-1 的位平面 VLC / 量化表 / 枚举常量（`vc1data.c`、`vc1_vlc_data.h`）
+  ffmpeg_src.py     从上游文件头**原样抽出**版权行（各生成器共用，见 NOTICE）
   gen_notice.py     生成根目录的 NOTICE
 ```
 
-⚠️ **四个生成器的默认源目录 `/tmp/ffsize/ffmpeg-7.1` 是作者的本地路径**，
+⚠️ **各生成器的默认源目录 `/tmp/ffsize/ffmpeg-7.1` 是作者的本地路径**，
 第三方 clone 里不存在。要重新生成表，先自己准备一份 FFmpeg 7.1 源码
 （<https://ffmpeg.org/download.html>），再用参数指过去：
-前三个是**位置参数**（`python3 tools/gen_tables.py <ffmpeg 源码目录>`），
+前四个是**位置参数**（`python3 tools/gen_tables.py <ffmpeg 源码目录>`），
 `gen_wma_tables.py` 用 `--src <ffmpeg>/libavcodec`。
 
 ## 构建与测试
@@ -72,6 +74,7 @@ V2V_ASF_SAMPLE=/path/to/sample.wmv cargo test --release -- --ignored
 | -------- | ----------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
 | **解封装**  | ASF / WMV（`v2v-asf`）、AVI（`v2v-avi`）                                                                         | 与 `ffprobe` 逐字段对：轨道、尺寸、包数、关键帧数                                                                  |
 | **解码**   | MS-MPEG-4 v3（**MP43**）、**WMV1**（WMV7）与 **WMV2**（WMV8）：I 帧 + P 帧（skip、MV 预测、半像素运动补偿、帧间残差）。三版共用骨架，**分叉在帧头与几处版本常量**上：`pict_type` 位宽、ext header 的位置、变长/定长的第三 escape、`ff_wmv1_scantable` 那套扫描表、DC 预测的平手方向与缩放（`scale != 8` 时走 `FASTDIV`，对负数**向下取整**）。**WMV2 另有一整套**：逐宏块 skip 表（4 种粒度）、按 qscale 挑的 CBP 表、`mspel` 四抽头半像素 + 逐宏块 `hshift`、**ABT**（4×8 / 8×4，含自己的扫描表与第二个半块）、**环路滤波**（逐宏块就地滤，skip 宏块也要滤） | 与 `ffmpeg` **逐像素**对：MP43 / WMV1 / WMV2 各自的真样本**每一帧最大差 0**（WMV2 三份样本共 1782 帧；含 `mspel`、ABT、环路滤波、边缘复制那些分支） |
+| **解码**   | **VC-1 / WMV3**（`v2v-vc1`）：**序列头 + 帧头 + 位平面**（7 种编码 + 差分算子）。范围限定 **Main profile / 渐进 / I-P**；Advanced profile、B 帧、隔行明确报错 | 对 `ffmpeg -debug pict` 的逐帧日志：真样本 1920×1080 **3719 帧的 `pict_type` 与两张位平面 `(imode, invert)` 全同**（位平面紧跟帧头标量，差一位就变形 ⇒ 位游标一位不差）。**宏块层还没写，所以还不出像素** |
 | **编码**   | MP43 **I 帧 + P 帧**：正向 DCT + 量化 + DC / RL 熵编码、运动估计（整像素粗搜 + 半像素细化）、skip 宏块                                    | 编出来的 I+P 序列交给 `ffmpeg` 解，与自己的解码器**逐像素一致**                                                       |
 | **编码**   | MPEG-4 Part 2（`v2v-mp4v`）**I 帧 + P 帧**：DC / AC 预测（逐宏块比位数择优）、运动估计（**三起点菱形搜索 + 时间预测**，半像素细化）、中值 MV 预测、skip 宏块、逐宏块帧内/帧间判决；`--video-bitrate` 时**逐帧调 qscale** 的码率控制 | 编出来的流交给 `ffmpeg` 解，真样本 **44.8 dB**（同 qscale 下 ffmpeg 自己的 mpeg4 是 43.6 dB）；**视频载荷比全 I 帧小 2.3 倍**；码率控制实测命中目标（371→373、621→618 kbps） |
 | **音频直通** | 转换时原样搬音频轨（ASF 多流复用）                                                                                         | 真样本整条音轨：输出音频与源**逐样本 0 差异**（整轨字节完全一致）                                           |
@@ -96,9 +99,18 @@ v2v convert --mp4 -g 12 in.wmv -o out/
 自己读不回来。WMA 同理。所以 `.wmv → .mp4` 这条路上视频必须过一遍 MPEG-4 Part 2 编码器，  
 音频必须解成 PCM 再重编码（默认 AAC，`--pcm` 则是原封不动的 `sowt`）。
 
-**还没做（解码侧）**：**WMV9 / VC-1**、WMV2 里的 **IntraX8**（`j_type`，那是另一个内帧
-编解码器，遇到就明确报错并停下）。MP41 / MP42 的帧头已经按版本分叉了，但 MB 层还没写
+**还没做（解码侧）**：**WMV9 / VC-1 的宏块层**（`v2v-vc1` 现在只到**帧头 + 位平面**，
+见下一段）、WMV2 里的 **IntraX8**（`j_type`，那是另一个内帧编解码器，遇到就明确报错并停下）。
+MP41 / MP42 的帧头已经按版本分叉了，但 MB 层还没写
 （要走 H.263 的 MCBPC 表）—— 输入被明确拒绝，不会静默出错。
+
+**VC-1 走到哪一步**：新 crate `v2v-vc1` 已经能解**序列头**（容器 extradata 里的 `STRUCT_C`）、
+**帧头**（I/P）与帧头里的**位平面**（逐宏块跳过标志那类整帧位图，7 种编码 + 差分算子）。
+判据是外部 oracle：`ffmpeg -debug pict` 的逐帧日志 —— 真样本 1920×1080 **3719 帧逐帧对齐**
+（`pict_type` 与两张位平面的 `(imode, invert)` 全同；位平面紧跟帧头标量，差一位就变形，
+所以这等价于「帧头解完时位游标一位不差」）。**宏块层、逆变换、运动补偿、环路滤波还没写** ——
+所以它现在还不能解出像素，也没接进 CLI。范围限定在 **Main profile / 渐进 / I/P**：
+Advanced profile、B 帧、隔行遇到就明确报错。
 
 **还没做（编码侧）**：MPEG-4 Part 2 的 **B 帧**与 8×8 运动补偿、AAC 的 **PNS** 与**逐带** M/S
 掩码（现在只做逐帧 —— 全部带一起选；TNS 只覆盖长窗）、WMA **编码器**（现在只能解）、
@@ -197,6 +209,11 @@ MP4 的分片 / `co64`、其他容器与编解码器。
 3. **变帧率的源上 ffmpeg 会补帧**：帧数对不上就不能逐帧比（`ms/帧` 才是公平的速度口径）。
 4. **音频不能用 `-n` 截**：`v2v -n N` 会把音频一起截，ffmpeg 的 `-frames:v` 不会 —— 两边截在不同位置。
 5. **对齐搜索别用暴力**：±20000 偏移 × 900 万样本在 Python 里是分钟级；FFT 互相关几秒就出。
+6. **`ffmpeg` 的日志默认会折叠重复行**（`AV_LOG_SKIP_REPEATED`）：拿 `-debug` 日志当 oracle
+   时，连续几十行一模一样的输出会被压成「Last message repeated N times」—— 日志成了**子集**，
+   不报错，只让逐帧对账**整体错位**（VC-1 那条：3719 帧只剩 3525 行，看着像「第 10 帧起全错」）。
+   要用 `-loglevel repeat+debug`。另外读入阶段的**探测解码器**也在打同一批日志，得按
+   上下文地址把它那几行摘掉。
 
 AAC 编码器**低码率已经反超 ffmpeg**（64k：**7.94 vs 6.37 dB**），中码率基本持平
 （128k：13.17 vs 13.74 dB，而且我们少用 6% 的字节），**高码率仍明显落后**
@@ -229,7 +246,7 @@ AAC 编码器**低码率已经反超 ffmpeg**（64k：**7.94 vs 6.37 dB**），�
 | **MP43**（MS-MPEG-4 v3）   | ✅ I / P   | ✅ I / P   | 这是 `.wmv` 的主编码。解码有 AC 预测那条路（ffmpeg 编的流里 `ac_pred` 恒 0，靠翻位测试覆盖）                 |
 | **WMV1**（WMV7）           | ✅ I / P   | ❌         | 与 MP43 共用 MB 层，分叉在帧头、扫描表、DC 预测/缩放表（见「状态」那行）。**不做错误隐藏** —— 首帧不是 I 帧的流直接报错，ffmpeg 会拿垃圾当参考硬解 |
 | **WMV2**（WMV8）           | ✅ I / P   | ❌         | 帧头与 MB 层是另一套（`wmv2dec.c`）。比 WMV1 多：`parse_mb_skip`（4 种跳帧类型）、按 qscale 挑的 CBP 表、`mspel` 四抽头半像素 + `hshift`、**ABT**（4×8 / 8×4）、**环路滤波**、它自己那份 8×8 IDCT。`j_type` 走的 **IntraX8**（一个独立的内帧编解码器）**没做** —— 遇到就明确报错 |
-| **WMV9 / VC-1**          | ❌         | ❌         | **ffmpeg 里根本没有 VC-1/wmv3 编码器**（只有解码器），想要 WMV9 得另找路子；解码这边也没做（唯一的真墙，见下）        |
+| **WMV9 / VC-1**          | 🚧 帧头      | ❌         | **ffmpeg 里根本没有 VC-1/wmv3 编码器**（只有解码器），想要 WMV9 得另找路子。解码侧 `v2v-vc1` 已落地**序列头 + 帧头 + 位平面**（Main profile / 渐进 / I/P，3719 帧逐帧对齐 `ffmpeg -debug pict`）；**宏块层及以下还没写**，所以还不能出像素 |
 | **MPEG-4 Part 2**（`mp4v`） | ❌         | ✅ I / P   | 解码不做（进 MP4 之后交给播放器）。编码缺 B 帧、8×8 运动补偿、`dquant`、resync marker、数据分割             |
 | **H.264 / AVC**          | ❌         | ❌         | 不在范围内（LGPL 侧链不了 x264，见「许可证」）                                                  |
 
