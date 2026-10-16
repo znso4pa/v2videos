@@ -94,7 +94,7 @@ fn zigzag_maps_raster_to_diagonal_order() {
 fn dc_predict_is_symmetric_under_constant_input() {
     // 常数场：a=b=c → 全部命中 `<=` → 取 C（方向 1）。这是 MS-MPEG-4 的 tie-break。
     for v in [-1000i32, -1, 0, 1, 1024, 65535] {
-        assert_eq!(dc_predict(v, v, v), (v, 1));
+        assert_eq!(dc_predict(v, v, v, v2v_msmpeg4::Version::V3), (v, 1));
     }
 }
 

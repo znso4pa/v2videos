@@ -41,7 +41,7 @@ args = [a for a in sys.argv[1:] if not a.startswith("-")]
 SRC = args[0] if args else DEFAULT_SRC
 
 # 每个产出**自己**衍生自哪几个文件 —— 写进头注释，也是版权声明的依据。
-MSMPEG4_SOURCES = ["msmpeg4data.c", "msmpeg4_vc1_data.c"]
+MSMPEG4_SOURCES = ["msmpeg4data.c", "msmpeg4_vc1_data.c", "wmv2data.c"]
 MP4V_SOURCES = ["h263data.c", "mpeg4data.h", "mpegvideodata.c"]
 
 
@@ -182,9 +182,9 @@ def gen_msmpeg4():
             "MS-MPEG-4（MP43）解码需要的 VLC / 反量化表。",
             MSMPEG4_SOURCES,
             "//!\n"
-            "//! 这些表是 **MP43 自用**的：宏块类型表 `MB_INTRA` / `MB_NON_INTRA`、\n"
-            "//! 三套 escape 的 RL 表、以及 WMV1 的 DC 缩放表。**MPEG-4 Part 2 不能用**，\n"
-            "//! 那边见 `crates/mp4v/src/tables.rs`。\n",
+            "//! 这些表是 **MS-MPEG-4 家族自用**的：宏块类型表（`MB_INTRA` / `MB_NON_INTRA`\n"
+            "//! / `V2_*` / `WMV2_*`）、三套 escape 的 RL 表、WMV1 的 DC 缩放表、\n"
+            "//! 以及 WMV2 的 ABT 扫描表。**MPEG-4 Part 2 不能用**，那边见 `crates/mp4v/src/tables.rs`。\n",
         )
     )
 
@@ -192,6 +192,45 @@ def gen_msmpeg4():
     o.pairs("MB_NON_INTRA", pairs(d, "ff_table_mb_non_intra"))
     o.pairs("MB_INTRA", pairs(v, "ff_msmp4_mb_i_table"))
     o.pairs("INTER_INTRA", pairs(d, "ff_table_inter_intra"))
+    # MP42 私有的两张宏块类型表（V2 的 P 帧 / I 帧各一张）。
+    # ⚠️ V1 不用它们 —— 它走 H.263 的 MCBPC（见 `crates/mp4v` 那两张）。
+    o.pairs("V2_MB_TYPE", pairs(d, "ff_v2_mb_type"))
+    o.pairs("V2_INTRA_CBCPC", pairs(d, "ff_v2_intra_cbpc"))
+
+    # ---- WMV2（WMV8）自用的三张宏块类型表 ----
+    #
+    # ⚠️ WMV2 的 P 帧**按 qscale 与一个 2 位的 `cbp_index` 挑表**（见 `wmv2.h` 的
+    # `wmv2_get_cbp_table_index`）：`map[(q>10)+(q>20)][cbp_index]` 选出 0/1/2，
+    # 依次对应下面这三张；`ff_table_mb_non_intra`（= 上面的 `MB_NON_INTRA`）是第 4 张，
+    # 但那个 map **只会选出 0/1/2** —— 所以第 4 张在解码侧用不到，不生成。
+    for i, name in enumerate(["table_mb_non_intra2", "table_mb_non_intra3", "table_mb_non_intra4"]):
+        o.pairs(f"WMV2_MB_NON_INTRA{i}", pairs(d, name))
+
+    # ---- WMV2 的 ABT（自适应块变换）扫描表 ----
+    #
+    # `abt_type == 1` → A（4×8：把 8×8 块按「两行一组」扫）；`== 2` → B（8×4：按「两列一组」）。
+    #
+    # ⚠️ 上游把这两张表**声明成 `[64]`**，却只初始化前 32 项 —— 尾巴是隐式的 0。
+    # 那不是笔误：`ff_msmpeg4_decode_block` 的 `i` 可以走到 32..63，它照样写
+    # `block[scan_table[i]]` —— 尾巴那 32 个 0 于是把系数写到 `block[0]`。
+    # 要对得上 ffmpeg，这个「尾巴全 0」就得一起搬过来（不是「补零凑长度」）。
+    w2 = read("wmv2data.c")
+    for name, src in [("ABT_SCAN_A", "ff_wmv2_scantableA"), ("ABT_SCAN_B", "ff_wmv2_scantableB")]:
+        vals = flat(w2, src)
+        o.flat(name, "u8", vals + [0] * (64 - len(vals)))
+
+    # ---- V1 走的是 **H.263** 的宏块语法，表在 `h263data.c` 里 ----
+    #
+    # ⚠️ 这几张与 `crates/mp4v/src/tables.rs` 里的**同名同源**（同一个生成器读同一个
+    # 文件）—— 不是「复刻第二份」：两个 crate 各自持有一份是既有格局
+    # （`RL_INTRA` / `RL_INTER` / `H_SCAN` / `V_SCAN` 早就两边都有）。
+    hd = read("h263data.c")
+    o.flat("H263_INTRA_MCBPC_CODE", "u8", flat(hd, "ff_h263_intra_MCBPC_code"), 9)
+    o.flat("H263_INTRA_MCBPC_BITS", "u8", flat(hd, "ff_h263_intra_MCBPC_bits"), 9)
+    o.flat("H263_INTER_MCBPC_CODE", "u8", flat(hd, "ff_h263_inter_MCBPC_code"), 28)
+    o.flat("H263_INTER_MCBPC_BITS", "u8", flat(hd, "ff_h263_inter_MCBPC_bits"), 28)
+    o.pairs("H263_CBPY", pairs(hd, "ff_h263_cbpy_tab"), "u8")
+    o.pairs("H263_MV", pairs(hd, "ff_mvtab"), "u8")
 
     # 系数 RL 表（vlc 是 (code,len)，run/level 是 int8）
     for tag in ("0", "1", "2", "4"):
@@ -255,6 +294,9 @@ def gen_msmpeg4():
 
     # 反量化：DC 缩放表
     o.flat("Y_DC_SCALE", "u8", flat(d, "ff_wmv1_y_dc_scale_table"))
+    # V1/V2 的 DC 缩放是 MPEG-1 的默认表（**全是 8**）—— 在 mpegvideodata.c 里，
+    # 是 `ff_mpeg12_dc_scale_table` 的第 0 行（DC 精度 8 位那一档）。
+    o.flat("MPEG1_DC_SCALE", "u8", flat(mvd, "ff_mpeg12_dc_scale_table")[:32])
     o.flat("C_DC_SCALE", "u8", flat(d, "ff_wmv1_c_dc_scale_table"))
     o.flat("OLD_Y_DC_SCALE", "u8", flat(d, "ff_old_ff_y_dc_scale_table"))
 

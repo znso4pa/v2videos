@@ -52,12 +52,12 @@ pub use error::{Error, Result};
 pub use fdct::{fdct, fdct_i};
 pub use fft::fft_in_place;
 pub use frame::{
-    decode_i_frame, mc_chroma8, mc_luma16, mc_mb, mc_params, mid_pred, sad_luma16, AcPredRead,
-    Decoder, Frame, McParams, Planes, Stats, ZIGZAG,
+    decode_i_frame, mc_chroma8, mc_luma16, mc_mb, mc_mb_mspel, mc_params, mid_pred, sad_luma16,
+    AcPredRead, Decoder, Frame, McParams, Planes, Stats, ZIGZAG,
 };
 pub use header::{
-    decode012, parse_frame_header, FrameHeader, HeaderState, PictureType, II_BITRATE,
-    MBAC_BITRATE,
+    decode012, parse_frame_header, parse_wmv2_frame, FrameHeader, HeaderState, PictureType,
+    Wmv2Flags, Wmv2Frame, Wmv2Header, II_BITRATE, MBAC_BITRATE,
 };
 pub use version::Version;
 pub use idct::{idct_add, idct_put};

@@ -93,6 +93,306 @@ pub struct FrameHeader {
     pub bit_rate: u32,
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// WMV2（WMV8）—— 帧头与 MS-MPEG-4 那套**不是一回事**
+// ════════════════════════════════════════════════════════════════════════════
+
+/// WMV2 的**能力位** —— 全部来自容器的 `extradata`（ASF 那条视频轨的私有数据前 4 字节）。
+///
+/// ⚠️ **它不是位流的一部分**：解码器在 init 时读一次，之后每帧沿用。
+/// 所以它得由调用方（`Decoder`）带进来，不能从帧数据里推。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Wmv2Flags {
+    /// 码率（`11 位 × 1024`）。ffmpeg 只用它推 `inter_intra_pred`，而 WMV2 那边
+    /// 这个开关恒为 0 —— 所以它**解出来了但没有用途**，留着是为了把 extradata 的布局写全。
+    #[allow(dead_code)]
+    pub bit_rate: u32,
+    /// 半像素 MV 时要不要再读一个 `hshift` 位。
+    pub mspel: bool,
+    /// 环路滤波 —— 只有 IntraX8 那条路用（本实现还没做），所以目前只解不用。
+    #[allow(dead_code)]
+    pub loop_filter: bool,
+    /// 有没有 **ABT**（自适应块变换：4×8 / 8×4）。
+    pub abt: bool,
+    /// 有没有 **IntraX8**（`j_type` 那一套，一个独立的内帧编解码器）。
+    pub j_type: bool,
+    /// MV 预测里那个「左上差得够大就多读一位 type」的开关。
+    pub top_left_mv: bool,
+    pub per_mb_rl: bool,
+    /// 3 位；`slice_height = mb_height / code`。
+    pub code: u8,
+}
+
+impl Wmv2Flags {
+    /// 从 `extradata` 的前 4 字节解出能力位。
+    ///
+    /// 字段顺序照 ffmpeg 的 `decode_ext_header`：fps(5) 码率(11) mspel(1)
+    /// loop_filter(1) abt(1) j_type(1) top_left_mv(1) per_mb_rl(1) code(3)。
+    pub fn from_extradata(extra: &[u8]) -> Result<Self> {
+        if extra.len() < 4 {
+            return Err(Error::Bad("WMV2 的 extradata 至少要 4 字节"));
+        }
+        let mut r = BitReader::new(&extra[..4]);
+        let _fps = r.u(5)?;
+        let bit_rate = r.u(11)? * 1024;
+        let mspel = r.bit()? != 0;
+        let loop_filter = r.bit()? != 0;
+        let abt = r.bit()? != 0;
+        let j_type = r.bit()? != 0;
+        let top_left_mv = r.bit()? != 0;
+        let per_mb_rl = r.bit()? != 0;
+        let code = r.u(3)? as u8;
+        if code == 0 {
+            return Err(Error::Bad("WMV2 的 extradata 里 slice code 为 0"));
+        }
+        Ok(Self {
+            bit_rate,
+            mspel,
+            loop_filter,
+            abt,
+            j_type,
+            top_left_mv,
+            per_mb_rl,
+            code,
+        })
+    }
+}
+
+/// WMV2 一帧的**完整帧头**（两段合起来 —— ffmpeg 把它拆成 picture / secondary 两趟，
+/// 那是为了在中间插 `ff_mpv_frame_start`；我们顺序解，一趟做完）。
+#[derive(Debug, Clone)]
+pub struct Wmv2Header {
+    pub picture_type: PictureType,
+    pub qscale: u8,
+    pub slice_height: u32,
+    /// **每个宏块是不是 skip** —— 整帧预先读出来（不在宏块循环里逐位读，这是 WMV2
+    /// 与 MS-MPEG-4 最大的结构差异）。长度 = `mb_w * mb_h`。
+    pub mb_skip: Vec<bool>,
+    pub rl_table_index: u8,
+    pub rl_chroma_table_index: u8,
+    pub dc_table_index: u8,
+    pub mv_table_index: u8,
+    pub per_mb_rl_table: bool,
+    /// 宏块类型表下标（0..=2）—— 由 `qscale` 与位流里的 `cbp_index` 一起选出来。
+    pub cbp_table_index: usize,
+    pub mspel: bool,
+    /// ABT：`per_mb_abt` 为真时每个宏块自己读 `abt_type`。
+    pub per_mb_abt: bool,
+    pub abt_type: u8,
+    /// 这一帧走 **IntraX8** —— 本实现不做（见 README 的能力矩阵）。
+    pub j_type: bool,
+    /// 本帧解完后 `no_rounding` 的新值（P 帧是 `^= 1`，I 帧恒 1）。
+    pub no_rounding: bool,
+}
+
+impl Wmv2Header {
+    /// 归一成**公共帧头** —— MB 循环只认这些字段，版本差异由调用方另行带着走。
+    ///
+    /// ⚠️ `use_skip_mb_code` 对 WMV2 是 **false**：它的逐宏块 skip 位**不在宏块循环里读**，
+    /// 而是整帧预先读成一张表（见 `mb_skip`）—— 循环里再读一次就会错位。
+    pub fn to_frame_header(&self) -> FrameHeader {
+        FrameHeader {
+            picture_type: self.picture_type,
+            qscale: self.qscale,
+            slice_height: self.slice_height,
+            rl_table_index: self.rl_table_index,
+            rl_chroma_table_index: self.rl_chroma_table_index,
+            dc_table_index: self.dc_table_index,
+            mv_table_index: self.mv_table_index,
+            use_skip_mb_code: false,
+            per_mb_rl_table: self.per_mb_rl_table,
+            inter_intra_pred: false,
+            flipflop_rounding: false,
+            bit_rate: 0,
+        }
+    }
+}
+
+/// `parse_wmv2_frame` 的结果。
+pub enum Wmv2Frame {
+    /// **整帧都是 skip 宏块**（ffmpeg 的 `FRAME_SKIPPED`）—— 这一帧不解，
+    /// 直接把参考帧当输出。位流里那一段全是 1 位。
+    Skipped,
+    /// 正常一帧。
+    Frame(Box<Wmv2Header>),
+}
+
+/// `wmv2.h` 的 `wmv2_get_cbp_table_index`：`map[(q>10)+(q>20)][cbp_index]`。
+///
+/// ⚠️ 这个 map **只会选出 0/1/2** —— 第 4 张表（`ff_table_mb_non_intra`）解码侧用不到。
+fn wmv2_cbp_table_index(qscale: u8, cbp_index: u8) -> usize {
+    const MAP: [[u8; 3]; 3] = [[0, 2, 1], [1, 0, 2], [2, 1, 0]];
+    let row = usize::from(qscale > 10) + usize::from(qscale > 20);
+    MAP[row][(cbp_index as usize).min(2)] as usize
+}
+
+/// 解 WMV2 一帧的帧头，返回**结果与消费掉的位数**。
+/// `no_rounding_in` 是**上一帧留下的**那个值（P 帧要翻转它）。
+pub fn parse_wmv2_frame(
+    data: &[u8],
+    mb_width: u32,
+    mb_height: u32,
+    f: &Wmv2Flags,
+    no_rounding_in: bool,
+) -> Result<(Wmv2Frame, usize)> {
+    let mut r = BitReader::new(data);
+
+    // ---- 第一段：帧类型 / qscale / 「整帧 skip」检测 ----
+    // ⚠️ `pict_type` 只有 **1 位**（MS-MPEG-4 是 2 位）。
+    let pict = r.bit()? + 1;
+    let picture_type = match pict {
+        1 => PictureType::I,
+        2 => PictureType::P,
+        _ => return Err(Error::Bad("WMV2 的 picture type 不合法")),
+    };
+    if picture_type == PictureType::I {
+        // I 帧多一个 7 位的字段（ffmpeg 只把它打日志，语义没用到）。
+        let _code = r.u(7)?;
+    }
+    let qscale = r.u(5)? as u8;
+    if qscale == 0 {
+        return Err(Error::Bad("WMV2 的 qscale 为 0"));
+    }
+
+    if picture_type == PictureType::P && r.show(1)? != 0 {
+        // 试探「整帧 skip」：`skip_type`(2) 之后按 25 位一组读，全 1 才算整帧跳过。
+        // ⚠️ 这是**试探**（ffmpeg 用 `GetBitContext gb = s->gb` 拷一份来读），
+        // 所以失败时要能退回原位 —— 用 `show`/`skip` 手工管位置。
+        let save = r.bit_pos();
+        let mut probe = BitReader::new(data);
+        probe.skip(save as u32)?;
+        if probe_all_skipped(&mut probe, mb_width, mb_height).is_some() {
+            return Ok((Wmv2Frame::Skipped, save));
+        }
+    }
+
+    // ---- 第二段：能力位 / 表选择 / 宏块 skip 表 ----
+    let mut h = Wmv2Header {
+        picture_type,
+        qscale,
+        slice_height: (mb_height / f.code.max(1) as u32).max(1),
+        mb_skip: Vec::new(),
+        rl_table_index: 0,
+        rl_chroma_table_index: 0,
+        dc_table_index: 0,
+        mv_table_index: 0,
+        per_mb_rl_table: false,
+        cbp_table_index: 0,
+        mspel: false,
+        per_mb_abt: false,
+        abt_type: 0,
+        j_type: false,
+        no_rounding: true,
+    };
+
+    match picture_type {
+        PictureType::I => {
+            h.j_type = f.j_type && r.bit()? != 0;
+            if !h.j_type {
+                h.per_mb_rl_table = f.per_mb_rl && r.bit()? != 0;
+                if !h.per_mb_rl_table {
+                    h.rl_chroma_table_index = decode012(&mut r)?;
+                    h.rl_table_index = decode012(&mut r)?;
+                }
+                h.dc_table_index = r.bit()? as u8;
+            }
+            h.no_rounding = true;
+        }
+        PictureType::P => {
+            h.mb_skip = parse_wmv2_mb_skip(&mut r, mb_width, mb_height)?;
+            let cbp_index = decode012(&mut r)?;
+            h.cbp_table_index = wmv2_cbp_table_index(qscale, cbp_index);
+            h.mspel = f.mspel && r.bit()? != 0;
+            if f.abt {
+                // ⚠️ ffmpeg 这里是 `get_bits1() ^ 1` —— 位流里的 1 表示**逐宏块**读。
+                h.per_mb_abt = r.bit()? == 0;
+                if !h.per_mb_abt {
+                    h.abt_type = decode012(&mut r)?;
+                }
+            }
+            h.per_mb_rl_table = f.per_mb_rl && r.bit()? != 0;
+            if !h.per_mb_rl_table {
+                h.rl_table_index = decode012(&mut r)?;
+                h.rl_chroma_table_index = h.rl_table_index;
+            }
+            h.dc_table_index = r.bit()? as u8;
+            h.mv_table_index = r.bit()? as u8;
+            h.no_rounding = no_rounding_in ^ true;
+        }
+    }
+
+    Ok((Wmv2Frame::Frame(Box::new(h)), r.bit_pos()))
+}
+
+/// 试探「整帧 skip」：读得下去且全 1 就返回 `Some(())`。
+fn probe_all_skipped(r: &mut BitReader, mb_width: u32, mb_height: u32) -> Option<()> {
+    const SKIP_TYPE_COL: u32 = 3;
+    let skip_type = r.u(2).ok()?;
+    let mut run = if skip_type == SKIP_TYPE_COL {
+        mb_width
+    } else {
+        mb_height
+    };
+    while run > 0 {
+        let block = run.min(25);
+        let v = r.u(block).ok()?;
+        // `v + 1 != 1 << block` = 这一组不全是 1 → 不是整帧 skip。
+        if v + 1 != 1u32 << block {
+            return None;
+        }
+        run -= block;
+    }
+    Some(())
+}
+
+/// WMV2 的**逐宏块 skip 表** —— 位流里按 4 种粒度给。
+///
+/// | `skip_type` | 粒度 |
+/// |---|---|
+/// | 0 | 全不 skip（一个位都不读） |
+/// | 1 | 逐宏块 1 位（MPEG 风格） |
+/// | 2 | 逐行：先 1 位「整行 skip？」，不是再逐宏块读 |
+/// | 3 | 逐列：同上，按列 |
+fn parse_wmv2_mb_skip(r: &mut BitReader, mb_w: u32, mb_h: u32) -> Result<Vec<bool>> {
+    let mut skip = vec![false; (mb_w * mb_h) as usize];
+    let skip_type = r.u(2)?;
+    match skip_type {
+        0 => {}
+        1 => {
+            for v in skip.iter_mut() {
+                *v = r.bit()? != 0;
+            }
+        }
+        2 => {
+            for y in 0..mb_h {
+                if r.bit()? != 0 {
+                    for x in 0..mb_w {
+                        skip[(y * mb_w + x) as usize] = true;
+                    }
+                } else {
+                    for x in 0..mb_w {
+                        skip[(y * mb_w + x) as usize] = r.bit()? != 0;
+                    }
+                }
+            }
+        }
+        _ => {
+            for x in 0..mb_w {
+                if r.bit()? != 0 {
+                    for y in 0..mb_h {
+                        skip[(y * mb_w + x) as usize] = true;
+                    }
+                } else {
+                    for y in 0..mb_h {
+                        skip[(y * mb_w + x) as usize] = r.bit()? != 0;
+                    }
+                }
+            }
+        }
+    }
+    Ok(skip)
+}
+
 /// `decode012` 这个三值编码：读 1 位，0 → 0；否则再读 1 位，0 → 1，1 → 2。
 pub fn decode012(r: &mut BitReader) -> Result<u8> {
     if r.bit()? == 0 {
@@ -202,8 +502,8 @@ pub fn parse_frame_header(
                     h.inter_intra_pred = false;
                 }
                 Version::Wmv2 => {
-                    return Err(Error::Unsupported(
-                        "WMV2 的帧头是另一套（见 wmv2dec.c），还没接".into(),
+                    return Err(Error::Bad(
+                        "WMV2 的帧头走 `parse_wmv2_frame`（另一套语法，1 位的 picture type）",
                     ))
                 }
             }
@@ -251,8 +551,8 @@ pub fn parse_frame_header(
                         mb_width * mb_height * 256 < 320 * 240 && h.bit_rate <= II_BITRATE;
                 }
                 Version::Wmv2 => {
-                    return Err(Error::Unsupported(
-                        "WMV2 的帧头是另一套（见 wmv2dec.c），还没接".into(),
+                    return Err(Error::Bad(
+                        "WMV2 的帧头走 `parse_wmv2_frame`（另一套语法，1 位的 picture type）",
                     ))
                 }
             }

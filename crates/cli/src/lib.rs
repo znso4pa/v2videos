@@ -43,6 +43,39 @@ pub use v2v_avi::AviDemuxer;
 pub use v2v_container::{AudioFormat, Sample};
 pub use v2v_msmpeg4::{Decoder, Encoder, EncoderConfig, Frame, Version};
 
+/// 认 FourCC → 版本，**只放逐像素对账过的版本进来**。
+///
+/// ⚠️ 解码器内部已经认五种版本，但经过**逐帧对 ffmpeg 逐像素 0 差**验证的只有：
+///
+/// | 版本 | 状态 |
+/// |---|---|
+/// | `MP43`（V3） | ✅ 多份真样本逐帧 0 差 |
+/// | `WMV1` | ✅ 四份真样本逐帧 0 差 |
+/// | `WMV2` | ✅ 三份真样本逐帧 0 差（含 `mspel` / ABT / 环路滤波那些分支） |
+/// | `MP41` / `MP42` | ❌ 帧头按版本分叉了，但 **MB 层还没写**（要 H.263 的 MCBPC 表 + `v2_*` 两张私有表） |
+///
+/// 宁可明确拒绝，也不能静默产出错误画面 —— 那比不支持糟得多。
+fn verified_version(fourcc: u32) -> Result<Version, Error> {
+    match Version::from_fourcc(fourcc) {
+        Some(v @ (Version::V3 | Version::Wmv1 | Version::Wmv2)) => Ok(v),
+        _ => Err(Error::Unsupported(format!(
+            "输入视频是 {}，本工具目前只解 MP43 / WMV1 / WMV2（MP41/MP42/WMV3 在接）",
+            v2v_asf::fourcc_string(fourcc)
+        ))),
+    }
+}
+
+/// 按版本建解码器。
+///
+/// ⚠️ **WMV2 要 `extradata`** —— 它的能力位（`mspel` / `abt` / `j_type` …）不在位流里，
+/// 只在容器的编解码器私有数据里。别的版本只用 FourCC 就够。
+fn make_decoder(version: Version, extra: &[u8]) -> Result<Decoder, Error> {
+    Ok(match version {
+        Version::Wmv2 => Decoder::with_wmv2(extra)?,
+        _ => Decoder::with_version(version),
+    })
+}
+
 /// MP43 的 FourCC（`.wmv` 输出用的编码）。
 pub const MP43: u32 = u32::from_le_bytes(*b"MP43");
 
@@ -243,13 +276,25 @@ impl From<v2v_wma::Error> for Error {
     }
 }
 
+/// 视频轨的入口信息。
+///
+/// `extra`（编解码器私有数据）**不是可有可无的**：WMV2 的**能力位**
+/// （`mspel` / `abt` / `j_type` …）就在里面 —— 少了它连帧头都读不出来。
+struct VideoTrack {
+    number: u8,
+    width: u32,
+    height: u32,
+    fourcc: u32,
+    extra: Vec<u8>,
+}
+
 /// 「能吐视频样本的东西」—— ASF / AVI 解封装器都实现它。
 ///
 /// 存在的理由：转码管线只关心「视频流是谁、多大、什么 codec」和「下一个样本」，
 /// 不该为每种容器写一份管线。加容器 = 加一个实现，管线不动。
 trait VideoSource {
-    /// `(流号, 宽, 高, fourcc)`；没有视频轨就 `None`。
-    fn video_stream(&self) -> Option<(u8, u32, u32, u32)>;
+    /// 视频轨；没有视频轨就 `None`。
+    fn video_stream(&self) -> Option<VideoTrack>;
     /// `(流号, WAVEFORMATEX)`；没有音频轨就 `None`。
     fn audio_stream(&self) -> Option<(u8, AudioFormat)>;
     fn next(&mut self) -> Result<Option<Sample>, Error>;
@@ -258,14 +303,20 @@ trait VideoSource {
 struct AsfSource(v2v_asf::AsfDemuxer<BufReader<File>>);
 
 impl VideoSource for AsfSource {
-    fn video_stream(&self) -> Option<(u8, u32, u32, u32)> {
+    fn video_stream(&self) -> Option<VideoTrack> {
         let v = self
             .0
             .streams()
             .iter()
             .find(|s| s.kind == StreamKind::Video)?;
         let vf = v.video.as_ref()?;
-        Some((v.number, vf.width, vf.height, vf.fourcc))
+        Some(VideoTrack {
+            number: v.number,
+            width: vf.width,
+            height: vf.height,
+            fourcc: vf.fourcc,
+            extra: vf.extra.clone(),
+        })
     }
     fn audio_stream(&self) -> Option<(u8, AudioFormat)> {
         let a = self
@@ -283,14 +334,20 @@ impl VideoSource for AsfSource {
 struct AviSource(v2v_avi::AviDemuxer<BufReader<File>>);
 
 impl VideoSource for AviSource {
-    fn video_stream(&self) -> Option<(u8, u32, u32, u32)> {
+    fn video_stream(&self) -> Option<VideoTrack> {
         let v = self
             .0
             .streams()
             .iter()
             .find(|s| s.kind == StreamKind::Video)?;
         let vf = v.video.as_ref()?;
-        Some((v.number, vf.width, vf.height, vf.fourcc))
+        Some(VideoTrack {
+            number: v.number,
+            width: vf.width,
+            height: vf.height,
+            fourcc: vf.fourcc,
+            extra: vf.extra.clone(),
+        })
     }
     fn audio_stream(&self) -> Option<(u8, AudioFormat)> {
         let a = self
@@ -357,24 +414,13 @@ fn convert_to_asf(
     let mut demux = open_source(input)?;
 
     // ---- 找视频轨；只认 MP43 ----
-    let (vnum, w, h, fourcc) = demux
+    let track = demux
         .video_stream()
         .ok_or_else(|| Error::Unsupported("文件里没有视频轨（或没有格式信息）".into()))?;
-    // ⚠️ **只放已验证的版本进来**。
-    //
-    // 解码器内部已经认五种版本，但**只有 MP43（V3）经过逐像素对账**。
-    // WMV1 的 I 帧已经能逐像素对上，P 帧还差一处（见 TODO）；
-    // MP41/MP42/WMV1/WMV2 的 MB 层与帧头虽已按版本分叉，但**没有验证过**。
-    //
-    // 宁可明确拒绝，也不能静默产出错误画面 —— 那比不支持糟得多。
-    let version = Version::from_fourcc(fourcc).filter(|v| *v == Version::V3).ok_or_else(|| {
-        Error::Unsupported(format!(
-            "输入视频是 {}，本工具目前只解 MP43（其余 MS-MPEG-4 版本在接）",
-            v2v_asf::fourcc_string(fourcc)
-        ))
-    })?;
+    let (vnum, w, h) = (track.number, track.width, track.height);
+    let version = verified_version(track.fourcc)?;
 
-    let mut dec = Decoder::with_version(version);
+    let mut dec = make_decoder(version, &track.extra)?;
     let mut enc = Encoder::new(EncoderConfig {
         qscale: opts.qscale,
         keyframe_interval: opts.keyframe_interval,
@@ -655,16 +701,11 @@ fn convert_to_mp4(
     let bytes_in = std::fs::metadata(input)?.len();
     let mut demux = open_source(input)?;
 
-    let (vnum, w, h, fourcc) = demux
+    let track = demux
         .video_stream()
         .ok_or_else(|| Error::Unsupported("文件里没有视频轨（或没有格式信息）".into()))?;
-    // 同 `convert_to_wmv`：只放已验证的版本进来。
-    let version = Version::from_fourcc(fourcc).filter(|v| *v == Version::V3).ok_or_else(|| {
-        Error::Unsupported(format!(
-            "输入视频是 {}，本工具目前只解 MP43（其余 MS-MPEG-4 版本在接）",
-            v2v_asf::fourcc_string(fourcc)
-        ))
-    })?;
+    let (vnum, w, h) = (track.number, track.width, track.height);
+    let version = verified_version(track.fourcc)?;
 
     // 源里那条音频轨的格式（有没有音频、采样率多少）—— 封装器的 `stsd` 要用。
     let src_audio = demux.audio_stream().map(|(_, af)| af);
@@ -798,7 +839,7 @@ fn convert_to_mp4(
         _ => v2v_mp4::Mp4Muxer::new(vtrack),
     };
 
-    let mut dec = Decoder::with_version(version);
+    let mut dec = make_decoder(version, &track.extra)?;
     let mut frames = 0usize;
     let mut key_frames = 0usize;
     let mut skipped_audio = 0usize;

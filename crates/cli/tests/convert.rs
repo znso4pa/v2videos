@@ -137,18 +137,44 @@ fn converts_and_output_is_readable() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// **还没实现的版本要明确拒绝**，而且不留输出文件。
 #[test]
-fn rejects_non_mp43_input() {
+fn rejects_versions_we_do_not_decode_yet() {
     let dir = temp_dir("reject");
     let frames = moving_sequence(160, 120, 2);
-    // 故意标成 WMV1：转码器必须明确报「不支持」，不能静默按 MP43 解。
-    let input = dir.join("wmv1.wmv");
-    make_wmv(&input, &frames, u32::from_le_bytes(*b"WMV1"), 8);
+    // WMV2 的帧头与 MB 层是另一套（ffmpeg 里在 `wmv2dec.c`），还没接。
+    let input = dir.join("wmv2.wmv");
+    make_wmv(&input, &frames, u32::from_le_bytes(*b"WMV2"), 8);
     let out = dir.join("out.wmv");
     let err = convert_file(&input, &out, &ConvertOptions::default()).expect_err("应当报不支持");
     let msg = err.to_string();
     eprintln!("报错：{msg}");
-    assert!(msg.contains("WMV1"), "报错里应点名实际格式：{msg}");
+    assert!(msg.contains("WMV2"), "报错里应点名实际格式：{msg}");
+    assert!(!out.exists(), "报错时不该留下输出文件");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **标错版本的流不能静默解出来**。
+///
+/// 这条是上一版 `rejects_non_mp43_input` 的延续：那版把 MP43 的流标成 `WMV1`
+/// 期望「被拒绝」，而现在 `WMV1` **已经支持**了 —— 于是判据变成：
+/// 拿 WMV1 的语法去解一份 MP43 的字节，**必须报错**，绝不能「解出来一份看着能播、
+/// 实际是垃圾」的输出。静默产出错误画面比明确拒绝糟得多。
+#[test]
+fn a_mislabeled_stream_does_not_decode_silently() {
+    let dir = temp_dir("mislabel");
+    let frames = moving_sequence(160, 120, 2);
+    let input = dir.join("mislabeled.wmv");
+    make_wmv(&input, &frames, u32::from_le_bytes(*b"WMV1"), 8);
+    let out = dir.join("out.wmv");
+    let r = convert_file(&input, &out, &ConvertOptions::default());
+    if r.is_ok() {
+        // 「解出来了」只有在**产物真的对**时才可接受 —— 但这里底本是 MP43、
+        // 语法标的是 WMV1，解出来必然不对，所以只允许报错。
+        panic!("标错版本的流被静默解出来了（产物 {} 字节）", std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0));
+    }
+    let msg = r.unwrap_err().to_string();
+    eprintln!("报错：{msg}");
     assert!(!out.exists(), "报错时不该留下输出文件");
     let _ = std::fs::remove_dir_all(&dir);
 }
