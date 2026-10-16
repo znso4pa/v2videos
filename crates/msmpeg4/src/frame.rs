@@ -1539,6 +1539,7 @@ fn sad_row16(cur: &[u8], refr: &[u8]) -> u32 {
     s
 }
 
+#[inline]
 pub fn sad_luma16_capped(
     cur: &[u8; 256],
     refp: &Planes,

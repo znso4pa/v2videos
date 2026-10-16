@@ -899,10 +899,10 @@ fn motion_estimate(
             }
         }
     }
-    // 细化一：最优周围 ±1.5 像素（半像素步长）
+    // 细化一：最优周围 ±1.5 像素，**按 1 像素粒度**（半像素步长 2）
     let base = best;
-    for dy in -3..=3i32 {
-        for dx in -3..=3i32 {
+    for dy in (-3..=3i32).step_by(2) {
+        for dx in (-3..=3i32).step_by(2) {
             let cand = (base.0 + dx, base.1 + dy);
             let s = sad_of(cand, best_sad);
             if s < best_sad {
