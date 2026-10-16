@@ -134,6 +134,21 @@ pub struct EncoderConfig {
     pub bitrate: Option<u32>,
     /// 要不要逐宏块试 AC 预测（见模块文档）。默认开。
     pub ac_pred: bool,
+    /// 要不要对**帧间块**做系数级 RD（trellis，见 `trellis_levels`）。
+    ///
+    /// 换了什么：量化不再是「逐系数取最近电平」，而是在 `{0, L, L∓1}` 里挑
+    /// `失真 + λ·位数` 最小的那个 —— 编码代价（run / escape / 符号）第一次参与决策。
+    ///
+    /// ⚠️ **默认关，因为实测是净亏**（数字见 TODO）：
+    /// - 固定 qscale 下它确实省位（−18%）而且是个公平交易（PSNR −1.6 dB）；
+    /// - 但接到我们这套**帧级**码控上，四档 λ 全是「体积更大 + 画质更差」
+    ///   （最好那档仍是 PSNR −0.5 dB / XPSNR −0.75，体积还 +4%）。
+    ///
+    /// 两条能解释实测的原因：① 我们**没有 GOP 级比特分配** —— I 帧不受 trellis 影响，
+    /// P 帧省下的位换不成整段更细的 q，反而让帧级码控把 q 一路压低、I 帧把体积撑回去；
+    /// ② λ 的「正确值」是帧级码控的边际失真-比特斜率，它不是只跟 `q²` 走的常数。
+    /// **要用它，得先有分配那一层**（那也正是感知加权生效的前提）。
+    pub trellis: bool,
     /// VOL 的 `quant_type`（见 `Quant`）。默认**开** —— 实测同码率下
     /// PSNR 持平而 SSIM / XPSNR / VMAF 都更高（默认矩阵就是对比敏感度曲线：
     /// 高频粗量化，人眼看不出来）。关掉退回 H.263 的平坦步长。
@@ -161,6 +176,7 @@ impl Default for EncoderConfig {
             bitrate: None,
             ac_pred: true,
             mpeg_quant: true,
+            trellis: false,
             keyframe_interval: 0,
             low_delay: true,
             profile_and_level: PROFILE_SIMPLE_LEVEL1,
@@ -544,6 +560,7 @@ impl Encoder {
             y_dc_scale,
             c_dc_scale,
             use_ac_pred: self.cfg.ac_pred,
+            trellis: self.cfg.trellis,
             dc: DcGrid::new(mb_w, mb_h, y_dc_scale, c_dc_scale),
             ac: AcGrid::new(mb_w, mb_h),
             mv: vec![(0, 0); mb_w * mb_h],
@@ -830,6 +847,8 @@ struct PState<'a> {
     y_dc_scale: i32,
     c_dc_scale: i32,
     use_ac_pred: bool,
+    /// 帧间块的系数级 RD 开关（见 `EncoderConfig::trellis`）。
+    trellis: bool,
     dc: DcGrid,
     ac: AcGrid,
     /// 每宏块一个 MV（只做 16×16 模式，亮度那 2×2 个格子填的是同一个值）。
@@ -1101,6 +1120,9 @@ impl PState<'_> {
             for (k, v) in coef.iter().enumerate() {
                 slot[k] = self.quant.quantize(k, *v, false);
             }
+            if self.trellis {
+                trellis_levels(&self.quant, self.rl_inter, &coef, slot, self.quant.lambda());
+            }
         }
         let cbp_i = inter_cbp(&qb);
         let skip = mv == (0, 0) && cbp_i == 0;
@@ -1230,6 +1252,8 @@ fn recon_at(cur: &mut Planes, n: usize, mbx: usize, mby: usize) -> (&mut [u8], u
 /// 逐频率变化」那一类 —— 不受「逐块常数加权是 no-op」那条结论的限制。
 pub(crate) struct Quant {
     mpeg: bool,
+    /// 本帧的 `qscale`（只为算 trellis 的 λ）。
+    q: i32,
     /// H.263 的两个常数（MPEG 时不用）。
     qmul: i32,
     qadd: i32,
@@ -1247,6 +1271,17 @@ pub(crate) struct Quant {
 /// 所以这是个真旋钮（扫描的数字见 TODO）。
 const INTRA_BIAS_EIGHTHS: i32 = 4;
 
+/// trellis 的 λ 旋钮，千分之一为单位（`λ = 它 · q² / 1000`）。
+///
+/// 尺度怎么来的：零掉一个「离判决边界半个步长」的系数，省下 `几步` 位、付出
+/// `(步长/2)²` 的失真 —— 而重建步长 ≈ `q·W/8`，所以 λ 的量级就是 `(qW/16)²/位数`。
+/// **它不是推出来的，是标定出来的**（扫描见 TODO）：本仓在另一条线上踩过 λ 差 90 倍。
+const TRELLIS_LAMBDA_MILLI: i64 = 2800;
+
+/// 允不允许 trellis 把系数**砍到 0**。关掉就只剩「挪一档」。
+/// 加这个开关是为了把「省位」和「漂移」分开量：丢残差会让预测环里的误差累积。
+const TRELLIS_ALLOW_ZERO: bool = true;
+
 impl Quant {
     fn new(qscale: u8, mpeg: bool) -> Self {
         let q = i32::from(qscale);
@@ -1258,11 +1293,17 @@ impl Quant {
         }
         Self {
             mpeg,
+            q,
             qmul: q << 1,
             qadd: (q - 1) | 1,
             intra_step,
             inter_step,
         }
+    }
+
+    /// trellis 的 λ（失真换位数的兑换率）：`TRELLIS_LAMBDA_MILLI · q² / 1000`。
+    fn lambda(&self) -> i64 {
+        TRELLIS_LAMBDA_MILLI * i64::from(self.q) * i64::from(self.q) / 1000
     }
 
     fn step(&self, k: usize, intra: bool) -> i32 {
@@ -1695,6 +1736,17 @@ fn write_ac(
 ///
 /// 严格取最短的（并列时取靠前的候选，与 ffmpeg 的 `len < best` 一致）。
 fn write_rl(w: &mut BitWriter, rl: &RlTable, last: bool, run: usize, level: i32) -> Result<()> {
+    let (code, len) = best_rl(rl, last, run, level)?;
+    debug_assert!(len <= 32, "一次最多写 32 位，ESC3 是 {len} 位");
+    w.put(code, len);
+    Ok(())
+}
+
+/// 一个 `(last, run, level)` 的**最省写法**：`(code, len)`。
+///
+/// ⚠️ 位数的唯一真源 —— 写位流（`write_rl`）与代价模型（`rl_cost`）都走这里。
+/// 各算一份必然分叉（本仓踩过：`band_cost` 与 `write_band` 的 escape 计数不一样）。
+fn best_rl(rl: &RlTable, last: bool, run: usize, level: i32) -> Result<(u32, u32)> {
     let esc = rl.escape_symbol();
     let (esc_code, esc_len) = rl
         .code_len(esc)
@@ -1749,10 +1801,129 @@ fn write_rl(w: &mut BitWriter, rl: &RlTable, last: bool, run: usize, level: i32)
         better(bits, esc_len + 23, &mut best);
     }
 
-    let (code, len) = best.ok_or(Error::Bad("AC 系数写不出来"))?;
-    debug_assert!(len <= 32, "一次最多写 32 位，ESC3 是 {len} 位");
-    w.put(code, len);
-    Ok(())
+    best.ok_or(Error::Bad("AC 系数写不出来"))
+}
+
+/// 一个 `(last, run, level)` 要花多少位（`best_rl` 的长度那一半）。
+fn rl_cost(rl: &RlTable, last: bool, run: usize, level: i32) -> u32 {
+    best_rl(rl, last, run, level).map_or(32, |(_, len)| len)
+}
+
+/// 系数级 RD（trellis）：在**扫描序**上做一遍 DP，逐系数在 `{L, L∓1}` 里挑
+/// `失真 + λ·位数` 最小的那个。
+///
+/// ## 为什么值得做
+///
+/// 只做「逐系数取最近电平」时，一个系数的编码代价（run / escape / 符号）**完全不参与决策**：
+/// 花 20 位才写得出来、却只换回一点失真的系数照写不误。DP 把失真和位数放在同一个尺度上比 ——
+/// 这也正是**感知加权唯一能生效的那一层**（权重必须和率项同时出现，见 TODO 的 5109 §1）。
+///
+/// ## 设计取舍（都是有意的收缩，别当成 bug）
+///
+/// - **只用于帧间块**：帧内块的扫描序随 AC 预测方向变（`H_SCAN` / `V_SCAN`），
+///   要接进来得连 `intra_try` 的候选一起改 —— 那一层先不动。
+/// - **候选只有 `{L, L∓1}`，且不新增非零系数**（基线为 0 的位置保持 0）：
+///   收益的大头是「把不划算的系数砍掉」，提电平那一半先不做。
+/// - **`last` 按基线算**：真把基线的「最后一个非零」砍掉时，代价模型会差 1–2 位
+///   （写出端自己算得对，只有这里的估计偏一点）。
+/// - **λ 的尺度是坑**：`dist` 是 DCT 域的平方误差（量级 1e6~1e8），`bits` 是个位数，
+///   而且步长变粗时失真单位跟着 `q²` 涨 —— 所以 λ 必须带着 `q²` 走
+///   （本仓在另一条线上踩过「λ 比实测最优大 90 倍」）。
+fn trellis_levels(
+    quant: &Quant,
+    rl: &RlTable,
+    coeff: &[i32; 64],
+    levels: &mut [i32; 64],
+    lambda: i64,
+) {
+    const INF: i64 = i64::MAX / 4;
+    // 基线（扫描序）+ 代价模型里的 `last`。
+    let mut base = [0i32; 64];
+    for (i, b) in base.iter_mut().enumerate() {
+        *b = levels[ZIGZAG[i] as usize];
+    }
+    let last_index = (0..64).rev().find(|&i| base[i] != 0).unwrap_or(0);
+
+    // 状态 = 最后一个非零系数的扫描序下标 + 1（0 = 还没有）；代价表滚动用。
+    let mut cost = [[INF; 65]; 2];
+    // `choice[出状态][i] = (候选下标, 入状态)` —— 2 字节，回溯靠它，
+    // 不能只存候选：`level != 0` 时同一个出状态来自哪个入状态，决定了 run、也就决定了位数。
+    let mut choice = [[(0u8, 0u8); 64]; 65];
+    cost[0][0] = 0;
+    for i in 0..64 {
+        let (cur, nxt) = (i & 1, (i & 1) ^ 1);
+        cost[nxt] = [INF; 65];
+        let l0 = base[i];
+        // 候选：**0** 与 `L∓1 / L`。0 必须在里面 —— 「砍掉不划算的系数」是收益最大的一类，
+        // 而只给 `{L, L∓1}` 时 `|L| >= 2` 的系数根本够不到 0（这条是单测逼出来的）。
+        let (mut cands, n_cands) = if l0 == 0 {
+            ([0i32; 4], 1usize)
+        } else {
+            let s = l0.signum();
+            let mut c = [0i32; 4];
+            let mut n = 0usize;
+            if TRELLIS_ALLOW_ZERO {
+                c[0] = 0;
+                n = 1;
+            }
+            for cand in [l0 - s, l0, l0 + s] {
+                if cand != 0 && !c[..n].contains(&cand) {
+                    c[n] = cand;
+                    n += 1;
+                }
+            }
+            (c, n)
+        };
+        for c in cands.iter_mut() {
+            *c = (*c).clamp(-2047, 2047); // ESC3 的 level 是 12 位有符号
+        }
+        let f = i64::from(coeff[ZIGZAG[i] as usize]);
+        for prev in 0..65usize {
+            if cost[cur][prev] >= INF {
+                continue;
+            }
+            for (ci, &l) in cands.iter().take(n_cands).enumerate() {
+                let dq = i64::from(quant.dequant(ZIGZAG[i] as usize, l, false));
+                let mut c = cost[cur][prev] + (f - dq) * (f - dq);
+                let nprev = if l != 0 { i + 1 } else { prev };
+                if l != 0 {
+                    let run = (i as i32 - (prev as i32 - 1) - 1).max(0) as usize;
+                    c += lambda * i64::from(rl_cost(rl, i == last_index, run, l));
+                }
+                if c < cost[nxt][nprev] {
+                    cost[nxt][nprev] = c;
+                    choice[nprev][i] = (ci as u8, prev as u8);
+                }
+            }
+        }
+    }
+
+    // 回溯（`i = 63` 时 `nxt == 0`，所以终局代价在 `cost[0]`）。
+    let mut st = (0..65usize).min_by_key(|&p| cost[0][p]).unwrap_or(0);
+    let mut out = [0i32; 64];
+    for i in (0..64).rev() {
+        let (ci, in_st) = choice[st][i];
+        let l0 = base[i];
+        out[i] = if l0 == 0 {
+            0
+        } else {
+            let s = l0.signum();
+            let mut c = [0i32; 4];
+            let mut n = 1usize;
+            for cand in [l0 - s, l0, l0 + s] {
+                if cand != 0 && !c[..n].contains(&cand) {
+                    c[n] = cand;
+                    n += 1;
+                }
+            }
+            let _ = n;
+            c[ci as usize].clamp(-2047, 2047)
+        };
+        st = in_st as usize;
+    }
+    for (i, &l) in out.iter().enumerate() {
+        levels[ZIGZAG[i] as usize] = l;
+    }
 }
 
 /// `mpeg4_encode_dc`：VLC 的**符号是 DC 差的位长**，后面跟位长个位。
@@ -2035,6 +2206,148 @@ mod tests {
         // 高频步长必须比低频粗 —— 这就是「感知」那一半
         assert!(quant.step(63, true) > quant.step(1, true));
         assert!(quant.step(63, false) > quant.step(0, false));
+    }
+
+    /// 按 trellis 自己的模型算一个 level 排布的代价（失真 + λ·位数）——只服务下面那条对拍。
+    fn model_cost(
+        quant: &Quant,
+        rl: &RlTable,
+        coeff: &[i32; 64],
+        levels: &[i32; 64],
+        lambda: i64,
+    ) -> i64 {
+        let last_index = (0..64)
+            .rev()
+            .find(|&i| levels[ZIGZAG[i] as usize] != 0)
+            .unwrap_or(0);
+        let mut cost = 0i64;
+        let mut prev: i32 = -1;
+        for i in 0..64 {
+            let k = ZIGZAG[i] as usize;
+            let l = levels[k];
+            let f = i64::from(coeff[k]);
+            let dq = i64::from(quant.dequant(k, l, false));
+            cost += (f - dq) * (f - dq);
+            if l != 0 {
+                let run = (i as i32 - prev - 1).max(0) as usize;
+                cost += lambda * i64::from(rl_cost(rl, i == last_index, run, l));
+                prev = i as i32;
+            }
+        }
+        cost
+    }
+
+    #[test]
+    fn trellis_dp_matches_brute_force_on_a_small_support() {
+        // 非零系数少的时候可以把候选组合全枚举一遍，DP 必须取到同一个最小值 ——
+        // 这条钉的是状态转移与回溯（出状态存候选、入状态用来还原 run）。
+        let quant = Quant::new(6, true);
+        let rl = inter_rl_table();
+        let lambda = quant.lambda();
+        let mut coeff = [0i32; 64];
+        for (scan_i, v) in [(1usize, 260i32), (5, -170), (30, 90)] {
+            coeff[ZIGZAG[scan_i] as usize] = v;
+        }
+        let mut base = [0i32; 64];
+        for k in 0..64 {
+            base[k] = quant.quantize(k, coeff[k], false);
+        }
+        let mut got = base;
+        trellis_levels(&quant, &rl, &coeff, &mut got, lambda);
+
+        let positions: Vec<usize> = (0..64)
+            .filter(|&i| base[ZIGZAG[i] as usize] != 0)
+            .collect();
+        assert_eq!(positions.len(), 3, "前提：基线只有 3 个非零");
+        let mut best = i64::MAX;
+        for mask in 0..64usize {
+            let mut cand = base;
+            let mut m = mask;
+            for &i in &positions {
+                let k = ZIGZAG[i] as usize;
+                let s = base[k].signum();
+                let mut set = [0i32; 4];
+                let mut n = 1usize;
+                for cand_l in [base[k] - s, base[k], base[k] + s] {
+                    if cand_l != 0 && !set[..n].contains(&cand_l) {
+                        set[n] = cand_l;
+                        n += 1;
+                    }
+                }
+                cand[k] = set[m % n].clamp(-2047, 2047);
+                m /= n;
+            }
+            best = best.min(model_cost(&quant, &rl, &coeff, &cand, lambda));
+        }
+        assert_eq!(
+            model_cost(&quant, &rl, &coeff, &got, lambda),
+            best,
+            "DP 没取到暴力枚举的最小值"
+        );
+    }
+
+
+    #[test]
+    fn trellis_drops_a_coefficient_whose_bits_are_expensive() {
+        // 孤零零一个高频系数：写它要 escape（20+ 位），换回的失真却很小 —— λ 够大时该砍掉。
+        //
+        // ⚠️ 这条用**显式的大 λ**：砍到 0 的失真代价是 `f²`（整格），比「挪一档」的
+        // `(重建步长)²` 大得多，所以「该不该砍」用的 λ 比「该挪哪一档」的 λ 高一个量级。
+        // 默认 λ 靠扫描标定（见 TODO），不在这条测试里钉。
+        let quant = Quant::new(6, true);
+        let rl = inter_rl_table();
+        let k = ZIGZAG[58] as usize;
+        let mut coeff = [0i32; 64];
+        coeff[k] = 30; // 该位置 step = 360，level 1 的门槛是 22.5 —— 30 刚好过线
+        let mut base = [0i32; 64];
+        base[k] = quant.quantize(k, coeff[k], false);
+        assert_eq!(base[k].abs(), 1, "前提：基线是 ±1（这样 0 才在候选集里）");
+        let mut out = base;
+        trellis_levels(&quant, &rl, &coeff, &mut out, 400);
+        assert_eq!(out[k], 0, "λ 够大时，昂贵的高频小系数该被砍掉");
+        assert!(
+            model_cost(&quant, &rl, &coeff, &out, 400)
+                <= model_cost(&quant, &rl, &coeff, &base, 400)
+        );
+        // 反过来：λ = 0（只看失真）必须留着它 —— 这半条是「砍」的对照
+        let mut kept = base;
+        trellis_levels(&quant, &rl, &coeff, &mut kept, 0);
+        assert!(kept[k].abs() >= 1, "λ=0 时不该砍");
+    }
+
+    #[test]
+    fn trellis_never_moves_a_level_by_more_than_one() {
+        // 收缩的边界：只在 {L, L∓1} 里挑，且不许新增非零、不许变号、不越 ESC3。
+        let quant = Quant::new(9, true);
+        let rl = inter_rl_table();
+        let mut seed = 0x1234_5678u32;
+        for _ in 0..40 {
+            let mut coeff = [0i32; 64];
+            for v in coeff.iter_mut() {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                *v = ((seed >> 16) as i32 % 2001) - 1000;
+            }
+            let mut base = [0i32; 64];
+            for k in 0..64 {
+                base[k] = quant.quantize(k, coeff[k], false);
+            }
+            let mut out = base;
+            trellis_levels(&quant, &rl, &coeff, &mut out, quant.lambda());
+            for k in 0..64 {
+                if base[k] == 0 {
+                    assert_eq!(out[k], 0, "不许新增非零系数");
+                } else if out[k] != 0 {
+                    assert!(
+                        (out[k] - base[k]).abs() <= 1,
+                        "只许动一档（或直接归零）：k={k} base={} out={}",
+                        base[k],
+                        out[k]
+                    );
+                    assert_eq!(out[k].signum(), base[k].signum(), "不许变号");
+                    assert!(out[k].abs() <= 2047, "不许越 ESC3 的 12 位");
+                }
+            }
+        }
     }
 
     #[test]
