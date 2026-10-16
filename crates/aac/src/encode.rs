@@ -2010,6 +2010,69 @@ fn band_cost(band: &[f32], sf: u8, qu: &mut Vec<i32>) -> (f32, u8) {
     }
 }
 
+/// 一个频带在 `(sf, cb)` 下要**多少位** —— 与 `write_band` 同一套计数。
+///
+/// 数的是这一带自己的开销：码本索引 + 无符号码本的符号位 + escape 码；
+/// **不含** `section_data` 的段长与 `scalefactor_data` 的差分（那些是跨带的，
+/// 同一个 `sf` 下的候选之间差别很小，当常数处理）。
+///
+/// `qu` 是**不封顶**的量化值（`band_cost` 里算好一次、各码本 `.min(maxval)` 共用）——
+/// 与 `write_band` 自己重算 `quant_one` **逐位相同**（那条等价性写在 `band_cost` 的注释里）。
+///
+/// ⚠️ 由 `band_bits_matches_what_write_band_actually_writes` 对拍钉住：
+/// 这里的计数与写出端**必须**一致，否则 RD 代价模型会追着错的位数量走。
+#[allow(dead_code)] // 只服务下一刀的逐带 RD（`dist + λ·位数`，见 TODO）—— 现在还没接线
+fn band_bits(band: &[f32], sf: u8, cb: u8, qu: &[i32]) -> u32 {
+    if cb == 0 {
+        return 0;
+    }
+    let cb = cb as usize;
+    let dim = CB_DIM[cb];
+    let maxval = i32::from(CB_MAXVAL[cb]);
+    let unsigned = CB_UNSIGNED[cb];
+    let bit_tab = &tables::SPECTRAL_BITS[cb - 1];
+    let size = tables::SPECTRAL_SIZE[cb - 1] as usize;
+    let vecs = tables::CODEBOOK_VECTORS[cb - 1];
+    let q34v = q34(sf);
+    let mut bits = 0u32;
+    for (ci, chunk) in band.chunks(dim).enumerate() {
+        let q0 = ci * dim;
+        let mut q = [0i32; 4];
+        for (j, &c) in chunk.iter().enumerate() {
+            let m = qu[q0 + j].min(maxval);
+            q[j] = if unsigned || c >= 0.0 { m } else { -m };
+        }
+        let off = if unsigned { 0 } else { maxval };
+        let mut curidx = 0usize;
+        for j in 0..dim {
+            curidx = curidx * usize::from(CB_RANGE[cb]) + (q[j] + off) as usize;
+        }
+        if curidx >= size {
+            // 越界 = 这一本写不出来（穷举 sf 时大量出现）：给个「必然不优」的数，
+            // 与 `band_dist` 的 f32::MAX/2 一个套路。
+            return u32::MAX / 2;
+        }
+        bits += u32::from(bit_tab[curidx]);
+        // 无符号码本：逐维写非零系数的符号。
+        if unsigned {
+            for j in 0..dim {
+                if vecs[curidx * dim + j] != 0 {
+                    bits += 1;
+                }
+            }
+        }
+        // escape 码本：矢量里是 `64` 的那几维要写真实幅值。
+        if cb == CB_ESC {
+            for j in 0..dim {
+                if vecs[curidx * dim + j] == 64 {
+                    bits += escape_bits(escape_coef(chunk[j].abs(), q34v));
+                }
+            }
+        }
+    }
+    bits
+}
+
 /// 一个频带在**某个码本的封顶值**下的平方失真（**不算位数**）。
 ///
 /// 这是代价模型的核心：编码器按它选 `sf` 与码本，所以它必须与解码端算同一个值
@@ -2110,11 +2173,26 @@ fn write_escape(w: &mut BitWriter, coef: i32) {
         len >= 4 && len <= 12,
         "escape 的 len 必须在 4..=12（{len}）"
     );
+    debug_assert_eq!(
+        escape_bits(coef),
+        (len - 4 + 1) + len,
+        "escape 的位数只有一份真源（`escape_bits`）"
+    );
     let nbits = len - 4 + 1;
     // 长度前缀：`nbits` 位、值是 `(1 << nbits) - 2`（一串 1 带个尾零）。
     w.put((1u32 << nbits) - 2, nbits);
     // 然后是 `len` 位的有符号值。
     w.put_signed(coef, len);
+}
+
+/// escape 码要多少位：**长度前缀**（`len-4+1`）**+ 值**（`len`）。
+///
+/// 与 `write_escape` 一一对应（那边有 `debug_assert_eq!` 钉着）。代价模型要数位数时
+/// 走这里，别在别处再推一遍 —— 本仓的历史是「`band_cost` 与 `write_band` 各数一份、
+/// 结果分叉」。
+pub(crate) fn escape_bits(coef: i32) -> u32 {
+    let len = av_log2(coef);
+    (len - 4 + 1) + len
 }
 
 /// `av_log2`（`coef` 最高位的位置）。
@@ -2475,6 +2553,39 @@ mod tests {
     /// 解码端读到 0 个前导 1 会 `b += 4` 变成 4，然后去读 4 位低位，
     /// 而编码端只写了 1 位 —— 整条位流从这里开始错位。
     ///
+    #[test]
+    fn band_bits_matches_what_write_band_actually_writes() {
+        // 代价模型与写出端**必须**数同一套位数。本仓的历史教训：两边各推一份 → 分叉
+        // （代价模型追着错的位数量走，RD 就白做了）。这条用**实际写出的位流长度**当裁判。
+        let mut state = 987_654_321u32;
+        for trial in 0..48usize {
+            let len = 4 * (1 + trial % 8);
+            let mut band = vec![0f32; len];
+            for v in band.iter_mut() {
+                state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                let unit = ((state >> 16) as f32 / 32768.0) - 1.0;
+                // 幅度跨三档：普通系数 / 无符号码本 / escape（`escape_coef` 要 ≥ 16）
+                let scale = [1.0e3, 1.0e5, 1.0e7][trial % 3];
+                *v = unit * scale;
+            }
+            for sf in [60u8, 100, 140, 180, 220] {
+                let mut qu = Vec::new();
+                let (_, cb) = band_cost(&band, sf, &mut qu);
+                if cb == 0 {
+                    assert_eq!(band_bits(&band, sf, cb, &qu), 0, "全零带没有位数");
+                    continue;
+                }
+                let mut w = BitWriter::new();
+                write_band(&mut w, &band, sf, cb).expect("这一档必须写得出来");
+                assert_eq!(
+                    band_bits(&band, sf, cb, &qu) as usize,
+                    w.bit_pos(),
+                    "sf={sf} cb={cb} len={len}：计数与实际写出的位数对不上"
+                );
+            }
+        }
+    }
+
     /// 生产代码里只有 oracle 需要它：`band_dist` 不算位数（位数由 `write_band` 在写
     /// 位流时自己算），而参考实现要按老样子把位数也数一遍。
     fn escape_bits(coef: i32) -> u32 {
