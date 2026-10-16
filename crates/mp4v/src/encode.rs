@@ -240,6 +240,14 @@ struct RateCtl {
     /// 已编码帧数与累计位数（收尾时自证「有没有落在目标附近」）。
     frames: u64,
     total_bits: u64,
+    /// **上一帧**的复杂度估计 `X = 位数 × q`（因为 `bits ∝ X/q`）。
+    ///
+    /// ⚠️ 这里**故意不按帧类型分开**：分开那一版量过（见 TODO 第五轮）——
+    /// 它等于把「I 帧该花多少位」变成「跟 P 帧一样多」，反而把 I 帧量化粗了，
+    /// 285k 上 PSNR −0.40 dB。I 帧的优待要**显式**给（见 `RC_I_SHARE`），不是靠分开记。
+    x_last: Option<f64>,
+    /// 最近一次给出的 q（当「每帧最多动几档」的起点）。
+    last_q: u8,
 }
 
 /// 每帧 qscale 最多动几档 —— 防一帧跳到底。
@@ -250,9 +258,21 @@ const RC_PULL_FRAMES: f64 = 8.0;
 const RC_MIN_WANTED: f64 = 0.25;
 /// 缓冲容量 = 几帧的预算。
 const RC_BUFFER_FRAMES: f64 = 8.0;
+/// **I 帧的比特份额倍数**（`1.0` = 与 P 帧相同的每帧预算）。
+///
+/// 为什么把它拎出来当旋钮：I 帧是**参考帧**，它的质量顺着预测链传给后面每一帧，
+/// 而帧级码控只认「这一帧花了多少位」、不认「这些位后面被谁用」。
+///
+/// ⚠️ **实测 `1.0` 就是最好**（等体积插值比，数字见 TODO 第六轮）：
+/// - `0.5`（让 I 帧更粗）明显更差 —— 方向对；
+/// - `2 / 4 / 8` 画质只涨一点点，但那是靠**超码率**换的；拉到**等体积**再比，三项全输
+///   （≈ PSNR −0.27 dB、SSIM −0.007、XPSNR −0.24）。
+/// 原因：我们是 **I+P、没有 B 帧** —— 每个 P 帧同样是后面 11 帧的参考，
+/// 「I 帧特别值」的前提在这套结构里不成立。等真做了 B 帧（B 不被参考）再回来看这个旋钮。
+const RC_I_SHARE: f64 = 1.0;
 
 impl RateCtl {
-    fn new(bitrate: u32, fps: u32) -> Self {
+    fn new(bitrate: u32, fps: u32, q0: u8) -> Self {
         let target_bits = f64::from(bitrate) / f64::from(fps);
         Self {
             target_bits,
@@ -260,25 +280,37 @@ impl RateCtl {
             buffer_size: target_bits * RC_BUFFER_FRAMES,
             frames: 0,
             total_bits: 0,
+            x_last: None,
+            last_q: q0,
         }
     }
 
-    /// 记下这一帧实际花掉的位数，返回**下一帧**该用的 qscale。
-    fn next_qscale(&mut self, bits: u64, cur_q: u8) -> u8 {
+    /// 给**下一帧**（类型 `is_i`）定 q。
+    ///
+    /// `q = X_last / wanted_t`（`X = 位数 × q` ⇒ 想花 `wanted` 位就该用 `X/wanted`）。
+    /// `wanted_t` 里带一个**按帧类型的份额**：I 帧是参考帧，它多花一位比 P 帧多花一位
+    /// 「更值」（后面整条预测链都吃它的质量）—— 这是「传播价值」的最便宜近似。
+    fn q_for(&mut self, is_i: bool) -> u8 {
+        let wanted = (self.target_bits - self.buffer / RC_PULL_FRAMES)
+            .clamp(self.target_bits * RC_MIN_WANTED, self.target_bits * 4.0);
+        let wanted = if is_i { wanted * RC_I_SHARE } else { wanted };
+        let want_q = match self.x_last {
+            Some(x) => x / wanted,
+            None => f64::from(self.last_q),
+        };
+        let step = (want_q - f64::from(self.last_q)).clamp(-RC_MAX_STEP, RC_MAX_STEP);
+        self.last_q = (f64::from(self.last_q) + step).round().clamp(1.0, QSCALE_MAX as f64) as u8;
+        self.last_q
+    }
+
+    /// 编完一帧：记账（缓冲 + 这一帧的复杂度）。
+    fn note_bits(&mut self, bits: u64, q: u8) {
         let bits = bits as f64;
         self.frames += 1;
         self.total_bits += bits as u64;
         self.buffer =
             (self.buffer + bits - self.target_bits).clamp(-self.buffer_size, self.buffer_size);
-
-        // 「下一帧该花多少位」：目标，再按缓冲偏差纠一点（不是一帧纠完）。
-        let wanted = (self.target_bits - self.buffer / RC_PULL_FRAMES)
-            .clamp(self.target_bits * RC_MIN_WANTED, self.target_bits * 4.0);
-
-        // bits 大致与 q 成反比 → 想让下一帧花 `wanted` 位，q 就乘 `bits / wanted`。
-        let want_q = f64::from(cur_q) * bits / wanted;
-        let step = (want_q - f64::from(cur_q)).clamp(-RC_MAX_STEP, RC_MAX_STEP);
-        (f64::from(cur_q) + step).round().clamp(1.0, f64::from(QSCALE_MAX)) as u8
+        self.x_last = Some(bits * f64::from(q));
     }
 }
 
@@ -311,7 +343,7 @@ impl Encoder {
             last_key_frame: false,
             intra_mbs_last: 0,
             cur_qscale: cfg.qscale,
-            rc: cfg.bitrate.map(|b| RateCtl::new(b, cfg.fps_num)),
+            rc: cfg.bitrate.map(|b| RateCtl::new(b, cfg.fps_num, cfg.qscale)),
             mv_prev: Vec::new(),
             cfg,
         })
@@ -415,7 +447,7 @@ impl Encoder {
         let (pw, ph) = (mb_w * 16, mb_h * 16);
         let (py, pu, pv) = pad_planes(frame, pw, ph);
 
-        let qscale = self.cur_qscale;
+        let qscale = self.take_qscale(true);
         let quant = Quant::new(qscale, self.cfg.mpeg_quant);
         let y_dc_scale = i32::from(tables::Y_DC_SCALE[qscale as usize]);
         let c_dc_scale = i32::from(tables::C_DC_SCALE[qscale as usize]);
@@ -497,7 +529,7 @@ impl Encoder {
 
         self.intra_mbs_last = mb_w * mb_h;
         self.reference = Some(cur);
-        Ok(self.note_frame(w.finish()))
+        Ok(self.note_frame(w.finish(), qscale))
     }
 
     /// 编一个 **P 帧**（只含 VOP 头 + 宏块）。
@@ -517,7 +549,7 @@ impl Encoder {
         let (pw, ph) = (mb_w * 16, mb_h * 16);
         let (sy, su, sv) = pad_planes(frame, pw, ph);
 
-        let qscale = self.cur_qscale;
+        let qscale = self.take_qscale(false);
         let quant = Quant::new(qscale, self.cfg.mpeg_quant);
         let y_dc_scale = i32::from(tables::Y_DC_SCALE[qscale as usize]);
         let c_dc_scale = i32::from(tables::C_DC_SCALE[qscale as usize]);
@@ -580,16 +612,24 @@ impl Encoder {
         self.reference = Some(st.cur);
         // 本帧的 MV 场留给下一帧当**时间预测**的起点。
         self.mv_prev = std::mem::take(&mut st.mv);
-        Ok(self.note_frame(w.finish()))
+        Ok(self.note_frame(w.finish(), qscale))
     }
 
-    /// 收下一个编好的帧：把位数报给码率控制器，并定下一帧的 qscale。
+    /// 本帧该用哪个 q：开码控时问控制器（要按本帧类型给份额），关着就用固定值。
+    fn take_qscale(&mut self, is_i: bool) -> u8 {
+        if let Some(rc) = self.rc.as_mut() {
+            self.cur_qscale = rc.q_for(is_i);
+        }
+        self.cur_qscale
+    }
+
+    /// 收下一个编好的帧：记账（位数 + 复杂度）。
     ///
     /// 关着码率控制时是个**直通**（原样返回），所以调用点不必分支。
-    fn note_frame(&mut self, bytes: Vec<u8>) -> Vec<u8> {
+    fn note_frame(&mut self, bytes: Vec<u8>, q: u8) -> Vec<u8> {
         if let Some(rc) = self.rc.as_mut() {
             // `* 8`：按位算 —— 预算本来就是位。
-            self.cur_qscale = rc.next_qscale(bytes.len() as u64 * 8, self.cur_qscale);
+            rc.note_bits(bytes.len() as u64 * 8, q);
         }
         bytes
     }
