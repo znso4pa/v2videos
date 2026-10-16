@@ -29,10 +29,12 @@ python3 tools/snr.py ours.pcm clean.pcm --per-channel
 
 - 输入是 **s16le 交织**（`ffmpeg -f s16le` 的格式），`--rate` / `--channels` 必须和它一致。
 - 两端各留 `--margin`（默认 20000）个样本不算 —— 编码器延迟与收尾渐变段不属于编码质量。
-- **不要拿 `-n` 截过的产物比**：音频截断会让两边对不上位置。
+- **不要拿 `-n` 截过的产物比**：音频截断会让两边对不上位置。要比短一点，
+  就先把**同一份**干净 PCM 切好再喂给两个编码器（两边拿到的是同一段）。
 - 报的数：**全局 SNR**（所有声道所有采样点一起算）、以及逐帧（1024 点）的
   **最差 / 中位**（均值会被少数极差帧主导，逐帧看才看得见）。
-- 纯 Python 也能跑；有 numpy 时快很多，结果一致。
+
+有 numpy 时用向量化切片算，没有就退回纯 Python（结果一样，慢）。
 
 退出码：0 正常；1 参数/读文件出错。
 """
@@ -54,6 +56,8 @@ def load(path, channels):
         a = _np.fromfile(path, dtype="<i2").astype(_np.float64)
         if a.size == 0:
             sys.exit(f"{path} 读不出样本")
+        if a.size % channels:
+            sys.exit(f"{path} 的样本数不是声道数的整数倍 —— --channels 对吗？")
         return a.reshape(-1, channels)
     # pragma: no cover - 纯 Python 兜底
     import array
@@ -67,70 +71,83 @@ def load(path, channels):
     return [[float(a[r * channels + c]) for c in range(channels)] for r in range(rows)]
 
 
-def snr_db(se, sp):
+def ssd(cur, ref, sh, lo, hi, step, ch=None):
+    """`Σ(cur[i+sh] − ref[i])²` 与 `Σ ref[i]²`，i 取 lo..hi 里每隔 step 个。
+
+    只此一处「怎么算」，两种实现（numpy 切片 / 纯 Python 循环）——
+    算法不复制第二份。`ch` 给定时只看那个声道。
+    """
+    hi = min(hi, len(ref), len(cur) - sh)
+    if hi <= lo:
+        return 0.0, 0.0, 0
+    if _np is not None:
+        c = slice(lo + sh, hi + sh, step)
+        r = slice(lo, hi, step)
+        a = cur[c] if ch is None else cur[c, ch]
+        b = ref[r] if ch is None else ref[r, ch]
+        d = a - b
+        return float((d * d).sum()), float((b * b).sum()), b.size
+    se = sp = 0.0
+    cnt = 0
+    for i in range(lo, hi, step):
+        a = cur[i + sh]
+        b = ref[i]
+        if ch is None:
+            cols = range(len(b))
+        else:
+            cols = (ch,)
+        for j in cols:
+            d = a[j] - b[j]
+            se += d * d
+            sp += b[j] * b[j]
+            cnt += 1
+    return se, sp, cnt
+
+
+def snr_db(se, sp, n):
+    if n == 0:
+        return float("nan")
     if se <= 0:
         return float("inf")
     if sp <= 0:
         return float("-inf")
-    return 10.0 * math.log10(sp / se)
+    return 10.0 * math.log10((sp / n) / (se / n))
 
 
-def aligned(got, src, margin, max_shift):
-    """搜「`got[i+sh] ≈ src[i]`」的最优 sh（双向）。返回 (sh, se, sp, n)。"""
-    nf = len(src)
-    ns = len(got)
+def aligned(cur, ref, margin, max_shift):
+    """搜「`cur[i+sh] ≈ ref[i]`」的最优 sh（**双向**粗搜 → 逐样本细化）。
 
-    def at(sh, step):
-        # 两端各留 margin；对 i 按 step 抽样
-        hi = min(ns - sh, nf)
-        if hi <= 2 * margin:
-            return (float("inf"), 0.0, 0, 0)
-        se = sp = 0.0
-        cnt = 0
-        for i in range(margin, hi - margin, step):
-            g = got[i + sh]
-            s = src[i]
-            for c in range(len(s)):
-                d = g[c] - s[c]
-                se += d * d
-                sp += s[c] * s[c]
-            cnt += 1
-        return (se / max(cnt, 1), se, sp, cnt)
+    返回 (sh, se, sp, n)。最优点贴在 `±max_shift` 上要当心（调用方会警告）。
+    """
+    def mse(sh, step):
+        se, _, n = ssd(cur, ref, sh, margin, len(ref) - margin, step)
+        return se / max(n, 1)
 
     best = (float("inf"), 0)
     for sh in range(-max_shift, max_shift + 1, 32):
-        v = at(sh, 7)[0]
+        v = mse(sh, 7)
         if v < best[0]:
             best = (v, sh)
     coarse = best[1]
     for sh in range(coarse - 32, coarse + 33):
-        if sh < -max_shift or sh > max_shift:
-            continue
-        v = at(sh, 2)[0]
-        if v < best[0]:
-            best = (v, sh)
+        if -max_shift <= sh <= max_shift:
+            v = mse(sh, 2)
+            if v < best[0]:
+                best = (v, sh)
     sh = best[1]
-    _, se, sp, cnt = at(sh, 1)
-    return sh, se, sp, cnt * len(src[0])
+    se, sp, n = ssd(cur, ref, sh, margin, len(ref) - margin, 1)
+    return sh, se, sp, n
 
 
-def per_frame(got, src, sh, margin):
-    """逐帧（1024 点）SNR 的 (最差, 中位)。"""
-    nf, ns = len(src), len(got)
-    hi = min(ns - sh, nf)
+def per_frame(cur, ref, sh, margin):
+    """逐帧（`FRAME` 点）SNR 的 (最差, 中位)。"""
     vals = []
     i = margin
-    while i + FRAME + margin < hi:
-        se = sp = 0.0
-        for k in range(i, i + FRAME):
-            s = src[k]
-            g = got[k + sh]
-            for c in range(len(s)):
-                d = g[c] - s[c]
-                se += d * d
-                sp += s[c] * s[c]
+    hi = min(len(ref), len(cur) - sh) - margin
+    while i + FRAME < hi:
+        se, sp, n = ssd(cur, ref, sh, i, i + FRAME, 1)
         if sp > 1.0:
-            vals.append(snr_db(se, sp))
+            vals.append(snr_db(se, sp, n))
         i += FRAME
     vals.sort()
     if not vals:
@@ -149,34 +166,29 @@ def main():
     ap.add_argument("--per-channel", action="store_true", help="再报每声道")
     args = ap.parse_args()
 
-    got = load(args.current, args.channels)
-    src = load(args.reference, args.channels)
+    cur = load(args.current, args.channels)
+    ref = load(args.reference, args.channels)
     print(
-        f"{args.rate} Hz / {args.channels} 声道：current {len(got)} 点（{len(got)/args.rate:.2f} s）"
-        f" / reference {len(src)} 点（{len(src)/args.rate:.2f} s）"
+        f"{args.rate} Hz / {args.channels} 声道：current {len(cur)} 点（{len(cur)/args.rate:.2f} s）"
+        f" / reference {len(ref)} 点（{len(ref)/args.rate:.2f} s）"
     )
 
-    sh, se, sp, n = aligned(got, src, args.margin, args.max_shift)
-    at_edge = abs(sh) >= args.max_shift - 32
-    print(f"\n对齐偏移：current 的样本 i+{sh} ≈ reference 的样本 i" + ("（0）" if sh == 0 else ""))
-    if at_edge:
+    sh, se, sp, n = aligned(cur, ref, args.margin, args.max_shift)
+    print(f"\n对齐偏移：current 的样本 i+{sh} ≈ reference 的样本 i")
+    if abs(sh) >= args.max_shift - 32:
         print(f"  ⚠️ 最优点贴在搜索窗口边界（|{sh}| ≥ {args.max_shift - 32}）—— 真实偏移可能在窗外，")
         print(f"     加大 --max-shift 再量；现在的 SNR 不可信。")
-    print(f"全局 SNR = {snr_db(se, sp):.2f} dB（{n} 个采样点，两端各丢 {args.margin}）")
+    if n == 0:
+        sys.exit("可比区间是空的 —— 文件太短或 --margin 太大")
+    print(f"全局 SNR = {snr_db(se, sp, n):.2f} dB（{n} 个采样点，两端各丢 {args.margin}）")
 
-    worst, med = per_frame(got, src, sh, args.margin)
+    worst, med = per_frame(cur, ref, sh, args.margin)
     print(f"逐帧（{FRAME} 点）：最差 {worst:.2f} dB / 中位 {med:.2f} dB")
 
     if args.per_channel:
         for c in range(args.channels):
-            se = sp = 0.0
-            hi = min(len(got) - sh, len(src))
-            for i in range(args.margin, hi - args.margin):
-                s = src[i][c]
-                d = got[i + sh][c] - s
-                se += d * d
-                sp += s * s
-            print(f"  声道 {c}：{snr_db(se, sp):.2f} dB")
+            se, sp, n = ssd(cur, ref, sh, args.margin, len(ref) - args.margin, 1, ch=c)
+            print(f"  声道 {c}：{snr_db(se, sp, n):.2f} dB")
 
 
 if __name__ == "__main__":
