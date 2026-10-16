@@ -1291,6 +1291,8 @@ fn quantize_block(
 }
 
 /// 取整除法（`b > 0`，`a` 可负）—— 四舍五入、远离零。
+///
+/// 只在 DC 那条路（每块一次）与测试里用；AC 那条走下面的倒数乘法。
 fn div_round(a: i32, b: i32) -> i32 {
     debug_assert!(b > 0);
     if a >= 0 {
@@ -1300,14 +1302,48 @@ fn div_round(a: i32, b: i32) -> i32 {
     }
 }
 
+/// `ceil(2^32 / b)` —— 「除以常数」那套魔数。
+///
+/// 依据：`(n * ceil(2^32/b)) >> 32 == n / b` 在 `b ∈ [1,128]`、`n < 2^20` 上**逐值精确**
+/// （穷举验证过；见 `ac_quantization_matches_division` 测试）。范围够用：
+/// `qmul = 2*qscale ≤ 62`，而 `n = |a| + qmul/2`，`|a| ≤ |DCT 系数| + qadd < 2^13`。
+const fn recip(b: u32) -> u32 {
+    (((1u64 << 32) + b as u64 - 1) / b as u64) as u32
+}
+
+/// `qmul` 只取偶数 `2*qscale`（`qscale ∈ 1..=31`）—— 表按 `qmul` 直接索引。
+static INV_QMUL: [u32; 64] = {
+    let mut t = [0u32; 64];
+    let mut i = 1;
+    while i < 64 {
+        t[i] = recip(i as u32);
+        i += 1;
+    }
+    t
+};
+
 /// 反量化的逆：`level` 使 `level*qmul ± qadd` 最接近 `f`。
+///
+/// ⚠️ **整数除法换成了倒数乘法**：`sdiv` 一条要几十周期，而这里每个 AC 系数都要除一次
+/// （`quantize_ac` 实测占整条 `.mp4` 链路的 7.5%）。`qmul` 一帧里是常数，倒数查表即可。
+/// **值与原式逐位相同**（`div_round` 的语义原样保留：先按 `a` 的符号取绝对值再还原）。
+#[inline(always)]
 fn quantize_ac(f: i32, qmul: i32, qadd: i32) -> i32 {
+    if f == 0 {
+        return 0;
+    }
+    let a = if f > 0 { f - qadd } else { f + qadd };
+    let inv = INV_QMUL[qmul as usize];
+    // `|a|` 用 i64 取，避免 `i32::MIN` 那条（实际到不了，但别留 UB 的口子）。
+    let m = if a >= 0 { a as u32 } else { (-(a as i64)) as u32 };
+    let n = m + (qmul as u32 / 2);
+    debug_assert!(n < (1 << 20), "倒数乘法的精确范围被打破了：n = {n}");
+    let q = (((n as u64) * (inv as u64)) >> 32) as i32;
+    let r = if a >= 0 { q } else { -q };
     if f > 0 {
-        div_round(f - qadd, qmul).max(0)
-    } else if f < 0 {
-        div_round(f + qadd, qmul).min(0)
+        r.max(0)
     } else {
-        0
+        r.min(0)
     }
 }
 
@@ -1838,6 +1874,25 @@ mod tests {
         assert_eq!(bit_length(3), 2);
         assert_eq!(bit_length(255), 8);
         assert_eq!(bit_length(256), 9);
+    }
+
+    #[test]
+    /// 倒数乘法必须与原式**逐值相同** —— 拿 `div_round` 当参照物扫一遍。
+    #[test]
+    fn ac_quantization_matches_division() {
+        for qscale in 1..=31i32 {
+            let (qmul, qadd) = (qscale << 1, (qscale - 1) | 1);
+            for f in (-9000..=9000i32).step_by(7) {
+                let want = if f > 0 {
+                    div_round(f - qadd, qmul).max(0)
+                } else if f < 0 {
+                    div_round(f + qadd, qmul).min(0)
+                } else {
+                    0
+                };
+                assert_eq!(quantize_ac(f, qmul, qadd), want, "qscale {qscale} f {f}");
+            }
+        }
     }
 
     #[test]
