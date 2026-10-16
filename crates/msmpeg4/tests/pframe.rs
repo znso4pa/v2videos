@@ -254,7 +254,14 @@ fn every_frame_of_the_whole_sample_matches_ffmpeg() {
         }
     };
 
-    let mut dec = Decoder::new();
+    let (version, extra) = match common::version_and_extra(&path) {
+        Some(v) => v,
+        None => {
+            eprintln!("SKIP: 认不出样本视频轨的 FourCC");
+            return;
+        }
+    };
+    let mut dec = common::decoder_for(version, &extra).expect("造解码器");
     let mut refbuf: Vec<u8> = Vec::new();
     let mut failures: Vec<(usize, i32, f64)> = Vec::new();
     let mut worst_overall = 0i32;
@@ -319,7 +326,25 @@ fn every_frame_of_the_whole_sample_matches_ffmpeg() {
         // 「我们和 ffmpeg 的帧数一致」这件事由 `extra == 0` 覆盖（上面已经数过 ffmpeg 那边
         // 还剩几帧）。**不要**在这里写死样本的帧数 —— 那是「从某个样本量出来的数字」，
         // 等于把夹具出处写进公开历史，而且换个样本就会红。
-        assert_eq!(extra, 0, "ffmpeg 比我们多 {extra} 帧 —— 解封装漏帧了");
+        //
+        // ⚠️ 例外：**截断的样本**（头里声明的大小 > 实际字节数）会少一个残缺尾包 ——
+        // 那是设计行为（不完整的包直接丢），ffmpeg 却会把那一帧也吐出来。这时只放宽
+        // **帧数**这一条：上面 767 帧的逐帧比对仍然是硬判据（实测最大差 0）。
+        // 别让它把设计行为报成「解封装漏帧」—— 那会把人引去查解封装。
+        let truncated = common::declared_file_size(&path)
+            .zip(std::fs::metadata(&path).ok().map(|m| m.len()))
+            .is_some_and(|(declared, actual)| declared > actual);
+        if truncated {
+            eprintln!(
+                "⚠️ 样本被截断：ffmpeg 多出 {extra} 帧（残缺尾包按设计丢）—— 逐帧比对仍然全对"
+            );
+            assert!(
+                extra <= 1,
+                "截断样本最多只该少 1 个尾包，ffmpeg 多出 {extra} 帧 —— 解封装漏帧了"
+            );
+        } else {
+            assert_eq!(extra, 0, "ffmpeg 比我们多 {extra} 帧 —— 解封装漏帧了");
+        }
     }
 
     // ---- 通路覆盖 ----
@@ -404,6 +429,17 @@ fn never_panics_on_truncated_or_garbage_frames() {
         return;
     }
 
+    // 解码器按**版本**造（版本来自容器）—— 用 `Decoder::new()` 那条默认路径去解
+    // WMV1 / WMV2 的样本，首帧就会以「ac coefficient overflow」之类失败，
+    // 而那句 `.expect("首帧应当解得出来")` 会把**版本没对上**报成解码器 bug。
+    let (version, extra) = match common::version_and_extra(&path) {
+        Some(v) => v,
+        None => {
+            eprintln!("SKIP: 认不出样本视频轨的 FourCC");
+            return;
+        }
+    };
+
     let mut seed = 0xC0FFEEu32;
     let mut rnd = move || {
         seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
@@ -413,7 +449,7 @@ fn never_panics_on_truncated_or_garbage_frames() {
     // 每个破坏样本都从一个干净的解码器开始（各自先解一帧真 I 帧拿到参考帧），
     // 免得前面一帧的垃圾状态影响后面 —— 我们要测的是「不 panic」，不是错误传播。
     for k in 0..120usize {
-        let mut dec = Decoder::new();
+        let mut dec = common::decoder_for(version, &extra).expect("造解码器");
         dec.decode(&samples[0], w, h).expect("首帧应当解得出来");
 
         // ① 截断到各种长度

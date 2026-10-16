@@ -21,10 +21,11 @@
 //! - ✅ Huffman 编码（码本选择 + escape）
 //! - ✅ ICS / SCE / CPE 语法 + AudioSpecificConfig
 //! - ✅ 短窗（`EIGHT_SHORT_SEQUENCE`，瞬态）+ 窗口分组（3GPP TS26.403 5.4.1）
-//! - ⏳ `LONG_START` / `LONG_STOP` 过渡窗（现在长短直接跳变；实测按规范形状构造
-//!   反而更差 —— 见 `TODO.md`，窗形状要按解码端 `saved` 的更新规则重新推）
-//! - ⏳ TNS / PNS / IS / MS / LTP
-//! - ✅ 心理声学模型（掩蔽阈值，`masking_thresholds`）
+//!   + `LONG_START` / `LONG_STOP` 过渡窗（状态机见 `plan_seq`、开窗表见 `mdct`）
+//! - ✅ 逐带率-失真分配（每带按 `失真 + λ·位数` 选 sf / 码本，λ 从上一帧的答案出发搜）
+//! - ⏳ PNS / IS / LTP
+//! - ⏳ 心理声学模型（`masking_thresholds` 算好了但**没接线** —— 两套接法
+//!   （线性加权 / 阈值饱和）实测都是净亏、已撤，见 `encode.rs` 与 `TODO.md`）
 //!
 //! ## 窄路径的选择
 //!

@@ -11,8 +11,23 @@ mod common;
 
 use common::{compare, ffmpeg_frames, first_video_frames, sample, unique_temp, wrap_single_frame_avi};
 use v2v_msmpeg4::{
-    decode_i_frame, parse_frame_header, Encoder, EncoderConfig, Frame, PictureType,
+    decode_i_frame, parse_frame_header, parse_wmv2_frame, Decoder, Encoder, EncoderConfig, Frame,
+    HeaderState, PictureType, Version, Wmv2Flags, Wmv2Frame,
 };
+
+/// 按**版本**解一帧原始 I 帧（只用来给编码器当输入）。
+///
+/// ⚠️ 不能用 `decode_i_frame`（那是 V3 专用）：拿它解 WMV1 / WMV2 的样本只会得到
+/// 「一帧都没验到」这种**指错方向**的失败 —— 看起来像解码器坏了，其实是版本没对上。
+fn decode_one_i_frame(bytes: &[u8], w: u32, h: u32, version: Version, extra: &[u8]) -> Option<Frame> {
+    let mut dec = if version == Version::Wmv2 {
+        // WMV2 的能力位在容器的 extradata 里。
+        Decoder::with_wmv2(extra).ok()?
+    } else {
+        Decoder::with_version(version)
+    };
+    dec.decode(bytes, w, h).ok()
+}
 
 /// Y 平面里出现了多少种不同的值（用来跳过纯色帧 —— 它测不到什么）。
 fn distinct_levels(y: &[u8]) -> usize {
@@ -82,19 +97,51 @@ fn encodes_i_frames_both_decoders_agree_on() {
             return;
         }
     };
+    // 按容器的 FourCC 选版本 —— 帧头与系数解码都按版本分叉。这条对账验的是
+    // **我们编出来的 MP43 流**，但**输入帧**来自样本，WMV1 / WMV2 的样本一样能用
+    // （只要用对版本去解）。认不出就跳过，别把「没实现」伪装成「对不上」。
+    let version = match common::video_fourcc(&path).and_then(|(_, _, fc)| Version::from_fourcc(fc)) {
+        Some(v) => v,
+        None => {
+            let name = common::video_fourcc(&path)
+                .map(|(_, _, fc)| v2v_asf::fourcc_string(fc))
+                .unwrap_or_else(|| "?".into());
+            eprintln!("SKIP: 视频是 {name}，不是 MS-MPEG-4 家族（本对账只覆盖 MP41/42/43 + WMV1/2）");
+            return;
+        }
+    };
+    let extra = common::video_extra(&path).unwrap_or_default();
+    // WMV2 的帧头有**自己的**解析器（能力位在 extradata 里、位流布局也不同）——
+    // 拿 `parse_frame_header` 去解它只会得到「qscale == 0 / invalid picture type」
+    // 这种**指错方向**的失败。按版本选解析器，这条对账只问一件事：这帧是不是 I 帧。
+    let wmv2_flags = match version {
+        Version::Wmv2 => match Wmv2Flags::from_extradata(&extra) {
+            Ok(f) => Some(f),
+            Err(_) => {
+                eprintln!("SKIP: WMV2 的能力位读不出来（容器 extradata 太短？）");
+                return;
+            }
+        },
+        _ => None,
+    };
     let (mw, mh) = (w.div_ceil(16), h.div_ceil(16));
 
     let mut checked = 0usize;
     for (idx, bytes) in samples.iter().enumerate() {
-        let Ok((hdr, _)) =
-            parse_frame_header(bytes, mw, mh, v2v_msmpeg4::Version::V3, &mut Default::default())
-        else {
-            continue;
+        let is_i = match &wmv2_flags {
+            Some(f) => matches!(
+                parse_wmv2_frame(bytes, mw, mh, f, false),
+                Ok((Wmv2Frame::Frame(h), _)) if h.picture_type == PictureType::I
+            ),
+            None => matches!(
+                parse_frame_header(bytes, mw, mh, version, &mut HeaderState::default()),
+                Ok((h, _)) if h.picture_type == PictureType::I
+            ),
         };
-        if hdr.picture_type != PictureType::I {
+        if !is_i {
             continue;
         }
-        let Ok(orig) = decode_i_frame(bytes, w, h) else {
+        let Some(orig) = decode_one_i_frame(bytes, w, h, version, &extra) else {
             continue;
         };
         if distinct_levels(&orig.y) <= 64 {
@@ -124,7 +171,11 @@ fn encodes_i_frames_both_decoders_agree_on() {
             break;
         }
     }
-    assert!(checked > 0, "一帧都没验到（样本里没有有内容的 I 帧？）");
+    assert!(
+        checked > 0,
+        "一帧都没验到：样本里没有「有内容的 I 帧」—— 这条只验 MP43 流，但输入帧可以来自 \
+         MP41/42/43 或 WMV1/2 的样本；先确认样本的 FourCC 认得出、且头几帧里有 I 帧"
+    );
     eprintln!("共验了 {checked} 个（帧 × qscale）组合");
 }
 

@@ -108,14 +108,16 @@ pub const CB_RANGE: [u8; 12] = [0, 3, 3, 3, 3, 9, 9, 8, 8, 13, 13, 17];
 /// 只有第 11 本是 escape 码本（`ESC_BT`）。
 const CB_ESC: usize = 11;
 
-/// `sf_offset` 的搜索上界（含）。
-///
-/// 够粗了：偏移每 +4 让量化精度翻一倍，+120 相当于把每带的 sf 抬到几乎全零带；
-/// 再往上位数不再降（全零带的位数是常数）。
-const MAX_SF_OFFSET: i32 = 120;
+/// λ 的指数搜索上界，**单位是 1/8**：`λ = 2^(k/8)`，`k ∈ [0, 208]`。
+const MAX_LAMBDA_K8: i32 = 280;
+/// λ 指数搜索的初始种子（`2^(96/8) = 2^12 ≈ 4e3`）。
+const LAMBDA_K8_SEED_INIT: i32 = 160;
+/// `λ = 2^(k/8)`（`k` 是 1/8 为单位的整数指数）。
+fn lambda_of(k8: i32) -> f32 {
+    (2.0f32).powf(k8 as f32 / 8.0)
+}
 
 /// 第一帧（还没有上一帧的答案）的搜索种子 —— 取区间中点。
-const SF_OFFSET_SEED_INIT: i32 = MAX_SF_OFFSET / 2;
 
 /// 编码配置。
 #[derive(Debug, Clone, Copy)]
@@ -150,7 +152,7 @@ pub struct EncoderConfig {
     /// 2. **声道并行**（`encode_frame` / 帧并行内部）—— 双声道时两个声道各占一个
     ///    线程，**输出逐字节相同**。
     ///
-    /// 帧并行的输出**不是**逐字节相同（原因见 `encode_frames` 的说明：`sf_offset`
+    /// 帧并行的输出**不是**逐字节相同（原因见 `encode_frames` 的说明：`lambda`
     /// 是近似搜索的锚点）。两条路径的线程数都**封顶到可用并行度** ——
     /// 单声道给多少都是 1、一批 4 帧给 8 个线程也只起 4 个。
     ///
@@ -328,7 +330,7 @@ impl WindowPlan {
 ///
 /// `cost_cache` 只影响**速度**（它本来就是帧内缓存，每帧开头 `reset`）。
 ///
-/// ⚠️ `sf_offset_prev` 则**也影响结果**：偏移搜索是近似搜索、锚在这个种子上
+/// ⚠️ `lambda_k8_prev` 则**也影响结果**：偏移搜索是近似搜索、锚在这个种子上
 /// （详见字段自身的说明）。所以 `to_chans` 把它设成固定初值 = 批量路径**每帧都
 /// 从冷种子开始**，既丢掉了热启动、也让结果与逐帧路径差一点点。
 /// 要「逐字节相同」就得让搜索与种子无关 —— 那是另一件事，现在没做。
@@ -366,7 +368,7 @@ impl FrameState {
                 attack_prev: *atk,
                 window_seq_prev: self.window_seq_prev,
                 cost_cache: BandCostCache::new(),
-                sf_offset_prev: SF_OFFSET_SEED_INIT,
+                lambda_k8_prev: LAMBDA_K8_SEED_INIT,
             })
             .collect()
     }
@@ -447,8 +449,10 @@ const MS_MARGIN: f64 = 0.98;
 /// 内存：每带 `256 × (f32,u8)` = 2 KB；长窗约 50 条带 → 100 KB，短窗最多 8 组
 /// 共 ~112 条带 → 约 230 KB。**挂在声道状态上跨帧复用，不随帧增长。**
 struct BandCostCache {
-    /// `tables[组][带][sf] = (代价, 码本)`；码本为 `NO_CB` = 还没算过。
-    tables: Vec<Vec<Vec<(f32, u8)>>>,
+    /// `tables[组][带][sf] = (失真, 码本, 位数)`；码本为 `NO_CB` = 还没算过。
+    ///
+    /// 位数与 λ 无关，所以同一个 `(带, sf)` 在**所有** λ 取值下都能复用（二分 λ 时这是关键）。
+    tables: Vec<Vec<Vec<(f32, u8, u32)>>>,
     /// `band_cost` 用的量化 scratch（不封顶的 `q`）—— 挂在这里**零额外分配**：
     /// 一条带最多 ~80 个系数，容量涨一次就不再动。
     q_scratch: Vec<i32>,
@@ -456,6 +460,7 @@ struct BandCostCache {
 
 /// 「这一格还没算过」的哨兵 —— 真码本只到 11，所以 `0xFF` 安全。
 const NO_CB: u8 = 0xFF;
+
 
 impl BandCostCache {
     fn new() -> Self {
@@ -472,7 +477,7 @@ impl BandCostCache {
             let t = &mut self.tables[g];
             t.resize_with(n, Vec::new);
             for band in t.iter_mut() {
-                band.resize(256, (0.0, NO_CB));
+                band.resize(256, (0.0, NO_CB, 0));
                 for e in band.iter_mut() {
                     e.1 = NO_CB;
                 }
@@ -481,13 +486,13 @@ impl BandCostCache {
     }
 
     #[inline]
-    fn get(&self, g: usize, b: usize, sf: u8) -> Option<(f32, u8)> {
+    fn get(&self, g: usize, b: usize, sf: u8) -> Option<(f32, u8, u32)> {
         let e = *self.tables.get(g)?.get(b)?.get(sf as usize)?;
         (e.1 != NO_CB).then_some(e)
     }
 
     #[inline]
-    fn put(&mut self, g: usize, b: usize, sf: u8, v: (f32, u8)) {
+    fn put(&mut self, g: usize, b: usize, sf: u8, v: (f32, u8, u32)) {
         if let Some(e) = self
             .tables
             .get_mut(g)
@@ -525,7 +530,7 @@ struct ChannelState {
     window_seq_prev: WindowSequence,
     /// `band_cost` 的帧内缓存（见 `BandCostCache`）。
     cost_cache: BandCostCache,
-    /// **上一帧选中的 `sf_offset`** —— 下一帧搜偏移时的**种子**。
+    /// **上一帧选中的 `lambda`** —— 下一帧搜偏移时的**种子**。
     ///
     /// 相邻帧的谱形状是连续的，所以上一帧的答案是很好的出发点：从它出发做
     /// 指数搜索，绝大多数帧 2–4 趟就收敛（固定区间二分恒 7 趟）。
@@ -534,7 +539,7 @@ struct ChannelState {
     /// 锚在这个偏移上，所以换种子会落到不同的格点、给出**略微不同**的码率分配
     /// （不是「同一个答案」—— 早期这里写错过，实测真音乐 350 帧里 2 帧差
     /// 14 字节）。改这里要知道自己在动**结果**，不只是动速度。
-    sf_offset_prev: i32,
+    lambda_k8_prev: i32,
 }
 
 pub struct Encoder {
@@ -617,7 +622,7 @@ impl Encoder {
                     attack_prev: None,
                     window_seq_prev: WindowSequence::OnlyLong,
                     cost_cache: BandCostCache::new(),
-                    sf_offset_prev: SF_OFFSET_SEED_INIT,
+                    lambda_k8_prev: LAMBDA_K8_SEED_INIT,
                 })
                 .collect(),
             window,
@@ -762,7 +767,7 @@ impl Encoder {
     /// 要看上一帧实际发的序列。其余状态都不是障碍：`cost_cache` 本来就是帧内
     /// 缓存、重叠历史就是**上一帧的 coded 样本**（可以直接算出来）。
     ///
-    /// ⚠️ `sf_offset_prev` 看着也像「只影响从哪儿开始探」，其实**不是**：
+    /// ⚠️ `lambda_k8_prev` 看着也像「只影响从哪儿开始探」，其实**不是**：
     /// `plan_group` 的三级细化（12→3→1）是**近似搜索**、锚在「上一帧留下的偏移」
     /// 上，换锚点就会落到不同的格点。批内每帧的锚由预扫铺好，所以**同一批里**
     /// 批量与逐帧一致；跨批（或与单帧 `encode_frame` 混用）时锚不一样，
@@ -819,11 +824,11 @@ impl Encoder {
                 handles.push(scope.spawn(move || -> crate::Result<Vec<(usize, Vec<u8>, bool)>> {
                     let mut v = Vec::with_capacity(part.len());
                     // ⚠️ **一份 `ChannelState` 在块内复用**（不是每帧一份）：
-                    // `apply_to` 只覆盖那四项语义状态，**保留 `sf_offset_prev` 与
+                    // `apply_to` 只覆盖那四项语义状态，**保留 `lambda_k8_prev` 与
                     // `cost_cache`** —— 于是块内第 2 帧起就拿到了上一帧的搜索种子。
                     //
                     // 这不是微调：种子决定偏移搜索的**起点**，冷启动（`to_chans`）
-                    // 时指数搜索要从 `SF_OFFSET_SEED_INIT` 一路探到真值（实测 6–8 趟），
+                    // 时指数搜索要从 `LAMBDA_K8_SEED_INIT` 一路探到真值（实测 6–8 趟），
                     // 而热启动只要 2–4 趟；每多一趟就多扫一遍全帧的带（`plan_group`），
                     // 那是整个链路最大的单项开销。块首帧仍是冷启动 —— 所以**块要长**。
                     let mut chans = states[base].to_chans();
@@ -864,7 +869,7 @@ impl Encoder {
     /// （多个线程可以同时调它，见 `encode_frames`）。
     ///
     /// `chans` 里只有四项影响输出：`overlap` / `overlap_ms` / `attack_prev` /
-    /// `window_seq_prev`（见 `FrameState`）；`cost_cache` 与 `sf_offset_prev`
+    /// `window_seq_prev`（见 `FrameState`）；`cost_cache` 与 `lambda_k8_prev`
     /// 只影响速度。返回 `(位流, 本帧是不是短窗)`。
     fn encode_frame_inner(
         &self,
@@ -1049,7 +1054,7 @@ impl Encoder {
         spec: &'a [f32],
         swb: &'a [u16],
         sf_floor: i32,
-        sf_offset: i32,
+        lambda: f32,
         prev_sf: &mut Option<i32>,
     ) -> GroupPlan<'a> {
         let max_sfb = swb.len() - 1;
@@ -1069,7 +1074,8 @@ impl Encoder {
             // ⚠️ 三个都必要：下界保证峰值不被裁；差分约束是位流硬要求；
             // `0..=255` 是 `sf` 自己的位宽。**偏移只抬下界** ——
             // 若把上界也压低，会挡住「该带本来想用更粗的 sf」的合法选择。
-            let floor = (sf_floor + sf_offset).clamp(0, 255);
+            let floor = sf_floor.clamp(0, 255);
+            let lam = lambda;
             let (lo_sf, hi_sf) = match *prev_sf {
                 Some(p) => (
                     floor.max(p - SCALE_MAX_DIFF).clamp(0, 255),
@@ -1098,9 +1104,19 @@ impl Encoder {
             //
             // 评估次数从 ~31 降到 ~21（窗口 120 宽时），而每一趟都要跑一遍 ——
             // 这是**又省时间又省 CPU** 的那一类（不靠多线程，也不增加内存）。
+            // 「全零带」的代价 = 本带能量（与 sf 无关 → 整条带算一次）。
+            let zero_cost: f32 = band.iter().map(|&c| c * c).sum();
             let mut best: Option<(f32, u8, u8)> = None; // (代价, sf, cb)
             let mut evaluate = |sf: i32, best: &mut Option<(f32, u8, u8)>| {
-                let (cost, cb) = cached_band_cost(cache, gi, sfb, band, sf as u8);
+                let (dist, cb, bits) = cached_band_cost(cache, gi, sfb, band, sf as u8);
+                // 代价 = 失真 + λ·位数，**全零带在同一把尺子上**。
+                //
+                // ⚠️ 「砍不砍这条带」必须在这儿比：`band_cost_rd` 内部那次
+                // `dist <= zero_cost` **不含 λ** —— 用它决定砍不砍，
+                // λ 一大时「砍掉」就永远赢不了（实测码率失控到 5.9 倍且与目标无关）。
+                let coded = dist + lam * bits as f32;
+                let zero = zero_cost;
+                let (cost, cb) = if coded <= zero { (coded, cb) } else { (zero, 0) };
                 if best.is_none_or(|(bc, _, _)| cost < bc) {
                     *best = Some((cost, sf as u8, cb));
                 }
@@ -1223,7 +1239,7 @@ impl Encoder {
         Ok((w, bits))
     }
 
-    /// **编一「趟」**：给定整帧 `sf_offset`，给每个窗口组选 sf/码本、写出完整的
+    /// **编一「趟」**：给定整帧 `lambda`，给每个窗口组选 sf/码本、写出完整的
     /// 通道元素体，返回 `(位流, 位数)`。
     ///
     /// ## 为什么要有「趟」这个概念
@@ -1248,14 +1264,14 @@ impl Encoder {
         seq: WindowSequence,
         group_specs: &[(&[f32], &[u16], usize)],
         sf_floor: i32,
-        sf_offset: i32,
+        lambda: f32,
         tns_data: Option<&Tns>,
         write_ics: bool,
     ) -> crate::Result<(BitWriter, u32)> {
         let mut prev_sf: Option<i32> = None;
         let mut plans: Vec<GroupPlan<'_>> = Vec::with_capacity(group_specs.len());
         for (gi, &(spec, swb, _)) in group_specs.iter().enumerate() {
-            plans.push(self.plan_group(cache, gi, spec, swb, sf_floor, sf_offset, &mut prev_sf));
+            plans.push(self.plan_group(cache, gi, spec, swb, sf_floor, lambda, &mut prev_sf));
         }
         let lens: Vec<usize> = group_specs.iter().map(|&(_, _, l)| l).collect();
         self.write_pass(seq, &plans, &lens, tns_data, write_ics)
@@ -1280,7 +1296,7 @@ impl Encoder {
     /// **先把元素头写进正式位流，再把二分选中的那一趟整段接上去**。
     ///
     /// 换句话说 `encode_pass` 的「趟」= 通道元素体，元素头归这里管。
-    /// 这个分界是刻意的：元素头（`ID_SCE` + 标签）跟 `sf_offset` 无关，
+    /// 这个分界是刻意的：元素头（`ID_SCE` + 标签）跟 `lambda` 无关，
     /// 让每趟都带一遍只是白算计数的次数。
     fn encode_channel(
         &self,
@@ -1456,13 +1472,13 @@ impl Encoder {
         // 找的**还是同一个答案**，所以位流逐字节不变 —— 这是纯提速，不改语义。
         //
         // 括号约定：`lo` = 已知**不可行**的最大偏移（`-1` = 还不知道），
-        // `hi` = 已知**可行**的最小偏移（`MAX_SF_OFFSET + 1` = 还不知道）。
-        let seed = st.sf_offset_prev.clamp(0, MAX_SF_OFFSET);
+        // `hi` = 已知**可行**的最小偏移（`MAX_LAMBDA_K8 + 1` = 还不知道）。
+        let seed = st.lambda_k8_prev.clamp(0, MAX_LAMBDA_K8);
         let mut chosen: Option<BitWriter> = None;
         let mut lo: i32 = -1;
-        let mut hi: i32 = MAX_SF_OFFSET + 1;
+        let mut hi: i32 = MAX_LAMBDA_K8 + 1;
         let (pass, bits) =
-            self.encode_pass(&mut st.cost_cache, seq, &group_specs, sf_floor, seed, tns_data.as_ref(), write_ics)?;
+            self.encode_pass(&mut st.cost_cache, seq, &group_specs, sf_floor, lambda_of(seed), tns_data.as_ref(), write_ics)?;
         if bits <= budget {
             hi = seed;
             chosen = Some(pass);
@@ -1473,10 +1489,10 @@ impl Encoder {
         // 指数搜索把另一侧也夹住：步长 1、2、4…（真值离种子远时才多探几次）。
         let mut step = 1i32;
         if chosen.is_none() {
-            while lo < MAX_SF_OFFSET {
-                let o = (lo + step).min(MAX_SF_OFFSET);
+            while lo < MAX_LAMBDA_K8 {
+                let o = (lo + step).min(MAX_LAMBDA_K8);
                 let (pass, bits) =
-                    self.encode_pass(&mut st.cost_cache, seq, &group_specs, sf_floor, o, tns_data.as_ref(), write_ics)?;
+                    self.encode_pass(&mut st.cost_cache, seq, &group_specs, sf_floor, lambda_of(o), tns_data.as_ref(), write_ics)?;
                 if bits <= budget {
                     hi = o;
                     chosen = Some(pass);
@@ -1489,7 +1505,7 @@ impl Encoder {
             while hi > 0 {
                 let o = (hi - step).max(0);
                 let (pass, bits) =
-                    self.encode_pass(&mut st.cost_cache, seq, &group_specs, sf_floor, o, tns_data.as_ref(), write_ics)?;
+                    self.encode_pass(&mut st.cost_cache, seq, &group_specs, sf_floor, lambda_of(o), tns_data.as_ref(), write_ics)?;
                 if bits > budget {
                     lo = o;
                     break;
@@ -1504,7 +1520,7 @@ impl Encoder {
         while lo + 1 < hi {
             let mid = (lo + hi) / 2;
             let (pass, bits) =
-                self.encode_pass(&mut st.cost_cache, seq, &group_specs, sf_floor, mid, tns_data.as_ref(), write_ics)?;
+                self.encode_pass(&mut st.cost_cache, seq, &group_specs, sf_floor, lambda_of(mid), tns_data.as_ref(), write_ics)?;
             if bits <= budget {
                 hi = mid;
                 chosen = Some(pass);
@@ -1513,7 +1529,7 @@ impl Encoder {
             }
         }
         // 记住这一帧的答案，给下一帧当种子（`hi` 超界 = 这一帧没有任何可行偏移）。
-        st.sf_offset_prev = if hi <= MAX_SF_OFFSET { hi } else { seed };
+        st.lambda_k8_prev = if hi <= MAX_LAMBDA_K8 { hi } else { seed };
 
         // ⚠️ **一趟都不够省**时（预算小到连最粗的量化都塞不下）退化成
         // 「用偏移上界那一趟」：位数超预算，但**位流仍然合法**。
@@ -1521,7 +1537,7 @@ impl Encoder {
         let pass = match chosen {
             Some(p) => p,
             None => {
-                self.encode_pass(&mut st.cost_cache, seq, &group_specs, sf_floor, MAX_SF_OFFSET, tns_data.as_ref(), write_ics)?
+                self.encode_pass(&mut st.cost_cache, seq, &group_specs, sf_floor, lambda_of(MAX_LAMBDA_K8), tns_data.as_ref(), write_ics)?
                     .0
             }
         };
@@ -1780,13 +1796,21 @@ fn band_is_zero(band: &[f32], sf: u8) -> bool {
 /// 先算好每带的 Bark 中心频率 —— 「邻近带」是按 Bark 距离算的，
 /// 不是按频带序号。低频的带很密（几十 Hz 一个）、高频很疏
 /// （一个带跨几千 Hz），按序号算会把高频的掩蔽扩散弄得过宽。
-#[allow(dead_code)] // 只服务 `masking_thresholds`（当前未使用）
-fn bark_of(swb: &[u16], sample_rate: u32) -> Vec<f32> {
+///
+/// ⚠️ **短窗必须按「单窗口」的划分算**：组的 `swb` 是「128 点划分 × 组内窗口数」
+/// （见 `encode_channel` 里建 `swbs` 的那段），而每条带对应的是**同一个**频率带
+/// 在组内各窗口的重复 —— 所以频率要把 `swb` 除回 `group_len`，尺度也要用单窗口的
+/// 系数个数（长窗 1024 / 短窗 128）。少了这一步，短窗的频率会算成 `gl` 倍，
+/// 掩蔽扩散整个错位（长窗 `group_len = 1`，两种算法等价）。
+#[allow(dead_code)] // 只服务 `masking_thresholds`
+fn bark_of(swb: &[u16], sample_rate: u32, group_len: usize, coefs_per_window: usize) -> Vec<f32> {
+    let gl = group_len.max(1) as f64;
+    let coefs = coefs_per_window.max(1) as f64;
     swb.windows(2)
         .map(|w| {
-            // 带的中心频率（Hz）。
-            let fc = (f64::from(w[0]) + f64::from(w[1])) * 0.5 * f64::from(sample_rate)
-                / (2.0 * LONG_LEN as f64);
+            // 带的中心频率（Hz），按**单窗口**的划分。
+            let fc = (f64::from(w[0]) + f64::from(w[1])) * 0.5 / gl * f64::from(sample_rate)
+                / (2.0 * coefs);
             // Bark 尺度的常用近似（Traunmüller 1990）：
             //   z = 26.81·f / (1960 + f) − 0.53
             (26.81 * fc / (1960.0 + fc) - 0.53) as f32
@@ -1816,12 +1840,19 @@ fn bark_of(swb: &[u16], sample_rate: u32) -> Vec<f32> {
 /// ⚠️ 这是个**简化模型**：不做 FFT 分析（直接用谱系数当掩蔽源）、
 /// 不含绝对听阈（安静段的阈值会偏乐观）。但它抓住了主要矛盾 ——
 /// 「强带掩蔽邻近带」。
-#[allow(dead_code)] // 当前未使用 —— 见 `band_cost` 的说明（当真音乐上有害）
-fn masking_thresholds(spec: &[f32], swb: &[u16], sample_rate: u32, _sf_floor: i32) -> Vec<f32> {
+#[allow(dead_code)] // 当前未使用 —— 两套接法（线性加权 / 阈值饱和）都实测为净亏、已撤，见上面的说明
+fn masking_thresholds(
+    spec: &[f32],
+    swb: &[u16],
+    sample_rate: u32,
+    _sf_floor: i32,
+    group_len: usize,
+) -> Vec<f32> {
     // `_sf_floor`（整帧的 sf 下界）在这里还用不上 —— 阈值只看源信号。
     // 留着签名是为了「将来把阈值抬到量化噪声下限」那条路不用改调用方。
     let n = swb.len() - 1;
-    let bark = bark_of(swb, sample_rate);
+    let coefs_per_window = spec.len() / group_len.max(1);
+    let bark = bark_of(swb, sample_rate, group_len, coefs_per_window);
 
     // 每带的能量（谱系数的平方和）。
     let energy: Vec<f64> = (0..n)
@@ -1855,16 +1886,38 @@ fn masking_thresholds(spec: &[f32], swb: &[u16], sample_rate: u32, _sf_floor: i3
         .collect()
 }
 
+/// 带缓存的 `band_cost`：命中就直接返回，没命中才算并记下。
+///
+/// 值**逐位相同**（同一帧里同一条带的谱系数不变），所以决策不会变 → 输出逐字节不变。
+#[inline]
+fn cached_band_cost(
+    cache: &mut BandCostCache,
+    gi: usize,
+    sfb: usize,
+    band: &[f32],
+    sf: u8,
+) -> (f32, u8, u32) {
+    if let Some(v) = cache.get(gi, sfb, sf) {
+        return v;
+    }
+    let v = band_cost_rd(band, sf, &mut cache.q_scratch);
+    cache.put(gi, sfb, sf, v);
+    v
+}
+
+// 历史上这里接过两套「按可闻度分配」，**实测都是净亏**，已撤：
+//   - **线性加权**（`w_b·失真 + λ·位数`）：码率追不上目标（128k 的目标只出 ~97 kbps），
+//     全局 SNR 掉 ~10 dB；
+//   - **阈值饱和**（`w·max(0, 失真 − T_b)`）：带代价几乎整片归零 → 编码器几乎不出码。
+// 症状、数字与判读留在本地 `TODO.md`。`masking_thresholds`（下面那份）照旧留着、**没接线**。
+
 /// 一个频带在给定 `sf` 下的 `(代价, 最优码本)`。
 ///
-/// ## 代价是**掩蔽归一化**的失真
+/// ## 代价是**纯平方失真**（这是当前实现）
 ///
 /// ```text
-///   代价 = Σ (误差² / 阈值²)
+///   代价 = Σ 误差²
 /// ```
-///
-/// 除以阈值让「听不见的误差」几乎不花代价、而「安静段里的误差」被放大。
-/// 阈值来自 `masking_thresholds`（邻带的掩蔽扩散）。
 ///
 /// ## ⚠️ 这里**故意没有 λ · 位数那一项**
 ///
@@ -1873,9 +1926,8 @@ fn masking_thresholds(spec: &[f32], swb: &[u16], sample_rate: u32, _sf_floor: i3
 /// —— 实测踩过，白忙一场（码率是目标的 3.4 倍）。
 ///
 /// **两者是正交的分工**：外层管「花多少位」，这里管「位花在哪」。
-/// 逐带选码本：**代价 = 平方失真**（不做掩蔽归一化）。
 ///
-/// ## ⚠️ 为什么把掩蔽阈值拿掉了（实测，不是偏好）
+/// ## ⚠️ 曾经除以掩蔽阈值²，已撤（实测，不是偏好）
 ///
 /// 曾经这里除以掩蔽阈值²（`dist / th²`，见 `masking_thresholds`）。在**粉噪声**
 /// 上它确实略好（效率 +8%，见 `quality_is_within_2db_of_ffmpeg` 的说明），
@@ -1912,28 +1964,29 @@ fn masking_thresholds(spec: &[f32], swb: &[u16], sample_rate: u32, _sf_floor: i3
 /// 这也解释了当初在粉噪声上量到的「+8% 效率」：那不是模型省下的位，
 /// 是**直接扔掉的频带**（粉噪声频谱平坦，扔几条听不出来）。
 ///
-/// **结论**：阈值不能当**权重**用。要用它得改成「按带分配比特」
-/// （让量化噪声落在阈值之下），而不是给失真乘一个系数。
-/// 带缓存的 `band_cost`：命中就直接返回，没命中才算并记下。
+/// ## 🚫 更根本的一条：**给失真乘一个逐带常数，按构造就不可能改变任何决策**
 ///
-/// 值**逐位相同**（同一帧里同一条带的谱系数不变），所以决策不会变 → 输出逐字节不变。
-#[inline]
-fn cached_band_cost(
-    cache: &mut BandCostCache,
-    gi: usize,
-    sfb: usize,
-    band: &[f32],
-    sf: u8,
-) -> (f32, u8) {
-    if let Some(v) = cache.get(gi, sfb, sf) {
-        return v;
-    }
-    let v = band_cost(band, sf, &mut cache.q_scratch);
-    cache.put(gi, sfb, sf, v);
-    v
-}
-
-fn band_cost(band: &[f32], sf: u8, qu: &mut Vec<i32>) -> (f32, u8) {
+/// `feat/aac-psy` 上试过「有界的比值权重」`w = clamp((E_带/阈值)^p, 1, W_MAX)`
+/// （权重恒 ≥ 1，只会加重可闻带的代价）—— 量出来**产物与改前逐字节相同**。
+/// 原因不是参数没调好，是数学上必然如此：
+///
+/// ```text
+///   argmin_sf ( w · dist(sf) )  ==  argmin_sf dist(sf)      （w > 0 且与 sf 无关）
+/// ```
+///
+/// 每带的 `w` 在**该带自己的候选之间是同一个常数**，所以它改变不了任何一条带的
+/// sf / 码本选择；而 sf 的选择又是逐带独立的（`prev_sf` 只提供**约束**、不参与比较），
+/// 于是整帧的决策、位数、外层偏移全都不变。
+///
+/// **要用掩蔽，权重必须和一个「率」项一起出现**（`w·dist + λ·位数`）——
+/// 只有那时它才会改变「这一带值不值得多花位」的权衡。也就是说：
+/// **心理声学模型得挂在率-失真分配（`feat/aac-rd-alloc` 那套 λ 机制）上，
+/// 单独挂在纯失真上等于没写。** 详见 TODO 的 `feat/aac-psy` 一节。
+/// 一个频带在 `(sf, cb)` 下的**失真与位数** —— `plan_group` 用 `失真 + λ·位数` 选 `sf`/码本。
+///
+/// 一条路径两个出口是有意的：决策口径只有一份，位数的口径也只有一份
+/// （`band_bits`，与 `write_band` 对拍钉住）。
+fn band_cost_rd(band: &[f32], sf: u8, qu: &mut Vec<i32>) -> (f32, u8, u32) {
     // ---- 量化只算一次，11 本码本共用 ----
     //
     // 同一个 `sf` 下所有码本的**量化步长相同**（都是 `q34(sf)`），差别只在
@@ -1978,9 +2031,71 @@ fn band_cost(band: &[f32], sf: u8, qu: &mut Vec<i32>) -> (f32, u8) {
     // 就把这条带标成零（代价 = 原始能量）。
     let zero_cost: f32 = band.iter().map(|&c| c * c).sum();
     match best {
-        Some((c, cb)) if c <= zero_cost => (c, cb),
-        _ => (zero_cost, 0),
+        Some((c, cb)) if c <= zero_cost => (c, cb, band_bits(band, sf, cb, qu)),
+        _ => (zero_cost, 0, 0),
     }
+}
+
+/// 一个频带在 `(sf, cb)` 下要**多少位** —— 与 `write_band` 同一套计数。
+///
+/// 数的是这一带自己的开销：码本索引 + 无符号码本的符号位 + escape 码；
+/// **不含** `section_data` 的段长与 `scalefactor_data` 的差分（那些是跨带的，
+/// 同一个 `sf` 下的候选之间差别很小，当常数处理）。
+///
+/// `qu` 是**不封顶**的量化值（`band_cost` 里算好一次、各码本 `.min(maxval)` 共用）——
+/// 与 `write_band` 自己重算 `quant_one` **逐位相同**（那条等价性写在 `band_cost` 的注释里）。
+///
+/// ⚠️ 由 `band_bits_matches_what_write_band_actually_writes` 对拍钉住：
+/// 这里的计数与写出端**必须**一致，否则 RD 代价模型会追着错的位数量走。
+fn band_bits(band: &[f32], sf: u8, cb: u8, qu: &[i32]) -> u32 {
+    if cb == 0 {
+        return 0;
+    }
+    let cb = cb as usize;
+    let dim = CB_DIM[cb];
+    let maxval = i32::from(CB_MAXVAL[cb]);
+    let unsigned = CB_UNSIGNED[cb];
+    let bit_tab = &tables::SPECTRAL_BITS[cb - 1];
+    let size = tables::SPECTRAL_SIZE[cb - 1] as usize;
+    let vecs = tables::CODEBOOK_VECTORS[cb - 1];
+    let q34v = q34(sf);
+    let mut bits = 0u32;
+    for (ci, chunk) in band.chunks(dim).enumerate() {
+        let q0 = ci * dim;
+        let mut q = [0i32; 4];
+        for (j, &c) in chunk.iter().enumerate() {
+            let m = qu[q0 + j].min(maxval);
+            q[j] = if unsigned || c >= 0.0 { m } else { -m };
+        }
+        let off = if unsigned { 0 } else { maxval };
+        let mut curidx = 0usize;
+        for j in 0..dim {
+            curidx = curidx * usize::from(CB_RANGE[cb]) + (q[j] + off) as usize;
+        }
+        if curidx >= size {
+            // 越界 = 这一本写不出来（穷举 sf 时大量出现）：给个「必然不优」的数，
+            // 与 `band_dist` 的 f32::MAX/2 一个套路。
+            return u32::MAX / 2;
+        }
+        bits += u32::from(bit_tab[curidx]);
+        // 无符号码本：逐维写非零系数的符号。
+        if unsigned {
+            for j in 0..dim {
+                if vecs[curidx * dim + j] != 0 {
+                    bits += 1;
+                }
+            }
+        }
+        // escape 码本：矢量里是 `64` 的那几维要写真实幅值。
+        if cb == CB_ESC {
+            for j in 0..dim {
+                if vecs[curidx * dim + j] == 64 {
+                    bits += escape_bits(escape_coef(chunk[j].abs(), q34v));
+                }
+            }
+        }
+    }
+    bits
 }
 
 /// 一个频带在**某个码本的封顶值**下的平方失真（**不算位数**）。
@@ -2083,11 +2198,26 @@ fn write_escape(w: &mut BitWriter, coef: i32) {
         len >= 4 && len <= 12,
         "escape 的 len 必须在 4..=12（{len}）"
     );
+    debug_assert_eq!(
+        escape_bits(coef),
+        (len - 4 + 1) + len,
+        "escape 的位数只有一份真源（`escape_bits`）"
+    );
     let nbits = len - 4 + 1;
     // 长度前缀：`nbits` 位、值是 `(1 << nbits) - 2`（一串 1 带个尾零）。
     w.put((1u32 << nbits) - 2, nbits);
     // 然后是 `len` 位的有符号值。
     w.put_signed(coef, len);
+}
+
+/// escape 码要多少位：**长度前缀**（`len-4+1`）**+ 值**（`len`）。
+///
+/// 与 `write_escape` 一一对应（那边有 `debug_assert_eq!` 钉着）。代价模型要数位数时
+/// 走这里，别在别处再推一遍 —— 本仓的历史是「`band_cost` 与 `write_band` 各数一份、
+/// 结果分叉」。
+pub(crate) fn escape_bits(coef: i32) -> u32 {
+    let len = av_log2(coef);
+    (len - 4 + 1) + len
 }
 
 /// `av_log2`（`coef` 最高位的位置）。
@@ -2448,6 +2578,39 @@ mod tests {
     /// 解码端读到 0 个前导 1 会 `b += 4` 变成 4，然后去读 4 位低位，
     /// 而编码端只写了 1 位 —— 整条位流从这里开始错位。
     ///
+    #[test]
+    fn band_bits_matches_what_write_band_actually_writes() {
+        // 代价模型与写出端**必须**数同一套位数。本仓的历史教训：两边各推一份 → 分叉
+        // （代价模型追着错的位数量走，RD 就白做了）。这条用**实际写出的位流长度**当裁判。
+        let mut state = 987_654_321u32;
+        for trial in 0..48usize {
+            let len = 4 * (1 + trial % 8);
+            let mut band = vec![0f32; len];
+            for v in band.iter_mut() {
+                state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                let unit = ((state >> 16) as f32 / 32768.0) - 1.0;
+                // 幅度跨三档：普通系数 / 无符号码本 / escape（`escape_coef` 要 ≥ 16）
+                let scale = [1.0e3, 1.0e5, 1.0e7][trial % 3];
+                *v = unit * scale;
+            }
+            for sf in [60u8, 100, 140, 180, 220] {
+                let mut qu = Vec::new();
+                let (_, cb, _) = band_cost_rd(&band, sf, &mut qu);
+                if cb == 0 {
+                    assert_eq!(band_bits(&band, sf, cb, &qu), 0, "全零带没有位数");
+                    continue;
+                }
+                let mut w = BitWriter::new();
+                write_band(&mut w, &band, sf, cb).expect("这一档必须写得出来");
+                assert_eq!(
+                    band_bits(&band, sf, cb, &qu) as usize,
+                    w.bit_pos(),
+                    "sf={sf} cb={cb} len={len}：计数与实际写出的位数对不上"
+                );
+            }
+        }
+    }
+
     /// 生产代码里只有 oracle 需要它：`band_dist` 不算位数（位数由 `write_band` 在写
     /// 位流时自己算），而参考实现要按老样子把位数也数一遍。
     fn escape_bits(coef: i32) -> u32 {
@@ -2526,11 +2689,11 @@ mod tests {
     /// ⚠️ **这里不能断言「逐字节相同」** —— 实测（真音乐 350 帧）有 **2 帧**不同、
     /// 音频载荷差 14 字节，而 **SNR 完全一致**（14.15 vs 14.15）。根因不在并行，
     /// 在 `plan_group` 的**三级细化是近似搜索**（12 → 3 → 1）：它从
-    /// `floor = sf_floor + sf_offset` 锚定格点，**不同的 `sf_offset` 会给出不同的
-    /// 格点**，偶尔落到不同的「最优」。而偏移搜索的**种子**（`sf_offset_prev`）
+    /// `floor = sf_floor + lambda` 锚定格点，**不同的 `lambda` 会给出不同的
+    /// 格点**，偶尔落到不同的「最优」。而偏移搜索的**种子**（`lambda_k8_prev`）
     /// 在批量版里每帧都是初始值、在逐帧版里是上一帧的答案 —— 于是极少数帧分叉。
     ///
-    /// 也就是说「`sf_offset_prev` 只影响速度、不影响答案」这条**在现在的实现下
+    /// 也就是说「`lambda_k8_prev` 只影响速度、不影响答案」这条**在现在的实现下
     /// 不成立**（它是按更早的「固定二分」写的）。两条路径各给出一个都合法的结果。
     #[test]
     fn batch_encoding_matches_frame_by_frame_with_attacks() {
@@ -2569,7 +2732,7 @@ mod tests {
     }
 
     /// 批量与逐帧：**帧数一致、线程数不影响结果**；但不保证**逐字节**相同
-    /// （原因见下面那条带攻击的测试与 `sf_offset_prev` 的说明）。
+    /// （原因见下面那条带攻击的测试与 `lambda_k8_prev` 的说明）。
     ///
     /// 这里仍断言「同一次批量里线程数不改变一个字节」—— 并行本身是确定的
     /// （每帧一份独立的 `ChannelState`，结果与分块方式无关）。
@@ -2731,7 +2894,7 @@ mod tests {
                 })
                 .collect();
             for &sf in &[0u8, 20, 40, 60, 80, 100, 120, 140, 160, 200, 230, 255] {
-                let fast = band_cost(&band, sf, &mut scratch);
+                let fast = band_cost_rd(&band, sf, &mut scratch);
                 let full = band_cost_reference(&band, sf);
                 assert_eq!(
                     fast.0.to_bits(),

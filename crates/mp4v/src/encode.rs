@@ -18,7 +18,8 @@
 //! ## I 帧的处理顺序（每一步的顺序都是语法的一部分，不能换）
 //!
 //! ```text
-//! 1. 6 个块各做正向 DCT → 量化（DC 用 dc_scale，AC 用 H.263 的 qmul/qadd）
+//! 1. 6 个块各做正向 DCT → 量化（DC 用 dc_scale；AC 按 `quant_type`：
+//!    H.263 平坦步长 / MPEG 逐系数矩阵，见 `Quant`）
 //! 2. **先**把 6 个块的 DC 预测全部算完（`ff_mpeg4_pred_dc`）—— 它会**就地更新** DC 网格，
 //!    而块 1/2/3 要读块 0 刚写进去的值，所以必须按 n = 0,1,2,3,4,5 顺序走
 //! 3. AC 预测（可选，见下）—— 同样按 n 顺序走，因为块 1 要读块 0 的 ac_val
@@ -133,6 +134,25 @@ pub struct EncoderConfig {
     pub bitrate: Option<u32>,
     /// 要不要逐宏块试 AC 预测（见模块文档）。默认开。
     pub ac_pred: bool,
+    /// 要不要对**帧间块**做系数级 RD（trellis，见 `trellis_levels`）。
+    ///
+    /// 换了什么：量化不再是「逐系数取最近电平」，而是在 `{0, L, L∓1}` 里挑
+    /// `失真 + λ·位数` 最小的那个 —— 编码代价（run / escape / 符号）第一次参与决策。
+    ///
+    /// ⚠️ **默认关，因为实测是净亏**（数字见 TODO）：
+    /// - 固定 qscale 下它确实省位（−18%）而且是个公平交易（PSNR −1.6 dB）；
+    /// - 但接到我们这套**帧级**码控上，四档 λ 全是「体积更大 + 画质更差」
+    ///   （最好那档仍是 PSNR −0.5 dB / XPSNR −0.75，体积还 +4%）。
+    ///
+    /// 两条能解释实测的原因：① 我们**没有 GOP 级比特分配** —— I 帧不受 trellis 影响，
+    /// P 帧省下的位换不成整段更细的 q，反而让帧级码控把 q 一路压低、I 帧把体积撑回去；
+    /// ② λ 的「正确值」是帧级码控的边际失真-比特斜率，它不是只跟 `q²` 走的常数。
+    /// **要用它，得先有分配那一层**（那也正是感知加权生效的前提）。
+    pub trellis: bool,
+    /// VOL 的 `quant_type`（见 `Quant`）。默认**开** —— 实测同码率下
+    /// PSNR 持平而 SSIM / XPSNR / VMAF 都更高（默认矩阵就是对比敏感度曲线：
+    /// 高频粗量化，人眼看不出来）。关掉退回 H.263 的平坦步长。
+    pub mpeg_quant: bool,
     /// **周期 I 帧间隔**（帧数）。`0` = 只首帧是 I（默认，与「全 I 帧」行为一致）。
     ///
     /// 开着的意义：P 帧只参考前一帧，误差会累积（漂移）；周期 I 帧还能让播放器 seek。
@@ -155,6 +175,8 @@ impl Default for EncoderConfig {
             qscale: 4,
             bitrate: None,
             ac_pred: true,
+            mpeg_quant: true,
+            trellis: false,
             keyframe_interval: 0,
             low_delay: true,
             profile_and_level: PROFILE_SIMPLE_LEVEL1,
@@ -218,6 +240,14 @@ struct RateCtl {
     /// 已编码帧数与累计位数（收尾时自证「有没有落在目标附近」）。
     frames: u64,
     total_bits: u64,
+    /// **上一帧**的复杂度估计 `X = 位数 × q`（因为 `bits ∝ X/q`）。
+    ///
+    /// ⚠️ 这里**故意不按帧类型分开**：分开那一版量过（见 TODO 第五轮）——
+    /// 它等于把「I 帧该花多少位」变成「跟 P 帧一样多」，反而把 I 帧量化粗了，
+    /// 285k 上 PSNR −0.40 dB。I 帧的优待要**显式**给（见 `RC_I_SHARE`），不是靠分开记。
+    x_last: Option<f64>,
+    /// 最近一次给出的 q（当「每帧最多动几档」的起点）。
+    last_q: u8,
 }
 
 /// 每帧 qscale 最多动几档 —— 防一帧跳到底。
@@ -228,9 +258,21 @@ const RC_PULL_FRAMES: f64 = 8.0;
 const RC_MIN_WANTED: f64 = 0.25;
 /// 缓冲容量 = 几帧的预算。
 const RC_BUFFER_FRAMES: f64 = 8.0;
+/// **I 帧的比特份额倍数**（`1.0` = 与 P 帧相同的每帧预算）。
+///
+/// 为什么把它拎出来当旋钮：I 帧是**参考帧**，它的质量顺着预测链传给后面每一帧，
+/// 而帧级码控只认「这一帧花了多少位」、不认「这些位后面被谁用」。
+///
+/// ⚠️ **实测 `1.0` 就是最好**（等体积插值比，数字见 TODO 第六轮）：
+/// - `0.5`（让 I 帧更粗）明显更差 —— 方向对；
+/// - `2 / 4 / 8` 画质只涨一点点，但那是靠**超码率**换的；拉到**等体积**再比，三项全输
+///   （≈ PSNR −0.27 dB、SSIM −0.007、XPSNR −0.24）。
+/// 原因：我们是 **I+P、没有 B 帧** —— 每个 P 帧同样是后面 11 帧的参考，
+/// 「I 帧特别值」的前提在这套结构里不成立。等真做了 B 帧（B 不被参考）再回来看这个旋钮。
+const RC_I_SHARE: f64 = 1.0;
 
 impl RateCtl {
-    fn new(bitrate: u32, fps: u32) -> Self {
+    fn new(bitrate: u32, fps: u32, q0: u8) -> Self {
         let target_bits = f64::from(bitrate) / f64::from(fps);
         Self {
             target_bits,
@@ -238,25 +280,37 @@ impl RateCtl {
             buffer_size: target_bits * RC_BUFFER_FRAMES,
             frames: 0,
             total_bits: 0,
+            x_last: None,
+            last_q: q0,
         }
     }
 
-    /// 记下这一帧实际花掉的位数，返回**下一帧**该用的 qscale。
-    fn next_qscale(&mut self, bits: u64, cur_q: u8) -> u8 {
+    /// 给**下一帧**（类型 `is_i`）定 q。
+    ///
+    /// `q = X_last / wanted_t`（`X = 位数 × q` ⇒ 想花 `wanted` 位就该用 `X/wanted`）。
+    /// `wanted_t` 里带一个**按帧类型的份额**：I 帧是参考帧，它多花一位比 P 帧多花一位
+    /// 「更值」（后面整条预测链都吃它的质量）—— 这是「传播价值」的最便宜近似。
+    fn q_for(&mut self, is_i: bool) -> u8 {
+        let wanted = (self.target_bits - self.buffer / RC_PULL_FRAMES)
+            .clamp(self.target_bits * RC_MIN_WANTED, self.target_bits * 4.0);
+        let wanted = if is_i { wanted * RC_I_SHARE } else { wanted };
+        let want_q = match self.x_last {
+            Some(x) => x / wanted,
+            None => f64::from(self.last_q),
+        };
+        let step = (want_q - f64::from(self.last_q)).clamp(-RC_MAX_STEP, RC_MAX_STEP);
+        self.last_q = (f64::from(self.last_q) + step).round().clamp(1.0, QSCALE_MAX as f64) as u8;
+        self.last_q
+    }
+
+    /// 编完一帧：记账（缓冲 + 这一帧的复杂度）。
+    fn note_bits(&mut self, bits: u64, q: u8) {
         let bits = bits as f64;
         self.frames += 1;
         self.total_bits += bits as u64;
         self.buffer =
             (self.buffer + bits - self.target_bits).clamp(-self.buffer_size, self.buffer_size);
-
-        // 「下一帧该花多少位」：目标，再按缓冲偏差纠一点（不是一帧纠完）。
-        let wanted = (self.target_bits - self.buffer / RC_PULL_FRAMES)
-            .clamp(self.target_bits * RC_MIN_WANTED, self.target_bits * 4.0);
-
-        // bits 大致与 q 成反比 → 想让下一帧花 `wanted` 位，q 就乘 `bits / wanted`。
-        let want_q = f64::from(cur_q) * bits / wanted;
-        let step = (want_q - f64::from(cur_q)).clamp(-RC_MAX_STEP, RC_MAX_STEP);
-        (f64::from(cur_q) + step).round().clamp(1.0, f64::from(QSCALE_MAX)) as u8
+        self.x_last = Some(bits * f64::from(q));
     }
 }
 
@@ -289,7 +343,7 @@ impl Encoder {
             last_key_frame: false,
             intra_mbs_last: 0,
             cur_qscale: cfg.qscale,
-            rc: cfg.bitrate.map(|b| RateCtl::new(b, cfg.fps_num)),
+            rc: cfg.bitrate.map(|b| RateCtl::new(b, cfg.fps_num, cfg.qscale)),
             mv_prev: Vec::new(),
             cfg,
         })
@@ -349,6 +403,7 @@ impl Encoder {
                 height: self.cfg.height,
                 fps_num: self.cfg.fps_num,
                 low_delay: self.cfg.low_delay,
+                mpeg_quant: self.cfg.mpeg_quant,
             },
         );
     }
@@ -392,10 +447,8 @@ impl Encoder {
         let (pw, ph) = (mb_w * 16, mb_h * 16);
         let (py, pu, pv) = pad_planes(frame, pw, ph);
 
-        let qscale = self.cur_qscale;
-        let q = i32::from(qscale);
-        let qmul = q << 1;
-        let qadd = (q - 1) | 1;
+        let qscale = self.take_qscale(true);
+        let quant = Quant::new(qscale, self.cfg.mpeg_quant);
         let y_dc_scale = i32::from(tables::Y_DC_SCALE[qscale as usize]);
         let c_dc_scale = i32::from(tables::C_DC_SCALE[qscale as usize]);
 
@@ -439,7 +492,7 @@ impl Encoder {
                     let (plane, stride, px, py) = block_at(&py, &pu, &pv, pw, mbx, mby, n);
                     let mut coeff = [0i32; 64];
                     fdct(&plane[py * stride + px..], stride, &mut coeff);
-                    quantize_block(&mut coeff, n, qmul, qadd, y_dc_scale, c_dc_scale);
+                    quantize_block(&mut coeff, n, &quant, y_dc_scale, c_dc_scale);
                     *slot = coeff;
                 }
 
@@ -469,14 +522,14 @@ impl Encoder {
 
                 // ---- 6. 重建（AC 预测不影响重建 —— 解码端会把预测加回来）----
                 reconstruct_intra(
-                    &mut cur, mbx, mby, &blocks, qmul, qadd, y_dc_scale, c_dc_scale,
+                    &mut cur, mbx, mby, &blocks, &quant, y_dc_scale, c_dc_scale,
                 );
             }
         }
 
         self.intra_mbs_last = mb_w * mb_h;
         self.reference = Some(cur);
-        Ok(self.note_frame(w.finish()))
+        Ok(self.note_frame(w.finish(), qscale))
     }
 
     /// 编一个 **P 帧**（只含 VOP 头 + 宏块）。
@@ -496,9 +549,8 @@ impl Encoder {
         let (pw, ph) = (mb_w * 16, mb_h * 16);
         let (sy, su, sv) = pad_planes(frame, pw, ph);
 
-        let qscale = self.cur_qscale;
-        let q = i32::from(qscale);
-        let (qmul, qadd) = (q << 1, (q - 1) | 1);
+        let qscale = self.take_qscale(false);
+        let quant = Quant::new(qscale, self.cfg.mpeg_quant);
         let y_dc_scale = i32::from(tables::Y_DC_SCALE[qscale as usize]);
         let c_dc_scale = i32::from(tables::C_DC_SCALE[qscale as usize]);
 
@@ -536,11 +588,11 @@ impl Encoder {
             pw,
             mb_w,
             mb_h,
-            qmul,
-            qadd,
+            quant,
             y_dc_scale,
             c_dc_scale,
             use_ac_pred: self.cfg.ac_pred,
+            trellis: self.cfg.trellis,
             dc: DcGrid::new(mb_w, mb_h, y_dc_scale, c_dc_scale),
             ac: AcGrid::new(mb_w, mb_h),
             mv: vec![(0, 0); mb_w * mb_h],
@@ -560,16 +612,24 @@ impl Encoder {
         self.reference = Some(st.cur);
         // 本帧的 MV 场留给下一帧当**时间预测**的起点。
         self.mv_prev = std::mem::take(&mut st.mv);
-        Ok(self.note_frame(w.finish()))
+        Ok(self.note_frame(w.finish(), qscale))
     }
 
-    /// 收下一个编好的帧：把位数报给码率控制器，并定下一帧的 qscale。
+    /// 本帧该用哪个 q：开码控时问控制器（要按本帧类型给份额），关着就用固定值。
+    fn take_qscale(&mut self, is_i: bool) -> u8 {
+        if let Some(rc) = self.rc.as_mut() {
+            self.cur_qscale = rc.q_for(is_i);
+        }
+        self.cur_qscale
+    }
+
+    /// 收下一个编好的帧：记账（位数 + 复杂度）。
     ///
     /// 关着码率控制时是个**直通**（原样返回），所以调用点不必分支。
-    fn note_frame(&mut self, bytes: Vec<u8>) -> Vec<u8> {
+    fn note_frame(&mut self, bytes: Vec<u8>, q: u8) -> Vec<u8> {
         if let Some(rc) = self.rc.as_mut() {
             // `* 8`：按位算 —— 预算本来就是位。
-            self.cur_qscale = rc.next_qscale(bytes.len() as u64 * 8, self.cur_qscale);
+            rc.note_bits(bytes.len() as u64 * 8, q);
         }
         bytes
     }
@@ -822,11 +882,13 @@ struct PState<'a> {
     pw: usize,
     mb_w: usize,
     mb_h: usize,
-    qmul: i32,
-    qadd: i32,
+    /// 本帧的量化规则（含逐系数步长）。
+    quant: Quant,
     y_dc_scale: i32,
     c_dc_scale: i32,
     use_ac_pred: bool,
+    /// 帧间块的系数级 RD 开关（见 `EncoderConfig::trellis`）。
+    trellis: bool,
     dc: DcGrid,
     ac: AcGrid,
     /// 每宏块一个 MV（只做 16×16 模式，亮度那 2×2 个格子填的是同一个值）。
@@ -1026,8 +1088,7 @@ impl PState<'_> {
             quantize_block(
                 &mut coeff,
                 n,
-                self.qmul,
-                self.qadd,
+                &self.quant,
                 self.y_dc_scale,
                 self.c_dc_scale,
             );
@@ -1097,7 +1158,10 @@ impl PState<'_> {
             let mut coef = [0i32; 64];
             fdct_i(&res, 8, &mut coef);
             for (k, v) in coef.iter().enumerate() {
-                slot[k] = quantize_ac(*v, self.qmul, self.qadd);
+                slot[k] = self.quant.quantize(k, *v, false);
+            }
+            if self.trellis {
+                trellis_levels(&self.quant, self.rl_inter, &coef, slot, self.quant.lambda());
             }
         }
         let cbp_i = inter_cbp(&qb);
@@ -1143,8 +1207,7 @@ impl PState<'_> {
                 mbx,
                 mby,
                 &ib,
-                self.qmul,
-                self.qadd,
+                &self.quant,
                 self.y_dc_scale,
                 self.c_dc_scale,
             );
@@ -1165,7 +1228,7 @@ impl PState<'_> {
             } else {
                 self.mv[mby * self.mb_w + mbx] = mv;
                 mc_mb(&mut self.cur, self.refp, mbx, mby, mv, NO_ROUNDING);
-                reconstruct_inter(&mut self.cur, mbx, mby, &qb, self.qmul, self.qadd);
+                reconstruct_inter(&mut self.cur, mbx, mby, &qb, &self.quant);
             }
         }
         Ok(())
@@ -1204,14 +1267,186 @@ fn recon_at(cur: &mut Planes, n: usize, mbx: usize, mby: usize) -> (&mut [u8], u
     }
 }
 
-/// 反量化（帧内 AC 与帧间通用）：`level > 0 → level*qmul + qadd`，反之减。
-fn dequant(level: i32, qmul: i32, qadd: i32) -> i16 {
-    if level > 0 {
-        (level * qmul + qadd) as i16
-    } else if level < 0 {
-        (level * qmul - qadd) as i16
-    } else {
-        0
+/// 量化/反量化的规则 —— 对应 VOL 里的 `quant_type`。
+///
+/// - **H.263**（`quant_type = 0`）：平坦步长，`qmul = 2q`、`qadd = (q-1)|1`，
+///   反量化是 `level*qmul ± qadd`（与 MP43 同一个式子）。
+/// - **MPEG**（`quant_type = 1`）：逐系数乘**规范默认矩阵**
+///   （`tables::DEFAULT_INTRA_MATRIX` / `DEFAULT_INTER_MATRIX`，自然序）：
+///   帧内 `(|level|·2q·W) >> 4`、帧间 `((2|level|+1)·2q·W) >> 5`。
+///   两者都是「先取绝对值、截断（算术右移）、最后补符号」——
+///   与 ffmpeg 的 `dct_unquantize_mpeg2_*` 逐位一致。
+///
+/// 帧内 DC 两种量化都用 `dc_scale`（解码端 `block[0] *= dc_scale`），由调用方单独处理。
+///
+/// ## ⚠️ 帧间的**失配控制**（MPEG 量化独有）
+///
+/// 把 64 个反量化值求和（初值 −1），是奇数就把**下标 63** 的最低位翻一下。
+/// 解码端的 `dct_unquantize_mpeg2_inter_c` 无条件做这一步，我们少做一次，
+/// 重建就每块差一位 —— P 帧会一帧帧累积成漂移。
+///
+/// ## 为什么这一项值得做（实测，见 TODO）
+///
+/// 默认矩阵就是一条对比敏感度曲线（高频步长最大到低频的 5 倍），
+/// 同码率下 PSNR 持平而 SSIM / XPSNR / VMAF 都更高。它属于「权重在**单元内部**
+/// 逐频率变化」那一类 —— 不受「逐块常数加权是 no-op」那条结论的限制。
+pub(crate) struct Quant {
+    mpeg: bool,
+    /// 本帧的 `qscale`（只为算 trellis 的 λ）。
+    q: i32,
+    /// H.263 的两个常数（MPEG 时不用）。
+    qmul: i32,
+    qadd: i32,
+    /// H.263 那条的倒数：`ceil(2^32/qmul)`（`qmul = 2q ≤ 62`，表按它直接索引）。
+    inv_qmul: u32,
+    /// 逐系数步长 `2q·W[k]`（自然序）。MPEG 时用。
+    intra_step: [i32; 64],
+    inter_step: [i32; 64],
+    /// MPEG 两条路的倒数：`ceil(2^48 / 除数)` —— 除数逐系数不同（`8·step` / `2·step`），
+    /// 所以是两张 64 项的表，在 `new` 里按帧算一次。
+    intra_inv: [u64; 64],
+    inter_inv: [u64; 64],
+}
+
+/// 帧内量化偏置，单位是 1/8 个量化步长。
+///
+/// `4` = 四舍五入到最近的合法电平 —— 与 ffmpeg 的**非 trellis** 路一致
+/// （`dct_quantize_c` 对 `mpeg_quant` 把 bias 覆盖成 `1<<(QMAT_SHIFT-1)`，也就是半个步长；
+/// 它那个 `intra_quant_bias = 3/8` 只服务 trellis 路）。调到更小 = 更偏死区：
+/// 小系数更容易被判成 0，省下的位由码控花到别处 —— 我们没有 trellis 替我们做这笔账，
+/// 所以这是个真旋钮（扫描的数字见 TODO）。
+const INTRA_BIAS_EIGHTHS: i32 = 4;
+
+/// trellis 的 λ 旋钮，千分之一为单位（`λ = 它 · q² / 1000`）。
+///
+/// 尺度怎么来的：零掉一个「离判决边界半个步长」的系数，省下 `几步` 位、付出
+/// `(步长/2)²` 的失真 —— 而重建步长 ≈ `q·W/8`，所以 λ 的量级就是 `(qW/16)²/位数`。
+/// **它不是推出来的，是标定出来的**（扫描见 TODO）：本仓在另一条线上踩过 λ 差 90 倍。
+const TRELLIS_LAMBDA_MILLI: i64 = 2800;
+
+/// 允不允许 trellis 把系数**砍到 0**。关掉就只剩「挪一档」。
+/// 加这个开关是为了把「省位」和「漂移」分开量：丢残差会让预测环里的误差累积。
+const TRELLIS_ALLOW_ZERO: bool = true;
+
+impl Quant {
+    fn new(qscale: u8, mpeg: bool) -> Self {
+        let q = i32::from(qscale);
+        let mut intra_step = [0i32; 64];
+        let mut inter_step = [0i32; 64];
+        let mut intra_inv = [0u64; 64];
+        let mut inter_inv = [0u64; 64];
+        for k in 0..64 {
+            intra_step[k] = 2 * q * i32::from(tables::DEFAULT_INTRA_MATRIX[k]);
+            inter_step[k] = 2 * q * i32::from(tables::DEFAULT_INTER_MATRIX[k]);
+            // 除数与 `quantize` 里用的一模一样：帧内 `8·step`、帧间 `2·step`。
+            intra_inv[k] = recip48((8 * intra_step[k]) as u64);
+            inter_inv[k] = recip48((2 * inter_step[k]) as u64);
+        }
+        let qmul = q << 1;
+        Self {
+            mpeg,
+            q,
+            qmul,
+            qadd: (q - 1) | 1,
+            inv_qmul: INV_QMUL[qmul as usize],
+            intra_step,
+            inter_step,
+            intra_inv,
+            inter_inv,
+        }
+    }
+
+    /// trellis 的 λ（失真换位数的兑换率）：`TRELLIS_LAMBDA_MILLI · q² / 1000`。
+    fn lambda(&self) -> i64 {
+        TRELLIS_LAMBDA_MILLI * i64::from(self.q) * i64::from(self.q) / 1000
+    }
+
+    fn step(&self, k: usize, intra: bool) -> i32 {
+        if intra {
+            self.intra_step[k]
+        } else {
+            self.inter_step[k]
+        }
+    }
+
+    /// 反量化一个 AC（帧间含下标 0）系数。`k` 是**自然序**下标。
+    fn dequant(&self, k: usize, level: i32, intra: bool) -> i32 {
+        if level == 0 {
+            return 0;
+        }
+        if !self.mpeg {
+            return if level > 0 {
+                level * self.qmul + self.qadd
+            } else {
+                level * self.qmul - self.qadd
+            };
+        }
+        let step = self.step(k, intra);
+        let v = if intra {
+            (level.abs() * step) >> 4
+        } else {
+            ((2 * level.abs() + 1) * step) >> 5
+        };
+        if level < 0 {
+            -v
+        } else {
+            v
+        }
+    }
+
+    /// `dequant` 的逆：取让重建值离 `f` 最近的 `level`。
+    ///
+    /// ⚠️ **除法全部换成了倒数乘法**：三条路各有一个运行期除数（`qmul` / `8·step` / `2·step`），
+    /// 而 `sdiv` 一条要几十周期、这里每个 AC 系数都要走一次（实测占整条 `.mp4` 链路的 7.5%）。
+    /// 除数在一帧里是常数（逐系数那两条各 64 个值），所以 `new` 里算一次倒数即可。
+    /// **值与原式逐位相同** —— 见 `quantize_matches_division` 测试（与 `div_round` 对拍）。
+    #[inline(always)]
+    fn quantize(&self, k: usize, f: i32, intra: bool) -> i32 {
+        if f == 0 {
+            return 0;
+        }
+        if !self.mpeg {
+            // 与旧路逐位相同（原 `quantize_ac`）：先按 `a` 的符号取绝对值再还原。
+            let a = if f > 0 { f - self.qadd } else { f + self.qadd };
+            let m = if a >= 0 { a as u32 } else { (-(a as i64)) as u32 };
+            let n = m + (self.qmul as u32 / 2);
+            let q = (((n as u64) * (self.inv_qmul as u64)) >> 32) as i32;
+            let r = if a >= 0 { q } else { -q };
+            return if f > 0 { r.max(0) } else { r.min(0) };
+        }
+        let step = self.step(k, intra);
+        let v = if intra {
+            // 帧内：重建电平在 `step/16` 的整数倍上。偏置 = `INTRA_BIAS_EIGHTHS`/8 个步长
+            // （`4` 就是四舍五入；写成 8 倍只是为了让更小的偏置也能取整数）。
+            let n = (f.unsigned_abs() as u64) * 128 + (INTRA_BIAS_EIGHTHS * step) as u64;
+            ((n * self.intra_inv[k]) >> 48) as i32
+        } else {
+            // 帧间：重建电平在 `step/32` 的**奇数**倍上（`(2|level|+1)`），
+            // 所以最近的合法电平是 `round((|f|·32/step − 1)/2)`，
+            // 也就是下面这个整数式（`step` 那一项就是那个 −1）。
+            // `div_round(N, 2·step)` 的 N = `|f|·32 − step`，而它自己还要 `+ b/2 = + step`
+            // —— 两项正好抵消，所以分子就是 `|f|·32`。
+            // 原式那条 `N ≤ 0 ⇒ 结果 ≤ 0 ⇒ .max(0) = 0` 也自动成立（`|f|·32 ≤ step` 时商为 0）。
+            let num = (f.unsigned_abs() as u64) * 32;
+            ((num * self.inter_inv[k]) >> 48) as i32
+        };
+        if f < 0 {
+            -v
+        } else {
+            v
+        }
+    }
+
+    /// 帧间块的失配控制（只有 `quant_type = 1` 做，见结构体文档）。
+    fn mismatch_control(&self, rb: &mut [i16; 64]) {
+        if !self.mpeg {
+            return;
+        }
+        let mut sum = -1i32;
+        for v in rb.iter() {
+            sum += i32::from(*v);
+        }
+        rb[63] ^= (sum & 1) as i16;
     }
 }
 
@@ -1223,8 +1458,7 @@ fn reconstruct_intra(
     mbx: usize,
     mby: usize,
     blocks: &[[i32; 64]; 6],
-    qmul: i32,
-    qadd: i32,
+    quant: &Quant,
     y_dc_scale: i32,
     c_dc_scale: i32,
 ) {
@@ -1233,7 +1467,7 @@ fn reconstruct_intra(
         let mut rb = [0i16; 64];
         rb[0] = (blocks[n][0] * scale) as i16;
         for k in 1..64 {
-            rb[k] = dequant(blocks[n][k], qmul, qadd);
+            rb[k] = quant.dequant(k, blocks[n][k], true) as i16;
         }
         let (plane, stride) = recon_at(cur, n, mbx, mby);
         idct_put(&mut rb, plane, stride);
@@ -1246,14 +1480,14 @@ fn reconstruct_inter(
     mbx: usize,
     mby: usize,
     blocks: &[[i32; 64]; 6],
-    qmul: i32,
-    qadd: i32,
+    quant: &Quant,
 ) {
     for n in 0..6 {
         let mut rb = [0i16; 64];
         for (k, slot) in rb.iter_mut().enumerate() {
-            *slot = dequant(blocks[n][k], qmul, qadd);
+            *slot = quant.dequant(k, blocks[n][k], false) as i16;
         }
+        quant.mismatch_control(&mut rb);
         let (plane, stride) = recon_at(cur, n, mbx, mby);
         idct_add(&mut rb, plane, stride);
     }
@@ -1272,21 +1506,20 @@ fn has_ac(block: &[i32; 64], scan: &[u8; 64]) -> bool {
 ///   解码端 `block[0] *= dc_scale` 再进 IDCT（`mpegvideo.c:210`），
 ///   而我们的 `fdct` 给的是 `F(0,0) = 8 × 均值`，所以 `level = 8×均值 / dc_scale`
 ///   正好还原 —— `dc_scale` 最小是 8，`level` 落在 `[0, 255]`。
-/// - **AC**：H.263 量化，`level` 使 `level*qmul ± qadd` 最接近 `F`。
-///   和 MP43 是同一个式子（`qmul = 2*qscale`、`qadd = (qscale-1)|1`），
-///   差别只在 MP43 把 level 限制在 8 位 escape 内，MPEG-4 的 ESC3 是 12 位、不用管。
+///   **两种 `quant_type` 都一样**（MPEG 量化的帧内 DC 也走 `dc_scale`）。
+/// - **AC**：按 `quant` 的规则取 `level`（H.263 平坦步长 / MPEG 逐系数矩阵）。
+///   两种都不必管 escape 上限：MPEG-4 的 ESC3 是 12 位。
 fn quantize_block(
     coeff: &mut [i32; 64],
     n: usize,
-    qmul: i32,
-    qadd: i32,
+    quant: &Quant,
     y_dc_scale: i32,
     c_dc_scale: i32,
 ) {
     let dc_scale = if n < 4 { y_dc_scale } else { c_dc_scale };
     coeff[0] = div_round(coeff[0], dc_scale);
-    for c in coeff.iter_mut().skip(1) {
-        *c = quantize_ac(*c, qmul, qadd);
+    for (k, c) in coeff.iter_mut().enumerate().skip(1) {
+        *c = quant.quantize(k, *c, true);
     }
 }
 
@@ -1311,6 +1544,14 @@ const fn recip(b: u32) -> u32 {
     (((1u64 << 32) + b as u64 - 1) / b as u64) as u32
 }
 
+/// `ceil(2^48 / b)` —— MPEG 那两条路用（除数大得多，2^32 那档的精度余量不够）。
+///
+/// 依据同 `recip`：`(n · ceil(2^S/b)) >> S == n / b` 只要 `n·b < 2^S`。
+/// 实测范围：`n ≤ |f|·128 + 偏置 < 2^19`、`b = 8·step ≤ 2^15` ⇒ `n·b < 2^34 ≪ 2^48`。
+const fn recip48(b: u64) -> u64 {
+    ((1u64 << 48) + b - 1) / b
+}
+
 /// `qmul` 只取偶数 `2*qscale`（`qscale ∈ 1..=31`）—— 表按 `qmul` 直接索引。
 static INV_QMUL: [u32; 64] = {
     let mut t = [0u32; 64];
@@ -1321,32 +1562,6 @@ static INV_QMUL: [u32; 64] = {
     }
     t
 };
-
-/// 反量化的逆：`level` 使 `level*qmul ± qadd` 最接近 `f`。
-///
-/// ⚠️ **整数除法换成了倒数乘法**：`sdiv` 一条要几十周期，而这里每个 AC 系数都要除一次
-/// （`quantize_ac` 实测占整条 `.mp4` 链路的 7.5%）。`qmul` 一帧里是常数，倒数查表即可。
-/// **值与原式逐位相同**（`div_round` 的语义原样保留：先按 `a` 的符号取绝对值再还原）。
-#[inline(always)]
-fn quantize_ac(f: i32, qmul: i32, qadd: i32) -> i32 {
-    if f == 0 {
-        return 0;
-    }
-    let a = if f > 0 { f - qadd } else { f + qadd };
-    let inv = INV_QMUL[qmul as usize];
-    // `|a|` 用 i64 取，避免 `i32::MIN` 那条（实际到不了，但别留 UB 的口子）。
-    let m = if a >= 0 { a as u32 } else { (-(a as i64)) as u32 };
-    let n = m + (qmul as u32 / 2);
-    debug_assert!(n < (1 << 20), "倒数乘法的精确范围被打破了：n = {n}");
-    let q = (((n as u64) * (inv as u64)) >> 32) as i32;
-    let r = if a >= 0 { q } else { -q };
-    if f > 0 {
-        r.max(0)
-    } else {
-        r.min(0)
-    }
-}
-
 // ───────────────────────── DC 预测 ─────────────────────────
 
 /// DC 预测网格。存的是 `level * dc_scale`（与 ffmpeg 的 `dc_val` 同口径），
@@ -1617,6 +1832,17 @@ fn write_ac(
 ///
 /// 严格取最短的（并列时取靠前的候选，与 ffmpeg 的 `len < best` 一致）。
 fn write_rl(w: &mut BitWriter, rl: &RlTable, last: bool, run: usize, level: i32) -> Result<()> {
+    let (code, len) = best_rl(rl, last, run, level)?;
+    debug_assert!(len <= 32, "一次最多写 32 位，ESC3 是 {len} 位");
+    w.put(code, len);
+    Ok(())
+}
+
+/// 一个 `(last, run, level)` 的**最省写法**：`(code, len)`。
+///
+/// ⚠️ 位数的唯一真源 —— 写位流（`write_rl`）与代价模型（`rl_cost`）都走这里。
+/// 各算一份必然分叉（本仓踩过：`band_cost` 与 `write_band` 的 escape 计数不一样）。
+fn best_rl(rl: &RlTable, last: bool, run: usize, level: i32) -> Result<(u32, u32)> {
     let esc = rl.escape_symbol();
     let (esc_code, esc_len) = rl
         .code_len(esc)
@@ -1671,10 +1897,129 @@ fn write_rl(w: &mut BitWriter, rl: &RlTable, last: bool, run: usize, level: i32)
         better(bits, esc_len + 23, &mut best);
     }
 
-    let (code, len) = best.ok_or(Error::Bad("AC 系数写不出来"))?;
-    debug_assert!(len <= 32, "一次最多写 32 位，ESC3 是 {len} 位");
-    w.put(code, len);
-    Ok(())
+    best.ok_or(Error::Bad("AC 系数写不出来"))
+}
+
+/// 一个 `(last, run, level)` 要花多少位（`best_rl` 的长度那一半）。
+fn rl_cost(rl: &RlTable, last: bool, run: usize, level: i32) -> u32 {
+    best_rl(rl, last, run, level).map_or(32, |(_, len)| len)
+}
+
+/// 系数级 RD（trellis）：在**扫描序**上做一遍 DP，逐系数在 `{L, L∓1}` 里挑
+/// `失真 + λ·位数` 最小的那个。
+///
+/// ## 为什么值得做
+///
+/// 只做「逐系数取最近电平」时，一个系数的编码代价（run / escape / 符号）**完全不参与决策**：
+/// 花 20 位才写得出来、却只换回一点失真的系数照写不误。DP 把失真和位数放在同一个尺度上比 ——
+/// 这也正是**感知加权唯一能生效的那一层**（权重必须和率项同时出现，见 TODO 的 5109 §1）。
+///
+/// ## 设计取舍（都是有意的收缩，别当成 bug）
+///
+/// - **只用于帧间块**：帧内块的扫描序随 AC 预测方向变（`H_SCAN` / `V_SCAN`），
+///   要接进来得连 `intra_try` 的候选一起改 —— 那一层先不动。
+/// - **候选只有 `{L, L∓1}`，且不新增非零系数**（基线为 0 的位置保持 0）：
+///   收益的大头是「把不划算的系数砍掉」，提电平那一半先不做。
+/// - **`last` 按基线算**：真把基线的「最后一个非零」砍掉时，代价模型会差 1–2 位
+///   （写出端自己算得对，只有这里的估计偏一点）。
+/// - **λ 的尺度是坑**：`dist` 是 DCT 域的平方误差（量级 1e6~1e8），`bits` 是个位数，
+///   而且步长变粗时失真单位跟着 `q²` 涨 —— 所以 λ 必须带着 `q²` 走
+///   （本仓在另一条线上踩过「λ 比实测最优大 90 倍」）。
+fn trellis_levels(
+    quant: &Quant,
+    rl: &RlTable,
+    coeff: &[i32; 64],
+    levels: &mut [i32; 64],
+    lambda: i64,
+) {
+    const INF: i64 = i64::MAX / 4;
+    // 基线（扫描序）+ 代价模型里的 `last`。
+    let mut base = [0i32; 64];
+    for (i, b) in base.iter_mut().enumerate() {
+        *b = levels[ZIGZAG[i] as usize];
+    }
+    let last_index = (0..64).rev().find(|&i| base[i] != 0).unwrap_or(0);
+
+    // 状态 = 最后一个非零系数的扫描序下标 + 1（0 = 还没有）；代价表滚动用。
+    let mut cost = [[INF; 65]; 2];
+    // `choice[出状态][i] = (候选下标, 入状态)` —— 2 字节，回溯靠它，
+    // 不能只存候选：`level != 0` 时同一个出状态来自哪个入状态，决定了 run、也就决定了位数。
+    let mut choice = [[(0u8, 0u8); 64]; 65];
+    cost[0][0] = 0;
+    for i in 0..64 {
+        let (cur, nxt) = (i & 1, (i & 1) ^ 1);
+        cost[nxt] = [INF; 65];
+        let l0 = base[i];
+        // 候选：**0** 与 `L∓1 / L`。0 必须在里面 —— 「砍掉不划算的系数」是收益最大的一类，
+        // 而只给 `{L, L∓1}` 时 `|L| >= 2` 的系数根本够不到 0（这条是单测逼出来的）。
+        let (mut cands, n_cands) = if l0 == 0 {
+            ([0i32; 4], 1usize)
+        } else {
+            let s = l0.signum();
+            let mut c = [0i32; 4];
+            let mut n = 0usize;
+            if TRELLIS_ALLOW_ZERO {
+                c[0] = 0;
+                n = 1;
+            }
+            for cand in [l0 - s, l0, l0 + s] {
+                if cand != 0 && !c[..n].contains(&cand) {
+                    c[n] = cand;
+                    n += 1;
+                }
+            }
+            (c, n)
+        };
+        for c in cands.iter_mut() {
+            *c = (*c).clamp(-2047, 2047); // ESC3 的 level 是 12 位有符号
+        }
+        let f = i64::from(coeff[ZIGZAG[i] as usize]);
+        for prev in 0..65usize {
+            if cost[cur][prev] >= INF {
+                continue;
+            }
+            for (ci, &l) in cands.iter().take(n_cands).enumerate() {
+                let dq = i64::from(quant.dequant(ZIGZAG[i] as usize, l, false));
+                let mut c = cost[cur][prev] + (f - dq) * (f - dq);
+                let nprev = if l != 0 { i + 1 } else { prev };
+                if l != 0 {
+                    let run = (i as i32 - (prev as i32 - 1) - 1).max(0) as usize;
+                    c += lambda * i64::from(rl_cost(rl, i == last_index, run, l));
+                }
+                if c < cost[nxt][nprev] {
+                    cost[nxt][nprev] = c;
+                    choice[nprev][i] = (ci as u8, prev as u8);
+                }
+            }
+        }
+    }
+
+    // 回溯（`i = 63` 时 `nxt == 0`，所以终局代价在 `cost[0]`）。
+    let mut st = (0..65usize).min_by_key(|&p| cost[0][p]).unwrap_or(0);
+    let mut out = [0i32; 64];
+    for i in (0..64).rev() {
+        let (ci, in_st) = choice[st][i];
+        let l0 = base[i];
+        out[i] = if l0 == 0 {
+            0
+        } else {
+            let s = l0.signum();
+            let mut c = [0i32; 4];
+            let mut n = 1usize;
+            for cand in [l0 - s, l0, l0 + s] {
+                if cand != 0 && !c[..n].contains(&cand) {
+                    c[n] = cand;
+                    n += 1;
+                }
+            }
+            let _ = n;
+            c[ci as usize].clamp(-2047, 2047)
+        };
+        st = in_st as usize;
+    }
+    for (i, &l) in out.iter().enumerate() {
+        levels[ZIGZAG[i] as usize] = l;
+    }
 }
 
 /// `mpeg4_encode_dc`：VLC 的**符号是 DC 差的位长**，后面跟位长个位。
@@ -1877,20 +2222,37 @@ mod tests {
     }
 
     #[test]
-    /// 倒数乘法必须与原式**逐值相同** —— 拿 `div_round` 当参照物扫一遍。
     #[test]
-    fn ac_quantization_matches_division() {
-        for qscale in 1..=31i32 {
-            let (qmul, qadd) = (qscale << 1, (qscale - 1) | 1);
-            for f in (-9000..=9000i32).step_by(7) {
-                let want = if f > 0 {
-                    div_round(f - qadd, qmul).max(0)
-                } else if f < 0 {
-                    div_round(f + qadd, qmul).min(0)
-                } else {
-                    0
-                };
-                assert_eq!(quantize_ac(f, qmul, qadd), want, "qscale {qscale} f {f}");
+    /// 三条路的倒数乘法都必须与原式**逐值相同** —— 与 `div_round` 对拍。
+    #[test]
+    fn quantize_matches_division() {
+        for qscale in 1..=31u8 {
+            for mpeg in [false, true] {
+                let q = Quant::new(qscale, mpeg);
+                for k in [0usize, 1, 3, 17, 40, 63] {
+                    for intra in [true, false] {
+                        for f in (-9000..=9000i32).step_by(11) {
+                            let want = if f == 0 {
+                                0
+                            } else if !mpeg {
+                                if f > 0 {
+                                    div_round(f - q.qadd, q.qmul).max(0)
+                                } else {
+                                    div_round(f + q.qadd, q.qmul).min(0)
+                                }
+                            } else {
+                                let step = q.step(k, intra);
+                                let v = if intra {
+                                    (f.abs() * 128 + INTRA_BIAS_EIGHTHS * step) / (8 * step)
+                                } else {
+                                    div_round(f.abs() * 32 - step, 2 * step).max(0)
+                                };
+                                if f < 0 { -v } else { v }
+                            };
+                            assert_eq!(q.quantize(k, f, intra), want, "q{qscale} mpeg{mpeg} k{k} intra{intra} f{f}");
+                        }
+                    }
+                }
             }
         }
     }
@@ -1898,6 +2260,7 @@ mod tests {
     #[test]
     fn quantize_ac_inverts_the_h263_dequant() {
         // 解码端：`level > 0 ? level*qmul + qadd : level*qmul - qadd`
+        let quant = Quant::new(4, false);
         let (qmul, qadd) = (2 * 4, (4 - 1) | 1);
         for level in [-20i32, -3, -1, 0, 1, 3, 20] {
             let f = if level > 0 {
@@ -1907,11 +2270,245 @@ mod tests {
             } else {
                 0
             };
-            assert_eq!(quantize_ac(f, qmul, qadd), level, "level {level} 没还原");
+            assert_eq!(quant.quantize(3, f, true), level, "level {level} 没还原");
         }
         // 落在两个 level 之间时取最近的
-        assert_eq!(quantize_ac(qmul + qadd - 1, qmul, qadd), 1);
-        assert_eq!(quantize_ac(qmul + qadd - 4, qmul, qadd), 1); // 还在上半区
+        assert_eq!(quant.quantize(3, qmul + qadd - 1, true), 1);
+        assert_eq!(quant.quantize(3, qmul + qadd - 4, true), 1); // 还在上半区
+    }
+
+    #[test]
+    fn mpeg_quant_round_trips_through_its_own_dequant() {
+        // 两套规则各自的「量化 → 反量化」自洽性：重建值必须落在半个步长之内。
+        // 顺带印证帧间是**奇数倍**电平（`2|level|+1`）、帧内是整数倍。
+        for qscale in [1u8, 4, 12, 31] {
+            let quant = Quant::new(qscale, true);
+            for k in [0usize, 1, 5, 20, 63] {
+                for f in [-900i32, -137, -8, 0, 7, 138, 901] {
+                    for intra in [true, false] {
+                        let level = quant.quantize(k, f, intra);
+                        let back = quant.dequant(k, level, intra);
+                        let step = quant.step(k, intra);
+                        // 帧内步长 `step/16`、帧间 `step/32`，取宽松的一侧比较
+                        let tol = step / 16 + 1;
+                        assert!(
+                            (back - f).abs() <= tol,
+                            "q={qscale} k={k} intra={intra} f={f} level={level} back={back}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mpeg_inter_reconstruction_levels_are_odd_multiples() {
+        // 帧间：`dequant(L) == ((2L+1)·step) >> 5`，L=0 是唯一的例外
+        // （解码端 `if (level)` 跳过零 → 0 就是 0，**不是** `step>>5`）。
+        // 电平落在奇数倍上意味着死区是「半个电平」，抄错会整块偏半步。
+        let quant = Quant::new(4, true);
+        for k in [0usize, 1, 40] {
+            let step = quant.step(k, false);
+            assert_eq!(quant.dequant(k, 0, false), 0, "level==0 就是 0");
+            for level in 1..6i32 {
+                assert_eq!(
+                    quant.dequant(k, level, false),
+                    ((2 * level + 1) * step) >> 5
+                );
+                assert_eq!(
+                    quant.dequant(k, -level, false),
+                    -(((2 * level + 1) * step) >> 5)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mpeg_intra_dequant_is_matrix_scaled() {
+        // 帧内：`(|level|·2q·W) >> 4` —— 高频的步长比低频大（W 从 8 涨到 45）。
+        let quant = Quant::new(6, true);
+        for level in [1i32, -1, 7, -7] {
+            for k in [1usize, 63] {
+                let step = quant.step(k, true);
+                let want = (level.abs() * step) >> 4;
+                let want = if level < 0 { -want } else { want };
+                assert_eq!(quant.dequant(k, level, true), want, "k={k} level={level}");
+            }
+        }
+        // 高频步长必须比低频粗 —— 这就是「感知」那一半
+        assert!(quant.step(63, true) > quant.step(1, true));
+        assert!(quant.step(63, false) > quant.step(0, false));
+    }
+
+    /// 按 trellis 自己的模型算一个 level 排布的代价（失真 + λ·位数）——只服务下面那条对拍。
+    fn model_cost(
+        quant: &Quant,
+        rl: &RlTable,
+        coeff: &[i32; 64],
+        levels: &[i32; 64],
+        lambda: i64,
+    ) -> i64 {
+        let last_index = (0..64)
+            .rev()
+            .find(|&i| levels[ZIGZAG[i] as usize] != 0)
+            .unwrap_or(0);
+        let mut cost = 0i64;
+        let mut prev: i32 = -1;
+        for i in 0..64 {
+            let k = ZIGZAG[i] as usize;
+            let l = levels[k];
+            let f = i64::from(coeff[k]);
+            let dq = i64::from(quant.dequant(k, l, false));
+            cost += (f - dq) * (f - dq);
+            if l != 0 {
+                let run = (i as i32 - prev - 1).max(0) as usize;
+                cost += lambda * i64::from(rl_cost(rl, i == last_index, run, l));
+                prev = i as i32;
+            }
+        }
+        cost
+    }
+
+    #[test]
+    fn trellis_dp_matches_brute_force_on_a_small_support() {
+        // 非零系数少的时候可以把候选组合全枚举一遍，DP 必须取到同一个最小值 ——
+        // 这条钉的是状态转移与回溯（出状态存候选、入状态用来还原 run）。
+        let quant = Quant::new(6, true);
+        let rl = inter_rl_table();
+        let lambda = quant.lambda();
+        let mut coeff = [0i32; 64];
+        for (scan_i, v) in [(1usize, 260i32), (5, -170), (30, 90)] {
+            coeff[ZIGZAG[scan_i] as usize] = v;
+        }
+        let mut base = [0i32; 64];
+        for k in 0..64 {
+            base[k] = quant.quantize(k, coeff[k], false);
+        }
+        let mut got = base;
+        trellis_levels(&quant, &rl, &coeff, &mut got, lambda);
+
+        let positions: Vec<usize> = (0..64)
+            .filter(|&i| base[ZIGZAG[i] as usize] != 0)
+            .collect();
+        assert_eq!(positions.len(), 3, "前提：基线只有 3 个非零");
+        let mut best = i64::MAX;
+        for mask in 0..64usize {
+            let mut cand = base;
+            let mut m = mask;
+            for &i in &positions {
+                let k = ZIGZAG[i] as usize;
+                let s = base[k].signum();
+                let mut set = [0i32; 4];
+                let mut n = 1usize;
+                for cand_l in [base[k] - s, base[k], base[k] + s] {
+                    if cand_l != 0 && !set[..n].contains(&cand_l) {
+                        set[n] = cand_l;
+                        n += 1;
+                    }
+                }
+                cand[k] = set[m % n].clamp(-2047, 2047);
+                m /= n;
+            }
+            best = best.min(model_cost(&quant, &rl, &coeff, &cand, lambda));
+        }
+        assert_eq!(
+            model_cost(&quant, &rl, &coeff, &got, lambda),
+            best,
+            "DP 没取到暴力枚举的最小值"
+        );
+    }
+
+
+    #[test]
+    fn trellis_drops_a_coefficient_whose_bits_are_expensive() {
+        // 孤零零一个高频系数：写它要 escape（20+ 位），换回的失真却很小 —— λ 够大时该砍掉。
+        //
+        // ⚠️ 这条用**显式的大 λ**：砍到 0 的失真代价是 `f²`（整格），比「挪一档」的
+        // `(重建步长)²` 大得多，所以「该不该砍」用的 λ 比「该挪哪一档」的 λ 高一个量级。
+        // 默认 λ 靠扫描标定（见 TODO），不在这条测试里钉。
+        let quant = Quant::new(6, true);
+        let rl = inter_rl_table();
+        let k = ZIGZAG[58] as usize;
+        let mut coeff = [0i32; 64];
+        coeff[k] = 30; // 该位置 step = 360，level 1 的门槛是 22.5 —— 30 刚好过线
+        let mut base = [0i32; 64];
+        base[k] = quant.quantize(k, coeff[k], false);
+        assert_eq!(base[k].abs(), 1, "前提：基线是 ±1（这样 0 才在候选集里）");
+        let mut out = base;
+        trellis_levels(&quant, &rl, &coeff, &mut out, 400);
+        assert_eq!(out[k], 0, "λ 够大时，昂贵的高频小系数该被砍掉");
+        assert!(
+            model_cost(&quant, &rl, &coeff, &out, 400)
+                <= model_cost(&quant, &rl, &coeff, &base, 400)
+        );
+        // 反过来：λ = 0（只看失真）必须留着它 —— 这半条是「砍」的对照
+        let mut kept = base;
+        trellis_levels(&quant, &rl, &coeff, &mut kept, 0);
+        assert!(kept[k].abs() >= 1, "λ=0 时不该砍");
+    }
+
+    #[test]
+    fn trellis_never_moves_a_level_by_more_than_one() {
+        // 收缩的边界：只在 {L, L∓1} 里挑，且不许新增非零、不许变号、不越 ESC3。
+        let quant = Quant::new(9, true);
+        let rl = inter_rl_table();
+        let mut seed = 0x1234_5678u32;
+        for _ in 0..40 {
+            let mut coeff = [0i32; 64];
+            for v in coeff.iter_mut() {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                *v = ((seed >> 16) as i32 % 2001) - 1000;
+            }
+            let mut base = [0i32; 64];
+            for k in 0..64 {
+                base[k] = quant.quantize(k, coeff[k], false);
+            }
+            let mut out = base;
+            trellis_levels(&quant, &rl, &coeff, &mut out, quant.lambda());
+            for k in 0..64 {
+                if base[k] == 0 {
+                    assert_eq!(out[k], 0, "不许新增非零系数");
+                } else if out[k] != 0 {
+                    assert!(
+                        (out[k] - base[k]).abs() <= 1,
+                        "只许动一档（或直接归零）：k={k} base={} out={}",
+                        base[k],
+                        out[k]
+                    );
+                    assert_eq!(out[k].signum(), base[k].signum(), "不许变号");
+                    assert!(out[k].abs() <= 2047, "不许越 ESC3 的 12 位");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mismatch_control_flips_only_the_lsb_of_the_last_coefficient() {
+        // 解码端 `dct_unquantize_mpeg2_inter_c`：`sum` **初值 −1**，累加 64 个反量化值，
+        // `sum & 1` 时翻下标 63 的最低位 —— 换成「64 个值之和」的说法就是：
+        // 和为**偶数**时翻（−1 把奇偶反了过来）。不做这一步，重建每块差一位、P 帧累积漂移。
+        let off = Quant::new(6, false);
+        let on = Quant::new(6, true);
+
+        // ① 和为偶数（2 + 4 = 6）→ 翻；H.263 不翻
+        let mut even = [0i16; 64];
+        even[1] = 2;
+        even[63] = 4;
+        let mut a = even;
+        on.mismatch_control(&mut a);
+        assert_eq!(a[63], even[63] ^ 1, "和为偶数要翻最低位");
+        assert_eq!(&a[..63], &even[..63], "只许动下标 63");
+        let mut b = even;
+        off.mismatch_control(&mut b);
+        assert_eq!(b, even, "H.263 没有失配控制");
+
+        // ② 和为奇数（2 + 15 = 17）→ 不翻
+        let mut odd = [0i16; 64];
+        odd[1] = 2;
+        odd[2] = 15;
+        let mut c = odd;
+        on.mismatch_control(&mut c);
+        assert_eq!(c, odd, "和为奇数不动");
     }
 
     #[test]

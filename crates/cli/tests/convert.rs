@@ -12,6 +12,32 @@ use v2v_asf::{AsfDemuxer, AsfMuxer, StreamKind, VideoStreamInfo};
 use v2v_cli::{convert_file, ConvertOptions, MP43};
 use v2v_msmpeg4::{Decoder, Encoder, EncoderConfig, Frame};
 
+/// 源样本视频轨的**版本 + extradata**（认不出 FourCC 给 `None`）。
+fn src_version(path: &Path) -> Option<(v2v_msmpeg4::Version, Vec<u8>)> {
+    let d = AsfDemuxer::new(std::fs::File::open(path).ok()?).ok()?;
+    let vf = d
+        .streams()
+        .iter()
+        .find(|s| s.kind == StreamKind::Video)?
+        .video
+        .as_ref()?;
+    Some((v2v_msmpeg4::Version::from_fourcc(vf.fourcc)?, vf.extra.clone()))
+}
+
+/// 按源样本的**版本**造解码器（WMV2 的能力位在容器的 extradata 里）。
+///
+/// ⚠️ 别对**源样本**用 `Decoder::new()`（V3 默认）：解 WMV1 / WMV2 的源会以
+/// 「ac coefficient overflow」之类失败 —— 报出来像解码器坏了，其实是版本没对上。
+/// 解**我们自己写出来的 `.wmv`**（按构造是 MP43）时才可以用默认值。
+fn src_decoder(path: &Path) -> Option<Decoder> {
+    let (version, extra) = src_version(path)?;
+    if version == v2v_msmpeg4::Version::Wmv2 {
+        Decoder::with_wmv2(&extra).ok()
+    } else {
+        Some(Decoder::with_version(version))
+    }
+}
+
 /// 进程内唯一的临时目录。
 fn temp_dir(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("v2v_cli_{}_{}", std::process::id(), tag));
@@ -1024,7 +1050,13 @@ fn mp4_from_real_sample_keeps_audio_in_sync() {
         let vf = v.video.as_ref().expect("视频格式");
         (v.number, vf.width, vf.height)
     };
-    let mut dec = Decoder::new();
+    let mut dec = match src_decoder(&input) {
+        Some(d) => d,
+        None => {
+            eprintln!("SKIP: 认不出来源视频轨的版本（不是 MS-MPEG-4 家族）");
+            return;
+        }
+    };
     let mut src = Vec::new();
     while let Some(s) = d.next_sample().expect("读") {
         if s.stream == vnum {
@@ -1126,6 +1158,15 @@ fn mp4_from_real_sample_keeps_audio_in_sync() {
     let ea = envelope(&a);
     let eb = envelope(&b);
     assert!(ea.len() < eb.len(), "我们的音频不该比源还长");
+
+    // ⚠️ **数字静音**上「对齐」无从判定：包络全零 ⇒ 归一化互相关没有意义
+    // （下面要么在 `best = None` 上炸，要么给出一个低相关 —— 那都是「测不了」，
+    // 不是「对不上」）。这种样本让路，别把前置条件不成立报成链路有问题。
+    let silent = |e: &[f64]| e.iter().all(|x| *x <= 0.0);
+    if silent(&ea) || silent(&eb) {
+        eprintln!("SKIP: 音频是数字静音（包络全零）—— 包络对齐无从判定");
+        return;
+    }
 
     // 在源的整条包络上滑动找最佳相关（包络点少，全搜也不贵）。
     let mut best: Option<(f64, usize)> = None;
