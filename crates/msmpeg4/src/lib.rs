@@ -36,6 +36,8 @@ mod fft;
 mod frame;
 mod grid;
 mod header;
+mod intrax8;
+mod intrax8_tables;
 mod idct;
 mod predict;
 pub mod tables;

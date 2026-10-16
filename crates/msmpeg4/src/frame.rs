@@ -38,6 +38,7 @@ use crate::block::RlTable;
 use crate::error::{Error, Result};
 use crate::grid::Grid;
 use crate::block::AcCtx;
+use crate::intrax8::IntraX8;
 use crate::header::{
     decode012 as v2v_msmpeg4_decode012, parse_frame_header, parse_wmv2_frame, HeaderState,
     PictureType, Wmv2Flags, Wmv2Frame,
@@ -107,6 +108,9 @@ impl Planes {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Stats {
     pub frames_i: u64,
+    /// 走 **IntraX8** 的 I 帧数（WMV2 的 `j_type`）。它是另一条内帧通路，
+    /// 单独数出来 —— 不然「全帧 0 差」看不出那条路到底有没有被走到。
+    pub frames_intrax8: u64,
     pub frames_p: u64,
     /// 帧内宏块总数（I 帧的全部 + P 帧里的那些）。
     pub mb_intra: u64,
@@ -186,6 +190,11 @@ pub struct Decoder {
     trace_ac_pred: bool,
     /// 记录下来的 `ac_pred` 位。
     ac_pred_reads: Vec<AcPredRead>,
+    /// **IntraX8** 的状态（`j_type` 那条路）。
+    ///
+    /// ⚠️ 必须挂在解码器上、**不能每帧现建**：它的 `prediction_table` 上游只在
+    /// 初始化时清零一次，所以上一帧的预测状态会影响下一帧。
+    x8: Option<IntraX8>,
 }
 
 impl Default for Decoder {
@@ -325,6 +334,7 @@ impl Decoder {
             stats: Stats::default(),
             trace_ac_pred: false,
             ac_pred_reads: Vec::new(),
+            x8: None,
         }
     }
 
@@ -384,14 +394,43 @@ impl Decoder {
                     });
                 }
                 Wmv2Frame::Frame(h) => {
-                    if h.j_type {
-                        return Err(Error::Unsupported(
-                            "WMV2 的 IntraX8（`j_type`）是另一套内帧编解码器，还没做".into(),
-                        ));
-                    }
                     // ⚠️ WMV2 的 `no_rounding` 是帧头算出来的（P 帧 `^= 1`），不走
                     // MS-MPEG-4 那条「I 帧尾部 ext header + flipflop」的路。
                     self.no_rounding = h.no_rounding;
+                    if h.j_type {
+                        // ---- **IntraX8**：整个 I 帧都归它 ----
+                        //
+                        // 帧头只读到 `j_type` 这一位为止（后面的 rl/dc 表选择**都不读**），
+                        // 所以位游标停在 `used`，接下来的整帧语法由 IntraX8 接管。
+                        let q = h.qscale as u32;
+                        let mut planes = Planes::new(mb_w * 16, mb_h * 16);
+                        let mut r = BitReader::new(data);
+                        r.skip(used as u32)?;
+                        if self.x8.as_ref().map_or(true, |x| !x.fits(mb_w, mb_h)) {
+                            self.x8 = Some(IntraX8::new(mb_w, mb_h));
+                        }
+                        self.x8.as_mut().unwrap().decode_picture(
+                            &mut r,
+                            &mut planes,
+                            q,
+                            // 上游就是这两个数：`dquant = 2*qscale`、`qsum = (qscale-1)|1`
+                            (q - 1) | 1,
+                            f.loop_filter,
+                        )?;
+                        self.frames += 1;
+                        self.stats.frames_i += 1;
+                        self.stats.frames_intrax8 += 1;
+                        self.prev = Some(planes);
+                        let p = self.prev.as_ref().unwrap();
+                        let (w, hh) = (width as usize, height as usize);
+                        return Ok(Frame {
+                            width,
+                            height,
+                            y: crop(&p.y, p.pw, w, hh),
+                            u: crop(&p.u, p.pw / 2, w / 2, hh / 2),
+                            v: crop(&p.v, p.pw / 2, w / 2, hh / 2),
+                        });
+                    }
                     let fh = h.to_frame_header();
                     (fh, used, Some(*h))
                 }

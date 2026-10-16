@@ -25,6 +25,16 @@ fn mul(w: u32, x: i16) -> u32 {
     w.wrapping_mul(x as i32 as u32)
 }
 
+/// 逐通道的 `wrapping` 加/减。
+#[inline(always)]
+fn add<const L: usize>(a: [u32; L], b: [u32; L]) -> [u32; L] {
+    std::array::from_fn(|i| a[i].wrapping_add(b[i]))
+}
+#[inline(always)]
+fn sub<const L: usize>(a: [u32; L], b: [u32; L]) -> [u32; L] {
+    std::array::from_fn(|i| a[i].wrapping_sub(b[i]))
+}
+
 /// 行变换（原地）。只有直流时走捷径。
 fn idct_row(row: &mut [i16; 8]) {
     if row[1] == 0 && row[2] == 0 && row[3] == 0 && row[4] == 0 && row[5] == 0 && row[6] == 0
@@ -95,11 +105,63 @@ fn idct_pass(block: &mut [i16; 64]) -> [[i32; 8]; 8] {
         idct_row(row);
     }
 
-    // 列
+    // 列：**4 列一批**（通道 = 列）。每个「系数 j 在 4 列上的值」正好是
+    // `block[j*8 + off .. +4]` 这 4 个连续 i16 —— 一次向量加载就够，
+    // 不用先把块拷成通道数组（上一版就是被那次拷贝吃掉了收益）。
     let mut cols = [[0i32; 8]; 8];
-    for x in 0..8 {
-        let c: [i16; 8] = std::array::from_fn(|i| block[8 * i + x]);
-        cols[x] = idct_col8(&c);
+    for half in 0..2 {
+        let off = half * 4;
+        // 8 个通道向量（term(j, w) = w * 该系数在 4 列上的值）
+        let t = |j: usize, w: u32| -> [u32; 4] {
+            std::array::from_fn(|l| mul(w, block[j * 8 + off + l]))
+        };
+        let bias = ((1 << (COL_SHIFT - 1)) / W4) as i32;
+        let init: [u32; 4] =
+            std::array::from_fn(|l| W4.wrapping_mul((block[off + l] as i32 + bias) as u32));
+        let (mut a0, mut a1, mut a2, mut a3) = (init, init, init, init);
+        let (t2a, t2b) = (t(2, W2), t(2, W6));
+        a0 = add(a0, t2a);
+        a1 = add(a1, t2b);
+        a2 = sub(a2, t2b);
+        a3 = sub(a3, t2a);
+        let (mut b0, mut b1, mut b2, mut b3) = (t(1, W1), t(1, W3), t(1, W5), t(1, W7));
+        b0 = add(b0, t(3, W3));
+        b1 = sub(b1, t(3, W7));
+        b2 = sub(b2, t(3, W1));
+        b3 = sub(b3, t(3, W5));
+        let t4 = t(4, W4);
+        a0 = add(a0, t4);
+        a1 = sub(a1, t4);
+        a2 = sub(a2, t4);
+        a3 = add(a3, t4);
+        b0 = add(b0, t(5, W5));
+        b1 = sub(b1, t(5, W1));
+        b2 = add(b2, t(5, W7));
+        b3 = add(b3, t(5, W3));
+        let t6 = t(6, W6);
+        a0 = add(a0, t6);
+        a1 = sub(a1, t(6, W2));
+        a2 = add(a2, t(6, W2));
+        a3 = sub(a3, t6);
+        b0 = add(b0, t(7, W7));
+        b1 = sub(b1, t(7, W5));
+        b2 = add(b2, t(7, W3));
+        b3 = sub(b3, t(7, W1));
+        let sum = [
+            add(a0, b0),
+            add(a1, b1),
+            add(a2, b2),
+            add(a3, b3),
+            sub(a3, b3),
+            sub(a2, b2),
+            sub(a1, b1),
+            sub(a0, b0),
+        ];
+        for j in 0..8 {
+            for l in 0..4 {
+                cols[off + l][j] = sum[j][l] as i32 >> COL_SHIFT;
+            }
+        }
     }
     cols
 }

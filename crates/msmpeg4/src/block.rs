@@ -35,7 +35,17 @@ pub struct RlTable {
     /// 编码时靠它反查：同一个 run 下 level 从 1 起连续排，所以
     /// `符号 = index_run[last][run] + level - 1`。
     index_run: [[u16; 64]; 2],
+    /// **快表**：偷看 `FAST_BITS` 位直接得 `(码长, run, level)` —— 把
+    /// 「VLC 查表 + `run[]`/`level[]` 两次取数组 + `last` 比较」压成一次查表。
+    /// 条目 0 = 码长超过 `FAST_BITS`（退回 `decode_symbol`）。
+    ///
+    /// 打包：`len | run << 5 | (level 的低 8 位) << 14`。escape 符号记成
+    /// `(66, 0)` —— 与 `decode_symbol` 的返回一致（调用方就靠 `level == 0` 认它）。
+    fast: Vec<u32>,
 }
+
+/// 快表位宽（与 `Vlc` 的 `FAST_BITS` 同档：多数符号一次命中）。
+const FAST_BITS: u32 = 9;
 
 impl RlTable {
     pub fn new(
@@ -64,6 +74,27 @@ impl RlTable {
                 max_run[li][l as usize] = run[i];
             }
         }
+        // 快表：把每个「码长 ≤ FAST_BITS」的符号解成 (run, level) 直接塞进表。
+        let mut fast = vec![0u32; 1 << FAST_BITS];
+        for (sym, &[code, len]) in vlc_table.iter().enumerate() {
+            if len == 0 || len > FAST_BITS {
+                continue;
+            }
+            let (run_v, level_v) = if sym == n {
+                (66u32, 0u32) // escape
+            } else {
+                let mut r = run[sym] as i32 + 1;
+                if sym >= last {
+                    r += 192;
+                }
+                (r as u32, (level[sym] as i32 as u32) & 0xff)
+            };
+            let entry = len | (run_v << 5) | (level_v << 14);
+            let base = (code << (FAST_BITS - len)) as usize;
+            for slot in fast[base..base + (1 << (FAST_BITS - len))].iter_mut() {
+                *slot = entry;
+            }
+        }
         Self {
             vlc: Vlc::new(vlc_table),
             run,
@@ -72,7 +103,28 @@ impl RlTable {
             max_level,
             max_run,
             index_run,
+            fast,
         }
+    }
+
+    /// 快路径：偷看 `FAST_BITS` 位一次拿到 `(run, level)`（level 已乘 qmul 加 qadd）。
+    /// `None` = 码长超过快表（或位不够）→ 调用方退回 `decode_symbol`。
+    #[inline]
+    fn decode_symbol_fast(&self, r: &mut BitReader, qmul: i32, qadd: i32) -> Option<(i32, i32)> {
+        if r.bits_left() < FAST_BITS as usize {
+            return None;
+        }
+        let e = self.fast[r.peek_u16(FAST_BITS) as usize];
+        if e == 0 {
+            return None;
+        }
+        r.skip(e & 0x1f).ok()?;
+        let run = ((e >> 5) & 0x1ff) as i32;
+        // ⚠️ level 字节为 0 = **escape** 符号：它的 level 必须是**字面 0**
+        // （调用方靠 `level == 0` 认它），不能走 `*qmul + qadd` —— 那会变成 qadd。
+        let lv = (((e >> 14) & 0xff) as u8 as i8) as i32;
+        let level = if lv == 0 { 0 } else { lv * qmul + qadd };
+        Some((run, level))
     }
 
     /// `ff_rl_table` 的 6 张表：0/1/2 = 帧内亮度（低 / 高 / 中运动），3/4/5 = 色度 / 帧间。
@@ -195,21 +247,39 @@ impl RlTable {
         let mut i = start_i;
 
         loop {
-            let (run, mut level, _) = self.decode_symbol(r, qmul, qadd)?;
+            let (run, mut level) = match self.decode_symbol_fast(r, qmul, qadd) {
+                Some(v) => v,
+                None => {
+                    let (run, level, _) = self.decode_symbol(r, qmul, qadd)?;
+                    (run, level)
+                }
+            };
             let mut needs_sign = true;
 
             if level == 0 {
                 // ---- escape ----
                 if r.bit()? == 1 {
                     // 第一 escape：再解一个 RL 符号，run 照用，level 补上该 (last,run) 的上界
-                    let (run2, lvl2, _) = self.decode_symbol(r, qmul, qadd)?;
+                    let (run2, lvl2) = match self.decode_symbol_fast(r, qmul, qadd) {
+                        Some(v) => v,
+                        None => {
+                            let (run, level, _) = self.decode_symbol(r, qmul, qadd)?;
+                            (run, level)
+                        }
+                    };
                     let base = run2 - if run2 >= 192 { 192 } else { 0 };
                     let li = usize::from(run2 >= 192);
                     i += run2;
                     level = lvl2 + self.max_level[li][((base - 1) & 63) as usize] as i32 * qmul;
                 } else if r.bit()? == 1 {
                     // 第二 escape：再解一个 RL 符号，run 再补上该 (last, level) 的上界（+run_diff）
-                    let (run2, lvl2, _) = self.decode_symbol(r, qmul, qadd)?;
+                    let (run2, lvl2) = match self.decode_symbol_fast(r, qmul, qadd) {
+                        Some(v) => v,
+                        None => {
+                            let (run, level, _) = self.decode_symbol(r, qmul, qadd)?;
+                            (run, level)
+                        }
+                    };
                     let li = usize::from(run2 >= 192);
                     let lv = (lvl2 / qmul).clamp(0, 63) as usize;
                     i += run2 + self.max_run[li][lv] as i32 + run_diff;
