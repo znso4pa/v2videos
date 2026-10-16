@@ -1238,6 +1238,15 @@ pub(crate) struct Quant {
     inter_step: [i32; 64],
 }
 
+/// 帧内量化偏置，单位是 1/8 个量化步长。
+///
+/// `4` = 四舍五入到最近的合法电平 —— 与 ffmpeg 的**非 trellis** 路一致
+/// （`dct_quantize_c` 对 `mpeg_quant` 把 bias 覆盖成 `1<<(QMAT_SHIFT-1)`，也就是半个步长；
+/// 它那个 `intra_quant_bias = 3/8` 只服务 trellis 路）。调到更小 = 更偏死区：
+/// 小系数更容易被判成 0，省下的位由码控花到别处 —— 我们没有 trellis 替我们做这笔账，
+/// 所以这是个真旋钮（扫描的数字见 TODO）。
+const INTRA_BIAS_EIGHTHS: i32 = 4;
+
 impl Quant {
     fn new(qscale: u8, mpeg: bool) -> Self {
         let q = i32::from(qscale);
@@ -1304,8 +1313,9 @@ impl Quant {
         }
         let step = self.step(k, intra);
         let v = if intra {
-            // 帧内：重建电平在 `step/16` 的整数倍上 —— 四舍五入到最近的。
-            div_round(f.abs() * 16, step)
+            // 帧内：重建电平在 `step/16` 的整数倍上。偏置 = `INTRA_BIAS_EIGHTHS`/8 个步长
+            // （`4` 就是四舍五入；写成 8 倍只是为了让更小的偏置也能取整数）。
+            (f.abs() * 128 + INTRA_BIAS_EIGHTHS * step) / (8 * step)
         } else {
             // 帧间：重建电平在 `step/32` 的**奇数**倍上（`(2|level|+1)`），
             // 所以最近的合法电平是 `round((|f|·32/step − 1)/2)`，
