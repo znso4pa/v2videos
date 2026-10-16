@@ -882,21 +882,42 @@ fn motion_estimate(
     //
     // 两个中心重叠时**跳过**落在第一个盒子里的候选。旧版用一个 `HashSet` 去重 ——
     // 实测那一个 `HashSet` 就占了整条 `.wmv` 链路的 **12%**，现在只要两次区间比较。
+    // ---- 粗搜：**区域（菱形）搜索**，不是固定网格 ----
+    //
+    // 旧版是「两个中心各一个 2 像素网格 × ±4 像素」= 最多 50 个候选，而且范围**钉死**在
+    // ±4 像素。现在从预测点出发按 2 像素步长走菱形（每次 4 个点），走到不再改善为止：
+    // 候选数少一半以上，**够得着的范围反而没有上限**（能一直走出去）。
+    //
+    // 起点两个：`(0,0)` 与空间预测（中值）。先评起点本身，再各自走菱形。
     let c1 = (0i32, 0i32);
     let c2 = (pred.0 >> 1, pred.1 >> 1);
-    for (i, (cx, cy)) in [c1, c2].into_iter().enumerate() {
-        for dy in (-8..=8i32).step_by(4) {
-            for dx in (-8..=8i32).step_by(4) {
-                let cand = (cx + dx, cy + dy);
-                if i == 1 && (cand.0 - c1.0).abs() <= 8 && (cand.1 - c1.1).abs() <= 8 {
-                    continue; // 已在第一个盒子里评过（值相同，重复评也不会改结果）
-                }
+    for (i, c) in [c1, c2].into_iter().enumerate() {
+        if i == 1 && c == c1 {
+            continue; // 两个起点重合时别走两遍
+        }
+        let s = sad_of(c, best_sad);
+        if s < best_sad {
+            best_sad = s;
+            best = c;
+        }
+        // 菱形：每次只看上下左右四个 2 像素步长的点，谁最好就从谁继续走。
+        let mut cur = best;
+        for _ in 0..DIAMOND_STEPS {
+            let base = cur;
+            let mut improved = false;
+            for (dx, dy) in [(2i32, 0i32), (-2, 0), (0, 2), (0, -2)] {
+                let cand = (base.0 + dx, base.1 + dy);
                 let s = sad_of(cand, best_sad);
                 if s < best_sad {
                     best_sad = s;
                     best = cand;
+                    improved = true;
                 }
             }
+            if !improved {
+                break;
+            }
+            cur = best;
         }
     }
     // 细化一：最优周围 ±1.5 像素，**按 1 像素粒度**（半像素步长 2）
@@ -928,6 +949,9 @@ fn motion_estimate(
     let clamp = |v: i32, p: i32| -> i32 { (v - p).clamp(-MV_DIFF_MAX, MV_DIFF_MAX) + p };
     (clamp(best.0, pred.0), clamp(best.1, pred.1))
 }
+
+/// 菱形搜索最多走几步（每步 2 像素）—— 上限只是防跑飞，实际都在「不再改善」处就停。
+const DIAMOND_STEPS: usize = 8;
 
 /// 补齐到宏块对齐的 YUV420P 平面（边缘复制）。
 fn pad_planes(frame: &Frame, pw: usize, ph: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
