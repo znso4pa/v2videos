@@ -951,10 +951,10 @@ impl PState<'_> {
         // 复制成局部量：闭包要**可变借** `me_cache`，就不能再借 `self` 的别的字段。
         let sy = self.sy;
         let mut cur = [0u8; 256];
+        // 逐行拷贝（每行 16 字节）—— 值不变，少一层带边界检查的内层循环。
         for r in 0..16usize {
-            for c in 0..16usize {
-                cur[r * 16 + c] = sy[(mby * 16 + r) * pw + mbx * 16 + c];
-            }
+            let o = (mby * 16 + r) * pw + mbx * 16;
+            cur[r * 16..r * 16 + 16].copy_from_slice(&sy[o..o + 16]);
         }
         let mut tmp = [0u8; 256];
         self.me_cache.next_mb();
