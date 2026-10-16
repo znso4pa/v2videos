@@ -1461,11 +1461,33 @@ pub fn sad_luma16(
     no_rounding: bool,
     tmp: &mut [u8; 256],
 ) -> u64 {
+    sad_luma16_capped(cur, refp, p, no_rounding, tmp, u32::MAX) as u64
+}
+
+/// 带**上限**的 SAD：累计值一到 `cap` 就停，直接返回 `cap`。
+///
+/// ⚠️ 提前退出**不改任何结果**：调用方只做 `s < best` 的比较，返回 `cap` 只会让这个
+/// 候选「不赢」—— 与算完再比完全等价。**但绝不能返回小于真值的数**（那会让本该输的赢）。
+/// 运动估计里一个宏块要评 150+ 个候选，绝大多数在第一行就注定输了。
+///
+/// 顺带把内层从 `(a as i32 - b as i32).unsigned_abs() as u64` 换成 `u8::abs_diff`
+/// 累加到 `u32`（值完全相同，但少两次转换、更容易向量化）。
+pub fn sad_luma16_capped(
+    cur: &[u8; 256],
+    refp: &Planes,
+    p: &McParams,
+    no_rounding: bool,
+    tmp: &mut [u8; 256],
+    cap: u32,
+) -> u32 {
     if p.need_emu {
         mc_luma16(tmp, 16, 0, 0, refp, p, no_rounding);
-        let mut acc = 0u64;
+        let mut acc = 0u32;
         for (a, b) in cur.iter().zip(tmp.iter()) {
-            acc += (*a as i32 - *b as i32).unsigned_abs() as u64;
+            acc += a.abs_diff(*b) as u32;
+            if acc >= cap {
+                return cap;
+            }
         }
         return acc;
     }
@@ -1477,7 +1499,7 @@ pub fn sad_luma16(
     let pw = refp.pw;
     let base = p.src_y as usize * pw + p.src_x as usize;
     let (hx, hy) = (p.dxy & 1 != 0, p.dxy & 2 != 0);
-    let mut acc = 0u64;
+    let mut acc = 0u32;
     // ⚠️ 四个相位**在行循环外**分开写。原来是把 `hx`/`hy` 的判断放在最内层，
     // 每次索引 `top[c]`/`top[c+1]`/`bot[c]`/`bot[c+1]` —— 编译器无法证明
     // `c + 1` 不越界，于是 256 次里每次都带边界检查；而且 `if hx` 在内层
@@ -1490,7 +1512,10 @@ pub fn sad_luma16(
                 let top = &refp.y[base + r * pw..base + r * pw + 16];
                 let crow = &cur[r * 16..r * 16 + 16];
                 for (a, b) in crow.iter().zip(top) {
-                    acc += (*a as i32 - *b as i32).unsigned_abs() as u64;
+                    acc += a.abs_diff(*b) as u32;
+                }
+                if acc >= cap {
+                    return cap;
                 }
             }
         }
@@ -1499,8 +1524,11 @@ pub fn sad_luma16(
                 let top = &refp.y[base + r * pw..base + r * pw + 17];
                 let crow = &cur[r * 16..r * 16 + 16];
                 for (a, t) in crow.iter().zip(top.windows(2)) {
-                    let v = (t[0] as u32 + t[1] as u32 + r1) >> 1;
-                    acc += (*a as i32 - v as i32).unsigned_abs() as u64;
+                    let v = ((t[0] as u32 + t[1] as u32 + r1) >> 1) as u8;
+                    acc += a.abs_diff(v) as u32;
+                }
+                if acc >= cap {
+                    return cap;
                 }
             }
         }
@@ -1510,8 +1538,11 @@ pub fn sad_luma16(
                 let bot = &refp.y[base + (r + 1) * pw..base + (r + 1) * pw + 16];
                 let crow = &cur[r * 16..r * 16 + 16];
                 for (a, (t, b)) in crow.iter().zip(top.iter().zip(bot)) {
-                    let v = (*t as u32 + *b as u32 + r1) >> 1;
-                    acc += (*a as i32 - v as i32).unsigned_abs() as u64;
+                    let v = ((*t as u32 + *b as u32 + r1) >> 1) as u8;
+                    acc += a.abs_diff(v) as u32;
+                }
+                if acc >= cap {
+                    return cap;
                 }
             }
         }
@@ -1521,8 +1552,12 @@ pub fn sad_luma16(
                 let bot = &refp.y[base + (r + 1) * pw..base + (r + 1) * pw + 17];
                 let crow = &cur[r * 16..r * 16 + 16];
                 for (a, (t, b)) in crow.iter().zip(top.windows(2).zip(bot.windows(2))) {
-                    let v = (t[0] as u32 + t[1] as u32 + b[0] as u32 + b[1] as u32 + r2) >> 2;
-                    acc += (*a as i32 - v as i32).unsigned_abs() as u64;
+                    let v =
+                        ((t[0] as u32 + t[1] as u32 + b[0] as u32 + b[1] as u32 + r2) >> 2) as u8;
+                    acc += a.abs_diff(v) as u32;
+                }
+                if acc >= cap {
+                    return cap;
                 }
             }
         }
