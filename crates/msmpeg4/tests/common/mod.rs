@@ -206,6 +206,48 @@ pub fn video_extra(path: &str) -> Option<Vec<u8>> {
     Some(v.video.as_ref()?.extra.clone())
 }
 
+/// 按**版本**解一帧（单帧、无前序状态）—— 给「拿样本的原始帧当输入/靶子」的测试用。
+///
+/// ⚠️ 别直接用 `decode_i_frame`：那是 **V3 专用**。拿它去解 WMV1 / WMV2 的样本
+/// 只会得到「解不开 / 对不上」这类**指错方向**的失败 —— 看着像解码器坏了，
+/// 其实是版本没对上。WMV2 还额外要容器 extradata 里的能力位。
+pub fn decode_one_frame(
+    bytes: &[u8],
+    w: u32,
+    h: u32,
+    version: v2v_msmpeg4::Version,
+    extra: &[u8],
+) -> Option<v2v_msmpeg4::Frame> {
+    decoder_for(version, extra)?.decode(bytes, w, h).ok()
+}
+
+/// 按**版本**造解码器（WMV2 要容器 extradata 里的能力位）；造不出来给 `None`。
+///
+/// 解码器是**流**的属性（版本来自容器 FourCC）—— 所以凡是要解真样本的测试，
+/// 都得走这里，别用 `Decoder::new()`（那是 V3 默认值）。
+pub fn decoder_for(
+    version: v2v_msmpeg4::Version,
+    extra: &[u8],
+) -> Option<v2v_msmpeg4::Decoder> {
+    if version == v2v_msmpeg4::Version::Wmv2 {
+        v2v_msmpeg4::Decoder::with_wmv2(extra).ok()
+    } else {
+        Some(v2v_msmpeg4::Decoder::with_version(version))
+    }
+}
+
+/// 样本视频轨的**版本 + extradata**；认不出 FourCC 给 `None`（调用方打 SKIP）。
+pub fn version_and_extra(path: &str) -> Option<(v2v_msmpeg4::Version, Vec<u8>)> {
+    Some((video_version(path)?, video_extra(path).unwrap_or_default()))
+}
+
+/// 样本视频轨的**版本**；认不出（不是 MS-MPEG-4 家族）就给 `None`。
+///
+/// 与 `decode_one_frame` 配对用：测试拿到版本才知道该怎么解、该不该让路。
+pub fn video_version(path: &str) -> Option<v2v_msmpeg4::Version> {
+    video_fourcc(path).and_then(|(_, _, fc)| v2v_msmpeg4::Version::from_fourcc(fc))
+}
+
 /// 按**解码顺序**取出全部视频帧（不过滤关键帧），连同视频尺寸。
 pub fn all_video_frames(path: &str) -> Option<(Vec<Vec<u8>>, u32, u32)> {
     first_video_frames(path, usize::MAX)

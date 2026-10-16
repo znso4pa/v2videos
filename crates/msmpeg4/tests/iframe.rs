@@ -5,13 +5,14 @@
 //!
 //! 设 `V2V_ASF_SAMPLE=<路径>` 才真跑；缺样本或缺 ffmpeg 打 `SKIP` 并通过。
 
+mod common;
+
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
 use std::process::Command;
 
 use v2v_asf::{AsfDemuxer, StreamKind};
-use v2v_msmpeg4::decode_i_frame;
 
 /// 对账时最多取几个 I 帧：够覆盖首帧 + 若干内容帧，又不至于让 oracle 测试太慢。
 const MAX_I_FRAMES: usize = 6;
@@ -179,7 +180,14 @@ fn decodes_the_first_i_frame_without_error() {
             return;
         }
     };
-    let f = decode_i_frame(&i_frames[0], w, h).expect("解 I 帧");
+    let (version, extra) = match common::version_and_extra(&path) {
+        Some(v) => v,
+        None => {
+            eprintln!("SKIP: 认不出样本视频轨的 FourCC（本对账只覆盖 MS-MPEG-4 家族 + WMV1/2）");
+            return;
+        }
+    };
+    let f = common::decode_one_frame(&i_frames[0], w, h, version, &extra).expect("解 I 帧");
     assert_eq!(f.y.len(), (w as usize) * (h as usize));
     assert_eq!(f.u.len(), (w as usize / 2) * (h as usize / 2));
     assert_eq!(f.v.len(), (w as usize / 2) * (h as usize / 2));
@@ -209,6 +217,13 @@ fn first_i_frame_matches_ffmpeg() {
             return;
         }
     };
+    let (version, extra) = match common::version_and_extra(&path) {
+        Some(v) => v,
+        None => {
+            eprintln!("SKIP: 认不出样本视频轨的 FourCC（本对账只覆盖 MS-MPEG-4 家族 + WMV1/2）");
+            return;
+        }
+    };
     let refs = match ffmpeg_i_frames(&path, 1, w, h) {
         Some(v) => v,
         None => {
@@ -217,7 +232,7 @@ fn first_i_frame_matches_ffmpeg() {
         }
     };
 
-    let ours = decode_i_frame(&i_frames[0], w, h).expect("解 I 帧");
+    let ours = common::decode_one_frame(&i_frames[0], w, h, version, &extra).expect("解 I 帧");
     let d = compare(&ours.y, &ours.u, &ours.v, &refs[0], w, h);
     eprintln!(
         "首帧对账：最大差 {}（第 {} 个像素），平均差 {:.3}，参考 Y 取值 {} 种",
@@ -257,6 +272,13 @@ fn coded_i_frames_match_ffmpeg() {
             return;
         }
     };
+    let (version, extra) = match common::version_and_extra(&path) {
+        Some(v) => v,
+        None => {
+            eprintln!("SKIP: 认不出样本视频轨的 FourCC（本对账只覆盖 MS-MPEG-4 家族 + WMV1/2）");
+            return;
+        }
+    };
     let want = i_frames.len().min(MAX_I_FRAMES);
     if want < 2 {
         eprintln!("SKIP: 样本里只有 {} 个 I 帧，覆盖不到内容帧", i_frames.len());
@@ -276,7 +298,7 @@ fn coded_i_frames_match_ffmpeg() {
 
     let mut coded_seen = 0usize;
     for n in 1..want {
-        let ours = decode_i_frame(&i_frames[n], w, h).expect("解 I 帧");
+        let ours = common::decode_one_frame(&i_frames[n], w, h, version, &extra).expect("解 I 帧");
         let d = compare(&ours.y, &ours.u, &ours.v, &refs[n], w, h);
         eprintln!(
             "I#{n} 对账：最大差 {}（第 {} 个像素），平均差 {:.3}，参考 Y 取值 {} 种",
