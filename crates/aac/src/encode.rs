@@ -1961,6 +1961,15 @@ fn cached_band_cost(
 /// **心理声学模型得挂在率-失真分配（`feat/aac-rd-alloc` 那套 λ 机制）上，
 /// 单独挂在纯失真上等于没写。** 详见 TODO 的 `feat/aac-psy` 一节。
 fn band_cost(band: &[f32], sf: u8, qu: &mut Vec<i32>) -> (f32, u8) {
+    let (cost, cb, _bits) = band_cost_rd(band, sf, qu);
+    (cost, cb)
+}
+
+/// 与 `band_cost` 同一条路径，但**把位数也带出来**（`dist + λ·位数` 那一刀要用）。
+///
+/// 一条路径两个出口是有意的：决策口径只有一份，位数的口径也只有一份
+/// （`band_bits`，与 `write_band` 对拍钉住）。
+fn band_cost_rd(band: &[f32], sf: u8, qu: &mut Vec<i32>) -> (f32, u8, u32) {
     // ---- 量化只算一次，11 本码本共用 ----
     //
     // 同一个 `sf` 下所有码本的**量化步长相同**（都是 `q34(sf)`），差别只在
@@ -2005,8 +2014,8 @@ fn band_cost(band: &[f32], sf: u8, qu: &mut Vec<i32>) -> (f32, u8) {
     // 就把这条带标成零（代价 = 原始能量）。
     let zero_cost: f32 = band.iter().map(|&c| c * c).sum();
     match best {
-        Some((c, cb)) if c <= zero_cost => (c, cb),
-        _ => (zero_cost, 0),
+        Some((c, cb)) if c <= zero_cost => (c, cb, band_bits(band, sf, cb, qu)),
+        _ => (zero_cost, 0, 0),
     }
 }
 
@@ -2021,7 +2030,6 @@ fn band_cost(band: &[f32], sf: u8, qu: &mut Vec<i32>) -> (f32, u8) {
 ///
 /// ⚠️ 由 `band_bits_matches_what_write_band_actually_writes` 对拍钉住：
 /// 这里的计数与写出端**必须**一致，否则 RD 代价模型会追着错的位数量走。
-#[allow(dead_code)] // 只服务下一刀的逐带 RD（`dist + λ·位数`，见 TODO）—— 现在还没接线
 fn band_bits(band: &[f32], sf: u8, cb: u8, qu: &[i32]) -> u32 {
     if cb == 0 {
         return 0;
