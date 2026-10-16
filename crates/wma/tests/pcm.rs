@@ -124,42 +124,99 @@ fn decoded_pcm_matches_ffmpeg() {
 
     // ---- 找「帧级偏移」（ffmpeg 跳掉的编码器延迟）----
     // 口径：`got[f] ≈ pcm[f - shift_frames]`
+    //
+    // ⚠️ 这是**搜索**，不是「断言偏移等于某个数」。三条踩过的坑：
+    // 1. **窗口要开宽**（±8 帧）并检查最优点有没有贴在边界上 —— 窄窗里的「极值」
+    //    多半是边界造出来的（本仓撞过：报 −4；把窗口开到 ±20 又报 −20 ——
+    //    那是「窗口里第一个 0」，不是偏移）。贴边 = 真偏移在窗外。
+    // 2. **要在有信号的窗口上比**：音轨开头经常是几秒数字静音，拿开头对齐会退化成
+    //    「所有偏移一样好」→ 整轨逐样本比全错位，而报出来像是解码器的错。
+    //    所以窗口先**滑**到参考能量够大的位置。
+    // 3. **判据不写死偏移的数值范围**：那种硬编码会随样本 / 解码器版本漂，
+    //    而且**炸得像是被测物的错**。改用无量纲的一条：最优点残差要显著小于参考能量。
+    //    参考在整段可比范围里都静音时，偏移**不可测**，跳过 ——
+    //    该由后面那条「两边都是静音 —— 这个对账没有意义」的守卫来报真正的错。
     let fl = params.frame_len;
     let nf_ours = n / fl;
     let nf_ref = pcm.len() / channels / fl;
-    let shift_frames: i64 = {
-        let mut best = (f64::MAX, 0i64);
-        for s in -4i64..=4 {
-            let (mut sum, mut cnt) = (0f64, 0usize);
-            for f in 8..nf_ours.min(60) as i64 {
-                let g = f - s;
-                if g < 0 || g >= nf_ref as i64 {
-                    continue;
-                }
-                for i in (0..fl).step_by(7) {
-                    let a = got[0][f as usize * fl + i];
-                    let b = pcm[(g as usize * fl + i) * channels] as f32;
-                    sum += ((a - b) * (a - b)) as f64;
-                    cnt += 1;
-                }
+    const SPAN: usize = 52; // 对齐窗口长度（帧）：够长才分得清「差一帧」
+
+    // 窗口里每样本的平均能量（只取每 7 个样本，够用且便宜）
+    let win_energy = |f0: usize, span: usize| -> f64 {
+        let (mut sp, mut c) = (0f64, 0usize);
+        for f in f0..(f0 + span).min(nf_ref) {
+            for i in (0..fl).step_by(7) {
+                let b = pcm[(f * fl + i) * channels] as f64;
+                sp += b * b;
+                c += 1;
             }
-            if cnt > 100 {
-                let mse = sum / cnt as f64;
-                if mse < best.0 {
-                    best = (mse, s);
+        }
+        if c == 0 {
+            0.0
+        } else {
+            sp / c as f64
+        }
+    };
+    // 1.0 ≈ 一个量化台阶的均方 —— 这是 16 位 PCM 的噪声底，不是对某个样本量出来的数
+    let mut f0 = 8usize;
+    let mut ref_energy = 0.0;
+    while f0 + SPAN <= nf_ours.min(nf_ref) {
+        ref_energy = win_energy(f0, SPAN);
+        if ref_energy >= 1.0 {
+            break;
+        }
+        f0 += 16;
+    }
+
+    let (best_mse, shift_frames) = {
+        let mut best = (f64::MAX, 0i64);
+        if ref_energy >= 1.0 {
+            for s in -8i64..=8 {
+                let (mut se, mut cnt) = (0f64, 0usize);
+                for f in f0..f0 + SPAN {
+                    let g = f as i64 - s;
+                    if g < 0 || g >= nf_ref as i64 {
+                        continue;
+                    }
+                    for i in (0..fl).step_by(7) {
+                        let a = got[0][f * fl + i];
+                        let b = pcm[(g as usize * fl + i) * channels] as f32;
+                        se += ((a - b) * (a - b)) as f64;
+                        cnt += 1;
+                    }
+                }
+                if cnt > 100 {
+                    let mse = se / cnt as f64;
+                    if mse < best.0 {
+                        best = (mse, s);
+                    }
                 }
             }
         }
-        eprintln!(
-            "帧级偏移：我们的帧 = ffmpeg 的帧 + {}（MSE {:8.2}）",
-            best.1, best.0
-        );
-        best.1
+        best
     };
-    // ffmpeg 的 `skip_samples = s->frame_len * 2`（整整两帧，见 `flush()`），v1/v2 一样 ——
-    // 实测偏移就是 +2。这里只是合理性守卫，真正的判据是下面的逐样本容差。
-    assert!((1..=4).contains(&shift_frames), "偏移不合理（{shift_frames}）");
-    let shift = shift_frames as usize * fl;
+    if ref_energy >= 1.0 {
+        eprintln!(
+            "帧级偏移：我们的帧 = ffmpeg 的帧 + {shift_frames}（窗口 {f0}..{} 帧，MSE {best_mse:8.2}，参考能量 {ref_energy:8.0}）",
+            f0 + SPAN
+        );
+    }
+
+    let shift = if ref_energy < 1.0 {
+        eprintln!("⚠️ 参考在整段可比范围里都是数字静音 —— 偏移不可测，按 0 偏移比");
+        0
+    } else {
+        assert!(
+            shift_frames != -8 && shift_frames != 8,
+            "最优点贴在搜索窗口边界（{shift_frames}）—— 真实偏移在窗外，把窗口开大再量"
+        );
+        assert!(
+            best_mse <= ref_energy * 1e-4,
+            "没对齐：最优点残差 {best_mse:.1} 相对参考能量 {ref_energy:.0} 太大 \
+             （偏移 {shift_frames}）—— 先怀疑搜索窗口与 ffmpeg 版本，别急着怪解码器"
+        );
+        shift_frames as usize * fl
+    };
 
     // ---- 逐样本比 ----
     let cmp_n = n.saturating_sub(shift).min(pcm.len() / channels);
@@ -178,10 +235,16 @@ fn decoded_pcm_matches_ffmpeg() {
         }
     }
     let mse = sum / (cmp_n * channels).max(1) as f64;
-    let ours_peak = got[0][shift..n].iter().fold(0f32, |m, &v| m.max(v.abs()));
+    // 峰值要**在同一量程上**比：我们的解码器内部是 f32，可以合法地超出 16 位满量程
+    // （ffmpeg 的 f32 输出同样会超），而它给我们的参考是**已经钳过**的 s16 ——
+    // 拿未钳的 f32 峰值去比已钳的 s16 峰值，会把「合法超量程」误判成「峰值差太多」。
+    // 所以先把我们这边也钳到 s16 量程（下面逐样本比也是这么钳的）。
+    let ours_peak = got[0][shift..n]
+        .iter()
+        .fold(0f32, |m, &v| m.max(v.clamp(-32768.0, 32767.0).abs()));
     let ref_peak = pcm[..(cmp_n * channels).min(pcm.len())]
         .iter()
-        .fold(0i16, |m, &v| m.max(v.abs()));
+        .fold(0u16, |m, &v| m.max(v.unsigned_abs()));
     eprintln!(
         "比了 {cmp_n} 个样本/声道：最大差 {worst}（第 {worst_at} 个）MSE {mse:.3}\n\
          峰值：我们 {ours_peak:.1} / ffmpeg {ref_peak}"

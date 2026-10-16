@@ -87,8 +87,17 @@ cargo run -p v2v-cli -- convert --mp4 -g 12 in.wmv -o out/  # .mp4：mp4v + AAC
 | `V2V_AUDIO_SAMPLE`       | 音频直通整文件对账（cli，标了 `#[ignore]`）                    |
 | `V2V_MP4_REF` / `V2V_MP4_PCM` | MP4 封装逐 box 对 `ffmpeg` 产的参考件（mp4）              |
 | `V2V_MP4_OUT` / `V2V_MP4_OUT_AV` | 上面那两条把我们的产物**落到哪个路径**（不设就落 `/tmp/v2v_ours*.mp4`） |
+| `V2V_BENCH_SAMPLE`       | 解码速度对表（`decode_bench`，`:` 分隔多个样本；不设就 SKIP）        |
 | `V2V_MAX_FRAMES` / `V2V_PFRAME_MAP` | 限量跑 / 逐帧定位（msmpeg4 调试用）                        |
 | `V2V_FUZZ_ROUNDS`        | 模糊测试的轮数（见下；不设就用各局自己的默认）                          |
+
+⚠️ **`V2V_ASF_SAMPLE` 的「多个样本用 `:` 分隔」只管 msmpeg4 / avi / cli**；
+`asf` 的 oracle 把整串当一个路径（`is_file()` 判掉）—— 会**静默 SKIP**。
+要多样本覆盖就**逐个样本跑**，别把 `:` 列表喂给全部 crate。
+
+⚠️ **SKIP 行是被 cargo 捕获的**：不 `--nocapture` 就看不见，于是「全绿」会被读成
+「都真跑了」。报证据时要连**「跑了几条 / 跳了几条」**一起报，或者看**用时**
+（`finished in 0.00s` 的「ok」多半是早退）。
 
 ```bash
 # 例：带样本跑全套；最重的是 #[ignore] 那一层

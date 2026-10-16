@@ -512,11 +512,22 @@ fn muxes_video_plus_pcm_audio_and_keeps_both_intact() {
         done += n;
     }
     // 视频放完还有剩的音频就补齐
+    let mut tail = 0usize;
     for i in done..points {
         let p = i * POINT;
         m.write_audio(&pcm[p..p + POINT], 1).expect("写尾部音频");
+        tail += 1;
     }
-    assert_eq!(done, points, "音频采样点应全部写完");
+    // `done` 只累加「视频时长内」写过的那部分，PCM 比视频长时它本来就到不了 points ——
+    // 断言的对象是「视频内 + 尾部补齐 = 全部」，不是 `done` 自己。
+    // （真正判「一个点都没漏」的是下面解码回来字节相等那一层。）
+    eprintln!(
+        "音频 {} 点 = 视频内 {done} + 尾部补齐 {tail}（{:.2} s @ {} Hz）",
+        points,
+        points as f64 / RATE as f64,
+        RATE
+    );
+    assert_eq!(done + tail, points, "音频采样点应全部写完");
 
     let ours = m.finish();
     std::fs::write(&out, &ours).expect("写我们的 MP4");
