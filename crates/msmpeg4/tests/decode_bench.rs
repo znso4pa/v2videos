@@ -39,11 +39,20 @@ fn ours(path: &str, limit: usize, reps: usize) -> Option<(usize, f64)> {
         .and_then(|(_, _, fc)| Version::from_fourcc(fc))
         .unwrap_or_default();
     let n = samples.len().min(if limit == 0 { usize::MAX } else { limit });
+    // WMV2 的能力位在容器的 extradata 里 —— 少了它连帧头都读不出来。
+    let extra = common::video_extra(path).unwrap_or_default();
 
     let mut best = f64::INFINITY;
     for _ in 0..reps {
         let t0 = Instant::now();
-        let mut dec = Decoder::with_version(version);
+        let mut dec = if version == Version::Wmv2 {
+            match Decoder::with_wmv2(&extra) {
+                Ok(d) => d,
+                Err(_) => return None,
+            }
+        } else {
+            Decoder::with_version(version)
+        };
         for s in &samples[..n] {
             // 解不开就当这一帧没解 —— 本表量的是速度，正确性由对账测试管。
             let _ = dec.decode(s, w, h);

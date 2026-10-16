@@ -15,7 +15,7 @@
 container  解封装共用的数据模型（Stream / Sample / AudioFormat / VideoFormat）—— 零依赖
 asf        ASF（.wmv / .wma）解封装 **+ 封装**（多载荷打包 + Simple Index）
 avi        AVI（RIFF）解封装
-msmpeg4    MP43 解码（I / P）**+ 编码**（I / P，含运动估计）；兼**共享数值内核**（见下）
+msmpeg4    MP43 / WMV1 / WMV2 解码（I / P）**+ MP43 编码**（I / P，含运动估计）；兼**共享数值内核**（见下）
 wma        WMA v1 / v2 解码（**只有解码器**）
 mp4v       MPEG-4 Part 2 编码（I / P + 码率控制）
 aac        AAC-LC 编码（MDCT / 短窗 / TNS / Huffman / 码率控制）

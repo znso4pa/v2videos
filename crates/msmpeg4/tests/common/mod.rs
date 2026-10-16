@@ -196,6 +196,16 @@ pub fn video_fourcc(path: &str) -> Option<(u32, u32, u32)> {
     Some((vf.width, vf.height, vf.fourcc))
 }
 
+/// 视频轨的**编解码器私有数据**（`BITMAPINFOHEADER` 之后那段）。
+///
+/// WMV2 的**能力位**（`mspel` / `abt` / `j_type` …）就在这里 —— 没有它连帧头都读不出来，
+/// 所以那条解码器不能只靠 FourCC 建起来。
+pub fn video_extra(path: &str) -> Option<Vec<u8>> {
+    let d = AsfDemuxer::new(BufReader::new(File::open(path).ok()?)).ok()?;
+    let v = d.streams().iter().find(|s| s.kind == StreamKind::Video)?;
+    Some(v.video.as_ref()?.extra.clone())
+}
+
 /// 按**解码顺序**取出全部视频帧（不过滤关键帧），连同视频尺寸。
 pub fn all_video_frames(path: &str) -> Option<(Vec<Vec<u8>>, u32, u32)> {
     first_video_frames(path, usize::MAX)

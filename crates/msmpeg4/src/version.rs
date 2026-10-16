@@ -70,6 +70,11 @@ impl Version {
         matches!(self, Version::V1 | Version::V2)
     }
 
+    /// 是不是 **WMV2** —— 它连帧头语法都是自己一套，判据散在好几处。
+    pub fn is_wmv2(self) -> bool {
+        self == Version::Wmv2
+    }
+
     /// 帧内块的 `run_diff`：`version >= MSMP4_WMV1` → 1，否则 0。
     pub fn intra_run_diff(self) -> i32 {
         i32::from(self.is_wmv())

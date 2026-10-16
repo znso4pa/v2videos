@@ -209,9 +209,15 @@ def gen_msmpeg4():
     # ---- WMV2 的 ABT（自适应块变换）扫描表 ----
     #
     # `abt_type == 1` → A（4×8：把 8×8 块按「两行一组」扫）；`== 2` → B（8×4：按「两列一组」）。
+    #
+    # ⚠️ 上游把这两张表**声明成 `[64]`**，却只初始化前 32 项 —— 尾巴是隐式的 0。
+    # 那不是笔误：`ff_msmpeg4_decode_block` 的 `i` 可以走到 32..63，它照样写
+    # `block[scan_table[i]]` —— 尾巴那 32 个 0 于是把系数写到 `block[0]`。
+    # 要对得上 ffmpeg，这个「尾巴全 0」就得一起搬过来（不是「补零凑长度」）。
     w2 = read("wmv2data.c")
-    o.flat("ABT_SCAN_A", "u8", flat(w2, "ff_wmv2_scantableA"))
-    o.flat("ABT_SCAN_B", "u8", flat(w2, "ff_wmv2_scantableB"))
+    for name, src in [("ABT_SCAN_A", "ff_wmv2_scantableA"), ("ABT_SCAN_B", "ff_wmv2_scantableB")]:
+        vals = flat(w2, src)
+        o.flat(name, "u8", vals + [0] * (64 - len(vals)))
 
     # ---- V1 走的是 **H.263** 的宏块语法，表在 `h263data.c` 里 ----
     #
