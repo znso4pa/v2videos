@@ -7,6 +7,7 @@
 //! 边框的值由调用方定：DC 预测要 **1024**（不是 0），运动矢量要 0。
 
 /// 一条块级的 DC/AC 预测状态网格（带 1 格边框，方便取左/上邻居）。
+#[derive(Debug, Clone)]
 pub(crate) struct Grid<T> {
     pub(crate) w: usize,
     pub(crate) data: Vec<T>,

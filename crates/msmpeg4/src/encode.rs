@@ -328,6 +328,18 @@ impl Encoder {
     /// —— ME 与 qscale 无关，截断也罕见，实践里最多重编一两次。
     pub fn encode_p_frame(&mut self, frame: &Frame) -> Result<Vec<u8>> {
         let mut q = self.cfg.qscale;
+        // ⚠️ **重编之前必须把状态退回去。** `encode_p_frame_at` 会把 `ref_planes`
+        // 换成「这一次尝试重建出来的帧」，还会改 MV 网格与 DC 预测器 —— 不退回去的话，
+        // 第二次是拿**解码器根本没见过的参考帧**在编，误差逐帧累积。
+        // 低 q 最容易触发 level 截断、也就最容易重编，所以症状在低 q 上最重
+        // （实测：`-q 3` 会把一段「渐亮到白」整帧编成暗的，`-q 6` 正常）。
+        let saved = (
+            self.ref_planes.clone(),
+            self.mv_grid.clone(),
+            self.dc_luma.clone(),
+            self.dc_cb.clone(),
+            self.dc_cr.clone(),
+        );
         loop {
             let (stream, clamped, max_coef) = self.encode_p_frame_at(frame, q)?;
             if !clamped || q >= 31 {
@@ -336,6 +348,11 @@ impl Encoder {
             }
             let need = ((max_coef as f64) / (2.0 * MAX_ESCAPE_LEVEL as f64)).ceil() as i64;
             q = q.max(need.clamp(1, 31) as u8);
+            self.ref_planes = saved.0.clone();
+            self.mv_grid = saved.1.clone();
+            self.dc_luma = saved.2.clone();
+            self.dc_cb = saved.3.clone();
+            self.dc_cr = saved.4.clone();
         }
     }
 

@@ -77,6 +77,7 @@ pub struct Frame {
 /// ⚠️ 这是**共享**的：`crates/mp4v` 的 P 帧编码也用它（连同下面那几个 MC 内核）。
 /// 从解码器里提出来公开，是因为半像素搬运那一套在 H.263 / MPEG-4 系里是同一份 ——
 /// 复刻第二份才是真会跑偏的那份。
+#[derive(Debug, Clone)]
 pub struct Planes {
     pub pw: usize,
     pub ph: usize,
