@@ -29,7 +29,8 @@ use crate::error::{Error, Result};
 use crate::fdct::{fdct, fdct_i};
 use crate::version::Version;
 use crate::frame::{
-    mc_chroma8, mc_luma16, mc_mb, mc_params, pred_motion, sad_luma16, Frame, Planes, ZIGZAG,
+    dc_unscale, mc_chroma8, mc_luma16, mc_mb, mc_params, pred_motion, sad_luma16, Frame, Planes,
+    ZIGZAG,
 };
 use crate::idct::{idct_add, idct_put};
 use crate::grid::Grid;
@@ -695,11 +696,13 @@ fn write_intra_blocks(
             b = 1024;
             c = 1024;
         }
-        // ⚠️ 截断除法（Rust 的 `/`），与解码端 `(a + scale/2) / scale` 逐位一致；
-        // 四舍五入会让预测值偏掉。
-        a = (a + scale / 2) / scale;
-        b = (b + scale / 2) / scale;
-        c = (c + scale / 2) / scale;
+        // ⚠️ **必须走解码端同一份**（`dc_unscale`）—— 它分两条路：`scale == 8` 是
+        // C 的 `/`（向零取整），其余是 `FASTDIV`（对负数**向下取整**）。
+        // 编码器自己写一份「看起来一样」的除法，只要哪边改了就会**静默**漂 ——
+        // 重建帧与解码器差 1，整条 P 帧链跟着跑偏。
+        a = dc_unscale(a, scale);
+        b = dc_unscale(b, scale);
+        c = dc_unscale(c, scale);
         let (pred, _dir) = dc_predict(a, b, c, Version::V3);
 
         let total = qb[n][0];
