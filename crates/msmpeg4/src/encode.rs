@@ -852,10 +852,10 @@ fn motion_estimate(
     let oy = mby * 16;
 
     let mut cur = [0u8; 256];
+    // 逐行拷贝（每行 16 字节正好是 `copy_from_slice`）—— 值不变，少一层带边界检查的内层循环。
     for r in 0..16usize {
-        for c in 0..16usize {
-            cur[r * 16 + c] = cur_y[(oy + r) * cstride + ox + c];
-        }
+        cur[r * 16..r * 16 + 16]
+            .copy_from_slice(&cur_y[(oy + r) * cstride + ox..(oy + r) * cstride + ox + 16]);
     }
     let mut tmp = [0u8; 256];
     // `cap` = 当前最优：**超过它就没必要算完**（调用方只做 `s < best` 比较，
@@ -996,12 +996,17 @@ const DIAMOND_STEPS: usize = 8;
 /// 补齐到宏块对齐的 YUV420P 平面（边缘复制）。
 fn pad_planes(frame: &Frame, pw: usize, ph: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let (w, h) = (frame.width as usize, frame.height as usize);
+    // 逐行 `copy_from_slice` + 只把**右边那一列**补成最后一列像素 ——
+    // 值与原版逐像素 `min()` 完全相同（`c.min(sw-1)` 对 c ≥ sw 就是 `sw-1`），
+    // 但内层不再是带 `min` 的标量循环，是一行 memcpy。
     let pad = |src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize| {
         let mut out = vec![0u8; dw * dh];
         for r in 0..dh {
             let sr = r.min(sh - 1);
-            for c in 0..dw {
-                out[r * dw + c] = src[sr * sw + c.min(sw - 1)];
+            let row = &mut out[r * dw..(r + 1) * dw];
+            row[..sw].copy_from_slice(&src[sr * sw..sr * sw + sw]);
+            if dw > sw {
+                row[sw..].fill(src[sr * sw + sw - 1]);
             }
         }
         out
