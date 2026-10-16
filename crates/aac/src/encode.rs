@@ -447,8 +447,10 @@ const MS_MARGIN: f64 = 0.98;
 /// 内存：每带 `256 × (f32,u8)` = 2 KB；长窗约 50 条带 → 100 KB，短窗最多 8 组
 /// 共 ~112 条带 → 约 230 KB。**挂在声道状态上跨帧复用，不随帧增长。**
 struct BandCostCache {
-    /// `tables[组][带][sf] = (代价, 码本)`；码本为 `NO_CB` = 还没算过。
-    tables: Vec<Vec<Vec<(f32, u8)>>>,
+    /// `tables[组][带][sf] = (失真, 码本, 位数)`；码本为 `NO_CB` = 还没算过。
+    ///
+    /// 位数与 λ 无关，所以同一个 `(带, sf)` 在**所有** λ 取值下都能复用（二分 λ 时这是关键）。
+    tables: Vec<Vec<Vec<(f32, u8, u32)>>>,
     /// `band_cost` 用的量化 scratch（不封顶的 `q`）—— 挂在这里**零额外分配**：
     /// 一条带最多 ~80 个系数，容量涨一次就不再动。
     q_scratch: Vec<i32>,
@@ -456,6 +458,23 @@ struct BandCostCache {
 
 /// 「这一格还没算过」的哨兵 —— 真码本只到 11，所以 `0xFF` 安全。
 const NO_CB: u8 = 0xFF;
+
+/// 逐带 RD 的 λ 斜率：`λ = RD_LAMBDA_K · sf_offset²`（失真/位数的兑换率）。
+///
+/// ## ⚠️ 现在是 `0.0`：这条「λ 挂偏移」的耦合路走不通（量过了，别再试同一条）
+///
+/// 让 λ 跟着偏移走是想复用外层「位数 ≤ 预算」的搜索（偏移本来就是粗细旋钮），
+/// 但实测 `K ∈ {0, 1, 10, 100}` 结果**完全一样**（13.85/13.86 dB、码率也不动）——
+/// RD 项根本没参与决策。两个原因：
+///
+/// 1. **量级**：sf 加一档失真 ×1.41（步长 ∝ `2^(sf/4)`），位数只变几点 —— 要顶动一档
+///    λ 得在 `1e3~1e4`，而按「失真/位数」估出来是几十（差 1~2 个数量级）。
+/// 2. **耦合本身是死的**：λ 一旦大到能顶动一档，偏移只要 > 0 就同时抬下界 + 给大 λ →
+///    位数直接崩到预算以下，搜索只能退回偏移 0 —— 粗细旋钮变成**二值**的。
+///
+/// **正路**（见 TODO 第八轮）：下界交还给「不裁剪」、由 λ 自己二分（对数网格 `2^k`），
+/// 偏移这个旋钮退场。在那之前这里保持 `0.0` —— 行为与旧路**逐字节相同**（md5 已对）。
+const RD_LAMBDA_K: f32 = 0.0;
 
 impl BandCostCache {
     fn new() -> Self {
@@ -472,7 +491,7 @@ impl BandCostCache {
             let t = &mut self.tables[g];
             t.resize_with(n, Vec::new);
             for band in t.iter_mut() {
-                band.resize(256, (0.0, NO_CB));
+                band.resize(256, (0.0, NO_CB, 0));
                 for e in band.iter_mut() {
                     e.1 = NO_CB;
                 }
@@ -481,13 +500,13 @@ impl BandCostCache {
     }
 
     #[inline]
-    fn get(&self, g: usize, b: usize, sf: u8) -> Option<(f32, u8)> {
+    fn get(&self, g: usize, b: usize, sf: u8) -> Option<(f32, u8, u32)> {
         let e = *self.tables.get(g)?.get(b)?.get(sf as usize)?;
         (e.1 != NO_CB).then_some(e)
     }
 
     #[inline]
-    fn put(&mut self, g: usize, b: usize, sf: u8, v: (f32, u8)) {
+    fn put(&mut self, g: usize, b: usize, sf: u8, v: (f32, u8, u32)) {
         if let Some(e) = self
             .tables
             .get_mut(g)
@@ -1070,6 +1089,10 @@ impl Encoder {
             // `0..=255` 是 `sf` 自己的位宽。**偏移只抬下界** ——
             // 若把上界也压低，会挡住「该带本来想用更粗的 sf」的合法选择。
             let floor = (sf_floor + sf_offset).clamp(0, 255);
+            // 逐带 RD 的 λ：由**偏移**单调映射（`RD_LAMBDA_K · offset²`，offset = 0 时 λ = 0
+            // 就退回「纯失真」）。偏移同时管着下界与 λ —— 这是这一刀的简化，
+            // 真正的版本该把下界交还给「不裁剪」、由 λ 单独控制粗细（见 TODO）。
+            let lam = RD_LAMBDA_K * (sf_offset * sf_offset) as f32;
             let (lo_sf, hi_sf) = match *prev_sf {
                 Some(p) => (
                     floor.max(p - SCALE_MAX_DIFF).clamp(0, 255),
@@ -1100,7 +1123,10 @@ impl Encoder {
             // 这是**又省时间又省 CPU** 的那一类（不靠多线程，也不增加内存）。
             let mut best: Option<(f32, u8, u8)> = None; // (代价, sf, cb)
             let mut evaluate = |sf: i32, best: &mut Option<(f32, u8, u8)>| {
-                let (cost, cb) = cached_band_cost(cache, gi, sfb, band, sf as u8);
+                let (dist, cb, bits) = cached_band_cost(cache, gi, sfb, band, sf as u8);
+                // 代价 = 失真 + λ·位数。位数进代价之后，同一条带内部的「粗一点更划算」
+                // 才第一次能被选出来（纯失真时最优点永远在窗口下界上）。
+                let cost = dist + lam * bits as f32;
                 if best.is_none_or(|(bc, _, _)| cost < bc) {
                     *best = Some((cost, sf as u8, cb));
                 }
@@ -1880,11 +1906,11 @@ fn cached_band_cost(
     sfb: usize,
     band: &[f32],
     sf: u8,
-) -> (f32, u8) {
+) -> (f32, u8, u32) {
     if let Some(v) = cache.get(gi, sfb, sf) {
         return v;
     }
-    let v = band_cost(band, sf, &mut cache.q_scratch);
+    let v = band_cost_rd(band, sf, &mut cache.q_scratch);
     cache.put(gi, sfb, sf, v);
     v
 }
@@ -1960,12 +1986,7 @@ fn cached_band_cost(
 /// 只有那时它才会改变「这一带值不值得多花位」的权衡。也就是说：
 /// **心理声学模型得挂在率-失真分配（`feat/aac-rd-alloc` 那套 λ 机制）上，
 /// 单独挂在纯失真上等于没写。** 详见 TODO 的 `feat/aac-psy` 一节。
-fn band_cost(band: &[f32], sf: u8, qu: &mut Vec<i32>) -> (f32, u8) {
-    let (cost, cb, _bits) = band_cost_rd(band, sf, qu);
-    (cost, cb)
-}
-
-/// 与 `band_cost` 同一条路径，但**把位数也带出来**（`dist + λ·位数` 那一刀要用）。
+/// 一个频带在 `(sf, cb)` 下的**失真与位数** —— `plan_group` 用 `失真 + λ·位数` 选 `sf`/码本。
 ///
 /// 一条路径两个出口是有意的：决策口径只有一份，位数的口径也只有一份
 /// （`band_bits`，与 `write_band` 对拍钉住）。
@@ -2578,7 +2599,7 @@ mod tests {
             }
             for sf in [60u8, 100, 140, 180, 220] {
                 let mut qu = Vec::new();
-                let (_, cb) = band_cost(&band, sf, &mut qu);
+                let (_, cb, _) = band_cost_rd(&band, sf, &mut qu);
                 if cb == 0 {
                     assert_eq!(band_bits(&band, sf, cb, &qu), 0, "全零带没有位数");
                     continue;
@@ -2877,7 +2898,7 @@ mod tests {
                 })
                 .collect();
             for &sf in &[0u8, 20, 40, 60, 80, 100, 120, 140, 160, 200, 230, 255] {
-                let fast = band_cost(&band, sf, &mut scratch);
+                let fast = band_cost_rd(&band, sf, &mut scratch);
                 let full = band_cost_reference(&band, sf);
                 assert_eq!(
                     fast.0.to_bits(),
