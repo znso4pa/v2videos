@@ -1055,8 +1055,6 @@ impl Encoder {
         swb: &'a [u16],
         sf_floor: i32,
         lambda: f32,
-        weights: &[f32],
-        mask_t: &[f32],
         prev_sf: &mut Option<i32>,
     ) -> GroupPlan<'a> {
         let max_sfb = swb.len() - 1;
@@ -1108,26 +1106,16 @@ impl Encoder {
             // 这是**又省时间又省 CPU** 的那一类（不靠多线程，也不增加内存）。
             // 「全零带」的代价 = 本带能量（与 sf 无关 → 整条带算一次）。
             let zero_cost: f32 = band.iter().map(|&c| c * c).sum();
-            let w = weights[sfb];
-            let t = mask_t[sfb];
-            // A 模式：阈值以下的误差不计代价（饱和）；B 模式：线性加权。
-            let shape = |e: f32| {
-                if MASK_TRANSPARENT {
-                    w * (e - t).max(0.0)
-                } else {
-                    w * e
-                }
-            };
             let mut best: Option<(f32, u8, u8)> = None; // (代价, sf, cb)
             let mut evaluate = |sf: i32, best: &mut Option<(f32, u8, u8)>| {
                 let (dist, cb, bits) = cached_band_cost(cache, gi, sfb, band, sf as u8);
-                // 代价 = （加权/饱和后的）失真 + λ·位数，**全零带在同一把尺子上**。
+                // 代价 = 失真 + λ·位数，**全零带在同一把尺子上**。
                 //
                 // ⚠️ 「砍不砍这条带」必须在这儿比：`band_cost_rd` 内部那次
-                // `dist <= zero_cost` 是**不加权、也不含 λ** 的 —— 用它决定砍不砍，
+                // `dist <= zero_cost` **不含 λ** —— 用它决定砍不砍，
                 // λ 一大时「砍掉」就永远赢不了（实测码率失控到 5.9 倍且与目标无关）。
-                let coded = shape(dist) + lam * bits as f32;
-                let zero = shape(zero_cost);
+                let coded = dist + lam * bits as f32;
+                let zero = zero_cost;
                 let (cost, cb) = if coded <= zero { (coded, cb) } else { (zero, 0) };
                 if best.is_none_or(|(bc, _, _)| cost < bc) {
                     *best = Some((cost, sf as u8, cb));
@@ -1282,11 +1270,8 @@ impl Encoder {
     ) -> crate::Result<(BitWriter, u32)> {
         let mut prev_sf: Option<i32> = None;
         let mut plans: Vec<GroupPlan<'_>> = Vec::with_capacity(group_specs.len());
-        for (gi, &(spec, swb, len)) in group_specs.iter().enumerate() {
-            let (w, t) = band_metrics(spec, swb, self.cfg.sample_rate, len);
-            plans.push(self.plan_group(
-                cache, gi, spec, swb, sf_floor, lambda, &w, &t, &mut prev_sf,
-            ));
+        for (gi, &(spec, swb, _)) in group_specs.iter().enumerate() {
+            plans.push(self.plan_group(cache, gi, spec, swb, sf_floor, lambda, &mut prev_sf));
         }
         let lens: Vec<usize> = group_specs.iter().map(|&(_, _, l)| l).collect();
         self.write_pass(seq, &plans, &lens, tns_data, write_ics)
@@ -1855,7 +1840,7 @@ fn bark_of(swb: &[u16], sample_rate: u32, group_len: usize, coefs_per_window: us
 /// ⚠️ 这是个**简化模型**：不做 FFT 分析（直接用谱系数当掩蔽源）、
 /// 不含绝对听阈（安静段的阈值会偏乐观）。但它抓住了主要矛盾 ——
 /// 「强带掩蔽邻近带」。
-#[allow(dead_code)] // 当前未使用 —— 见 `band_cost` 的说明（当真音乐上有害 + 逐带常数权重是 no-op）
+#[allow(dead_code)] // 当前未使用 —— 两套接法（线性加权 / 阈值饱和）都实测为净亏、已撤，见上面的说明
 fn masking_thresholds(
     spec: &[f32],
     swb: &[u16],
@@ -1920,55 +1905,11 @@ fn cached_band_cost(
     v
 }
 
-/// 可闻度权重的上下限（`clamp(T̄/T_b, 1/W, W)`）—— 防一个带把预算全吃走。
-const MASK_W_MAX: f32 = 32.0;
-
-/// **B 模式（同码率内重排）**的强度：代价用 `w_b · 失真 + λ·位数`，`w_b` 归一到全带均值 1。
-/// `0.0` = 关（权重恒 1，行为与纯 RD 逐字节相同）。
-const MASK_STRENGTH: f32 = 0.0;
-
-/// **A 模式（透明即止）**：把失真项换成**饱和**形式 —— 阈值 `T_b` 以下的误差不计代价。
-///
-/// 这是「噪声落在掩蔽阈值之下」的正确实现（5109 那句：要用阈值就得按带分配，
-/// 而不是给失真乘系数）。它顺带修掉「线性权重在响带上放大有效 λ → 响带被砍没」的病：
-/// 响带 `T` 大 → 超出部分小 → 不会被砍；而内容本来就是透明的时候，
-/// `λ = 0` 也不会再抢着多花位 —— 于是码率变成**上限**（这正是 A 的语义）。
-const MASK_TRANSPARENT: bool = false;
-
-/// 逐带的 `(可闻度权重 w_b, 掩蔽阈值 T_b)`。
-///
-/// `T` 直接取 `masking_thresholds`（**不复制第二份扩展函数** —— 会漂的就是第二份）；
-/// 单位和 `band_dist` 的失真一样（谱系数平方），所以可以直接相减做饱和。
-/// 权重方向：安静带阈值低 → 权重大（噪声更容易被听见），响带权重小；**归一到全带均值 1**，
-/// 这样 λ 的标定不受影响（不归一的话，一个近似静音的声道会被整体抬权重 → 它开始花位，
-/// `a_silent_side_channel_does_not_hoard_half_the_budget` 会红）。
-fn band_metrics(
-    spec: &[f32],
-    swb: &[u16],
-    sample_rate: u32,
-    group_len: usize,
-) -> (Vec<f32>, Vec<f32>) {
-    let t = masking_thresholds(spec, swb, sample_rate, 0, group_len);
-    if MASK_STRENGTH == 0.0 {
-        return (vec![1.0; t.len()], t);
-    }
-    let mean_t = t.iter().sum::<f32>() / t.len() as f32;
-    let mut w: Vec<f32> = t
-        .iter()
-        .map(|&v| {
-            (mean_t / v.max(1e-30))
-                .clamp(1.0 / MASK_W_MAX, MASK_W_MAX)
-                .powf(MASK_STRENGTH)
-        })
-        .collect();
-    let mean_w = w.iter().sum::<f32>() / w.len() as f32;
-    if mean_w > 0.0 {
-        for v in w.iter_mut() {
-            *v /= mean_w;
-        }
-    }
-    (w, t)
-}
+// 历史上这里接过两套「按可闻度分配」，**实测都是净亏**，已撤：
+//   - **线性加权**（`w_b·失真 + λ·位数`）：码率追不上目标（128k 的目标只出 ~97 kbps），
+//     全局 SNR 掉 ~10 dB；
+//   - **阈值饱和**（`w·max(0, 失真 − T_b)`）：带代价几乎整片归零 → 编码器几乎不出码。
+// 症状、数字与判读留在本地 `TODO.md`。`masking_thresholds`（下面那份）照旧留着、**没接线**。
 
 /// 一个频带在给定 `sf` 下的 `(代价, 最优码本)`。
 ///
