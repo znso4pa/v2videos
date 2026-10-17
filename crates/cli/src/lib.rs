@@ -403,6 +403,14 @@ pub fn convert_file(
     }
 }
 
+/// 并行那条路**最多攒多少字节的帧**在内存里（`--threads > 1` 时）。
+///
+/// 通道按 GOP 数限量是不够的：720p 一个 GOP 是 12 帧 × 1.38 MB ≈ 17 MB，
+/// `2 × 10` 个 GOP 就是 330 MB —— 桌面（16 GB）无所谓，**Android 上这个量级会被 LMK 杀**。
+/// 所以再加一道字节预算：排队 + 正在编的一起算，超了就压到预算之内（至少留 2 个 GOP，
+/// 否则 worker 会饿死）。
+const INFLIGHT_BUDGET_BYTES: usize = 128 << 20;
+
 /// `.wmv`（MP43 in ASF）那条路。
 fn convert_to_asf(
     input: &Path,
@@ -476,6 +484,12 @@ fn convert_to_asf(
     //
     // 并行度**上限就是 GOP 数**：`-g 12` 时 300 帧 = 25 个 GOP，8 线程够用；
     // `-g 250` 时 300 帧只有 2 个 GOP，再多的线程也白搭（这是格式约束，不是实现问题）。
+    //
+    // ⚠️ **这条路隐含一个前提：能同时开 N 个编码器实例。** 桌面上的软件编码器成立，
+    // **Android 上不成立** —— MediaCodec 的并发实例数有限、硬件编码器通常一个编解码器一份，
+    // 而且真机是 big.LITTLE（8 核里常常只有 2 个大的），线程数 ≠ 倍数。
+    // 所以：`--threads 1`（下面那条串行老路）必须始终是第一等的，
+    // 它是唯一在「只有一个编码器」时也成立的形状；并行只是**可选加速**，不是架构。
     if opts.threads > 1 {
         let nthreads = opts.threads;
         let gop_len = if opts.keyframe_interval == 0 {
@@ -490,7 +504,11 @@ fn convert_to_asf(
         };
         let verify = opts.verify;
 
-        let (jtx, jrx) = std::sync::mpsc::sync_channel::<(usize, Vec<(u32, Frame)>)>(2 * nthreads);
+        // 在途帧的上限：GOP 数与字节预算取小（见 `INFLIGHT_BUDGET_BYTES` 的说明）。
+        let gop_bytes = gop_len * w as usize * h as usize * 3 / 2;
+        let queued = (INFLIGHT_BUDGET_BYTES / gop_bytes.max(1))
+            .clamp(2, 2 * nthreads);
+        let (jtx, jrx) = std::sync::mpsc::sync_channel::<(usize, Vec<(u32, Frame)>)>(queued);
         let jrx = std::sync::Arc::new(std::sync::Mutex::new(jrx));
         let (rtx, rrx) = std::sync::mpsc::channel::<(usize, Vec<(u32, Vec<u8>, bool)>, f64, u64)>();
 
