@@ -97,6 +97,42 @@ def rows(text, name):
     return [nums(g) for g in re.findall(r"\{\s*([^{}]*?)\s*\}", body(text, name))]
 
 
+def ac_tables(text, name):
+    """`vc1_ac_tables[AC_MODES][186][2]` -> `[[(code, len), …], …]`（按编码集分组）。
+
+    ⚠️ 不能用 `rows()`：那个按**最内层**分组，会把 8 个编码集揉成一大串。
+    这里按**花括号深度**切顶层，再在每一组里抠 `{code, len}`。
+    """
+    s = body(text, name)
+    modes, depth, start = [], 0, None
+    for i, ch in enumerate(s):
+        if ch == "{":
+            depth += 1
+            if depth == 1:
+                start = i
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start is not None:
+                group = s[start : i + 1]
+                if not re.search(r"\{\s*(0[xX][0-9a-fA-F]+|\d+)", group):
+                    raise SystemExit(f"{name}: 有一组里一条 `{{码, 长度}}` 都没抠到（表里是十六进制？）")
+                modes.append(
+                    # ⚠️ 表里是**十六进制**（`{ 0x0001, 2}`）—— 只认十进制会一条都抠不到，
+                    # 而且不会报错（空表照样能生成、能编译、无声全错）。
+                    [
+                        [int(a, 0), int(b, 0)]
+                        for a, b in re.findall(
+                            r"\{\s*(0[xX][0-9a-fA-F]+|\d+)\s*,\s*(0[xX][0-9a-fA-F]+|\d+)\s*\}",
+                            group,
+                        )
+                    ]
+                )
+                start = None
+    if not modes:
+        raise SystemExit(f"{name}: 一个编码集都没解析出来")
+    return modes
+
+
 def sym_rows(text, name):
     """所有最内层 `{ ... }`，每组返回**原样的逗号分隔 token**。
 
@@ -180,6 +216,19 @@ class Out:
         self.w(f"pub static {name}: [[{ty}; {len(data[0])}]; {len(data)}] = [\n")
         for row in data:
             self.w("    [" + ", ".join(str(v) for v in row) + "],\n")
+        self.w("];\n\n")
+
+    def ac_tables(self, name, modes, pad=None):
+        """3 维的 `{码, 长度}` 表。`pad` 给了就补零到那个长度（C 侧是定长数组 + 定长初始化列表）。"""
+        n = pad if pad is not None else max(len(m) for m in modes)
+        self.w(f"pub static {name}: [[[u32; 2]; {n}]; {len(modes)}] = [\n")
+        for m in modes:
+            self.w("  [\n")
+            for a, b in m:
+                self.w(f"    [{a}, {b}],\n")
+            for _ in range(n - len(m)):
+                self.w("    [0, 0],\n")
+            self.w("  ],\n")
         self.w("];\n\n")
 
     def text(self):
@@ -275,6 +324,24 @@ def gen():
         if len(c) != len(b):
             raise SystemExit(f"{name}: codes/bits 长度不一致（{len(c)} vs {len(b)}）")
         out.pairs(name, list(zip(c, b)))
+
+    # ---- AC 系数：8 种「编码集」（intra/inter × 高/中/低码率）× 186 项 `{码, 长度}`。
+    #
+    # ⚠️ **不是 186 项都有效**：每个编码集的有效项数由 `ff_vc1_ac_sizes` 给，
+    # 解码端建表用的就是这个数。全 186 项照排（无效项是 0/0，不会被查到），
+    # 但**有效项数必须一起生成**，否则会把无效项也认成合法码字。
+    out.w("// ---- AC 系数 VLC：`[编码集][项][{码, 长度}]`；**每集的有效项数见 `AC_SIZES`**。\n\n")
+    ac = ac_tables(vlc_h, "vc1_ac_tables")
+    sizes = flat(vlc_h, "ff_vc1_ac_sizes")  # ⚠️ 这张在 .h 里，不在 .c
+    if len(sizes) != len(ac):
+        raise SystemExit(f"AC_SIZES 与编码集数对不上（{len(sizes)} vs {len(ac)}）")
+    for m, n in zip(ac, sizes):
+        if len(m) != n:
+            # C 侧是 `[186]` 的定长数组 + 定长初始化列表（不够的补零），
+            # 有效项数由 `ff_vc1_ac_sizes` 给 —— 这里必须对得上，否则就是抠错了。
+            raise SystemExit(f"某编码集抠到 {len(m)} 项，但 AC_SIZES 说 {n} 项")
+    out.ac_tables("AC_TABLES", ac, pad=186)
+    out.flat("AC_SIZES", "u8", sizes)
 
     # ---- 量化。
     out.w("// ---- 量化：`pqindex` -> `pq`。三行分别是隐式 / 显式均匀 / 显式非均匀。\n\n")
