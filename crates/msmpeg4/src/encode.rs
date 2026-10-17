@@ -954,18 +954,13 @@ fn motion_estimate(
     for _ in 0..DIAMOND_STEPS {
         let base = cur;
         let mut improved = false;
-        for dy in [-2i32, 0, 2] {
-            for dx in [-2i32, 0, 2] {
-                if dx == 0 && dy == 0 {
-                    continue;
-                }
-                let cand = clamp2((base.0 + dx, base.1 + dy));
-                let s = sad_of(cand, best_sad);
-                if s < best_sad {
-                    best_sad = s;
-                    best = cand;
-                    improved = true;
-                }
+        for (dx, dy) in [(2i32, 0i32), (-2, 0), (0, 2), (0, -2)] {
+            let cand = clamp2((base.0 + dx, base.1 + dy));
+            let s = sad_of(cand, best_sad);
+            if s < best_sad {
+                best_sad = s;
+                best = cand;
+                improved = true;
             }
         }
         if !improved {
