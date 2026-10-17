@@ -45,7 +45,7 @@ SRC = args[0] if args else DEFAULT_SRC
 # 每个产出**自己**衍生自哪几个文件 —— 写进头注释，也是版权声明的依据。
 # 前两个是**数据表**，后两个是**枚举常量**（`ff_vc1_ttfrm_to_tt` 那类表里是符号名，
 # 数值要从枚举翻出来 —— 那份枚举顺序同样是上游的著作）。
-VC1_SOURCES = ["vc1data.c", "vc1_vlc_data.h", "vc1.h", "vc1_common.h"]
+VC1_SOURCES = ["vc1data.c", "vc1_vlc_data.h", "vc1.h", "vc1_common.h", "vc1acdata.h"]
 
 # 要落到 Rust 的枚举。名字必须在源文件里找得到 —— 找不到就是上游改了名，
 # 那时候**要有人来看一眼**，不能默默跳过。
@@ -212,10 +212,13 @@ class Out:
             self.w("    " + ", ".join(str(v) for v in data[i : i + per_line]) + ",\n")
         self.w("];\n\n")
 
-    def matrix(self, name, ty, data):
-        self.w(f"pub static {name}: [[{ty}; {len(data[0])}]; {len(data)}] = [\n")
+    def matrix(self, name, ty, data, pad=None):
+        """`[N][M]`。C 侧是定长数组 + 定长初始化列表，不够的行**补零**到 `pad`。"""
+        n = pad if pad is not None else max(len(r) for r in data)
+        self.w(f"pub static {name}: [[{ty}; {n}]; {len(data)}] = [\n")
         for row in data:
-            self.w("    [" + ", ".join(str(v) for v in row) + "],\n")
+            vals = list(row) + [0] * (n - len(row))
+            self.w("    [" + ", ".join(str(v) for v in vals) + "],\n")
         self.w("];\n\n")
 
     def ac_tables(self, name, modes, pad=None):
@@ -289,6 +292,7 @@ def header():
 def gen():
     data_c = read("vc1data.c")
     vlc_h = read("vc1_vlc_data.h")
+    ac_h = read("vc1acdata.h")
     enums = {}
     for f in VC1_SOURCES:
         for k, v in parse_enums(read(f)).items():
@@ -342,6 +346,31 @@ def gen():
             raise SystemExit(f"某编码集抠到 {len(m)} 项，但 AC_SIZES 说 {n} 项")
     out.ac_tables("AC_TABLES", ac, pad=186)
     out.flat("AC_SIZES", "u8", sizes)
+
+    # ---- AC 解码要用的**派生表**（`vc1acdata.h`）：
+    #
+    # 拿到一个 AC 码字的「下标」之后，还要查它对应的 `(run, level)`；
+    # escape 那几条还要在基值上加 delta。这六张表就是为此存在的。
+    # ⚠️ `INDEX_DECODE` 是 `[8][185][2]` —— 185 比 `AC_SIZES` 的最大值 186 少 1
+    # （最后一项是 escape，不走这张表）。
+    out.w("// ---- AC 解码的派生表（下标 -> run/level，以及 escape 的 delta）。\n\n")
+    out.ac_tables("AC_INDEX_DECODE", ac_tables(ac_h, "vc1_index_decode_table"), pad=185)
+    out.flat("AC_LAST_DECODE", "u8", nums(body(ac_h, "vc1_last_decode_table")))
+
+    def as_u8(vals):
+        """把 C 的 `uint8_t x = -1` 照抄成 `255`。
+
+        ⚠️ **不猜作者意图**：上游声明就是 `uint8_t`，C 存的就是补码低 8 位；
+        用的时候 `run += 表值 + 1` 会把 `255` 提升成 `256`。照抄这套语义，
+        免得 Rust 这边自作主张写个 `-1` 反而与上游分叉（那几项实测不可达，
+        但「不可达」不该由我来断言）。
+        """
+        return [v & 0xFF for v in vals]
+
+    out.matrix("AC_DELTA_LEVEL", "u8", [as_u8(r) for r in rows(ac_h, "vc1_delta_level_table")], pad=31)
+    out.matrix("AC_LAST_DELTA_LEVEL", "u8", [as_u8(r) for r in rows(ac_h, "vc1_last_delta_level_table")], pad=44)
+    out.matrix("AC_DELTA_RUN", "u8", [as_u8(r) for r in rows(ac_h, "vc1_delta_run_table")], pad=57)
+    out.matrix("AC_LAST_DELTA_RUN", "u8", [as_u8(r) for r in rows(ac_h, "vc1_last_delta_run_table")], pad=10)
 
     # ---- 量化。
     out.w("// ---- 量化：`pqindex` -> `pq`。三行分别是隐式 / 显式均匀 / 显式非均匀。\n\n")
