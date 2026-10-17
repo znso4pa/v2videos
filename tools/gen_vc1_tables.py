@@ -234,6 +234,23 @@ class Out:
             self.w("  ],\n")
         self.w("];\n\n")
 
+    def matrix_pairs(self, name, codes, bits):
+        """`[N][M]` 的 `[码, 长度]` —— `codes` 与 `bits` 是两张平行表，拼起来。"""
+        if len(codes) != len(bits):
+            raise SystemExit(f"{name}: codes/bits 行数不一致（{len(codes)} vs {len(bits)}）")
+        n = max(len(r) for r in codes)
+        self.w(f"pub static {name}: [[[u16; 2]; {n}]; {len(codes)}] = [\n")
+        for c_row, b_row in zip(codes, bits):
+            if len(c_row) != len(b_row):
+                raise SystemExit(f"{name}: 某行 codes/bits 长度不一致")
+            self.w("  [\n")
+            for c, b in zip(c_row, b_row):
+                self.w(f"    [{c}, {b}],\n")
+            for _ in range(n - len(c_row)):
+                self.w("    [0, 0],\n")
+            self.w("  ],\n")
+        self.w("];\n\n")
+
     def text(self):
         return "".join(self.buf)
 
@@ -371,6 +388,18 @@ def gen():
     out.matrix("AC_LAST_DELTA_LEVEL", "u8", [as_u8(r) for r in rows(ac_h, "vc1_last_delta_level_table")], pad=44)
     out.matrix("AC_DELTA_RUN", "u8", [as_u8(r) for r in rows(ac_h, "vc1_delta_run_table")], pad=57)
     out.matrix("AC_LAST_DELTA_RUN", "u8", [as_u8(r) for r in rows(ac_h, "vc1_last_delta_run_table")], pad=10)
+
+    # ---- P 帧宏块层：CBPCY / 4MV 块模式 / MV 差分。
+    #
+    # 三张都是 `[表号][符号]` 的平行表（codes 与 bits 分开写），拼成 `[码, 长度]`。
+    # 表号是 0..3（`tt_index` / `mv_table_index` 那一档）。
+    out.w("// ---- P 帧宏块层：`[表号][符号] -> [码, 长度]`。\n\n")
+    for name, codes, bits in [
+        ("P_CBPCY_VLC", "vc1_cbpcy_p_codes", "vc1_cbpcy_p_bits"),
+        ("P_4MV_BLOCK_PATTERN_VLC", "vc1_4mv_block_pattern_codes", "vc1_4mv_block_pattern_bits"),
+        ("P_MV_DIFF_VLC", "vc1_mv_diff_codes", "vc1_mv_diff_bits"),
+    ]:
+        out.matrix_pairs(name, rows(vlc_h, codes), rows(vlc_h, bits))
 
     # ---- 量化。
     out.w("// ---- 量化：`pqindex` -> `pq`。三行分别是隐式 / 显式均匀 / 显式非均匀。\n\n")
