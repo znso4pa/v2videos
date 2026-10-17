@@ -1178,39 +1178,52 @@ fn convert_to_mp4(
     let (vtx, vrx) = std::sync::mpsc::sync_channel::<Vec<(usize, Frame, u32)>>(2 * nthreads);
     let vrx = std::sync::Arc::new(std::sync::Mutex::new(vrx));
     let (otx, orx) = std::sync::mpsc::channel::<(Vec<Pending>, usize, (u64, u64))>();
-    let mut vworkers = Vec::with_capacity(nthreads);
-    for _ in 0..nthreads {
+
+    // 一个 worker 的活：不停从队列领一块 GOP、编完把结果发回去。
+    //
+    // 抽成闭包是为了**主线程也能跑它** —— 主线程解码那一趟约占全程 6%，跑完就闲着了，
+    // 8 核上等于白丢一个核。所以 worker 数 = `threads − 1`，主线程喂完最后一块就下场补上。
+    // （`.wmv` 那条路一开始就是这么写的；这条是补上的。）
+    let work = move |vrx: &std::sync::Arc<
+        std::sync::Mutex<std::sync::mpsc::Receiver<Vec<(usize, Frame, u32)>>>,
+    >,
+                     otx: &std::sync::mpsc::Sender<(Vec<Pending>, usize, (u64, u64))>|
+          -> std::result::Result<(), String> {
+        // 单线程时只建一次编码器，跨 GOP 连续（= 老行为）。
+        let mut keep = if nthreads == 1 {
+            Some(v2v_mp4v::Encoder::new(mp4v_cfg).map_err(|e| e.to_string())?)
+        } else {
+            None
+        };
+        loop {
+            let job = {
+                let rx = vrx.lock().map_err(|e| e.to_string())?;
+                rx.recv()
+            };
+            let Ok(items) = job else { break };
+            let (out, kf, stats) = match keep.as_mut() {
+                Some(enc) => encode_items(enc, items, all_i)?,
+                None => {
+                    let mut enc =
+                        v2v_mp4v::Encoder::new(mp4v_cfg).map_err(|e| e.to_string())?;
+                    encode_items(&mut enc, items, all_i)?
+                }
+            };
+            otx.send((out, kf, stats)).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    };
+
+    // ⚠️ **至少留一个 worker**：`threads == 1` 时 `nthreads - 1` 是 0，而 GOP 通道是
+    // **有界**的（容量 `2 × nthreads`）—— 没有消费者时主线程喂到第 3 块就永久阻塞。
+    // （`.wmv` 那条只在 `threads > 1` 时进，所以没这个坑；这条两条都要成立。）
+    let nworkers = nthreads.saturating_sub(1).max(1);
+    let mut vworkers = Vec::with_capacity(nworkers);
+    for _ in 0..nworkers {
         let vrx = std::sync::Arc::clone(&vrx);
         let otx = otx.clone();
-        let cfg = mp4v_cfg;
-        vworkers.push(std::thread::spawn(
-            move || -> std::result::Result<(), String> {
-                // 单线程时只建一次编码器，跨 GOP 连续（= 老行为）。
-                let mut keep = if nthreads == 1 {
-                    Some(v2v_mp4v::Encoder::new(cfg).map_err(|e| e.to_string())?)
-                } else {
-                    None
-                };
-                loop {
-                    let job = {
-                        let rx = vrx.lock().map_err(|e| e.to_string())?;
-                        rx.recv()
-                    };
-                    let Ok(items) = job else { break };
-                    let (out, kf, stats) = match keep.as_mut() {
-                        Some(enc) => encode_items(enc, items, all_i)?,
-                        None => {
-                            let mut enc = v2v_mp4v::Encoder::new(cfg).map_err(|e| e.to_string())?;
-                            encode_items(&mut enc, items, all_i)?
-                        }
-                    };
-                    otx.send((out, kf, stats)).map_err(|e| e.to_string())?;
-                }
-                Ok(())
-            },
-        ));
+        vworkers.push(std::thread::spawn(move || work(&vrx, &otx)));
     }
-    drop(otx);
 
     // 上一帧的视频时间戳（毫秒）—— `stts` 写的是**真实间隔**。
     let mut prev_vts: Option<i64> = None;
@@ -1281,6 +1294,12 @@ fn convert_to_mp4(
 
     // 关掉发送端：worker 把剩下的样本处理完、编掉 AAC 的尾巴之后退出。
     drop(tx_audio);
+
+    // **主线程下场编**（队列已经封口，跑完自然退出）。音频那两条线程一直在并行跑着，
+    // 这里不用等它们 —— 等它们会白白空出一个核。
+    let main_res = work(&vrx, &otx);
+    drop(otx);
+
     // 解码线程退出 → 它的 `tx_pcm` 随之 drop → 编码线程收完尾巴后自然退出。
     match decode_worker.join() {
         Ok(Ok(())) => {}
@@ -1301,6 +1320,9 @@ fn convert_to_mp4(
             Ok(Err(e)) => return Err(Error::Io(std::io::Error::other(format!("视频线程：{e}")))),
             Err(_) => return Err(Error::Io(std::io::Error::other("视频线程 panic"))),
         }
+    }
+    if let Err(e) = main_res {
+        return Err(Error::Io(std::io::Error::other(format!("视频（主线程）：{e}"))));
     }
     let mut video_events: Vec<Pending> = Vec::with_capacity(frames);
     let mut rate_stats = (0u64, 0u64);
