@@ -1075,21 +1075,6 @@ impl PState<'_> {
                     break;
                 }
             }
-            // 收尾：最优周围全搜 ±2（补菱形漏掉的格子）。
-            let base = cur_best;
-            for dy in -2..=2i32 {
-                for dx in -2..=2i32 {
-                    let cand = (base.0 + dx, base.1 + dy);
-                    if cand == base || !in_window(cand) {
-                        continue;
-                    }
-                    let s = sad_of(cand);
-                    if s < cur_sad {
-                        cur_sad = s;
-                        cur_best = cand;
-                    }
-                }
-            }
             if cur_sad < best_sad {
                 best_sad = cur_sad;
                 best = cur_best;
