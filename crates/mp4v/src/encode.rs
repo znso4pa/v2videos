@@ -1162,6 +1162,10 @@ impl PState<'_> {
             }
             if self.trellis {
                 trellis_levels(&self.quant, self.rl_inter, &coef, slot, self.quant.lambda());
+                // trellis 会在基线电平上 ∓1，可能把刚好在边界上的值顶出去 —— 夹回来。
+                for l in slot.iter_mut() {
+                    *l = (*l).clamp(-2047, 2047);
+                }
             }
         }
         let cbp_i = inter_cbp(&qb);
@@ -1412,7 +1416,10 @@ impl Quant {
             let n = m + (self.qmul as u32 / 2);
             let q = (((n as u64) * (self.inv_qmul as u64)) >> 32) as i32;
             let r = if a >= 0 { q } else { -q };
-            return if f > 0 { r.max(0) } else { r.min(0) };
+            let v = if f > 0 { r.max(0) } else { r.min(0) };
+            // ⚠️ 这条**提前 return**，别漏了夹取（见下面 `lim` 的说明）。
+            let lim = if intra { 1023 } else { 2047 };
+            return v.clamp(-lim, lim);
         }
         let step = self.step(k, intra);
         let v = if intra {
@@ -1430,11 +1437,14 @@ impl Quant {
             let num = (f.unsigned_abs() as u64) * 32;
             ((num * self.inter_inv[k]) >> 48) as i32
         };
-        if f < 0 {
-            -v
-        } else {
-            v
-        }
+        let v = if f < 0 { -v } else { v };
+        // ⚠️ **电平必须夹进位流装得下的范围**，而且**重建要用同一个值** ——
+        // ESC3 的 level 字段是 12 位有符号（`& 0xfff`），超了会**静默回绕**：
+        // 编码器按原值重建、解码器读到的是回绕后的值，两边就此分叉。
+        // 帧间直接写电平 ⇒ ±2047；帧内写的是「电平 − 预测」，而预测取自邻居**同样被夹过**
+        // 的电平 ⇒ 两边各 ±1023 就够保证差分 ≤ 2046。
+        let lim = if intra { 1023 } else { 2047 };
+        v.clamp(-lim, lim)
     }
 
     /// 帧间块的失配控制（只有 `quant_type = 1` 做，见结构体文档）。
@@ -2222,6 +2232,51 @@ mod tests {
     }
 
     #[test]
+    /// **写出去的电平必须装得进 ESC3 的 12 位字段**。
+    ///
+    /// ESC3 写的是 `(level as u32) & 0xfff` —— 超了**静默回绕**，而编码器的重建用的是
+    /// 原值 ⇒ 编解码从那个系数起分叉（解码器还会报 `|level| overflow in 3. esc`）。
+    /// 所以 `quantize` 自己就把电平夹住：
+    ///
+    /// - **帧间**直接写电平 ⇒ 12 位有符号，±2047；
+    /// - **帧内**写的是「电平 − 预测」，而预测取自邻居**同样被夹过**的电平 ⇒
+    ///   两边各 ±1023 就够保证差分 ≤ 2046。
+    ///
+    /// ⚠️ 只喂**域内**系数：`quantize` 的倒数乘法要求 `|f| < 2^13`（见 `recip` 的说明），
+    /// 超出会溢出 —— debug 下直接 panic，那是另一回事，不在这条的射程里。
+    /// 正常内容到不了夹取（真样本上它是**逐字节的 no-op**，见 TODO.md），
+    /// 所以末尾有一条「必须真被触发」的反空转断言。
+    #[test]
+    fn quantized_levels_fit_the_escape_field() {
+        let mut clamped = 0usize;
+        for qscale in [1u8, 2, 3, 8, 31] {
+            for mpeg in [false, true] {
+                let q = Quant::new(qscale, mpeg);
+                for &f in &[8191i32, -8191, 4096, -2048, 1024, -513] {
+                    for k in [1usize, 2, 5, 17, 63] {
+                        let inter = q.quantize(k, f, false);
+                        assert!(
+                            inter.abs() <= 2047,
+                            "帧间电平 {inter} 装不进 12 位（q{qscale} mpeg{mpeg} k{k} f{f}）"
+                        );
+                        let intra = q.quantize(k, f, true);
+                        assert!(
+                            intra.abs() <= 1023,
+                            "帧内电平 {intra} 会让差分越界（q{qscale} mpeg{mpeg} k{k} f{f}）"
+                        );
+                        // 两个被夹过的帧内电平之差也必须装得下。
+                        let diff = intra - (-1023);
+                        assert!(diff.abs() <= 2047, "差分 {diff} 越界");
+                        if inter.abs() == 2047 || intra.abs() == 1023 {
+                            clamped += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(clamped > 0, "夹取一次都没触发 —— 这条测试是空的");
+    }
+
     #[test]
     /// 三条路的倒数乘法都必须与原式**逐值相同** —— 与 `div_round` 对拍。
     #[test]
@@ -2249,6 +2304,11 @@ mod tests {
                                 };
                                 if f < 0 { -v } else { v }
                             };
+                            // `quantize` 末尾还有一道「夹进 12 位可表示范围」的策略
+                            // （见 `quantized_levels_fit_the_escape_field`）——
+                            // 这条测的是**算术**，所以把它也算进来，别让两边互相打架。
+                            let lim = if intra { 1023 } else { 2047 };
+                            let want = want.clamp(-lim, lim);
                             assert_eq!(q.quantize(k, f, intra), want, "q{qscale} mpeg{mpeg} k{k} intra{intra} f{f}");
                         }
                     }
