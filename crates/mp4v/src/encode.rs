@@ -102,6 +102,14 @@ const F_CODE: u8 = 1;
 const MV_DIFF_MAX: i32 = 31;
 
 /// `sign_extend(val, 6)` 的值域：绝对 MV 必须落在这里面。
+/// 帧内试编的**预判倍数**：帧间最优 SAD × 它 仍小于「帧内块的 AC 能量」时，
+/// 跳过帧内试编（那一趟要 6 次正向 DCT + 量化 + **两遍**熵编码，是每宏块最贵的一段）。
+///
+/// 道理：帧内编的是**原始块**（MPEG-4 帧内没有方向预测），代价与「块减去自身均值之后的
+/// 能量」强相关；帧间的代价与残差 SAD 强相关 —— 两者都是同一量纲的绝对差之和，
+/// 所以直接比。**倍数越大越保守（跳得越少）**，取值见 TODO.md 的 A/B。
+const INTRA_SKIP_RATIO: u64 = 2;
+
 const MV_MIN: i32 = -32;
 const MV_MAX: i32 = 31;
 
@@ -207,6 +215,9 @@ pub struct Encoder {
     /// **上一帧里走了帧内路径的宏块数**（P 帧判决的结果；I 帧恒为全部）。
     /// 测试与调用方用它确认「画面切换时帧内真的接管了」。
     pub intra_mbs_last: usize,
+    /// 上一帧**被预判挡掉**的帧内试编次数（见 `INTRA_SKIP_RATIO`）——
+    /// 与 `intra_mbs_last` 一起看就知道预判挡得狠不狠。
+    pub intra_skips_last: usize,
     /// **本帧要用的 qscale**。码率控制关着时恒等于 `cfg.qscale`，开着时逐帧变。
     cur_qscale: u8,
     /// 码率控制器的状态。`cfg.bitrate` 是 `None` 时也是 `None`。
@@ -342,6 +353,7 @@ impl Encoder {
             frames_since_i: 0,
             last_key_frame: false,
             intra_mbs_last: 0,
+            intra_skips_last: 0,
             cur_qscale: cfg.qscale,
             rc: cfg.bitrate.map(|b| RateCtl::new(b, cfg.fps_num, cfg.qscale)),
             mv_prev: Vec::new(),
@@ -598,6 +610,7 @@ impl Encoder {
             mv: vec![(0, 0); mb_w * mb_h],
             mv_prev: &mv_prev,
             intra_mbs: 0,
+            intra_skips: 0,
             rl_intra: &rl_intra,
             rl_inter: &rl_inter,
             me_cache: MeSadCache::new(),
@@ -609,6 +622,7 @@ impl Encoder {
         }
 
         self.intra_mbs_last = st.intra_mbs;
+        self.intra_skips_last = st.intra_skips;
         self.reference = Some(st.cur);
         // 本帧的 MV 场留给下一帧当**时间预测**的起点。
         self.mv_prev = std::mem::take(&mut st.mv);
@@ -761,6 +775,33 @@ fn write_inter_mb(
 }
 
 /// 帧间宏块的 cbp：**任一系数非零**（含 DC）就置位 —— 帧间没有单独的 DC 一趟。
+/// 帧内试编的便宜代理：4 个亮度块「减去自身均值之后的绝对差之和」。
+///
+/// 与运动估计的 SAD 同量纲（都是绝对差之和），所以能直接比 —— 见 `INTRA_SKIP_RATIO`。
+/// 代价约 512 次加法/减法，而它要替代的那一趟是 6 次 DCT + 量化 + 两遍熵编码。
+fn intra_luma_ac(y: &[u8], stride: usize, mbx: usize, mby: usize) -> u64 {
+    let mut acc = 0u64;
+    for n in 0..4usize {
+        let ox = mbx * 16 + (n & 1) * 8;
+        let oy = mby * 16 + (n >> 1) * 8;
+        let mut sum = 0u32;
+        for r in 0..8usize {
+            let row = &y[(oy + r) * stride + ox..][..8];
+            for &p in row {
+                sum += u32::from(p);
+            }
+        }
+        let mean = (sum / 64) as i32;
+        for r in 0..8usize {
+            let row = &y[(oy + r) * stride + ox..][..8];
+            for &p in row {
+                acc += (i32::from(p) - mean).unsigned_abs() as u64;
+            }
+        }
+    }
+    acc
+}
+
 fn inter_cbp(blocks: &[[i32; 64]; 6]) -> usize {
     let mut cbp = 0usize;
     for (n, b) in blocks.iter().enumerate() {
@@ -896,6 +937,8 @@ struct PState<'a> {
     /// 参考帧的 MV 场（时间预测的起点）。长度对不上就当作没有。
     mv_prev: &'a [(i32, i32)],
     intra_mbs: usize,
+    /// 被预判挡掉的帧内试编次数（见 `INTRA_SKIP_RATIO`）。
+    intra_skips: usize,
     rl_intra: &'a RlTable,
     rl_inter: &'a RlTable,
     /// 运动估计的候选 SAD 记忆表（见 `MeSadCache`）。
@@ -945,7 +988,7 @@ impl PState<'_> {
     /// MV 不同 → 位流不同。所以它不是「同语义更快」：质量必须重新对账
     /// （**固定 qscale** 下比 PSNR 与体积 —— 开码率控制时不同的 MV 场会让控制器
     /// 落到不同的 qscale，比出来的差不干净）。三个起点就是为了把这一档差补回来。
-    fn motion_estimate(&mut self, mbx: usize, mby: usize, pred: (i32, i32)) -> (i32, i32) {
+    fn motion_estimate(&mut self, mbx: usize, mby: usize, pred: (i32, i32)) -> ((i32, i32), u64) {
         let (pw, ph) = (self.pw, self.refp.ph);
         let refp = self.refp;
         // 复制成局部量：闭包要**可变借** `me_cache`，就不能再借 `self` 的别的字段。
@@ -1052,7 +1095,7 @@ impl PState<'_> {
                 best = cur_best;
             }
             if best_sad == 0 {
-                return clamp_mv(best, pred);
+                return (clamp_mv(best, pred), 0);
             }
         }
 
@@ -1068,7 +1111,8 @@ impl PState<'_> {
                 }
             }
         }
-        clamp_mv(best, pred)
+        // 最优 SAD 一并带出去 —— 帧内试编的预判要用（见 `INTRA_SKIP_RATIO`）。
+        (clamp_mv(best, pred), best_sad)
     }
 
     /// 帧内候选：把当前帧的**原始像素**当 I 帧宏块编一遍。
@@ -1120,7 +1164,7 @@ impl PState<'_> {
     fn mb(&mut self, w: &mut BitWriter, mbx: usize, mby: usize) -> Result<()> {
         // ---------- 帧间候选 ----------
         let pred = self.mv_predict(mbx, mby);
-        let mv = self.motion_estimate(mbx, mby, pred);
+        let (mv, inter_sad) = self.motion_estimate(mbx, mby, pred);
         let p = mc_params(mbx, mby, mv, self.pw, self.refp.ph);
         let mut pred16 = [0u8; 256];
         mc_luma16(&mut pred16, 16, 0, 0, self.refp, &p, NO_ROUNDING);
@@ -1190,6 +1234,10 @@ impl PState<'_> {
         // 而「跳过」的代价只是少写一次 DC/AC 网格 —— 那本来就只在帧内赢时才有用，
         // 帧间分支里那两句 `restore` 正是它的逆操作。输出**逐字节不变**。
         let intra = if skip {
+            None
+        } else if inter_sad * INTRA_SKIP_RATIO < intra_luma_ac(self.sy, self.pw, mbx, mby) {
+            // 帧间明显更好 —— 省掉帧内那一趟试编（网格也不用动，与 `skip` 那条同形）。
+            self.intra_skips += 1;
             None
         } else {
             let dc_snap = self.dc.snap(mbx, mby);
