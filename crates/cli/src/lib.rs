@@ -464,6 +464,193 @@ fn convert_to_asf(
     let mut sq_err = 0f64;
     let mut n_px = 0u64;
 
+    // ---- 视频：GOP 并行（只在 `--threads > 1` 时；否则走下面那条串行老路）----
+    //
+    // 单线程**逐字节不变**。并行时每个 GOP 起一个新编码器 —— MP43 编码器**没有跨 GOP
+    // 的状态**（MV / DC 网格每帧重置，`ref_planes` 只在 GOP 内部有用，我们不写 ext header
+    // 所以 `flipflop_rounding` 恒 0），所以这条也逐字节不变（有测试钉）。
+    //
+    // 解码（参考链，天然串行）留在主线程当生产者，编码交给 worker 池；结果带 GOP 序号回来。
+    // ASF 是「攒载荷、按写入顺序打包」，所以并行这条路最后要按 pts 合并视频与音频再写 ——
+    // 实测合并出来的顺序与串行读到的**完全一致**（带音频直通也是 md5 相同）。
+    //
+    // 并行度**上限就是 GOP 数**：`-g 12` 时 300 帧 = 25 个 GOP，8 线程够用；
+    // `-g 250` 时 300 帧只有 2 个 GOP，再多的线程也白搭（这是格式约束，不是实现问题）。
+    if opts.threads > 1 {
+        let nthreads = opts.threads;
+        let gop_len = if opts.keyframe_interval == 0 {
+            1
+        } else {
+            opts.keyframe_interval
+        };
+        let cfg = EncoderConfig {
+            qscale: opts.qscale,
+            keyframe_interval: opts.keyframe_interval,
+            ..Default::default()
+        };
+        let verify = opts.verify;
+
+        let (jtx, jrx) = std::sync::mpsc::sync_channel::<(usize, Vec<(u32, Frame)>)>(2 * nthreads);
+        let jrx = std::sync::Arc::new(std::sync::Mutex::new(jrx));
+        let (rtx, rrx) = std::sync::mpsc::channel::<(usize, Vec<(u32, Vec<u8>, bool)>, f64, u64)>();
+
+        // 一个 worker 的活：不停从队列领 GOP、编完把结果发回去。
+        // 抽成闭包是为了**主线程也能跑它** —— 8 核上开 8 个 worker 再加一个解码线程
+        // 会超订，所以 worker 数 = `threads - 1`，主线程喂完最后一个 GOP 就下场补上。
+        let work = move |jrx: &std::sync::Arc<
+            std::sync::Mutex<std::sync::mpsc::Receiver<(usize, Vec<(u32, Frame)>)>>,
+        >,
+                         rtx: &std::sync::mpsc::Sender<(
+            usize,
+            Vec<(u32, Vec<u8>, bool)>,
+            f64,
+            u64,
+        )>|
+              -> std::result::Result<(), v2v_msmpeg4::Error> {
+            loop {
+                let job = {
+                    let rx = jrx
+                        .lock()
+                        .map_err(|_| v2v_msmpeg4::Error::Bad("worker 接收端锁坏了"))?;
+                    rx.recv()
+                };
+                let Ok((idx, gop)) = job else { break };
+                let mut e = Encoder::new(cfg);
+                let mut out = Vec::with_capacity(gop.len());
+                let (mut se, mut np) = (0f64, 0u64);
+                let mut vd = if verify { Some(Decoder::new()) } else { None };
+                for (pts, f) in &gop {
+                    let st = e.encode_frame(f)?;
+                    if let Some(v) = vd.as_mut() {
+                        let back = v.decode(&st, w, h)?;
+                        for (a, b) in [(&f.y, &back.y), (&f.u, &back.u), (&f.v, &back.v)] {
+                            for (&x, &y) in a.iter().zip(b.iter()) {
+                                let d = x as f64 - y as f64;
+                                se += d * d;
+                            }
+                            np += a.len() as u64;
+                        }
+                    }
+                    out.push((*pts, st, e.last_key_frame));
+                }
+                if rtx.send((idx, out, se, np)).is_err() {
+                    break;
+                }
+            }
+            Ok(())
+        };
+
+        let mut workers = Vec::with_capacity(nthreads.saturating_sub(1));
+        for _ in 0..nthreads.saturating_sub(1) {
+            let jrx = std::sync::Arc::clone(&jrx);
+            let rtx = rtx.clone();
+            workers.push(std::thread::spawn(move || work(&jrx, &rtx)));
+        }
+
+        // 主线程：解封装 + 解码 → 攒够一个 GOP 就发出去；音频载荷先按序收着。
+        let mut audio_buf: Vec<(u32, Vec<u8>)> = Vec::new();
+        let mut gop: Vec<(u32, Frame)> = Vec::new();
+        let mut n_gop = 0usize;
+        while let Some(s) = demux.next()? {
+            if Some(s.stream) == audio_num {
+                if opts.copy_audio {
+                    let pts = u32::try_from(s.timestamp_ms.max(0)).unwrap_or(0);
+                    audio_buf.push((pts, s.data));
+                    audio_payloads += 1;
+                } else {
+                    skipped_audio += 1;
+                }
+                continue;
+            }
+            if s.stream != vnum {
+                continue;
+            }
+            let pts = u32::try_from(s.timestamp_ms.max(0))
+                .map_err(|_| Error::Unsupported(format!("时间戳 {} ms 超出 u32", s.timestamp_ms)))?;
+            let frame = dec.decode(&s.data, w, h)?;
+            gop.push((pts, frame));
+            frames += 1;
+            if gop.len() >= gop_len {
+                jtx.send((n_gop, std::mem::take(&mut gop)))
+                    .map_err(|_| Error::Unsupported("视频 worker 池提前退出".into()))?;
+                n_gop += 1;
+            }
+            if let Some(max) = opts.max_frames {
+                if frames >= max {
+                    break;
+                }
+            }
+        }
+        if !gop.is_empty() {
+            jtx.send((n_gop, gop))
+                .map_err(|_| Error::Unsupported("视频 worker 池提前退出".into()))?;
+            n_gop += 1;
+        }
+        drop(jtx);
+
+        // 主线程下场编（队列已经封口，跑完自然退出）。
+        let main_res = work(&jrx, &rtx);
+        drop(rtx);
+        for w in workers {
+            match w.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(Error::Msmpeg4(e)),
+                Err(_) => return Err(Error::Unsupported("视频 worker 线程 panic".into())),
+            }
+        }
+        main_res.map_err(Error::Msmpeg4)?;
+
+        // 结果乱序回来 → 按 GOP 序号归位，再按 pts 合并视频与音频。
+        let mut gops: Vec<Vec<(u32, Vec<u8>, bool)>> = vec![Vec::new(); n_gop];
+        for (idx, out, se, np) in rrx {
+            if idx < gops.len() {
+                gops[idx] = out;
+                sq_err += se;
+                n_px += np;
+            }
+        }
+        let mut vid: Vec<(u32, &Vec<u8>, bool)> = Vec::with_capacity(frames);
+        for g in &gops {
+            for (pts, st, key) in g {
+                vid.push((*pts, st, *key));
+            }
+        }
+        vid.sort_by_key(|(p, _, _)| *p);
+        let mut aud: Vec<(u32, &Vec<u8>)> = audio_buf.iter().map(|(p, d)| (*p, d)).collect();
+        aud.sort_by_key(|(p, _)| *p);
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < vid.len() || j < aud.len() {
+            let take_video = j >= aud.len() || (i < vid.len() && vid[i].0 <= aud[j].0);
+            if take_video {
+                mux.write_video(vid[i].1, vid[i].2, vid[i].0)?;
+                if vid[i].2 {
+                    key_frames += 1;
+                }
+                i += 1;
+            } else {
+                mux.write_audio(aud[j].1, aud[j].0)?;
+                j += 1;
+            }
+        }
+        let wmv = mux.finish();
+        write_out(output, &wmv)?;
+        let psnr_db = if opts.verify && n_px > 0 {
+            Some(psnr(sq_err, n_px))
+        } else {
+            None
+        };
+        return Ok(ConvertReport {
+            frames,
+            key_frames,
+            audio_payloads,
+            skipped_audio,
+            bytes_in,
+            bytes_out: wmv.len() as u64,
+            psnr_db,
+            video_kbps: None,
+        });
+    }
+
     while let Some(s) = demux.next()? {
         // 音频：直通（原样写载荷，时间戳照搬）
         if Some(s.stream) == audio_num {

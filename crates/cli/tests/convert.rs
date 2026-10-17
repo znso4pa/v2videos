@@ -38,6 +38,17 @@ fn src_decoder(path: &Path) -> Option<Decoder> {
     }
 }
 
+/// 源样本里有没有音频轨 —— 音频相关的真样本测试靠它决定「跑」还是「SKIP」。
+///
+/// 只按 ASF 解（这两条测试针对的就是 `.wmv` 样本）。判据取自**源的解封装结果**，
+/// 不是转码报告里的 `audio_payloads` —— 后者正是被测的东西，拿它当前提会把
+/// 「音频整条丢了」变成「跳过」，那是最糟的一种假绿。
+fn src_has_audio(path: &Path) -> bool {
+    AsfDemuxer::new(std::fs::File::open(path).expect("开样本"))
+        .map(|d| d.streams().iter().any(|s| s.kind == StreamKind::Audio))
+        .unwrap_or(false)
+}
+
 /// 进程内唯一的临时目录。
 fn temp_dir(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("v2v_cli_{}_{}", std::process::id(), tag));
@@ -160,6 +171,56 @@ fn converts_and_output_is_readable() {
         decoded += 1;
     }
     assert_eq!(decoded, 8);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **GOP 并行的产物与串行逐字节相同**（`--threads > 1` 那条路）。
+///
+/// 这是 `.wmv` 并行化唯一站得住的理由：MP43 编码器**没有跨 GOP 的状态**
+/// （MV / DC 网格每帧重置、`ref_planes` 只在 GOP 内部有用、我们不写 ext header
+/// 所以 `flipflop_rounding` 恒 0），所以按 GOP 分给多个 worker、每个 worker 起一个
+/// 新编码器，编出来的字节应当与单线程**完全一样**。哪天有人往编码器里加了跨 GOP 的
+/// 状态、或改了结果的归并顺序，这条会立刻红。
+///
+/// 也顺带钉住**包的排布**：并行那条路是「结果按 GOP 序号归位 → 与音频按 pts 合并」
+/// 再写封装器的，合并规则一旦与串行读到的顺序不一致，长度或字节就会变。
+///
+/// 合成源、无样本、无 ffmpeg —— 所以 CI 里也真跑，不是 SKIP。
+#[test]
+fn parallel_gop_encoding_is_byte_identical() {
+    let dir = temp_dir("par");
+    let (w, h) = (320u32, 240u32);
+    let frames = moving_sequence(w, h, 20);
+    let input = dir.join("in.wmv");
+    make_wmv(&input, &frames, MP43, 4);
+
+    let base = ConvertOptions {
+        qscale: 6,
+        keyframe_interval: 5, // 20 帧 → 4 个 GOP
+        verify: false,
+        max_frames: None,
+        copy_audio: false,
+        ..Default::default()
+    };
+    let serial = dir.join("serial.wmv");
+    let rep1 = convert_file(&input, &serial, &base).expect("串行转换");
+    let par = dir.join("par.wmv");
+    let rep2 = convert_file(
+        &input,
+        &par,
+        &ConvertOptions {
+            threads: 4,
+            ..base.clone()
+        },
+    )
+    .expect("并行转换");
+
+    assert_eq!(rep1.frames, rep2.frames, "帧数不一致");
+    assert_eq!(rep1.key_frames, rep2.key_frames, "关键帧数不一致");
+    let a = std::fs::read(&serial).expect("读串行产物");
+    let b = std::fs::read(&par).expect("读并行产物");
+    assert_eq!(a.len(), b.len(), "产物长度不同：{} vs {}", a.len(), b.len());
+    assert!(a == b, "并行与串行的产物不是逐字节相同");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1005,6 +1066,12 @@ fn mp4_from_real_sample_keeps_audio_in_sync() {
         eprintln!("SKIP: PATH 上没有 ffmpeg");
         return;
     }
+    // 源里没有音轨就无从谈同步 —— 这条测的是音频那条轨，没轨就该跳过而不是失败。
+    // ⚠️ 判据取自**源的解封装结果**，不是 `rep.audio_payloads`（那正是被测的东西）。
+    if !src_has_audio(Path::new(&src_path)) {
+        eprintln!("SKIP: 样本里没有音频轨");
+        return;
+    }
     let dir = temp_dir("mp4_real");
     let input = dir.join("in.wmv");
     std::fs::copy(&src_path, &input).expect("拷样本");
@@ -1382,6 +1449,10 @@ fn mp4_with_aac_audio_decodes_with_ffmpeg() {
     }
     if !has_ffmpeg() {
         eprintln!("SKIP: PATH 上没有 ffmpeg");
+        return;
+    }
+    if !src_has_audio(Path::new(&src)) {
+        eprintln!("SKIP: 样本里没有音频轨");
         return;
     }
     let dir = temp_dir("mp4_aac_real");
