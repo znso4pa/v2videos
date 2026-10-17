@@ -104,6 +104,68 @@ fn random_case(rng: &mut Rng, shape: usize, n: usize) -> Case {
     }
 }
 
+/// **包步长与声明不符时必须明确拒绝** —— 不能学「跳过坏包继续走」。
+///
+/// 实测一份畸形样本（缺陷报告合集里的）：File Properties 写死包长 1250，
+/// 而文件里前两个包 1250 字节、之后变成 2048 —— 元数据自相矛盾。
+/// ffmpeg 对它的处理是报 360 次 `Skip due to FRAME_HEADER_SIZE`，
+/// 然后**吐出三倍于声明帧数的东西**：那种「能跑完」比报错糟得多。
+///
+/// 这里**合成**同一种畸形（不依赖真样本，CI 里真跑）：正常封一份，
+/// 再把 File Properties 里的 `max_packet_size` 改掉 —— 解析器按声明值读包
+/// 就会读到半路，包头部随即变成垃圾。
+#[test]
+fn packet_size_mismatch_is_rejected_loudly() {
+    // 1) 正常封一份（写够多帧，保证包数 > 1）
+    let video = VideoStreamInfo {
+        width: 64,
+        height: 48,
+        fourcc: u32::from_le_bytes(*b"MP43"),
+    };
+    let mut m = AsfMuxer::new(video);
+    for i in 0..40u32 {
+        let data: Vec<u8> = (0..400).map(|k| (i as u8).wrapping_add(k as u8)).collect();
+        m.write_video(&data, i == 0, i * 40).expect("写");
+    }
+    let mut bytes = m.finish();
+
+    // 2) 找到 File Properties 对象，改掉 `max_packet_size`（对象内偏移 +96：
+    //    GUID(16)+大小(8)+FileID(16)+文件大小(8)+创建时间(8)+包数(8)+播放时长(8)
+    //    +发送时长(8)+preroll(4)+忽略(4)+flags(4)+min(4) ⇒ max 落在 +96）
+    const FP: [u8; 16] = [
+        0xa1, 0xdc, 0xab, 0x8c, 0x47, 0xa9, 0xcf, 0x11, 0x8e, 0xe4, 0x00, 0xc0, 0x0c, 0x20, 0x53,
+        0x65,
+    ];
+    let at = bytes
+        .windows(16)
+        .position(|w| w == FP)
+        .expect("找不到 File Properties")
+        + 96;
+    let old = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+    let bad = old / 2 + 1;
+    bytes[at..at + 4].copy_from_slice(&bad.to_le_bytes());
+
+    // 3) 判据：**明确报错**，而且说得出真因
+    let mut d = AsfDemuxer::new(std::io::Cursor::new(&bytes)).expect("头部本身是好的");
+    let mut err = None;
+    for _ in 0..10_000 {
+        match d.next_sample() {
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(e) => {
+                err = Some(e.to_string());
+                break;
+            }
+        }
+    }
+    // ⚠️ 判据是「**必须报错**」而不是「报哪一条」：具体落在哪个检查上取决于
+    // 篡改后的步长把游标带到哪儿 —— 实测偏小会先撞 EOF（`unexpected end of data`），
+    // 偏大则更可能落到「包头部不像包头」那条。两条都是**明确拒绝**，
+    // 而「一路读下去、吐出一堆垃圾样本」才是要防的。
+    let e = err.expect("步长与声明不符时必须报错，不能一路读下去");
+    eprintln!("（合成畸形被拒：{e}）");
+}
+
 /// 封一份，再解回来，逐样本比。
 fn roundtrip(case: &Case) -> Result<Vec<Sample>, String> {
     let mut m = match case.audio.clone() {

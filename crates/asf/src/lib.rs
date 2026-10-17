@@ -217,7 +217,17 @@ impl<R: Read> AsfDemuxer<R> {
             return Err(Error::Bad("invalid packet length"));
         }
         if padsize >= packet_length {
-            return Err(Error::Bad("padding >= packet length"));
+            // 读到垃圾的**典型原因**是「包的步长与 File Properties 里声明的不符」——
+            // 也就是文件本身畸形（实测一份畸形样本：前两个包 1250 字节、之后变成 2048，
+            // 而 File Properties 里写死 1250）。
+            //
+            // ⚠️ 这里**明确拒绝**，不学「跳过坏包继续走」：后者会静默产出错误画面。
+            // 同一份样本上 ffmpeg 报了 360 次 `Skip due to FRAME_HEADER_SIZE`，
+            // 然后吐出三倍于声明帧数的东西 —— 那种「能跑完」比报错更糟。
+            return Err(Error::Bad(
+                "包头部不像包头（padding ≥ 包长）—— 多半是包的步长与 File Properties 声明的不符；\
+                 本工具拒绝静默产出错误画面（要那份残缺结果请用 ffmpeg）",
+            ));
         }
         let header_len = c.pos();
         if header_len as u32 > packet_length - padsize {
