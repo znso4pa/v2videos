@@ -15,6 +15,7 @@
 
 mod bitplane;
 mod header;
+pub mod idct;
 pub mod tables;
 
 pub use bitplane::{Bitplane, Imode};
