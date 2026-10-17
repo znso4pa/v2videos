@@ -629,6 +629,16 @@ impl Encoder {
         Ok(self.note_frame(w.finish(), qscale))
     }
 
+    /// 编码器**自己的重建**（= 下一帧 P 的参考帧）。`None` = 还没编过帧。
+    ///
+    /// 平面是**宏块对齐**的（`mb_w*16 × mb_h*16`）。这个出口的用途是**对账**：
+    /// 它必须与解码器解同一帧的结果**逐像素相同** —— 这条比 PSNR 直接得多，
+    /// 重建一旦漂移（失配控制、逆量化、IDCT 哪一处写错）PSNR 可能只掉一点点甚至不掉，
+    /// 而逐像素比会立刻红。判据在 `tests/ffmpeg_roundtrip.rs::reconstruction_matches_ffmpeg_decode`。
+    pub fn reconstruction(&self) -> Option<&v2v_msmpeg4::Planes> {
+        self.reference.as_ref()
+    }
+
     /// 本帧该用哪个 q：开码控时问控制器（要按本帧类型给份额），关着就用固定值。
     fn take_qscale(&mut self, is_i: bool) -> u8 {
         if let Some(rc) = self.rc.as_mut() {

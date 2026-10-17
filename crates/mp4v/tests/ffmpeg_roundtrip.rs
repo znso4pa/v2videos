@@ -625,6 +625,70 @@ fn p_frames_compress_a_low_motion_sequence() {
 
 /// P 帧里「帧间宏块用上了没有、MV 有没有真的动」—— 单看体积容易漏掉这层。
 ///
+/// **编码器自己的重建 == ffmpeg 解同一帧的结果**（逐像素）。
+///
+/// 这条比 PSNR 直接：重建一旦漂移（失配控制、逆量化、IDCT、DC/AC 预测哪一处写错），
+/// PSNR 可能只掉一点点、甚至不掉（漂移被下一帧的残差吸收），而逐像素比会立刻红。
+///
+/// 判据是**同一帧**的两个产物：
+/// - 编码器内部那份（`Encoder::reconstruction()`，下一帧 P 的参考）；
+/// - ffmpeg 解我们的基本流得到的那份。
+///
+/// 两者必须**逐字节相同**。测试素材的宽高是宏块对齐的（320×240），所以不用裁剪。
+#[test]
+fn reconstruction_matches_ffmpeg_decode() {
+    if !has_ffmpeg() {
+        eprintln!("SKIP: PATH 上没有 ffmpeg / ffprobe");
+        return;
+    }
+    let frames: Vec<Frame> = (0..FRAMES).map(test_frame).collect();
+    let mut e = Encoder::new(EncoderConfig {
+        width: W,
+        height: H,
+        fps_num: FPS,
+        keyframe_interval: 250,
+        ..Default::default()
+    })
+    .expect("建编码器");
+    let mut es = e.elementary_stream_header();
+    // 逐帧编、逐帧记下**编码器自己的重建**。
+    let mut recons: Vec<Vec<u8>> = Vec::new();
+    for f in &frames {
+        es.extend_from_slice(&e.encode_frame(f).expect("编码"));
+        let p = e.reconstruction().expect("编过一帧就该有重建");
+        let mut buf = Vec::with_capacity(p.y.len() + p.u.len() + p.v.len());
+        buf.extend_from_slice(&p.y);
+        buf.extend_from_slice(&p.u);
+        buf.extend_from_slice(&p.v);
+        recons.push(buf);
+    }
+    let path = std::env::temp_dir().join("v2v_mp4v_recon.m4v");
+    std::fs::write(&path, &es).expect("写");
+    let (got, log) = decode_to_yuv(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    for bad in ["error", "corrupt", "invalid", "damaged"] {
+        assert!(!log.to_lowercase().contains(bad), "流里 ffmpeg 报了「{bad}」：\n{log}");
+    }
+
+    let one = (W * H * 3 / 2) as usize;
+    assert_eq!(got.len(), frames.len() * one, "解码出来的帧数不对");
+    for (i, want) in recons.iter().enumerate() {
+        let have = &got[i * one..(i + 1) * one];
+        assert_eq!(want.len(), one, "第 {i} 帧重建的长度不对（宏块对齐了吗？）");
+        if want != have {
+            let k = want.iter().zip(have.iter()).position(|(a, b)| a != b).unwrap();
+            let (plane, off) = if k < (W * H) as usize {
+                ("Y", k)
+            } else if k < (W * H + W * H / 4) as usize {
+                ("U", k - (W * H) as usize)
+            } else {
+                ("V", k - (W * H + W * H / 4) as usize)
+            };
+            panic!("第 {i} 帧重建与解码结果不同：首个差异在 {plane} 平面偏移 {off}");
+        }
+    }
+}
+
 /// 判据：`intra_mbs_last`（上一帧走帧内路径的宏块数）在 P 帧里必须**远小于**总数。
 ///
 /// ⚠️ 阈值为什么是「一半」而不是「四分之一」：这条序列上**全搜自己**就产出
