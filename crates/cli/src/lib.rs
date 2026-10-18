@@ -1406,8 +1406,25 @@ fn convert_to_mp4(
         let idx = sample_idx;
         sample_idx += 1;
 
+        // 最后一个已收视频样本的结束时刻（毫秒）。还没收到视频时给 `i64::MAX`，
+        // 这样开头的音频不会被误裁。
+        let video_end_ms = prev_vts.map_or(i64::MAX, |p| p + i64::from(last_dur));
+
         // ---- 音频：原样转给 worker（它自己解 WMA、编 AAC）----
         if Some(s.stream) == audio_num {
+            // ⚠️ **`-n` 到了之后，队列里预读的音频样本不能无条件转发。**
+            //
+            // 上面为了探帧率预读了 8 个样本（见下面的注释）。`-n` 触发后主循环
+            // 只是「不再解视频」，队列里那 8 个样本还会被走一遍 —— 其中音频会被
+            // 照常转给 worker。实测后果：**10 s 的视频配了 12.1 s 的音频**，
+            // 产物多出约 2 s，播放器尾部会多一段声音（视频已停）。
+            //
+            // 正解是按**时间戳**裁：只放行仍落在视频时长之内的音频样本。
+            // `video_end_ms` 是最后一个已收视频样本的「起点 + 时长」，
+            // 在 `stop` 置位之后就固定了（stop 后不再更新 `prev_vts` / `last_dur`）。
+            if stop && s.timestamp_ms >= video_end_ms {
+                continue;
+            }
             if tx_audio.send((idx, s.data)).is_err() {
                 break; // worker 已退出（出错），由下面的 join 报出来
             }
@@ -1514,7 +1531,7 @@ fn convert_to_mp4(
         Ok(Err(e)) => return Err(Error::Io(std::io::Error::other(format!("音频解码线程：{e}")))),
         Err(_) => return Err(Error::Io(std::io::Error::other("音频解码线程 panic"))),
     }
-    let (audio_events, audio_points) = match audio_worker.join() {
+    let (mut audio_events, audio_points) = match audio_worker.join() {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => return Err(Error::Io(std::io::Error::other(format!("音频编码线程：{e}")))),
         Err(_) => return Err(Error::Io(std::io::Error::other("音频编码线程 panic"))),
@@ -1539,6 +1556,32 @@ fn convert_to_mp4(
         key_frames += kf;
         rate_stats.0 += st.0;
         rate_stats.1 += st.1;
+    }
+
+    // ---- 音频裁到视频时长 ----
+    //
+    // ⚠️ `-n N` 只限**视频帧**，但音频载荷是按 ASF 包送来的，落在预读队列里的
+    // 那部分会被照常解码、编码。实测后果：**10 s 的视频配了 12.1 s 的音频**
+    // （570 个 AAC 帧对 480 个），产物多出约 2 s 尾巴。
+    //
+    // 修法：在回放前按**采样点数**裁掉超出视频时长的音频。目标采样点数 =
+    // `frames / fps` 秒 × 采样率。`duration` 对 AAC 帧是 1024（采样点）、
+    // 对 PCM 是 1（每采样点），单位一致，可以累计。
+    //
+    // 整帧裁掉（不拆帧）：AAC 的粒度是 1024 采样点 ≈ 21 ms，够细了。
+    if let Some(af) = src_audio.as_ref() {
+        let want = (u64::try_from(frames).unwrap_or(0) * u64::from(af.sample_rate) + fps as u64 - 1) / fps as u64;
+        let mut acc = 0u64;
+        audio_events.retain(|p| match &p.kind {
+            PendingKind::Audio { duration, .. } => {
+                if acc >= want {
+                    return false;
+                }
+                acc += u64::from(*duration);
+                true
+            }
+            PendingKind::Video { .. } => true,
+        });
     }
 
     // ---- 按**原交错顺序**回放：`mdat` 的排布必须与串行版逐字节相同 ----
