@@ -2265,7 +2265,6 @@ mod tests {
         assert_eq!(bit_length(256), 9);
     }
 
-    #[test]
     /// **写出去的电平必须装得进 ESC3 的 12 位字段**。
     ///
     /// ESC3 写的是 `(level as u32) & 0xfff` —— 超了**静默回绕**，而编码器的重建用的是
@@ -2311,7 +2310,6 @@ mod tests {
         assert!(clamped > 0, "夹取一次都没触发 —— 这条测试是空的");
     }
 
-    #[test]
     /// 三条路的倒数乘法都必须与原式**逐值相同** —— 与 `div_round` 对拍。
     #[test]
     fn quantize_matches_division() {
