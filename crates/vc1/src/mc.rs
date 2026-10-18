@@ -22,7 +22,11 @@ use v2v_msmpeg4::mid_pred;
 use crate::decoder::Ctx;
 
 /// 本地缓冲的边长（够放 16×16 块 + mspel 的余量）。
-const BUF: usize = 32;
+///
+/// ⚠️ 这两个常数**不能随便调大**：`let mut buf = [0u8; BUF * BUF]` 是**每个块**都要
+/// 清零一次的栈数组，而 MC 每个宏块至少进一次（4MV 是四次）。24 是「够用且最小」那一档：
+/// mspel 时 `base = BUF_STRIDE + 1`、`k = 19`，最远读到 `(1+19)*BUF_STRIDE + 19 = 499 < 576`。
+const BUF: usize = 24;
 const BUF_STRIDE: usize = BUF;
 
 /// `vc1_mspel_filter()`：单向插值（`stride` 是跨过边缘的方向）。
@@ -322,6 +326,37 @@ impl Ctx<'_, '_> {
         let mut uvmx = (mx + ((mx & 3) == 3) as i32) >> 1;
         let mut uvmy = (my + ((my & 3) == 3) as i32) >> 1;
         self.grids.luma_mv[mb_pos] = [uvmx as i16, uvmy as i16];
+
+        // ---- 快路：整像素且无亮度补偿 ⇒ 输出就是参考块原样搬过来 ----
+        //
+        // 静态素材里「MV 预测出来恰好是 (0,0)」的宏块很多（跳过的宏块尤其如此）。
+        // 走通用路径要 `load_ref`（19×19 逐像素 clamp）+ 256 次 `mspel_filter` 调用，
+        // 而正确答案只是把参考块拷过来。`use_ic` 时必须绕开（那会改像素值）。
+        if mx == 0 && my == 0 && !self.use_ic {
+            let (dx, dy) = (mbx * 16, mby * 16);
+            let ys = self.plane_stride(0);
+            let cs = self.plane_stride(1);
+            {
+                let (src, dst) = (&self.ref_planes.y, &mut self.planes.y);
+                for j in 0..16 {
+                    let o = (dy + j) * ys + dx;
+                    dst[o..o + 16].copy_from_slice(&src[o..o + 16]);
+                }
+            }
+            let (cdx, cdy) = (dx / 2, dy / 2);
+            for plane in [1usize, 2] {
+                let (src, dst) = if plane == 1 {
+                    (&self.ref_planes.u, &mut self.planes.u)
+                } else {
+                    (&self.ref_planes.v, &mut self.planes.v)
+                };
+                for j in 0..8 {
+                    let o = (cdy + j) * cs + cdx;
+                    dst[o..o + 8].copy_from_slice(&src[o..o + 8]);
+                }
+            }
+            return;
+        }
         if self.seq.fastuvmc {
             uvmx += if uvmx < 0 { uvmx & 1 } else { -(uvmx & 1) };
             uvmy += if uvmy < 0 { uvmy & 1 } else { -(uvmy & 1) };
@@ -396,8 +431,22 @@ impl Ctx<'_, '_> {
         }
         let (mx, my) = self.mv_of(mbx, mby, n);
         let mspel = self.hdr.p.as_ref().unwrap().mspel as usize;
-        let mut src_x = mbx as i32 * 16 + (n & 1) as i32 * 8 + (mx >> 2);
-        let mut src_y = mby as i32 * 16 + (n & 2) as i32 * 4 + (my >> 2);
+        let (bx, by) = (
+            mbx * 16 + (n & 1) * 8,
+            mby * 16 + (n & 2) * 4,
+        );
+        // 快路：整像素且无亮度补偿 ⇒ 直接把参考块拷过来（与 `mc_1mv` 同一个理由）。
+        if mx == 0 && my == 0 && !self.use_ic {
+            let ys = self.plane_stride(0);
+            let (src, dst) = (&self.ref_planes.y, &mut self.planes.y);
+            for j in 0..8 {
+                let o = (by + j) * ys + bx;
+                dst[o..o + 8].copy_from_slice(&src[o..o + 8]);
+            }
+            return;
+        }
+        let mut src_x = bx as i32 + (mx >> 2);
+        let mut src_y = by as i32 + (my >> 2);
         src_x = src_x.clamp(-16, (self.mb_width * 16) as i32);
         src_y = src_y.clamp(-16, (self.mb_height * 16) as i32);
         let mut buf = [0u8; BUF * BUF];
