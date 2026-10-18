@@ -40,20 +40,26 @@ fn mspel_filter(src: &[u8], off: isize, stride: isize, mode: u32, r: i32) -> i32
     }
 }
 
-/// `OPNAME vc1_mspel_mc`：`w × w` 块的四分之一像素插值（`hmode` / `vmode` ∈ 0..4）。
+/// `OPNAME vc1_mspel_mc`：`W × W` 块的四分之一像素插值（`hmode` / `vmode` ∈ 0..4）。
+///
+/// `W` 走**常量泛型**而不是运行时参数：中间结果缓冲正好 `(W+3)*W` 个 i16，
+/// 不必按最大尺寸（16）开一个再白清零一大半 —— 4MV 时每个宏块要进四次，
+/// 那个 memset 是实打实的浪费。顺带每个 `W` 各自单态化，内层循环能完全展开。
 #[allow(clippy::too_many_arguments)]
-fn mspel_mc(
+fn mspel_mc<const W: usize>(
     dst: &mut [u8],
     dstride: usize,
     dx: usize,
     dy: usize,
-    w: usize,
     src: &[u8],
     base: usize,
     hmode: u32,
     vmode: u32,
     rnd: i32,
+    // 调用方按 `(W+3)*W` 开（常量泛型不能在数组长度里做算术），这里只切片。
+    tmp: &mut [i16],
 ) {
+    let w = W;
     let b = base as isize;
     if vmode != 0 {
         if hmode != 0 {
@@ -64,11 +70,8 @@ fn mspel_mc(
             // ⚠️ 中间结果**不夹取**（上游就是 `int16_t` 直接存）——夹了会在
             // 陡边处差 1，而那种差只出现在少数像素上，最难查。
             //
-            // 用**栈上固定数组**而不是 `vec![]`：`w` 只可能是 4 / 8 / 16，
-            // `(16+3)*16 = 304` 就是上限。这个函数每个块都要进一次，
-            // 原来每次调用都 malloc/free 一回。
-            let mut tmp_buf = [0i16; 19 * 16];
-            let tmp = &mut tmp_buf[..(w + 3) * w];
+            // 缓冲**正好** `(W+3)*W`：由调用方按常量开，不为 8×8 白开 16×16 的。
+            let tmp = &mut tmp[..(W + 3) * W];
             // 竖直那一趟：4 个抽头是「上下 4 行、同一列」。把**行偏移**提到内层循环
             // 外面，`vmode` 的系数选择也跟着提出来 —— 原来每像素都要重新 match 一次
             // （走的是 `mspel_filter16`，那个 `match mode` 在函数里）。
@@ -387,17 +390,18 @@ impl Ctx<'_, '_> {
             let dst = self.plane_mut(0);
             if mspel != 0 {
                 let dxy = (((my & 3) << 2) | (mx & 3)) as usize;
-                mspel_mc(
+                let mut tmp = [0i16; (16 + 3) * 16];
+                mspel_mc::<16>(
                     dst,
                     stride,
                     dx,
                     dy,
-                    16,
                     &buf,
                     base,
                     (dxy & 3) as u32,
                     (dxy >> 2) as u32,
                     rnd,
+                    &mut tmp,
                 );
             } else {
                 let dxy = ((my & 2) | ((mx & 2) >> 1)) as usize;
@@ -464,17 +468,18 @@ impl Ctx<'_, '_> {
         let dst = self.plane_mut(0);
         if mspel != 0 {
             let dxy = (((my & 3) << 2) | (mx & 3)) as usize;
-            mspel_mc(
+            let mut tmp = [0i16; (8 + 3) * 8];
+            mspel_mc::<8>(
                 dst,
                 stride,
                 dx,
                 dy,
-                8,
                 &buf,
                 base,
                 (dxy & 3) as u32,
                 (dxy >> 2) as u32,
                 rnd,
+                &mut tmp,
             );
         } else {
             let dxy = ((my & 2) | ((mx & 2) >> 1)) as usize;

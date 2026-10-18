@@ -161,7 +161,7 @@ impl Ctx<'_, '_> {
                 self.grids.coded_block[bi] = val as u8;
             }
             let block = self.decode_i_block(mbx, mby, k, val != 0, ac_pred)?;
-            self.put_block(mbx, mby, k, &block, false);
+            self.put_block(mbx, mby, k, block, false);
         }
         Ok(())
     }
@@ -375,7 +375,7 @@ impl Ctx<'_, '_> {
                     if mb_intra {
                         self.set_avail(mbx, mby, i);
                         let block = self.decode_intra_block(mbx, mby, i, val != 0, mquant, ac_pred)?;
-                        self.put_block(mbx, mby, i, &block, true);
+                        self.put_block(mbx, mby, i, block, true);
                         block_cbp |= 0xF << (i << 2);
                         block_intra |= 1 << i;
                     } else if val != 0 {
@@ -481,7 +481,7 @@ impl Ctx<'_, '_> {
                         self.set_avail(mbx, mby, i);
                         let block =
                             self.decode_intra_block(mbx, mby, i, is_coded[i], mquant, ac_pred)?;
-                        self.put_block(mbx, mby, i, &block, true);
+                        self.put_block(mbx, mby, i, block, true);
                         block_cbp |= 0xF << (i << 2);
                         block_intra |= 1 << i;
                     } else if is_coded[i] {
@@ -1118,8 +1118,9 @@ impl Ctx<'_, '_> {
     ///
     /// `signed` 对应上游 `vc1_put_blocks_clamped()` 的 `put_signed` 参数：
     /// I 帧是 `false`（块值当像素）、P 帧的帧内块是 `true`（块值 + 128）。
-    fn put_block(&mut self, mbx: usize, mby: usize, n: usize, block: &[i16; 64], signed: bool) {
-        let mut b = *block;
+    fn put_block(&mut self, mbx: usize, mby: usize, n: usize, mut b: [i16; 64], signed: bool) {
+        // 按**值**收块：调用方拿到 `decode_intra_block` 的结果就不再用了，
+        // 传引用会逼这里先 `*block` 拷 128 字节（每个块一次）。
         idct::inv_trans_8x8(&mut b);
         let (plane, px, py) = self.block_origin(mbx, mby, n);
         let stride = self.plane_stride(plane);
