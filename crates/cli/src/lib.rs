@@ -54,12 +54,15 @@ pub use v2v_msmpeg4::{Decoder, Encoder, EncoderConfig, Frame, Version};
 /// | `WMV2` | ✅ 三份真样本逐帧 0 差（含 `mspel` / ABT / 环路滤波那些分支） |
 /// | `MP41` / `MP42` | ❌ 帧头按版本分叉了，但 **MB 层还没写**（要 H.263 的 MCBPC 表 + `v2_*` 两张私有表） |
 ///
+/// `WMV3` 不走这里 —— 它不是 MS-MPEG-4 的版本，是**另一套骨架**（`v2v-vc1`），
+/// 见 [`open_video_decoder`]。
+///
 /// 宁可明确拒绝，也不能静默产出错误画面 —— 那比不支持糟得多。
 fn verified_version(fourcc: u32) -> Result<Version, Error> {
     match Version::from_fourcc(fourcc) {
         Some(v @ (Version::V3 | Version::Wmv1 | Version::Wmv2)) => Ok(v),
         _ => Err(Error::Unsupported(format!(
-            "输入视频是 {}，本工具目前只解 MP43 / WMV1 / WMV2（MP41/MP42/WMV3 在接）",
+            "输入视频是 {}，本工具目前只解 MP43 / WMV1 / WMV2 / WMV3（MP41/MP42 在接）",
             v2v_asf::fourcc_string(fourcc)
         ))),
     }
@@ -78,6 +81,73 @@ fn make_decoder(version: Version, extra: &[u8]) -> Result<Decoder, Error> {
 
 /// MP43 的 FourCC（`.wmv` 输出用的编码）。
 pub const MP43: u32 = u32::from_le_bytes(*b"MP43");
+
+/// WMV3（VC-1）的 FourCC —— **只做输入**，不做出编码。
+///
+/// 不是因为不想：ffmpeg 里根本没有 VC-1 编码器，本仓也没有可对账的 oracle。
+pub const WMV3: u32 = u32::from_le_bytes(*b"WMV3");
+
+/// 输入视频解码器。
+///
+/// 存在的理由：VC-1 与 MS-MPEG-4 **不是同一套骨架**（帧头、宏块层、变换、MC 全不同），
+/// 没法共用一个实现；但**下游只认一种形状** —— 所以这里只做「出口归一」：
+/// 两种解码器都吐 `v2v_msmpeg4::Frame`（已裁到显示尺寸的 YUV420P），
+/// 编码器与封装器一行都不用改。
+///
+/// ⚠️ **不要**为了「省一次拷贝」让下游认 `v2v_vc1::Frame` —— 那会把 VC-1 的类型
+/// 漏进 MP43 / mp4v 的编码路径，等于让编码器知道输入是什么编解码器。
+pub enum VideoDecoder {
+    /// MP43 / WMV1 / WMV2。
+    Msmpeg4(Decoder),
+    /// VC-1（WMV3）。
+    Vc1(v2v_vc1::Decoder),
+}
+
+impl VideoDecoder {
+    /// 解一帧。`w` / `h` 是**显示**尺寸（只有 MS-MPEG-4 那一侧用得上 ——
+    /// VC-1 的解码器在构造时就把尺寸记下来了）。
+    pub fn decode(&mut self, data: &[u8], w: u32, h: u32) -> Result<Frame, Error> {
+        match self {
+            Self::Msmpeg4(d) => Ok(d.decode(data, w, h)?),
+            Self::Vc1(d) => {
+                d.decode_frame(data)?;
+                let f = d.frame();
+                Ok(Frame {
+                    width: f.width,
+                    height: f.height,
+                    y: f.y,
+                    u: f.u,
+                    v: f.v,
+                })
+            }
+        }
+    }
+}
+
+/// 按 FourCC 建解码器。`extra` 是容器的编解码器私有数据，`w` / `h` 是显示尺寸。
+///
+/// | FourCC | 走哪条 |
+/// |---|---|
+/// | `MP43` / `WMV1` / `WMV2` | `v2v-msmpeg4`（`WMV2` 还要 `extra` 里的能力位） |
+/// | `WMV3` | `v2v-vc1`（`extra` 是 `STRUCT_C` 序列头） |
+///
+/// 别的一律明确报 `Unsupported`。
+fn open_video_decoder(
+    fourcc: u32,
+    extra: &[u8],
+    w: u32,
+    h: u32,
+) -> Result<VideoDecoder, Error> {
+    if fourcc == WMV3 {
+        let seq = v2v_vc1::SeqHeader::parse(extra)
+            .map_err(|e| Error::Unsupported(format!("VC-1 序列头解析失败：{e}")))?;
+        let dec = v2v_vc1::Decoder::new(seq, w, h)
+            .map_err(|e| Error::Unsupported(format!("VC-1 解码器建不起来：{e}")))?;
+        return Ok(VideoDecoder::Vc1(dec));
+    }
+    let version = verified_version(fourcc)?;
+    Ok(VideoDecoder::Msmpeg4(make_decoder(version, extra)?))
+}
 
 /// 输出容器。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -426,9 +496,8 @@ fn convert_to_asf(
         .video_stream()
         .ok_or_else(|| Error::Unsupported("文件里没有视频轨（或没有格式信息）".into()))?;
     let (vnum, w, h) = (track.number, track.width, track.height);
-    let version = verified_version(track.fourcc)?;
 
-    let mut dec = make_decoder(version, &track.extra)?;
+    let mut dec = open_video_decoder(track.fourcc, &track.extra, w, h)?;
     let mut enc = Encoder::new(EncoderConfig {
         qscale: opts.qscale,
         keyframe_interval: opts.keyframe_interval,
@@ -910,7 +979,6 @@ fn convert_to_mp4(
         .video_stream()
         .ok_or_else(|| Error::Unsupported("文件里没有视频轨（或没有格式信息）".into()))?;
     let (vnum, w, h) = (track.number, track.width, track.height);
-    let version = verified_version(track.fourcc)?;
 
     // 源里那条音频轨的格式（有没有音频、采样率多少）—— 封装器的 `stsd` 要用。
     let src_audio = demux.audio_stream().map(|(_, af)| af);
@@ -1044,7 +1112,7 @@ fn convert_to_mp4(
         _ => v2v_mp4::Mp4Muxer::new(vtrack),
     };
 
-    let mut dec = make_decoder(version, &track.extra)?;
+    let mut dec = open_video_decoder(track.fourcc, &track.extra, w, h)?;
     let mut frames = 0usize;
     let mut key_frames = 0usize;
     let mut skipped_audio = 0usize;
@@ -1255,6 +1323,15 @@ fn convert_to_mp4(
             continue;
         }
         if s.stream != vnum {
+            continue;
+        }
+
+        // `--max-frames` 到了就**不再解视频**，但队列里剩下的音频还要转给 worker。
+        //
+        // ⚠️ 这一句是必需的，不是防御性代码：上面为了探帧率**预读了 8 个样本**，
+        // 那 8 个在 `stop` 之后仍然躺在 `queue` 里 —— 少了这句，`-n 6` 会产出 8 帧
+        // （实测过，`.mp4` 那条路；`.wmv` 那条路没有预读，所以不受影响）。
+        if stop {
             continue;
         }
 

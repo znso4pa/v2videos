@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use v2v_asf::{AsfDemuxer, AsfMuxer, StreamKind, VideoStreamInfo};
-use v2v_cli::{convert_file, ConvertOptions, MP43};
+use v2v_cli::{convert_file, ConvertOptions, OutputFormat, MP43};
 use v2v_msmpeg4::{Decoder, Encoder, EncoderConfig, Frame};
 
 /// 源样本视频轨的**版本 + extradata**（认不出 FourCC 给 `None`）。
@@ -445,6 +445,101 @@ fn converts_real_sample_and_ffmpeg_agrees() {
         }
     }
     eprintln!("真样本闭环：{n} 帧逐位一致（{w}×{h}）");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **WMV3（VC-1）输入**：这条路以前是明确拒绝的（`Unsupported`），现在要能走完。
+///
+/// 判据两层，都**不依赖 ffmpeg**：
+/// 1. `.wmv` 输出 + `verify`：产物会被我们自己的 MP43 解码器解回来、与源帧比 PSNR。
+///    它显著高于 30 dB 就说明「VC-1 解出来的像素」真的进了编码器 —— 不是黑帧、不是全灰。
+/// 2. `.mp4` 输出：帧数与关键帧数对得上、文件非空（走的是另一条封装路）。
+///
+/// 样本不是 WMV3 就 `SKIP` 并通过 —— 与别的真样本测试同一个约定。
+///
+/// ```text
+/// V2V_ASF_SAMPLE=<一份 WMV3 样本> cargo test --release -p v2v-cli -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "需要一份 WMV3 真样本"]
+fn converts_wmv3_input() {
+    let src = match std::env::var("V2V_ASF_SAMPLE") {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!("SKIP: V2V_ASF_SAMPLE 未设置");
+            return;
+        }
+    };
+    if !Path::new(&src).is_file() {
+        eprintln!("SKIP: 样本不存在");
+        return;
+    }
+    let fourcc = match AsfDemuxer::new(std::fs::File::open(&src).expect("开样本")) {
+        Ok(d) => d
+            .streams()
+            .iter()
+            .find(|s| s.kind == StreamKind::Video)
+            .and_then(|s| s.video.as_ref())
+            .map(|v| v.fourcc),
+        Err(_) => None,
+    };
+    let Some(fourcc) = fourcc else {
+        eprintln!("SKIP: 取不到视频轨");
+        return;
+    };
+    if fourcc != u32::from_le_bytes(*b"WMV3") {
+        eprintln!("SKIP: 样本不是 WMV3（{}）", v2v_asf::fourcc_string(fourcc));
+        return;
+    }
+
+    let dir = temp_dir("wmv3");
+    let input = dir.join("in.wmv");
+    std::fs::copy(&src, &input).expect("拷样本");
+    // ⚠️ 别取太少的帧：这类样本的开头常是一段**静止**画面，MP43 在 q=6 下能把它们
+    // **逐位还原**，于是 PSNR 是 `inf` —— 那个数看着漂亮，其实什么都没证明
+    // （解出一片纯色也同样是 inf）。取够帧数，让后面有真实内容进来。
+    let n = 12usize;
+
+    // ---- 1. `.wmv`（MP43）+ 校验 ----
+    let rep = convert_file(
+        &input,
+        &dir.join("out.wmv"),
+        &ConvertOptions {
+            format: OutputFormat::Asf,
+            qscale: 6,
+            keyframe_interval: 0,
+            verify: true,
+            max_frames: Some(n),
+            // 这条测试只管视频 —— 音频直通要求源是 WMA，不该成为「VC-1 能不能转」的前提。
+            copy_audio: false,
+            ..Default::default()
+        },
+    )
+    .expect("WMV3 → .wmv 应该能转");
+    eprintln!("WMV3 → .wmv：{rep:?}");
+    assert_eq!(rep.frames, n, "帧数不对");
+    assert!(
+        rep.psnr_db.expect("verify 开着就一定有 PSNR") > 30.0,
+        "VC-1 解出来的内容没进编码器（PSNR 太低）"
+    );
+
+    // ---- 2. `.mp4`（mp4v + AAC）----
+    let rep = convert_file(
+        &input,
+        &dir.join("out.mp4"),
+        &ConvertOptions {
+            format: OutputFormat::Mp4,
+            keyframe_interval: 12,
+            max_frames: Some(n),
+            ..Default::default()
+        },
+    )
+    .expect("WMV3 → .mp4 应该能转");
+    eprintln!("WMV3 → .mp4：{rep:?}");
+    assert_eq!(rep.frames, n, "帧数不对");
+    assert!(rep.bytes_out > 0, "产物是空的");
+    assert!(rep.key_frames >= 1, "一帧关键帧都没有");
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 

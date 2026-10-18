@@ -14,6 +14,8 @@ v2v-asf = { path = "../asf" }
 v2v-avi = { path = "../avi" }
 v2v-container = { path = "../container" }
 v2v-msmpeg4 = { path = "../msmpeg4" }
+# VC-1（WMV3）输入：只有解码器，输出仍走 MP43 / mp4v。
+v2v-vc1 = { path = "../vc1" }
 # MP4 那条路：容器 + MPEG-4 Part 2 编码器 + WMA 解码 →（AAC 编码 / PCM）。
 v2v-mp4 = { path = "../mp4" }
 v2v-mp4v = { path = "../mp4v" }
