@@ -42,19 +42,29 @@ impl<'a> BitReader<'a> {
     }
 
     /// 偷看 `n` 位但**不前进**（`n <= 32`）。调用方必须自己保证位数够。
+    ///
+    /// ⚠️ 走 **8 字节窗口**：一次 `get(byte..byte+8)`（一次边界检查）再 `u64::from_be_bytes`
+    /// 装进来，而不是逐字节 `get().unwrap_or(&0)` 五次（五次边界检查）。
+    /// 窗口装得下 `7 + 32 = 39` 位，够用。**只有文件尾部不足 8 字节时**才走逐字节慢路
+    /// （那时多读的字节本来就只是凑数）。
     #[inline]
     pub fn peek_u(&self, n: u32) -> u32 {
         debug_assert!(n <= 32);
         debug_assert!(self.bits_left() >= n as usize);
         let byte = self.pos >> 3;
         let shift = (self.pos & 7) as u32;
-        // 32 位 + 最多 7 位的偏移 → 跨 5 个字节。越界的按 0 补（调用方已保证
-        // 「需要的那些位」在范围内，这里多读的字节只是凑数）。
-        let mut w = 0u64;
-        for i in 0..5usize {
-            w = (w << 8) | *self.data.get(byte + i).unwrap_or(&0) as u64;
-        }
-        ((w >> (40 - shift - n)) & ((1u64 << n) - 1)) as u32
+        let w = match self.data.get(byte..byte + 8) {
+            Some(s) => u64::from_be_bytes(s.try_into().unwrap()),
+            None => {
+                // 慢路：尾部不足 8 字节，逐字节读、缺的补 0。
+                let mut w = 0u64;
+                for i in 0..5usize {
+                    w = (w << 8) | *self.data.get(byte + i).unwrap_or(&0) as u64;
+                }
+                w << 24 // 对齐到「取高 40 位」的口径，见下面那一行
+            }
+        };
+        ((w >> (64 - shift - n)) & ((1u64 << n) - 1)) as u32
     }
 
     /// 偷看 `n <= 16` 位（不前进）—— 只读 2 个字节，前缀码快表用这个。
@@ -68,9 +78,11 @@ impl<'a> BitReader<'a> {
         debug_assert!((self.pos & 7) as u32 + n <= 16);
         let byte = self.pos >> 3;
         let shift = (self.pos & 7) as u32;
-        let hi = self.data[byte] as u32;
-        let lo = *self.data.get(byte + 1).unwrap_or(&0) as u32;
-        ((hi << 8 | lo) >> (16 - shift - n)) & ((1u32 << n) - 1)
+        let pair = match self.data.get(byte..byte + 2) {
+            Some(s) => u16::from_be_bytes(s.try_into().unwrap()) as u32,
+            None => ((self.data[byte] as u32) << 8) | *self.data.get(byte + 1).unwrap_or(&0) as u32,
+        };
+        (pair >> (16 - shift - n)) & ((1u32 << n) - 1)
     }
 
     pub fn bit(&mut self) -> Result<u32> {
