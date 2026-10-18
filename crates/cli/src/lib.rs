@@ -1238,9 +1238,18 @@ fn convert_to_mp4(
     // GOP 边界与编码器内部的判据一致（`frames_since_i >= keyframe_interval`，
     // 首帧恒 I）—— 所以按 `gop_len` 切出来的每一块，第一帧正好是 I 帧。
     // `-g 0`（全 I 帧）时每帧独立，`gop_len = 1`。
-    let nthreads = opts.threads.max(1);
     let all_i = opts.keyframe_interval == 0;
     let gop_len = if all_i { 1 } else { opts.keyframe_interval };
+    // 解码池与编码池**分核**。实测 1080p 上「解码 : 编码」约 **1 : 3**
+    // （每帧解码 ~10 ms、mp4v 编码 ~30 ms），所以解码拿 1/4 的核才均衡 ——
+    // 给多了反而把编码饿死（实测 6 解 / 2 编比 2 解 / 6 编慢一倍多）。
+    let par_decode = opts.threads > 1 && track.fourcc == WMV3 && gop_len > 1;
+    let n_dec = if par_decode { (opts.threads / 4).max(1) } else { 0 };
+    let nthreads = if par_decode {
+        opts.threads.saturating_sub(n_dec).max(1)
+    } else {
+        opts.threads.max(1)
+    };
     // 有界通道：解码（主线程）领先编码（worker）最多 `2 * nthreads` 个 GOP，
     // 解码帧就不会堆在内存里（一帧 320×240 的 YUV 是 115 KB）。
     let (vtx, vrx) = std::sync::mpsc::sync_channel::<Vec<(usize, Frame, u32)>>(2 * nthreads);
@@ -1301,6 +1310,92 @@ fn convert_to_mp4(
     // 攒够一个 GOP 就派给 worker。
     let mut gop_buf: Vec<(usize, Frame, u32)> = Vec::with_capacity(gop_len);
 
+    // ---- 视频**解码池**：按 GOP 独立解 ----
+    //
+    // 前提是「从任意 I 帧起解 == 整条链解到那里」，由 `crates/vc1/tests/gop_start.rs`
+    // 钉着（真样本上抽查 50 个关键帧，逐像素 0 差）。
+    //
+    // ⚠️ **只对 VC-1 开**：MS-MPEG-4 那套的跨帧状态（`flipflop_rounding` / `Stats` /
+    // WMV2 的 IntraX8）还没验过，别顺手打开。
+    // ⚠️ `par_decode == false` 时**走下面那条串行老路，一个字节都不变**。
+    let mut sample_gop: Vec<(usize, Vec<u8>, u32)> = Vec::with_capacity(gop_len);
+    let mut gop_seq = 0usize;
+    let mut dec_txs: Vec<std::sync::mpsc::SyncSender<Vec<(usize, Vec<u8>, u32)>>> = Vec::new();
+    let mut dec_workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
+    let mut collector: Option<std::thread::JoinHandle<std::result::Result<(), String>>> = None;
+    if par_decode {
+        let seq = v2v_vc1::SeqHeader::parse(&track.extra)
+            .map_err(|e| Error::Unsupported(format!("VC-1 序列头解析失败：{e}")))?;
+        // 每个 worker 一条**专用**结果通道：派活与取活都是轮转，收端按同样的轮转顺序
+        // 取就天然保持了全局顺序 —— 不需要重排缓冲。
+        let mut res_rxs = Vec::new();
+        for _ in 0..n_dec {
+            let (jtx, jrx) = std::sync::mpsc::sync_channel::<Vec<(usize, Vec<u8>, u32)>>(2);
+            let (rtx, rrx) =
+                std::sync::mpsc::sync_channel::<std::result::Result<Vec<(usize, Frame, u32)>, String>>(2);
+            res_rxs.push(rrx);
+            dec_txs.push(jtx);
+            dec_workers.push(std::thread::spawn(move || {
+                while let Ok(gop) = jrx.recv() {
+                    let r = (|| -> std::result::Result<Vec<(usize, Frame, u32)>, String> {
+                        // 每条 GOP 一条**全新的**解码器（前提就是它和串行链等价）。
+                        let mut d = v2v_vc1::Decoder::new(seq, w, h).map_err(|e| e.to_string())?;
+                        let mut out = Vec::with_capacity(gop.len());
+                        for (idx, data, dur) in gop {
+                            d.decode_frame(&data).map_err(|e| e.to_string())?;
+                            let f = d.frame();
+                            out.push((
+                                idx,
+                                Frame {
+                                    width: f.width,
+                                    height: f.height,
+                                    y: f.y,
+                                    u: f.u,
+                                    v: f.v,
+                                },
+                                dur,
+                            ));
+                        }
+                        Ok(out)
+                    })();
+                    let failed = r.is_err();
+                    if rtx.send(r).is_err() || failed {
+                        break;
+                    }
+                }
+            }));
+        }
+        // 收端：按轮转顺序取，再把帧**重新按编码器的 GOP 长度**切块 ——
+        // 这样编码器看到的分批与串行版完全一样，输出不受影响。
+        let vtx_c = vtx.clone();
+        collector = Some(std::thread::spawn(move || -> std::result::Result<(), String> {
+            let mut batch: Vec<(usize, Frame, u32)> = Vec::with_capacity(gop_len);
+            let mut cur = 0usize;
+            loop {
+                match res_rxs[cur].recv() {
+                    Ok(Ok(gop)) => {
+                        for it in gop {
+                            batch.push(it);
+                            if batch.len() >= gop_len {
+                                vtx_c
+                                    .send(std::mem::take(&mut batch))
+                                    .map_err(|_| "视频线程提前退出".to_string())?;
+                                batch = Vec::with_capacity(gop_len);
+                            }
+                        }
+                        cur = (cur + 1) % n_dec;
+                    }
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => break,
+                }
+            }
+            if !batch.is_empty() {
+                vtx_c.send(batch).map_err(|_| "视频线程提前退出".to_string())?;
+            }
+            Ok(())
+        }));
+    }
+
     loop {
         let s = match queue.pop_front() {
             Some(s) => Some(s),
@@ -1344,17 +1439,32 @@ fn convert_to_mp4(
         }
         prev_vts = Some(s.timestamp_ms);
 
-        let frame = dec.decode(&s.data, w, h)?;
-        // ⚠️ **`-g 0` 在 `.mp4` 这条路上就是「全 I 帧」** ——
-        // 这条路的默认值是 0（每个 I 帧都独立可解，见 `ConvertOptions` 的说明），
-        // 所以 worker 那边不能直接调 `encode_frame`（在 `mp4v` 里 `0` 的含义是
-        // 「无 GOP」，会编 P 帧、而且第一个 P 帧会因为没有参考帧而报错）——
-        // `all_i` 就是为这个传进去的。
-        gop_buf.push((idx, frame, last_dur));
-        frames += 1;
-        if gop_buf.len() >= gop_len {
-            vtx.send(std::mem::take(&mut gop_buf))
-                .map_err(|_| Error::Io(std::io::Error::other("视频线程提前退出")))?;
+        if par_decode {
+            // ---- 并行解码：把**样本**攒成 GOP 派给解码池，本线程不解 ----
+            // 新 GOP 的边界：当前样本是关键帧、且手上已经攒了东西。
+            if s.key_frame && !sample_gop.is_empty() {
+                let gop = std::mem::take(&mut sample_gop);
+                dec_txs[gop_seq % dec_txs.len()]
+                    .send(gop)
+                    .map_err(|_| Error::Io(std::io::Error::other("解码线程提前退出")))?;
+                gop_seq += 1;
+                sample_gop = Vec::with_capacity(gop_len);
+            }
+            sample_gop.push((idx, s.data, last_dur));
+            frames += 1;
+        } else {
+            let frame = dec.decode(&s.data, w, h)?;
+            // ⚠️ **`-g 0` 在 `.mp4` 这条路上就是「全 I 帧」** ——
+            // 这条路的默认值是 0（每个 I 帧都独立可解，见 `ConvertOptions` 的说明），
+            // 所以 worker 那边不能直接调 `encode_frame`（在 `mp4v` 里 `0` 的含义是
+            // 「无 GOP」，会编 P 帧、而且第一个 P 帧会因为没有参考帧而报错）——
+            // `all_i` 就是为这个传进去的。
+            gop_buf.push((idx, frame, last_dur));
+            frames += 1;
+            if gop_buf.len() >= gop_len {
+                vtx.send(std::mem::take(&mut gop_buf))
+                    .map_err(|_| Error::Io(std::io::Error::other("视频线程提前退出")))?;
+            }
         }
         if let Some(max) = opts.max_frames {
             if frames >= max {
@@ -1364,7 +1474,28 @@ fn convert_to_mp4(
         }
     }
     // 最后一块不满一个 GOP 也要发出去。
-    if !gop_buf.is_empty() {
+    if par_decode {
+        if !sample_gop.is_empty() {
+            let gop = std::mem::take(&mut sample_gop);
+            dec_txs[gop_seq % dec_txs.len()]
+                .send(gop)
+                .map_err(|_| Error::Io(std::io::Error::other("解码线程提前退出")))?;
+        }
+        // 关掉派活端 → worker 收工 → 收端取完最后一块也收工。
+        drop(dec_txs);
+        for h in dec_workers {
+            let _ = h.join();
+        }
+        if let Some(c) = collector {
+            match c.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    return Err(Error::Io(std::io::Error::other(format!("视频解码线程：{e}"))))
+                }
+                Err(_) => return Err(Error::Io(std::io::Error::other("视频解码线程 panic"))),
+            }
+        }
+    } else if !gop_buf.is_empty() {
         vtx.send(gop_buf).map_err(|_| Error::Io(std::io::Error::other("视频线程提前退出")))?;
     }
     drop(vtx);
