@@ -163,6 +163,8 @@ df -h /System/Volumes/Data  # 磁盘 <10% 可用会让 macOS 整体变卡（换�
 - **load average 超过核数（8）就不要开新构建**；先等它降下来，或者把并发的会话停掉。
 - **能 debug 就别 release。** `--release` 的优化（尤其 LTO）会把所有核拉满几分钟；
   只为跑测试、看报错、量体积以外的东西，debug 足够。
+  ⚠️ **本仓的 release 还额外设了 `codegen-units = 1`**（见根 `Cargo.toml`，为 VC-1 解码
+  快 9%），所以 **release 编译比默认更慢、更吃单核** —— 更别反复全量 `--release`。
 - **限并发**：`cargo build -j 4` / `cargo test -j 4`。不要让它吃满所有核。
 - **不要多个会话同时跑同一个仓库的全量 `cargo test --workspace`。** 既费电，
   也会互相抢 `target/` 的锁。同仓库并行请走 `git worktree` 换目录（各自的 `target/` 独立，
