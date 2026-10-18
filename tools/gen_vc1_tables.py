@@ -49,7 +49,8 @@ VC1_SOURCES = ["vc1data.c", "vc1_vlc_data.h", "vc1.h", "vc1_common.h", "vc1acdat
 
 # 要落到 Rust 的枚举。名字必须在源文件里找得到 —— 找不到就是上游改了名，
 # 那时候**要有人来看一眼**，不能默默跳过。
-WANTED_ENUMS = ["Profile", "QuantMode", "DQProfile", "MVModes", "TransformTypes", "Imode"]
+WANTED_ENUMS = ["Profile", "QuantMode", "DQProfile", "MVModes", "TransformTypes", "Imode",
+                "CodingSet"]
 
 
 def read(path):
@@ -401,9 +402,42 @@ def gen():
     ]:
         out.matrix_pairs(name, rows(vlc_h, codes), rows(vlc_h, bits))
 
+    # ---- P 帧宏块层：**变换类型**那一组（`tt_index` = 0/1/2 选表）。
+    #
+    # `ttmb` 是整帧一个（`ttmbf == 0`）还是逐宏块一个（`ttmbf != 0`）由帧头决定；
+    # 逐块那个（`ttblk`）与 4×4 的子块模式（`subblkpat`）都在这三张表里。
+    out.w("// ---- P 帧的变换类型：`[tt_index][符号] -> [码, 长度]`。\n\n")
+    for name, codes, bits in [
+        ("TTMB_VLC", "vc1_ttmb_codes", "vc1_ttmb_bits"),
+        ("TTBLK_VLC", "vc1_ttblk_codes", "vc1_ttblk_bits"),
+        ("SUBBLKPAT_VLC", "vc1_subblkpat_codes", "vc1_subblkpat_bits"),
+    ]:
+        out.matrix_pairs(name, rows(vlc_h, codes), rows(vlc_h, bits))
+
+    # `ttblk` 的**下标**要先过这张符号表才是真正的变换类型（`TT_*`）。
+    # 与 `TTFRM_TO_TT` 同理：名字由生成器翻，不手抄数值。
+    out.w("// ---- `ttblk` 下标 -> `TT_*`（符号名表，逐行翻译）。\n\n")
+    out.matrix(
+        "TTBLK_TO_TT",
+        "u8",
+        [[resolve(t) for t in row] for row in sym_rows(data_c, "ff_vc1_ttblk_to_tt")],
+    )
+
+    # ---- 扫描表：4×4 变换（ABT）与 8×4 / 4×8 那两张。
+    #
+    # 8×4 / 4×8 用**本仓已有**的 `msmpeg4::tables::ABT_SCAN_A/B`（就是上游的
+    # `ff_wmv2_scantableA/B`，逐项核过），所以这里只生成 4×4 的那一张。
+    out.w("// ---- 4×4（ABT）的扫描表（表 232）。\n\n")
+    out.flat("SCAN_4X4", "u8", flat(data_c, "ff_vc1_simple_progressive_4x4_zz"))
+
     # ---- 量化。
     out.w("// ---- 量化：`pqindex` -> `pq`。三行分别是隐式 / 显式均匀 / 显式非均匀。\n\n")
     out.matrix("PQUANT", "u8", rows(data_c, "ff_vc1_pquant_table"))
+
+    # ---- DC 定标与「量化步长换算」（AC/DC 预测跨不同 pq 的宏块时要用）。
+    out.w("// ---- DC 定标（`pq` -> DC 乘数）与 `ff_vc1_dqscale`。\n\n")
+    out.flat("DC_SCALE", "u8", flat(data_c, "ff_wmv3_dc_scale_table"))
+    out.flat("DQSCALE", "u32", flat(data_c, "ff_vc1_dqscale"))
 
     # ---- 帧级运动补偿模式。
     out.w("// ---- P 帧的帧级 MV 模式：`[lowquant][unary 值]` -> `MV_PMODE_*`。\n\n")

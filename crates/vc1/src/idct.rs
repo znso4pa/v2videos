@@ -1,10 +1,12 @@
-//! VC-1 的**逆变换**：8×8 / 8×4 / 4×8 / 4×4 四套，外加各自的「只有 DC」捷径。
+//! VC-1 的**逆变换**：8×8 / 8×4 / 4×8 / 4×4 四套，外加各自的「只有 DC」捷径，
+//! 以及把变换结果落到像素上的三个写回函数。
 //!
 //! 与 MPEG-4 那套**不是一回事**（`v2v-msmpeg4` 里的 `simple_idct` 别往这儿搬）：
 //! VC-1 的变换核是整数蝶形，系数 12/16/6/9/15/4 那一组，两趟分别 `>> 3` 与 `>> 7`。
 //! 定标也不一样，搬错就是「能出图但一片噪声」。
 //!
-//! 对照上游：`libavcodec/vc1dsp.c` 的 `vc1_inv_trans_{8x8,8x4,4x8,4x4}[_dc]_c()`。
+//! 对照上游：`libavcodec/vc1dsp.c` 的 `vc1_inv_trans_{8x8,8x4,4x8,4x4}[_dc]_c()` 与
+//! `idctdsp.c` 的 `put_pixels_clamped` / `put_signed_pixels_clamped` / `add_pixels_clamped`。
 //! 这是 **VC-1（SMPTE 421M）规范里的变换**，不是某个实现的私有数据。
 //!
 //! ## 为什么照抄得这么死
@@ -21,6 +23,9 @@
 //! - `4x8`：用全 8 行、前 4 列，直接写像素
 //! - `4x4`：用前 4 行、前 4 列，直接写像素
 //!
+//! ABT 的 4×4 子块在**同一块缓冲里**以 `+off` 偏移取（上游传 `block + off`）——
+//! 所以这几个函数吃的是**切片**而不是定长数组，偏移由调用方给。
+//!
 //! 中间量一律 `i32`（与 C 的 `int` 一致），**落回 `i16` 缓冲时按 C 的截断**。
 
 /// `av_clip_uint8`：先加后夹。
@@ -29,8 +34,8 @@ fn add_clip(dst: u8, v: i32) -> u8 {
     (i32::from(dst) + v).clamp(0, 255) as u8
 }
 
-/// 8×8 逆变换（**就地**改 `block`）。
-pub fn inv_trans_8x8(block: &mut [i16; 64]) {
+/// 8×8 逆变换（**就地**改 `block`；`block` 至少 64 项，步长固定 8）。
+pub fn inv_trans_8x8(block: &mut [i16]) {
     let mut temp = [0i16; 64];
 
     // ---- 第一趟：列（源步长 8，落在 temp 的行上）----
@@ -90,19 +95,19 @@ pub fn inv_trans_8x8(block: &mut [i16; 64]) {
 }
 
 /// 8×8 的「只有 DC」捷径：`dc` 三次缩放后**整块加同一个值**。
-pub fn inv_trans_8x8_dc(dst: &mut [u8], stride: usize, block: &[i16; 64]) {
+pub fn inv_trans_8x8_dc(dst: &mut [u8], stride: usize, block: &[i16], x: usize, y: usize) {
     let mut dc = i32::from(block[0]);
     dc = (3 * dc + 1) >> 1;
     dc = (3 * dc + 16) >> 5;
     for r in 0..8usize {
         for c in 0..8usize {
-            dst[r * stride + c] = add_clip(dst[r * stride + c], dc);
+            dst[(y + r) * stride + x + c] = add_clip(dst[(y + r) * stride + x + c], dc);
         }
     }
 }
 
 /// 8×4 逆变换（用前 4 行 × 8 列，**直接写像素**）。
-pub fn inv_trans_8x4(dst: &mut [u8], stride: usize, block: &mut [i16; 64]) {
+pub fn inv_trans_8x4(dst: &mut [u8], stride: usize, block: &mut [i16], x: usize, y: usize) {
     // 第一趟：4 行 × 8 列，就地（步长 8）
     for i in 0..4usize {
         let s = |k: usize| i32::from(block[i * 8 + k]);
@@ -134,27 +139,28 @@ pub fn inv_trans_8x4(dst: &mut [u8], stride: usize, block: &mut [i16; 64]) {
         let s = |k: usize| i32::from(block[k * 8 + i]);
         let (t1, t2) = (17 * (s(0) + s(2)) + 64, 17 * (s(0) - s(2)) + 64);
         let (t3, t4) = (22 * s(1) + 10 * s(3), 22 * s(3) - 10 * s(1));
-        dst[i] = add_clip(dst[i], (t1 + t3) >> 7);
-        dst[stride + i] = add_clip(dst[stride + i], (t2 - t4) >> 7);
-        dst[2 * stride + i] = add_clip(dst[2 * stride + i], (t2 + t4) >> 7);
-        dst[3 * stride + i] = add_clip(dst[3 * stride + i], (t1 - t3) >> 7);
+        let base = y * stride + x + i;
+        dst[base] = add_clip(dst[base], (t1 + t3) >> 7);
+        dst[base + stride] = add_clip(dst[base + stride], (t2 - t4) >> 7);
+        dst[base + 2 * stride] = add_clip(dst[base + 2 * stride], (t2 + t4) >> 7);
+        dst[base + 3 * stride] = add_clip(dst[base + 3 * stride], (t1 - t3) >> 7);
     }
 }
 
 /// 8×4 的「只有 DC」捷径。
-pub fn inv_trans_8x4_dc(dst: &mut [u8], stride: usize, block: &[i16; 64]) {
+pub fn inv_trans_8x4_dc(dst: &mut [u8], stride: usize, block: &[i16], x: usize, y: usize) {
     let mut dc = i32::from(block[0]);
     dc = (3 * dc + 1) >> 1;
     dc = (17 * dc + 64) >> 7;
     for r in 0..4usize {
         for c in 0..8usize {
-            dst[r * stride + c] = add_clip(dst[r * stride + c], dc);
+            dst[(y + r) * stride + x + c] = add_clip(dst[(y + r) * stride + x + c], dc);
         }
     }
 }
 
 /// 4×8 逆变换（用 8 行 × 前 4 列，**直接写像素**）。
-pub fn inv_trans_4x8(dst: &mut [u8], stride: usize, block: &mut [i16; 64]) {
+pub fn inv_trans_4x8(dst: &mut [u8], stride: usize, block: &mut [i16], x: usize, y: usize) {
     // 第一趟：8 行 × 4 列，就地（步长 8）
     for i in 0..8usize {
         let s = |k: usize| i32::from(block[i * 8 + k]);
@@ -182,31 +188,32 @@ pub fn inv_trans_4x8(dst: &mut [u8], stride: usize, block: &mut [i16; 64]) {
             9 * s(1) - 16 * s(3) + 4 * s(5) + 15 * s(7),
             4 * s(1) - 9 * s(3) + 15 * s(5) - 16 * s(7),
         );
-        dst[i] = add_clip(dst[i], (t5 + u1) >> 7);
-        dst[stride + i] = add_clip(dst[stride + i], (t6 + u2) >> 7);
-        dst[2 * stride + i] = add_clip(dst[2 * stride + i], (t7 + u3) >> 7);
-        dst[3 * stride + i] = add_clip(dst[3 * stride + i], (t8 + u4) >> 7);
-        dst[4 * stride + i] = add_clip(dst[4 * stride + i], (t8 - u4 + 1) >> 7);
-        dst[5 * stride + i] = add_clip(dst[5 * stride + i], (t7 - u3 + 1) >> 7);
-        dst[6 * stride + i] = add_clip(dst[6 * stride + i], (t6 - u2 + 1) >> 7);
-        dst[7 * stride + i] = add_clip(dst[7 * stride + i], (t5 - u1 + 1) >> 7);
+        let base = y * stride + x + i;
+        dst[base] = add_clip(dst[base], (t5 + u1) >> 7);
+        dst[base + stride] = add_clip(dst[base + stride], (t6 + u2) >> 7);
+        dst[base + 2 * stride] = add_clip(dst[base + 2 * stride], (t7 + u3) >> 7);
+        dst[base + 3 * stride] = add_clip(dst[base + 3 * stride], (t8 + u4) >> 7);
+        dst[base + 4 * stride] = add_clip(dst[base + 4 * stride], (t8 - u4 + 1) >> 7);
+        dst[base + 5 * stride] = add_clip(dst[base + 5 * stride], (t7 - u3 + 1) >> 7);
+        dst[base + 6 * stride] = add_clip(dst[base + 6 * stride], (t6 - u2 + 1) >> 7);
+        dst[base + 7 * stride] = add_clip(dst[base + 7 * stride], (t5 - u1 + 1) >> 7);
     }
 }
 
 /// 4×8 的「只有 DC」捷径。
-pub fn inv_trans_4x8_dc(dst: &mut [u8], stride: usize, block: &[i16; 64]) {
+pub fn inv_trans_4x8_dc(dst: &mut [u8], stride: usize, block: &[i16], x: usize, y: usize) {
     let mut dc = i32::from(block[0]);
     dc = (17 * dc + 4) >> 3;
     dc = (12 * dc + 64) >> 7;
     for r in 0..8usize {
         for c in 0..4usize {
-            dst[r * stride + c] = add_clip(dst[r * stride + c], dc);
+            dst[(y + r) * stride + x + c] = add_clip(dst[(y + r) * stride + x + c], dc);
         }
     }
 }
 
 /// 4×4 逆变换（用前 4 行 × 前 4 列，**直接写像素**）。
-pub fn inv_trans_4x4(dst: &mut [u8], stride: usize, block: &mut [i16; 64]) {
+pub fn inv_trans_4x4(dst: &mut [u8], stride: usize, block: &mut [i16], x: usize, y: usize) {
     // 第一趟：4 行 × 4 列，就地（步长 8）
     for i in 0..4usize {
         let s = |k: usize| i32::from(block[i * 8 + k]);
@@ -223,21 +230,66 @@ pub fn inv_trans_4x4(dst: &mut [u8], stride: usize, block: &mut [i16; 64]) {
         let s = |k: usize| i32::from(block[k * 8 + i]);
         let (t1, t2) = (17 * (s(0) + s(2)) + 64, 17 * (s(0) - s(2)) + 64);
         let (t3, t4) = (22 * s(1) + 10 * s(3), 22 * s(3) - 10 * s(1));
-        dst[i] = add_clip(dst[i], (t1 + t3) >> 7);
-        dst[stride + i] = add_clip(dst[stride + i], (t2 - t4) >> 7);
-        dst[2 * stride + i] = add_clip(dst[2 * stride + i], (t2 + t4) >> 7);
-        dst[3 * stride + i] = add_clip(dst[3 * stride + i], (t1 - t3) >> 7);
+        let base = y * stride + x + i;
+        dst[base] = add_clip(dst[base], (t1 + t3) >> 7);
+        dst[base + stride] = add_clip(dst[base + stride], (t2 - t4) >> 7);
+        dst[base + 2 * stride] = add_clip(dst[base + 2 * stride], (t2 + t4) >> 7);
+        dst[base + 3 * stride] = add_clip(dst[base + 3 * stride], (t1 - t3) >> 7);
     }
 }
 
 /// 4×4 的「只有 DC」捷径。
-pub fn inv_trans_4x4_dc(dst: &mut [u8], stride: usize, block: &[i16; 64]) {
+pub fn inv_trans_4x4_dc(dst: &mut [u8], stride: usize, block: &[i16], x: usize, y: usize) {
     let mut dc = i32::from(block[0]);
     dc = (17 * dc + 4) >> 3;
     dc = (17 * dc + 64) >> 7;
     for r in 0..4usize {
         for c in 0..4usize {
-            dst[r * stride + c] = add_clip(dst[r * stride + c], dc);
+            dst[(y + r) * stride + x + c] = add_clip(dst[(y + r) * stride + x + c], dc);
+        }
+    }
+}
+
+// ---- 三个写回函数（`idctdsp.c` 的同名函数）----
+
+/// 把块值**当像素**写（I 帧）：夹到 `[0, 255]`。
+pub fn put_pixels_clamped(block: &[i16; 64], dst: &mut [u8], stride: usize, x: usize, y: usize) {
+    for r in 0..8usize {
+        for c in 0..8usize {
+            dst[(y + r) * stride + x + c] = block[r * 8 + c].clamp(0, 255) as u8;
+        }
+    }
+}
+
+/// 把块值当**有符号残差**写（P 帧的帧内块）：先 `+128` 再夹取。
+///
+/// ⚠️ 与 `put_pixels_clamped` 差一个 128 的偏置 —— 这是上游的语义，不是笔误。
+pub fn put_signed_pixels_clamped(
+    block: &[i16; 64],
+    dst: &mut [u8],
+    stride: usize,
+    x: usize,
+    y: usize,
+) {
+    for r in 0..8usize {
+        for c in 0..8usize {
+            let v = block[r * 8 + c];
+            dst[(y + r) * stride + x + c] = if v < -128 {
+                0
+            } else if v > 127 {
+                255
+            } else {
+                (v + 128) as u8
+            };
+        }
+    }
+}
+
+/// 把块值**加到**像素上（P 帧的帧间残差）。
+pub fn add_pixels_clamped(block: &[i16; 64], dst: &mut [u8], stride: usize, x: usize, y: usize) {
+    for r in 0..8usize {
+        for c in 0..8usize {
+            dst[(y + r) * stride + x + c] = add_clip(dst[(y + r) * stride + x + c], i32::from(block[r * 8 + c]));
         }
     }
 }
@@ -255,9 +307,9 @@ mod tests {
 
         let mut px = vec![128u8; 16 * 16];
         let mut b = [0i16; 64];
-        inv_trans_8x4(&mut px, 16, &mut b);
-        inv_trans_4x8(&mut px, 16, &mut b);
-        inv_trans_4x4(&mut px, 16, &mut b);
+        inv_trans_8x4(&mut px, 16, &mut b, 0, 0);
+        inv_trans_4x8(&mut px, 16, &mut b, 0, 0);
+        inv_trans_4x4(&mut px, 16, &mut b, 0, 0);
         assert!(px.iter().all(|&p| p == 128), "全零系数不该改像素");
     }
 
@@ -281,32 +333,73 @@ mod tests {
                 }
             }
             let mut shortcut = vec![0u8; 8 * 8];
-            inv_trans_8x8_dc(&mut shortcut, 8, &b);
+            inv_trans_8x8_dc(&mut shortcut, 8, &b, 0, 0);
             assert_eq!(full, shortcut, "8×8 只有 DC 时 dc={dc}");
 
             // 8×4
             let mut blk = b;
             let mut full = vec![0u8; 8 * 8];
-            inv_trans_8x4(&mut full, 8, &mut blk);
+            inv_trans_8x4(&mut full, 8, &mut blk, 0, 0);
             let mut shortcut = vec![0u8; 8 * 8];
-            inv_trans_8x4_dc(&mut shortcut, 8, &b);
+            inv_trans_8x4_dc(&mut shortcut, 8, &b, 0, 0);
             assert_eq!(full, shortcut, "8×4 只有 DC 时 dc={dc}");
 
             // 4×8
             let mut blk = b;
             let mut full = vec![0u8; 8 * 8];
-            inv_trans_4x8(&mut full, 8, &mut blk);
+            inv_trans_4x8(&mut full, 8, &mut blk, 0, 0);
             let mut shortcut = vec![0u8; 8 * 8];
-            inv_trans_4x8_dc(&mut shortcut, 8, &b);
+            inv_trans_4x8_dc(&mut shortcut, 8, &b, 0, 0);
             assert_eq!(full, shortcut, "4×8 只有 DC 时 dc={dc}");
 
             // 4×4
             let mut blk = b;
             let mut full = vec![0u8; 8 * 8];
-            inv_trans_4x4(&mut full, 8, &mut blk);
+            inv_trans_4x4(&mut full, 8, &mut blk, 0, 0);
             let mut shortcut = vec![0u8; 8 * 8];
-            inv_trans_4x4_dc(&mut shortcut, 8, &b);
+            inv_trans_4x4_dc(&mut shortcut, 8, &b, 0, 0);
             assert_eq!(full, shortcut, "4×4 只有 DC 时 dc={dc}");
         }
+    }
+
+    /// ABT 的子块是「同一块缓冲 + 偏移」取出来的：偏移版的 4×4 与把子块搬到
+    /// 缓冲开头再变换，结果必须逐像素相同。
+    #[test]
+    fn abt_subblock_offset_matches_a_copied_block() {
+        let mut src = [0i16; 64];
+        for (i, v) in src.iter_mut().enumerate() {
+            *v = ((i as i32 * 37) % 401 - 200) as i16;
+        }
+        for off in [0usize, 4, 16, 20] {
+            let mut a = vec![128u8; 16 * 16];
+            let mut b = vec![128u8; 16 * 16];
+            let mut blk = src;
+            inv_trans_4x4(&mut a, 16, &mut blk[off..], 3, 5);
+            // 把子块搬到开头
+            let mut moved = [0i16; 64];
+            for r in 0..4 {
+                for c in 0..4 {
+                    moved[r * 8 + c] = src[(off / 8 + r) * 8 + (off % 8) + c];
+                }
+            }
+            inv_trans_4x4(&mut b, 16, &mut moved, 3, 5);
+            assert_eq!(a, b, "off={off}");
+        }
+    }
+
+    /// 三个写回函数的差别就是「覆盖 / +128 / 相加」。
+    #[test]
+    fn pixel_writers_differ_exactly_as_documented() {
+        let mut block = [0i16; 64];
+        block[0] = 200; // > 127
+        let mut a = vec![10u8; 64];
+        put_pixels_clamped(&block, &mut a, 8, 0, 0);
+        assert_eq!(a[0], 200);
+        let mut b = vec![10u8; 64];
+        put_signed_pixels_clamped(&block, &mut b, 8, 0, 0);
+        assert_eq!(b[0], 255, "有符号写回会夹到 255");
+        let mut c = vec![10u8; 64];
+        add_pixels_clamped(&block, &mut c, 8, 0, 0);
+        assert_eq!(c[0], 210, "相加写回是叠加");
     }
 }

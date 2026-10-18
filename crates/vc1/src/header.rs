@@ -420,10 +420,22 @@ impl FrameHeader {
         mb_height: usize,
         state: &mut HeaderState,
     ) -> Result<Self> {
+        let mut r = BitReader::new(data);
+        Self::parse_from(&mut r, seq, mb_width, mb_height, state)
+    }
+
+    /// 同 [`FrameHeader::parse`]，但**复用调用方的位读取器** —— 宏块层紧跟在帧头之后，
+    /// 解完帧头要接着往下读，所以游标必须留在同一个读取器上。
+    pub fn parse_from(
+        r: &mut BitReader,
+        seq: &SeqHeader,
+        mb_width: usize,
+        mb_height: usize,
+        state: &mut HeaderState,
+    ) -> Result<Self> {
         if mb_width == 0 || mb_height == 0 {
             return Err(Error::Bad("vc1: 宏块网格尺寸为 0"));
         }
-        let mut r = BitReader::new(data);
 
         if seq.finterpflag {
             let _interpfrm = r.bit()?;
@@ -464,7 +476,7 @@ impl FrameHeader {
         };
 
         let mvrange = if seq.extended_mv {
-            unary(&mut r, 0, 3)? as u8
+            unary(r, 0, 3)? as u8
         } else {
             0
         };
@@ -487,7 +499,7 @@ impl FrameHeader {
         if pict_type == PictType::P {
             let lowquant = if pq > 12 { 0 } else { 1 };
             let mv_mode = MvMode::from_u32(
-                tables::MV_PMODE_TABLE[lowquant][unary(&mut r, 1, 4)? as usize] as u32,
+                tables::MV_PMODE_TABLE[lowquant][unary(r, 1, 4)? as usize] as u32,
             )
             .ok_or(Error::Bad("vc1: 非法的 MV 模式"))?;
 
@@ -497,7 +509,7 @@ impl FrameHeader {
             if mv_mode == MvMode::IntensityComp {
                 mv_mode2 = Some(
                     MvMode::from_u32(
-                        tables::MV_PMODE_TABLE2[lowquant][unary(&mut r, 1, 3)? as usize] as u32,
+                        tables::MV_PMODE_TABLE2[lowquant][unary(r, 1, 3)? as usize] as u32,
                     )
                     .ok_or(Error::Bad("vc1: 非法的亮度补偿 MV 模式"))?,
                 );
@@ -514,17 +526,17 @@ impl FrameHeader {
             let mixed = mv_mode == MvMode::MixedMv
                 || (mv_mode == MvMode::IntensityComp && mv_mode2 == Some(MvMode::MixedMv));
             let mv_type_plane = if mixed {
-                Some(bitplane::decode(&mut r, mb_width, mb_height)?)
+                Some(bitplane::decode(r, mb_width, mb_height)?)
             } else {
                 None
             };
-            let skip_plane = bitplane::decode(&mut r, mb_width, mb_height)?;
+            let skip_plane = bitplane::decode(r, mb_width, mb_height)?;
 
             let mv_table_index = r.u(2)? as u8;
             let cbptab = r.u(2)? as u8;
             // 帧级量化变化**只在 P（和 B）帧里**，而且排在位平面之后。
             let dquant = if seq.dquant != 0 {
-                vop_dquant(&mut r, seq, pq, &mut halfpq)?
+                vop_dquant(r, seq, pq, &mut halfpq)?
             } else {
                 None
             };
@@ -561,9 +573,9 @@ impl FrameHeader {
 
         let (mut c_ac_table_index, mut y_ac_table_index, mut dc_table_index) = (0u8, None, 0u8);
         if !x8_type {
-            c_ac_table_index = decode012(&mut r)?;
+            c_ac_table_index = decode012(r)?;
             if pict_type == PictType::I {
-                y_ac_table_index = Some(decode012(&mut r)?);
+                y_ac_table_index = Some(decode012(r)?);
             }
             dc_table_index = r.bit()? as u8;
         }

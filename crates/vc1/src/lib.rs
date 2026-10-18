@@ -4,21 +4,30 @@
 //! Advanced profile（序列头在码流里、带起始码）、B 帧、隔行、sprite 帧都不在范围内 ——
 //! 遇到就报 `Unsupported` 或 `Bad`，不静默出错。
 //!
-//! **走到哪一步了**：目前只到**头** —— 序列头（容器 extradata 里的 `STRUCT_C`）、
-//! 帧头、以及帧头里的**位平面**（逐宏块跳过标志那一类整帧位图）。
-//! 宏块层、逆变换（8×8 + ABT）、运动补偿、环路滤波是后面的切片，还没做。
-//! 所以这一层现在的作用是「把每帧的头部字段解对、把游标停在宏块层的起点」，
-//! 而它自己已经被真样本 + `ffmpeg` 的 `-debug pict` 日志钉住了。
+//! **走到哪一步了**：**整条链路通了** —— 序列头（容器 extradata 里的 `STRUCT_C`）→
+//! 帧头（含位平面）→ 宏块层（I / P）→ 逆变换（8×8 + ABT 四种）→ 运动补偿
+//! （四分之一 / 半像素）→ 环路滤波 → YUV420P。
 //!
-//! 与上游的对照：`vc1.c` 的 `ff_vc1_decode_sequence_header()` / `bitplane_decoding()`
-//! / `ff_vc1_parse_frame_header()`。
+//! 还没做的：`res_fasttx=0`（走 MS-MPEG-4 simple_idct 的那一档）、overlap smoothing、
+//! 多分辨率、`rangered`、重同步标记、B 帧、隔行、Advanced profile ——
+//! `Decoder::new` 会直接拒掉其中影响重建的那几个，不静默出错。
+//!
+//! 与上游的对照：`vc1.c`（序列头 / 帧头 / 位平面）、`vc1_block.c`（宏块层）、
+//! `vc1_mc.c`（运动补偿）、`vc1_pred.c`（MV 预测）、`vc1_loopfilter.c`（环路滤波）、
+//! `vc1dsp.c`（变换与插值核）、`vc1dec.c`（帧级组装）。
 
 mod bitplane;
+mod decoder;
 mod header;
 pub mod idct;
+mod loopfilter;
+mod mb;
+mod mc;
+mod mv;
 pub mod tables;
 
 pub use bitplane::{Bitplane, Imode};
+pub use decoder::{Decoder, Frame};
 pub use header::{
     Dquant, FrameHeader, HeaderState, MvMode, PFrameHeader, PictType, Profile, QuantizerMode,
     SeqHeader,

@@ -1,0 +1,479 @@
+//! 运动补偿（渐进式）：亮度四分之一 / 半像素插值 + 色度双线性。
+//!
+//! 对照上游：`vc1_mc.c` 的 `ff_vc1_mc_1mv()` / `ff_vc1_mc_4mv_luma()` /
+//! `ff_vc1_mc_4mv_chroma()`（各自只留渐进式那一支），插值核来自 `vc1dsp.c` 的
+//! `vc1_mspel_*`，色度来自 `h264chroma` 与 `vc1dsp` 的 `put_no_rnd_vc1_chroma_*`。
+//!
+//! ## 越界：永远先拷进本地缓冲
+//!
+//! 上游分两条路（够用就直接指参考帧、越界才 `emulated_edge_mc` 拷一份）。这里
+//! **一律**拷进本地缓冲并做边缘复制 —— 两者在「没越界」时逐像素相同，而统一之后
+//! 少一条只在边界上才走、因而最难验的路径。缓冲的布局：源坐标 `(src_x - pad, src_y - pad)`
+//! 落在 `(pad, pad)`，`pad = mspel`（插值核要往左上多读 `mspel` 个像素）。
+//!
+//! ## 取整位 `rnd`
+//!
+//! `rnd` 是**逐帧翻转**的一位（位流里没有它，见 `HeaderState::rnd`）：它同时决定
+//! 亮度插值的取整偏置与色度走哪张表（`rnd=0` 走 h264 的 `+32`，`rnd=1` 走 VC-1 的 `+28`）。
+//! 少一处就是「一半的帧偏半个像素」。
+
+use v2v_msmpeg4::mid_pred;
+
+use crate::decoder::Ctx;
+
+/// 本地缓冲的边长（够放 16×16 块 + mspel 的余量）。
+const BUF: usize = 32;
+const BUF_STRIDE: usize = BUF;
+
+/// `vc1_mspel_filter()`：单向插值（`stride` 是跨过边缘的方向）。
+fn mspel_filter(src: &[u8], off: isize, stride: isize, mode: u32, r: i32) -> i32 {
+    let s = |k: isize| src[(off + k * stride) as usize] as i32;
+    match mode {
+        0 => s(0),
+        1 => (-4 * s(-1) + 53 * s(0) + 18 * s(1) - 3 * s(2) + 32 - r) >> 6,
+        2 => (-1 * s(-1) + 9 * s(0) + 9 * s(1) - 1 * s(2) + 8 - r) >> 4,
+        _ => (-3 * s(-1) + 18 * s(0) + 53 * s(1) - 4 * s(2) + 32 - r) >> 6,
+    }
+}
+
+/// `vc1_mspel_{ver,hor}_filter_16bits()`：两趟滤波的中间那一步（不取整）。
+fn mspel_filter16(src: &[u8], off: isize, stride: isize, mode: u32) -> i32 {
+    let s = |k: isize| src[(off + k * stride) as usize] as i32;
+    match mode {
+        1 => -4 * s(-1) + 53 * s(0) + 18 * s(1) - 3 * s(2),
+        2 => -1 * s(-1) + 9 * s(0) + 9 * s(1) - 1 * s(2),
+        _ => -3 * s(-1) + 18 * s(0) + 53 * s(1) - 4 * s(2),
+    }
+}
+
+/// `OPNAME vc1_mspel_mc`：`w × w` 块的四分之一像素插值（`hmode` / `vmode` ∈ 0..4）。
+#[allow(clippy::too_many_arguments)]
+fn mspel_mc(
+    dst: &mut [u8],
+    dstride: usize,
+    dx: usize,
+    dy: usize,
+    w: usize,
+    src: &[u8],
+    base: usize,
+    hmode: u32,
+    vmode: u32,
+    rnd: i32,
+) {
+    let b = base as isize;
+    if vmode != 0 {
+        if hmode != 0 {
+            // 两趟：先竖直（出中间结果），再水平。
+            const SHIFT_VALUE: [i32; 4] = [0, 5, 1, 5];
+            let shift = (SHIFT_VALUE[hmode as usize] + SHIFT_VALUE[vmode as usize]) >> 1;
+            let r = (1 << (shift - 1)) + rnd - 1;
+            // ⚠️ 中间结果**不夹取**（上游就是 `int16_t` 直接存）——夹了会在
+            // 陡边处差 1，而那种差只出现在少数像素上，最难查。
+            let mut tmp = vec![0i16; (w + 3) * w];
+            for j in 0..w {
+                for i in 0..(w + 3) {
+                    // `src -= 1`：竖直那一趟整体左移一列。
+                    let off = b + (j * BUF_STRIDE + i) as isize - 1;
+                    tmp[j * (w + 3) + i] =
+                        ((mspel_filter16(src, off, BUF_STRIDE as isize, vmode) + r) >> shift) as i16;
+                }
+            }
+            let r2 = 64 - rnd;
+            for j in 0..w {
+                for i in 0..w {
+                    // ⚠️ 水平这一趟的系数**按 `hmode` 选**（1/4 位移那组系数只在
+                    // `hmode == 1` 时才对）—— 写死成一组，平坦区就会整体偏亮/偏暗。
+                    let off = (j * (w + 3) + i + 1) as isize;
+                    let s = |k: isize| i32::from(tmp[(off + k) as usize]);
+                    let h = match hmode {
+                        1 => -4 * s(-1) + 53 * s(0) + 18 * s(1) - 3 * s(2),
+                        2 => -1 * s(-1) + 9 * s(0) + 9 * s(1) - 1 * s(2),
+                        _ => -3 * s(-1) + 18 * s(0) + 53 * s(1) - 4 * s(2),
+                    };
+                    let v = (h + r2) >> 7;
+                    dst[(dy + j) * dstride + dx + i] = v.clamp(0, 255) as u8;
+                }
+            }
+        } else {
+            let r = 1 - rnd;
+            for j in 0..w {
+                for i in 0..w {
+                    let off = b + (j * BUF_STRIDE + i) as isize;
+                    let v = mspel_filter(src, off, BUF_STRIDE as isize, vmode, r);
+                    dst[(dy + j) * dstride + dx + i] = v.clamp(0, 255) as u8;
+                }
+            }
+        }
+    } else {
+        // 只有水平（含 hmode == 0 的整像素拷贝）。
+        for j in 0..w {
+            for i in 0..w {
+                let off = b + (j * BUF_STRIDE + i) as isize;
+                let v = mspel_filter(src, off, 1, hmode, rnd);
+                dst[(dy + j) * dstride + dx + i] = v.clamp(0, 255) as u8;
+            }
+        }
+    }
+}
+
+/// 半像素（hpel）插值：`dxy` 的位 0 = 水平、位 1 = 竖直。
+#[allow(clippy::too_many_arguments)]
+fn hpel_mc(
+    dst: &mut [u8],
+    dstride: usize,
+    dx: usize,
+    dy: usize,
+    w: usize,
+    src: &[u8],
+    base: usize,
+    dxy: usize,
+    rnd: bool,
+) {
+    let hm = dxy & 1 != 0;
+    let vm = dxy & 2 != 0;
+    // ⚠️ **反的**：上游是 `if (!v->rnd) put_pixels_tab`（**带**取整）`else put_no_rnd_pixels_tab` ——
+    // 也就是 `rnd == 0` 走 `rnd_avg`（`(a+b+1)>>1`）、`rnd == 1` 走截断。写反了就是
+    // 「一半的帧整体偏 1」，而且只在半像素（hpel）那条路上现形。
+    let avg2 = |a: i32, b: i32| if rnd { (a + b) >> 1 } else { (a + b + 1) >> 1 };
+    let avg4 = |a: i32, b: i32, c: i32, d: i32| {
+        if rnd {
+            (a + b + c + d + 1) >> 2
+        } else {
+            (a + b + c + d + 2) >> 2
+        }
+    };
+    for j in 0..w {
+        for i in 0..w {
+            let o = base + j * BUF_STRIDE + i;
+            let v = match (hm, vm) {
+                (false, false) => src[o] as i32,
+                (true, false) => avg2(src[o] as i32, src[o + 1] as i32),
+                (false, true) => avg2(src[o] as i32, src[o + BUF_STRIDE] as i32),
+                (true, true) => avg4(
+                    src[o] as i32,
+                    src[o + 1] as i32,
+                    src[o + BUF_STRIDE] as i32,
+                    src[o + BUF_STRIDE + 1] as i32,
+                ),
+            };
+            dst[(dy + j) * dstride + dx + i] = v as u8;
+        }
+    }
+}
+
+/// 色度插值：`rnd=0` 走 h264（`+32`），`rnd=1` 走 VC-1 的 no-rnd（`+28`）。
+#[allow(clippy::too_many_arguments)]
+fn chroma_mc(
+    dst: &mut [u8],
+    dstride: usize,
+    dx: usize,
+    dy: usize,
+    src: &[u8],
+    base: usize,
+    x: i32,
+    y: i32,
+    rnd: bool,
+) {
+    let a = (8 - x) * (8 - y);
+    let b = x * (8 - y);
+    let c = (8 - x) * y;
+    let d = x * y;
+    let bias = if rnd { 32 - 4 } else { 32 };
+    for j in 0..8usize {
+        for i in 0..8usize {
+            let o = base + j * BUF_STRIDE + i;
+            let s = a * src[o] as i32
+                + b * src[o + 1] as i32
+                + c * src[o + BUF_STRIDE] as i32
+                + d * src[o + BUF_STRIDE + 1] as i32;
+            dst[(dy + j) * dstride + dx + i] = ((s + bias) >> 6) as u8;
+        }
+    }
+}
+
+/// `median4()`（`mathops.h`）：四个数的中值（取中间两个的平均）。
+fn median4(a: i32, b: i32, c: i32, d: i32) -> i32 {
+    if a < b {
+        if c < d {
+            (b.min(d) + a.max(c)) / 2
+        } else {
+            (b.min(c) + a.max(d)) / 2
+        }
+    } else if c < d {
+        (a.min(d) + b.max(c)) / 2
+    } else {
+        (a.min(c) + b.max(d)) / 2
+    }
+}
+
+/// `get_chroma_mv()` 里那张「两个有效块」的配对表。
+static CHROMA_INDEX2: [u8; 16] = [
+    0, 0, 0, 0x01, 0, 0x02, 0x12, 0, 0, 0x03, 0x13, 0, 0x23, 0, 0, 0,
+];
+
+impl Ctx<'_, '_> {
+    /// 亮度补偿：把缓冲里那 `k × k` 个参考像素按 `luts` 映射一遍。
+    ///
+    /// 逐行交替用两张表（`[0]` / `[1]`）—— 上游对**隔行**的两场各有一张表，
+    /// 渐进式下退化成「按行的奇偶交替」，但交替这件事本身是语义的一部分，不能省。
+    fn apply_ic(&self, plane: usize, buf: &mut [u8], k: usize, row_parity: i32) {
+        let (lut0, lut1) = if plane == 0 {
+            (&self.luts.last_y[0], &self.luts.last_y[1])
+        } else {
+            (&self.luts.last_uv[0], &self.luts.last_uv[1])
+        };
+        for j in 0..k {
+            // 行 `j` 对应源行 `row_parity + j`（`row_parity = src_y - pad`）。
+            let lut: &[u8; 256] = if (row_parity + j as i32) & 1 == 0 {
+                lut0
+            } else {
+                lut1
+            };
+            for i in 0..k {
+                // ⚠️ 与 `load_ref` **同一套下标**（缓冲的 (0,0) = 参考帧的 (src_x-pad, src_y-pad)）。
+                let o = j * BUF_STRIDE + i;
+                buf[o] = lut[buf[o] as usize];
+            }
+        }
+    }
+
+    /// 从参考帧取一块到本地缓冲（越界处边缘复制）。
+    ///
+    /// ⚠️ 缓冲的 **(0,0)** 对应参考帧的 `(src_x - pad, src_y - pad)`，而插值基准在
+    /// `(pad, pad)` —— 与上游 `emulated_edge_mc` + `srcY += mspel*(1+linesize)` 同一套布局。
+    /// 把源块放到 `(pad, pad)` 会让四分之一像素（`pad = 1`）整体错开一个像素：
+    /// **平坦区看不出来，边缘才差 1** —— 最难查的那种。
+    fn load_ref(&self, plane: usize, src_x: i32, src_y: i32, k: usize, pad: usize, buf: &mut [u8]) {
+        let data = self.ref_plane(plane);
+        let stride = self.plane_stride(plane);
+        let (w, h) = if plane == 0 {
+            (self.mb_width * 16, self.mb_height * 16)
+        } else {
+            (self.mb_width * 8, self.mb_height * 8)
+        };
+        for j in 0..k {
+            let sy = (src_y - pad as i32 + j as i32).clamp(0, h as i32 - 1) as usize;
+            for i in 0..k {
+                let sx = (src_x - pad as i32 + i as i32).clamp(0, w as i32 - 1) as usize;
+                buf[j * BUF_STRIDE + i] = data[sy * stride + sx];
+            }
+        }
+    }
+
+    /// `ff_vc1_mc_1mv()`（渐进式）。
+    pub(crate) fn mc_1mv(&mut self, mbx: usize, mby: usize) {
+        if !self.has_ref {
+            return;
+        }
+        let p = self.hdr.p.as_ref().unwrap().clone();
+        let (mx, my) = self.mv_of(mbx, mby, 0);
+        let mb_pos = self.mbidx(mbx, mby);
+        let mut uvmx = (mx + ((mx & 3) == 3) as i32) >> 1;
+        let mut uvmy = (my + ((my & 3) == 3) as i32) >> 1;
+        self.grids.luma_mv[mb_pos] = [uvmx as i16, uvmy as i16];
+        if self.seq.fastuvmc {
+            uvmx += if uvmx < 0 { uvmx & 1 } else { -(uvmx & 1) };
+            uvmy += if uvmy < 0 { uvmy & 1 } else { -(uvmy & 1) };
+        }
+        let mspel = p.mspel as usize;
+        let mut src_x = mbx as i32 * 16 + (mx >> 2);
+        let mut src_y = mby as i32 * 16 + (my >> 2);
+        let mut uvsrc_x = mbx as i32 * 8 + (uvmx >> 2);
+        let mut uvsrc_y = mby as i32 * 8 + (uvmy >> 2);
+        // Simple/Main profile 的裁剪范围（Advanced 才是另一套）。
+        src_x = src_x.clamp(-16, (self.mb_width * 16) as i32);
+        src_y = src_y.clamp(-16, (self.mb_height * 16) as i32);
+        uvsrc_x = uvsrc_x.clamp(-8, (self.mb_width * 8) as i32);
+        uvsrc_y = uvsrc_y.clamp(-8, (self.mb_height * 8) as i32);
+
+        let mut buf = [0u8; BUF * BUF];
+        let k = 17 + 2 * mspel;
+        self.load_ref(0, src_x, src_y, k, mspel, &mut buf);
+        if self.use_ic {
+            self.apply_ic(0, &mut buf, k, src_y - mspel as i32);
+        }
+        let base = mspel * BUF_STRIDE + mspel;
+        let stride = self.plane_stride(0);
+        let (dx, dy) = (mbx * 16, mby * 16);
+        let rnd = self.hdr.rnd as i32;
+        let rnd_bit = self.hdr.rnd;
+        {
+            let dst = self.plane_mut(0);
+            if mspel != 0 {
+                let dxy = (((my & 3) << 2) | (mx & 3)) as usize;
+                mspel_mc(
+                    dst,
+                    stride,
+                    dx,
+                    dy,
+                    16,
+                    &buf,
+                    base,
+                    (dxy & 3) as u32,
+                    (dxy >> 2) as u32,
+                    rnd,
+                );
+            } else {
+                let dxy = ((my & 2) | ((mx & 2) >> 1)) as usize;
+                hpel_mc(dst, stride, dx, dy, 16, &buf, base, dxy, rnd_bit);
+            }
+        }
+
+        // 色度：永远是「四分之一像素双线性」。
+        let cdx = uvmx & 3;
+        let cdy = uvmy & 3;
+        let cstride = self.plane_stride(1);
+        let mut bufv = [0u8; BUF * BUF];
+        self.load_ref(1, uvsrc_x, uvsrc_y, 9, 0, &mut buf);
+        self.load_ref(2, uvsrc_x, uvsrc_y, 9, 0, &mut bufv);
+        if self.use_ic {
+            self.apply_ic(1, &mut buf, 9, uvsrc_y);
+            self.apply_ic(2, &mut bufv, 9, uvsrc_y);
+        }
+        {
+            let dst = self.plane_mut(1);
+            chroma_mc(dst, cstride, dx / 2, dy / 2, &buf, 0, cdx << 1, cdy << 1, rnd_bit);
+        }
+        let dst = self.plane_mut(2);
+        chroma_mc(dst, cstride, dx / 2, dy / 2, &bufv, 0, cdx << 1, cdy << 1, rnd_bit);
+    }
+
+    /// `ff_vc1_mc_4mv_luma()`（渐进式）。
+    pub(crate) fn mc_4mv_luma(&mut self, mbx: usize, mby: usize, n: usize) {
+        if !self.has_ref {
+            return;
+        }
+        let p = self.hdr.p.as_ref().unwrap().clone();
+        let (mx, my) = self.mv_of(mbx, mby, n);
+        let mspel = p.mspel as usize;
+        let mut src_x = mbx as i32 * 16 + (n & 1) as i32 * 8 + (mx >> 2);
+        let mut src_y = mby as i32 * 16 + (n & 2) as i32 * 4 + (my >> 2);
+        src_x = src_x.clamp(-16, (self.mb_width * 16) as i32);
+        src_y = src_y.clamp(-16, (self.mb_height * 16) as i32);
+        let mut buf = [0u8; BUF * BUF];
+        let k = 9 + 2 * mspel;
+        self.load_ref(0, src_x, src_y, k, mspel, &mut buf);
+        if self.use_ic {
+            self.apply_ic(0, &mut buf, k, src_y - mspel as i32);
+        }
+        let base = mspel * BUF_STRIDE + mspel;
+        let stride = self.plane_stride(0);
+        let dx = mbx * 16 + (n & 1) * 8;
+        let dy = mby * 16 + (n & 2) * 4;
+        let rnd = self.hdr.rnd as i32;
+        let rnd_bit = self.hdr.rnd;
+        let dst = self.plane_mut(0);
+        if mspel != 0 {
+            let dxy = (((my & 3) << 2) | (mx & 3)) as usize;
+            mspel_mc(
+                dst,
+                stride,
+                dx,
+                dy,
+                8,
+                &buf,
+                base,
+                (dxy & 3) as u32,
+                (dxy >> 2) as u32,
+                rnd,
+            );
+        } else {
+            let dxy = ((my & 2) | ((mx & 2) >> 1)) as usize;
+            hpel_mc(dst, stride, dx, dy, 8, &buf, base, dxy, rnd_bit);
+        }
+    }
+
+    /// `get_chroma_mv()`：由四个亮度块的 MV 推色度 MV（返回 `(mvx, mvy, 有效块数)`）。
+    fn get_chroma_mv(&self, mbx: usize, mby: usize) -> (i32, i32, u32) {
+        let b = [
+            self.blk(mbx, mby, 0),
+            self.blk(mbx, mby, 1),
+            self.blk(mbx, mby, 2),
+            self.blk(mbx, mby, 3),
+        ];
+        let mut idx = 0u32;
+        for (k, &bi) in b.iter().enumerate() {
+            // `!mb_type` = 「这个块不是帧内」= 有效。
+            if self.grids.mb_type[bi] == 0 {
+                idx |= 1 << k;
+            }
+        }
+        let valid_count = idx.count_ones();
+        let mv = |k: usize| {
+            let m = self.grids.mv[b[k]];
+            (m[0] as i32, m[1] as i32)
+        };
+        let (tx, ty) = match valid_count {
+            4 => (
+                median4(mv(0).0, mv(1).0, mv(2).0, mv(3).0),
+                median4(mv(0).1, mv(1).1, mv(2).1, mv(3).1),
+            ),
+            3 => {
+                let i = idx as usize;
+                (
+                    mid_pred(
+                        mv((i > 0xd) as usize).0,
+                        mv(1 + (i > 0xb) as usize).0,
+                        mv(2 + (i > 0x7) as usize).0,
+                    ),
+                    mid_pred(
+                        mv((i > 0xd) as usize).1,
+                        mv(1 + (i > 0xb) as usize).1,
+                        mv(2 + (i > 0x7) as usize).1,
+                    ),
+                )
+            }
+            2 => {
+                let i = CHROMA_INDEX2[idx as usize] as usize;
+                (
+                    (mv(i >> 4).0 + mv(i & 0xf).0) / 2,
+                    (mv(i >> 4).1 + mv(i & 0xf).1) / 2,
+                )
+            }
+            _ => return (0, 0, 0),
+        };
+        (tx, ty, valid_count)
+    }
+
+    /// `ff_vc1_mc_4mv_chroma()`（渐进式）。
+    pub(crate) fn mc_4mv_chroma(&mut self, mbx: usize, mby: usize) {
+        if !self.has_ref {
+            return;
+        }
+        let (tx, ty, valid_count) = self.get_chroma_mv(mbx, mby);
+        let mb_pos = self.mbidx(mbx, mby);
+        if valid_count == 0 {
+            self.grids.luma_mv[mb_pos] = [0, 0];
+            return;
+        }
+        let mut uvmx = (tx + ((tx & 3) == 3) as i32) >> 1;
+        let mut uvmy = (ty + ((ty & 3) == 3) as i32) >> 1;
+        self.grids.luma_mv[mb_pos] = [uvmx as i16, uvmy as i16];
+        if self.seq.fastuvmc {
+            uvmx += if uvmx < 0 { uvmx & 1 } else { -(uvmx & 1) };
+            uvmy += if uvmy < 0 { uvmy & 1 } else { -(uvmy & 1) };
+        }
+        let mut uvsrc_x = mbx as i32 * 8 + (uvmx >> 2);
+        let mut uvsrc_y = mby as i32 * 8 + (uvmy >> 2);
+        uvsrc_x = uvsrc_x.clamp(-8, (self.mb_width * 8) as i32);
+        uvsrc_y = uvsrc_y.clamp(-8, (self.mb_height * 8) as i32);
+        let mut buf = [0u8; BUF * BUF];
+        let mut bufv = [0u8; BUF * BUF];
+        self.load_ref(1, uvsrc_x, uvsrc_y, 9, 0, &mut buf);
+        self.load_ref(2, uvsrc_x, uvsrc_y, 9, 0, &mut bufv);
+        if self.use_ic {
+            self.apply_ic(1, &mut buf, 9, uvsrc_y);
+            self.apply_ic(2, &mut bufv, 9, uvsrc_y);
+        }
+        let cstride = self.plane_stride(1);
+        let (dx, dy) = (mbx * 8, mby * 8);
+        let (cx, cy) = ((uvmx & 3) << 1, (uvmy & 3) << 1);
+        let rnd_bit = self.hdr.rnd;
+        {
+            let dst = self.plane_mut(1);
+            chroma_mc(dst, cstride, dx, dy, &buf, 0, cx, cy, rnd_bit);
+        }
+        let dst = self.plane_mut(2);
+        chroma_mc(dst, cstride, dx, dy, &bufv, 0, cx, cy, rnd_bit);
+    }
+}
