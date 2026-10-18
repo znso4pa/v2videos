@@ -8,7 +8,7 @@
 
 ## 现状
 
-**链路已经打通到 `.wmv → .mp4`**：9 个 crate、约 3 万行 Rust，**零第三方依赖**
+**链路已经打通到 `.wmv → .mp4`**：10 个 crate、约 5.5 万行 Rust，**零第三方依赖**
 （`Cargo.lock` 里只有本仓的包）。
 
 ```text
@@ -17,11 +17,15 @@ asf        ASF（.wmv / .wma）解封装 **+ 封装**（多载荷打包 + Simple
 avi        AVI（RIFF）解封装
 msmpeg4    MP43 / WMV1 / WMV2 解码（I / P）**+ MP43 编码**（I / P，含运动估计）；兼**共享数值内核**（见下）
 wma        WMA v1 / v2 解码（**只有解码器**）
+vc1        VC-1（WMV3）解码（I / P，含 ABT / ¼ 像素 MC / 环路滤波；**只有解码器**）
 mp4v       MPEG-4 Part 2 编码（I / P + 码率控制）
 aac        AAC-LC 编码（MDCT / 短窗 / TNS / Huffman / 码率控制）
 mp4        MP4 / ISOBMFF 封装（mp4v + mp4a(AAC) 或 sowt PCM）
 cli        `v2v convert`：ASF / AVI → `.wmv`（MP43 + 音频直通）或 `.mp4`（mp4v + AAC）
 ```
+
+⚠️ **`v2v-vc1` 还没接进 `v2v-cli`** —— 它能解 WMV3 出像素，但 `v2v convert` 仍不认这个
+fourcc。接线时要处理「解码顺序 ≠ 显示顺序」（VC-1 的 I/P 按解码序进、按 PTS 出）。
 
 下面的**约定**与**架构不变量**是硬约束（从隔壁 UsefulUnpack 的实战里换来的，不是摆设）——
 动手前先读完；**进度、判据、下一步**在 `TODO.md`（本地、不入库、唯一真源），面向人的状态表在 README。
@@ -76,22 +80,26 @@ cargo build -j 4                # 并发**限 4** —— 见下一节「构建�
 
 cargo run -p v2v-cli -- convert in.wmv -o out/              # .wmv：MP43 + 音频直通
 cargo run -p v2v-cli -- convert --mp4 -g 12 in.wmv -o out/  # .mp4：mp4v + AAC
+
+# VC-1 逐帧逐像素对账（最吃时间的一条；V2V_MAX_FRAMES 可先限量跑）
+V2V_ASF_SAMPLE=/path/x.wmv cargo test -p v2v-vc1 --release --test frames -- --nocapture
 ```
 
 **带真样本的对账测试**按**环境变量**找样本（样本一律 `.gitignore`，缺了就 `SKIP`）：
 
 | 变量                       | 用途                                              |
 | ------------------------ | ----------------------------------------------- |
-| `V2V_ASF_SAMPLE`         | 视频逐帧对 `ffmpeg`（msmpeg4 / avi / cli；多个样本用 `:` 分隔） |
+| `V2V_ASF_SAMPLE`         | 视频逐帧对 `ffmpeg`（msmpeg4 / avi / vc1 / cli；多个样本用 `:` 分隔） |
 | `V2V_WMA_SAMPLE`         | WMA 解码出的 PCM 对 `ffmpeg`（wma）                    |
 | `V2V_AUDIO_SAMPLE`       | 音频直通整文件对账（cli，标了 `#[ignore]`）                    |
 | `V2V_MP4_REF` / `V2V_MP4_PCM` | MP4 封装逐 box 对 `ffmpeg` 产的参考件（mp4）              |
 | `V2V_MP4_OUT` / `V2V_MP4_OUT_AV` | 上面那两条把我们的产物**落到哪个路径**（不设就落 `/tmp/v2v_ours*.mp4`） |
 | `V2V_BENCH_SAMPLE`       | 解码速度对表（`decode_bench`，`:` 分隔多个样本；不设就 SKIP）        |
-| `V2V_MAX_FRAMES` / `V2V_PFRAME_MAP` | 限量跑 / 逐帧定位（msmpeg4 调试用）                        |
+| `V2V_MAX_FRAMES` / `V2V_PFRAME_MAP` | 限量跑 / 逐帧定位（msmpeg4、vc1 调试用）                    |
+| `V2V_FRAME_LOG`          | 逐帧打印「用掉多少位 / 差多少像素」（vc1）                      |
 | `V2V_FUZZ_ROUNDS`        | 模糊测试的轮数（见下；不设就用各局自己的默认）                          |
 
-⚠️ **`V2V_ASF_SAMPLE` 的「多个样本用 `:` 分隔」只管 msmpeg4 / avi / cli**；
+⚠️ **`V2V_ASF_SAMPLE` 的「多个样本用 `:` 分隔」只管 msmpeg4 / avi / vc1 / cli**；
 `asf` 的 oracle 把整串当一个路径（`is_file()` 判掉）—— 会**静默 SKIP**。
 要多样本覆盖就**逐个样本跑**，别把 `:` 列表喂给全部 crate。
 
@@ -110,7 +118,7 @@ V2V_ASF_SAMPLE='/path/a.wmv:/path/b.asf' cargo test --workspace -j 4 -- --ignore
 ### 变异模糊测试（`crates/*/tests/fuzz.rs`）
 
 **零样本、零 ffmpeg、纯内存** —— 所以它在 CI 里也真跑，不是「SKIP 了」。
-五个目标各一局：MP43 解码 / WMA 解码 / ASF 解封装 / AVI 解封装 / MP4 封装。
+六个目标各一局：MP43 解码 / WMA 解码 / ASF 解封装 / AVI 解封装 / MP4 封装 / **VC-1 帧头**。
 判据是「**允许 `Err`，禁止 `panic`**」—— 解码器吃的是别人的字节，
 一条 panic 会把整个转换流程带走。
 
@@ -128,7 +136,10 @@ V2V_FUZZ_ROUNDS=30000 cargo test --release -j 4 --workspace -- --ignored --nocap
   于是「几千轮没报错」可能是「几千轮什么都没解」。所以 WMA 那局数的是
   **真的产出了多少帧**，不是「多少轮没报错」。
 
-变异算子只有一份（`crates/msmpeg4/tests/common/mutate.rs`），其余各局用 `#[path]` 引它。
+变异算子只有一份（`crates/msmpeg4/tests/common/mutate.rs`），`avi` / `asf` / `wma` / `mp4`
+用 `#[path]` 引它。**`vc1` 那局是例外、也是有意为之**：它要的底本不是「一段现成字节」，
+而是「先按语法**写出**一个像样的帧头、再变异」—— 形状不同，硬套那份算子只会得到一个
+测不到深处的底本。真要合，就先把「造底本」与「变异」拆成两件事再合。
 
 ## 🖥️ 构建资源纪律（**动手前先看表** —— 这台机器很吃紧）
 
@@ -171,8 +182,10 @@ df -h /System/Volumes/Data  # 磁盘 <10% 可用会让 macOS 整体变卡（换�
    （LGPL 兼容：Apache-2.0 / MIT / BSD；MPL 这类 copyleft 一律不引），并说清现有代码
    为什么做不到。
 3. **`v2v-msmpeg4` 兼共享数值内核**：`BitReader` / `BitWriter`（MSB 优先）/ FDCT / IDCT /
-   VLC 表被 `v2v-mp4v` 与 `v2v-aac` 复用。**不要复刻第二份** —— 会漂的就是第二份。
-   改这些共享件要**同时**跑 mp4v 与 aac 的对账测试。
+   VLC 表 / `Error` 被 `v2v-mp4v`、`v2v-aac`、`v2v-vc1` 复用。**不要复刻第二份** ——
+   会漂的就是第二份。改这些共享件要**同时**跑 mp4v / aac / vc1 的对账测试。
+   （`vc1` 只借位读取器与前缀码解码，**它自己的逆变换是独立的** —— VC-1 的 8×8 核
+   与 H.263 那套不是一回事，别为了「统一」把两套混成一套。）
 4. **码表只有一份真源**：`crates/*/src/tables.rs` 是唯一落点，生成与自检脚本在
    `tools/`（`gen_tables.py` / `gen_aac_tables.py` / `gen_wma_tables.py` / `check_tables.py`）。
    加格式只改那一处，别的地方转发。
