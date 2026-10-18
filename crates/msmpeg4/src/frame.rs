@@ -1562,83 +1562,12 @@ pub fn sad_luma16_capped(
         }
         return acc;
     }
-    let (r1, r2) = if no_rounding {
-        (0u32, 1u32)
-    } else {
-        (1u32, 2u32)
-    };
     let pw = refp.pw;
     let base = p.src_y as usize * pw + p.src_x as usize;
-    let (hx, hy) = (p.dxy & 1 != 0, p.dxy & 2 != 0);
-    let mut acc = 0u32;
-    // ⚠️ 四个相位**在行循环外**分开写。原来是把 `hx`/`hy` 的判断放在最内层，
-    // 每次索引 `top[c]`/`top[c+1]`/`bot[c]`/`bot[c+1]` —— 编译器无法证明
-    // `c + 1` 不越界，于是 256 次里每次都带边界检查；而且 `if hx` 在内层
-    // 会挡住向量化。分开之后用 `zip`/`windows(2)` 表达「正好 16 个」，
-    // 边界检查消失，内层变成可向量化的纯算术。
-    // **值必须逐位相同**：公式与舍入常数一个字没动。
-    match (hx, hy) {
-        (false, false) => {
-            for r in 0..16usize {
-                let top = &refp.y[base + r * pw..base + r * pw + 16];
-                let crow = &cur[r * 16..r * 16 + 16];
-                acc += sad_row16(crow, top);
-                if acc >= cap {
-                    return cap;
-                }
-            }
-        }
-        (true, false) => {
-            for r in 0..16usize {
-                let top = &refp.y[base + r * pw..base + r * pw + 17];
-                let crow = &cur[r * 16..r * 16 + 16];
-                let mut rv = [0u8; 16];
-                for i in 0..16 {
-                    rv[i] = ((top[i] as u32 + top[i + 1] as u32 + r1) >> 1) as u8;
-                }
-                acc += sad_row16(crow, &rv);
-                if acc >= cap {
-                    return cap;
-                }
-            }
-        }
-        (false, true) => {
-            for r in 0..16usize {
-                let top = &refp.y[base + r * pw..base + r * pw + 16];
-                let bot = &refp.y[base + (r + 1) * pw..base + (r + 1) * pw + 16];
-                let crow = &cur[r * 16..r * 16 + 16];
-                let mut rv = [0u8; 16];
-                for i in 0..16 {
-                    rv[i] = ((top[i] as u32 + bot[i] as u32 + r1) >> 1) as u8;
-                }
-                acc += sad_row16(crow, &rv);
-                if acc >= cap {
-                    return cap;
-                }
-            }
-        }
-        (true, true) => {
-            for r in 0..16usize {
-                let top = &refp.y[base + r * pw..base + r * pw + 17];
-                let bot = &refp.y[base + (r + 1) * pw..base + (r + 1) * pw + 17];
-                let crow = &cur[r * 16..r * 16 + 16];
-                let mut rv = [0u8; 16];
-                for i in 0..16 {
-                    rv[i] = ((top[i] as u32
-                        + top[i + 1] as u32
-                        + bot[i] as u32
-                        + bot[i + 1] as u32
-                        + r2)
-                        >> 2) as u8;
-                }
-                acc += sad_row16(crow, &rv);
-                if acc >= cap {
-                    return cap;
-                }
-            }
-        }
-    }
-    acc
+    // 非边界（绝大多数候选）：走共享 SIMD 内核 —— 一个 16×16 整块**一次调用**，
+    // 半像素插值在寄存器里做，不再先写 `rv[16]` 临时数组再读一遍。
+    // 提前退出的语义（每行查一次 cap、命中返回 cap）与旧实现逐位相同。
+    crate::simd::sad_block16(cur, &refp.y, pw, base, p.dxy, no_rounding, cap)
 }
 
 /// 8×8 色度块的半像素搬运（`which`：0 = U，1 = V）。半像素相位由 `uvdxy` 表示。

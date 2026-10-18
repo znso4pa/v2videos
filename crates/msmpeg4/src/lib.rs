@@ -25,6 +25,7 @@
 //!
 //! 实现按 H.263 / MPEG-4 Part 2 的语法写，**不链 ffmpeg、不引依赖** ——
 //! ffmpeg 只当**交叉验证的 oracle**（测试里解同一条流、逐像素对账），不进产物。
+#![deny(unsafe_code)]
 
 mod bitreader;
 pub mod bitwriter;
@@ -40,6 +41,7 @@ mod intrax8;
 mod intrax8_tables;
 mod idct;
 mod predict;
+pub mod simd;
 pub mod tables;
 #[cfg(test)]
 mod testbit;
