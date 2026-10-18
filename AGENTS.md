@@ -94,7 +94,8 @@ V2V_ASF_SAMPLE=/path/x.wmv cargo test -p v2v-vc1 --release --test frames -- --no
 | `V2V_AUDIO_SAMPLE`       | 音频直通整文件对账（cli，标了 `#[ignore]`）                    |
 | `V2V_MP4_REF` / `V2V_MP4_PCM` | MP4 封装逐 box 对 `ffmpeg` 产的参考件（mp4）              |
 | `V2V_MP4_OUT` / `V2V_MP4_OUT_AV` | 上面那两条把我们的产物**落到哪个路径**（不设就落 `/tmp/v2v_ours*.mp4`） |
-| `V2V_BENCH_SAMPLE`       | 解码速度对表（`decode_bench`，`:` 分隔多个样本；不设就 SKIP）        |
+| `V2V_BENCH_SAMPLE`       | 解码速度对表（msmpeg4 / vc1 的 `decode_bench`，`:` 分隔多个样本；不设就 SKIP） |
+| `V2V_BENCH_FRAMES` / `V2V_BENCH_REPS` | 上面那条的「只比前 N 帧」/「取几次里最快」（默认全解 / 3 次）        |
 | `V2V_MAX_FRAMES` / `V2V_PFRAME_MAP` | 限量跑 / 逐帧定位（msmpeg4、vc1 调试用）                    |
 | `V2V_FRAME_LOG`          | 逐帧打印「用掉多少位 / 差多少像素」（vc1）                      |
 | `V2V_FUZZ_ROUNDS`        | 模糊测试的轮数（见下；不设就用各局自己的默认）                          |
