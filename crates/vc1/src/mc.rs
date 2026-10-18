@@ -36,16 +36,6 @@ fn mspel_filter(src: &[u8], off: isize, stride: isize, mode: u32, r: i32) -> i32
     }
 }
 
-/// `vc1_mspel_{ver,hor}_filter_16bits()`：两趟滤波的中间那一步（不取整）。
-fn mspel_filter16(src: &[u8], off: isize, stride: isize, mode: u32) -> i32 {
-    let s = |k: isize| src[(off + k * stride) as usize] as i32;
-    match mode {
-        1 => -4 * s(-1) + 53 * s(0) + 18 * s(1) - 3 * s(2),
-        2 => -1 * s(-1) + 9 * s(0) + 9 * s(1) - 1 * s(2),
-        _ => -3 * s(-1) + 18 * s(0) + 53 * s(1) - 4 * s(2),
-    }
-}
-
 /// `OPNAME vc1_mspel_mc`：`w × w` 块的四分之一像素插值（`hmode` / `vmode` ∈ 0..4）。
 #[allow(clippy::too_many_arguments)]
 fn mspel_mc(
@@ -69,29 +59,54 @@ fn mspel_mc(
             let r = (1 << (shift - 1)) + rnd - 1;
             // ⚠️ 中间结果**不夹取**（上游就是 `int16_t` 直接存）——夹了会在
             // 陡边处差 1，而那种差只出现在少数像素上，最难查。
-            let mut tmp = vec![0i16; (w + 3) * w];
+            //
+            // 用**栈上固定数组**而不是 `vec![]`：`w` 只可能是 4 / 8 / 16，
+            // `(16+3)*16 = 304` 就是上限。这个函数每个块都要进一次，
+            // 原来每次调用都 malloc/free 一回。
+            let mut tmp_buf = [0i16; 19 * 16];
+            let tmp = &mut tmp_buf[..(w + 3) * w];
+            // 竖直那一趟：4 个抽头是「上下 4 行、同一列」。把**行偏移**提到内层循环
+            // 外面，`vmode` 的系数选择也跟着提出来 —— 原来每像素都要重新 match 一次
+            // （走的是 `mspel_filter16`，那个 `match mode` 在函数里）。
             for j in 0..w {
+                // `src -= 1`：竖直那一趟整体左移一列（与上游一致）。
+                let row0 = b + (j as isize - 1) * BUF_STRIDE as isize - 1;
                 for i in 0..(w + 3) {
-                    // `src -= 1`：竖直那一趟整体左移一列。
-                    let off = b + (j * BUF_STRIDE + i) as isize - 1;
-                    tmp[j * (w + 3) + i] =
-                        ((mspel_filter16(src, off, BUF_STRIDE as isize, vmode) + r) >> shift) as i16;
+                    let o = (row0 + i as isize) as usize;
+                    let (a, bb, c, d) = (
+                        src[o] as i32,
+                        src[o + BUF_STRIDE] as i32,
+                        src[o + 2 * BUF_STRIDE] as i32,
+                        src[o + 3 * BUF_STRIDE] as i32,
+                    );
+                    let v = match vmode {
+                        1 => -4 * a + 53 * bb + 18 * c - 3 * d,
+                        2 => -1 * a + 9 * bb + 9 * c - 1 * d,
+                        _ => -3 * a + 18 * bb + 53 * c - 4 * d,
+                    };
+                    tmp[j * (w + 3) + i] = ((v + r) >> shift) as i16;
                 }
             }
             let r2 = 64 - rnd;
             for j in 0..w {
+                let t = j * (w + 3) + 1;
+                let drow = (dy + j) * dstride + dx;
                 for i in 0..w {
                     // ⚠️ 水平这一趟的系数**按 `hmode` 选**（1/4 位移那组系数只在
                     // `hmode == 1` 时才对）—— 写死成一组，平坦区就会整体偏亮/偏暗。
-                    let off = (j * (w + 3) + i + 1) as isize;
-                    let s = |k: isize| i32::from(tmp[(off + k) as usize]);
+                    let o = t + i;
+                    let (a, bb, c, d) = (
+                        i32::from(tmp[o - 1]),
+                        i32::from(tmp[o]),
+                        i32::from(tmp[o + 1]),
+                        i32::from(tmp[o + 2]),
+                    );
                     let h = match hmode {
-                        1 => -4 * s(-1) + 53 * s(0) + 18 * s(1) - 3 * s(2),
-                        2 => -1 * s(-1) + 9 * s(0) + 9 * s(1) - 1 * s(2),
-                        _ => -3 * s(-1) + 18 * s(0) + 53 * s(1) - 4 * s(2),
+                        1 => -4 * a + 53 * bb + 18 * c - 3 * d,
+                        2 => -1 * a + 9 * bb + 9 * c - 1 * d,
+                        _ => -3 * a + 18 * bb + 53 * c - 4 * d,
                     };
-                    let v = (h + r2) >> 7;
-                    dst[(dy + j) * dstride + dx + i] = v.clamp(0, 255) as u8;
+                    dst[drow + i] = ((h + r2) >> 7).clamp(0, 255) as u8;
                 }
             }
         } else {
@@ -134,29 +149,53 @@ fn hpel_mc(
     // ⚠️ **反的**：上游是 `if (!v->rnd) put_pixels_tab`（**带**取整）`else put_no_rnd_pixels_tab` ——
     // 也就是 `rnd == 0` 走 `rnd_avg`（`(a+b+1)>>1`）、`rnd == 1` 走截断。写反了就是
     // 「一半的帧整体偏 1」，而且只在半像素（hpel）那条路上现形。
-    let avg2 = |a: i32, b: i32| if rnd { (a + b) >> 1 } else { (a + b + 1) >> 1 };
-    let avg4 = |a: i32, b: i32, c: i32, d: i32| {
-        if rnd {
-            (a + b + c + d + 1) >> 2
-        } else {
-            (a + b + c + d + 2) >> 2
+    // 取整常数**只算一次**：`rnd` 是整帧不变量，原来把它写进闭包里，
+    // 等于每个像素再分一次支。
+    let r2 = if rnd { 0 } else { 1 };
+    let r4 = if rnd { 1 } else { 2 };
+    let avg2 = |a: i32, b: i32| (a + b + r2) >> 1;
+    let avg4 = |a: i32, b: i32, c: i32, d: i32| (a + b + c + d + r4) >> 2;
+    // `(hm, vm)` 是**循环不变量**，四条路各自一个紧循环 —— 写在最内层等于每个像素
+    // 再分一次支；顺手把目的行的起点也算到行首（省掉每像素一次乘法）。
+    match (hm, vm) {
+        (false, false) => {
+            for j in 0..w {
+                let s = base + j * BUF_STRIDE;
+                let d = (dy + j) * dstride + dx;
+                dst[d..d + w].copy_from_slice(&src[s..s + w]);
+            }
         }
-    };
-    for j in 0..w {
-        for i in 0..w {
-            let o = base + j * BUF_STRIDE + i;
-            let v = match (hm, vm) {
-                (false, false) => src[o] as i32,
-                (true, false) => avg2(src[o] as i32, src[o + 1] as i32),
-                (false, true) => avg2(src[o] as i32, src[o + BUF_STRIDE] as i32),
-                (true, true) => avg4(
-                    src[o] as i32,
-                    src[o + 1] as i32,
-                    src[o + BUF_STRIDE] as i32,
-                    src[o + BUF_STRIDE + 1] as i32,
-                ),
-            };
-            dst[(dy + j) * dstride + dx + i] = v as u8;
+        (true, false) => {
+            for j in 0..w {
+                let s = base + j * BUF_STRIDE;
+                let d = (dy + j) * dstride + dx;
+                for i in 0..w {
+                    dst[d + i] = avg2(src[s + i] as i32, src[s + i + 1] as i32) as u8;
+                }
+            }
+        }
+        (false, true) => {
+            for j in 0..w {
+                let s = base + j * BUF_STRIDE;
+                let d = (dy + j) * dstride + dx;
+                for i in 0..w {
+                    dst[d + i] = avg2(src[s + i] as i32, src[s + i + BUF_STRIDE] as i32) as u8;
+                }
+            }
+        }
+        (true, true) => {
+            for j in 0..w {
+                let s = base + j * BUF_STRIDE;
+                let d = (dy + j) * dstride + dx;
+                for i in 0..w {
+                    dst[d + i] = avg4(
+                        src[s + i] as i32,
+                        src[s + i + 1] as i32,
+                        src[s + i + BUF_STRIDE] as i32,
+                        src[s + i + BUF_STRIDE + 1] as i32,
+                    ) as u8;
+                }
+            }
         }
     }
 }
@@ -251,10 +290,22 @@ impl Ctx<'_, '_> {
         } else {
             (self.mb_width * 8, self.mb_height * 8)
         };
+        let (x0, y0) = (src_x - pad as i32, src_y - pad as i32);
+        // **快路**：整块都在画面内（绝大多数宏块都在）—— 逐行 `copy_from_slice`，
+        // 省掉每像素两次 `clamp` 与一次边界检查。这是解码里调用次数最多的函数之一。
+        if x0 >= 0 && y0 >= 0 && x0 + k as i32 <= w as i32 && y0 + k as i32 <= h as i32 {
+            let (x0, y0) = (x0 as usize, y0 as usize);
+            for j in 0..k {
+                let s = (y0 + j) * stride + x0;
+                buf[j * BUF_STRIDE..j * BUF_STRIDE + k].copy_from_slice(&data[s..s + k]);
+            }
+            return;
+        }
+        // 慢路：越界处边缘复制。
         for j in 0..k {
-            let sy = (src_y - pad as i32 + j as i32).clamp(0, h as i32 - 1) as usize;
+            let sy = (y0 + j as i32).clamp(0, h as i32 - 1) as usize;
             for i in 0..k {
-                let sx = (src_x - pad as i32 + i as i32).clamp(0, w as i32 - 1) as usize;
+                let sx = (x0 + i as i32).clamp(0, w as i32 - 1) as usize;
                 buf[j * BUF_STRIDE + i] = data[sy * stride + sx];
             }
         }
@@ -265,7 +316,7 @@ impl Ctx<'_, '_> {
         if !self.has_ref {
             return;
         }
-        let p = self.hdr.p.as_ref().unwrap().clone();
+        // ⚠️ 只取标量 —— `hdr.p.clone()` 会把两张位平面一起拷（每块一次 malloc + memcpy）。
         let (mx, my) = self.mv_of(mbx, mby, 0);
         let mb_pos = self.mbidx(mbx, mby);
         let mut uvmx = (mx + ((mx & 3) == 3) as i32) >> 1;
@@ -275,7 +326,7 @@ impl Ctx<'_, '_> {
             uvmx += if uvmx < 0 { uvmx & 1 } else { -(uvmx & 1) };
             uvmy += if uvmy < 0 { uvmy & 1 } else { -(uvmy & 1) };
         }
-        let mspel = p.mspel as usize;
+        let mspel = self.hdr.p.as_ref().unwrap().mspel as usize;
         let mut src_x = mbx as i32 * 16 + (mx >> 2);
         let mut src_y = mby as i32 * 16 + (my >> 2);
         let mut uvsrc_x = mbx as i32 * 8 + (uvmx >> 2);
@@ -343,9 +394,8 @@ impl Ctx<'_, '_> {
         if !self.has_ref {
             return;
         }
-        let p = self.hdr.p.as_ref().unwrap().clone();
         let (mx, my) = self.mv_of(mbx, mby, n);
-        let mspel = p.mspel as usize;
+        let mspel = self.hdr.p.as_ref().unwrap().mspel as usize;
         let mut src_x = mbx as i32 * 16 + (n & 1) as i32 * 8 + (mx >> 2);
         let mut src_y = mby as i32 * 16 + (n & 2) as i32 * 4 + (my >> 2);
         src_x = src_x.clamp(-16, (self.mb_width * 16) as i32);

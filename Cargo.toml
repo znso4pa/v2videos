@@ -7,3 +7,10 @@ version = "0.0.0"
 edition = "2021"
 license = "LGPL-2.1-or-later"
 repository = "https://github.com/znso4pa/v2videos"
+
+[profile.release]
+# 单个 codegen unit：解码的内层循环跨函数（IDCT / MC / 位读取）互相内联之后
+# 才压得动边界检查。实测 VC-1 解码快 **9%**（1080p，21.54 → 19.6 ms/帧那一段）。
+# 代价是 release 编译变慢（少了跨 CGU 并行），所以只影响 `--release`，
+# 日常 `cargo test` / `cargo build`（debug）不受影响。
+codegen-units = 1

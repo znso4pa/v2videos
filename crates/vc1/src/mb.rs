@@ -302,19 +302,29 @@ impl Ctx<'_, '_> {
 
     /// `vc1_decode_p_mb()`（渐进式那一条路）。
     fn decode_p_mb(&mut self, mbx: usize, mby: usize) -> Result<()> {
-        let p = self.hdr.p.as_ref().unwrap().clone();
+        // ⚠️ 这里**不要** `self.hdr.p...clone()`：`PFrameHeader` 里带着两张位平面，
+        // 一个宏块克隆一次就是 malloc + 几 KB memcpy。只要把标量取出来，
+        // 位平面在**短作用域**里借一下（`self.hdr` 与 `self.r` 是不相交的字段，
+        // 借用检查器允许同时存在）。
+        let (fourmv, skipped) = {
+            let p = self.hdr.p.as_ref().unwrap();
+            let fourmv = match &p.mv_type_plane {
+                Some(pl) if pl.raw => self.r.bit()? != 0,
+                Some(pl) => pl.get(mbx, mby) != 0,
+                None => false,
+            };
+            let skipped = if p.skip_plane.raw {
+                self.r.bit()? != 0
+            } else {
+                p.skip_plane.get(mbx, mby) != 0
+            };
+            (fourmv, skipped)
+        };
+        let (cbptab, tt, ttmbf) = {
+            let p = self.hdr.p.as_ref().unwrap();
+            (p.cbptab, p.tt, p.ttmbf)
+        };
         let mb_pos = self.mbidx(mbx, mby);
-
-        let fourmv = match &p.mv_type_plane {
-            Some(pl) if pl.raw => self.r.bit()? != 0,
-            Some(pl) => pl.get(mbx, mby) != 0,
-            None => false,
-        };
-        let skipped = if p.skip_plane.raw {
-            self.r.bit()? != 0
-        } else {
-            p.skip_plane.get(mbx, mby) != 0
-        };
 
         let mut mquant = self.hdr.pq as i32;
         let mut block_cbp = 0u32;
@@ -340,7 +350,7 @@ impl Ctx<'_, '_> {
                     if mb_intra {
                         ac_pred = self.r.bit()? != 0;
                     }
-                    cbp = vlc_p_cbpcy(p.cbptab as usize).decode(&mut self.r)? as u32;
+                    cbp = vlc_p_cbpcy(cbptab as usize).decode(&mut self.r)? as u32;
                     mquant = self.get_mquant(mquant, mbx, mby)?;
                 } else {
                     mquant = self.hdr.pq as i32;
@@ -348,8 +358,8 @@ impl Ctx<'_, '_> {
                 }
                 self.mbp.qscale[mb_pos] = mquant;
 
-                let mut ttmb: i32 = p.tt as i32;
-                if !p.ttmbf && !mb_intra && mb_has_coeffs {
+                let mut ttmb: i32 = tt as i32;
+                if !ttmbf && !mb_intra && mb_has_coeffs {
                     ttmb = vlc_ttmb(self.tt_index).decode(&mut self.r)? as i32;
                 }
                 if !mb_intra {
@@ -373,7 +383,7 @@ impl Ctx<'_, '_> {
                             self.decode_p_block(mbx, mby, i, mquant, ttmb, first_block)?;
                         block_cbp |= pat << (i << 2);
                         block_tt |= tt;
-                        if !p.ttmbf && ttmb < 8 {
+                        if !ttmbf && ttmb < 8 {
                             ttmb = -1;
                         }
                         first_block = false;
@@ -397,7 +407,7 @@ impl Ctx<'_, '_> {
                 let mut coded_inter = false;
                 let mut is_intra = [false; 6];
                 let mut is_coded = [false; 6];
-                let cbp = vlc_p_cbpcy(p.cbptab as usize).decode(&mut self.r)? as u32;
+                let cbp = vlc_p_cbpcy(cbptab as usize).decode(&mut self.r)? as u32;
                 for i in 0..6usize {
                     let val = (cbp >> (5 - i)) & 1;
                     self.set_dc(mbx, mby, i, 0);
@@ -461,8 +471,8 @@ impl Ctx<'_, '_> {
                 }
                 let ac_pred = if intrapred { self.r.bit()? != 0 } else { false };
 
-                let mut ttmb: i32 = p.tt as i32;
-                if !p.ttmbf && coded_inter {
+                let mut ttmb: i32 = tt as i32;
+                if !ttmbf && coded_inter {
                     ttmb = vlc_ttmb(self.tt_index).decode(&mut self.r)? as i32;
                 }
                 let mut first_block = true;
@@ -479,7 +489,7 @@ impl Ctx<'_, '_> {
                             self.decode_p_block(mbx, mby, i, mquant, ttmb, first_block)?;
                         block_cbp |= pat << (i << 2);
                         block_tt |= tt;
-                        if !p.ttmbf && ttmb < 8 {
+                        if !ttmbf && ttmb < 8 {
                             ttmb = -1;
                         }
                         first_block = false;
@@ -917,7 +927,9 @@ impl Ctx<'_, '_> {
         ttmb: i32,
         first_block: bool,
     ) -> Result<(u32, u32)> {
-        let p = self.hdr.p.as_ref().unwrap().clone();
+        // ⚠️ 只取这一个标量。原来是 `self.hdr.p...clone()` —— 这个函数**每块**都进一次
+        // （一个宏块 6 次，ABT 更多），克隆会把两张位平面一起拷，代价是 malloc + 几 KB memcpy。
+        let ttmbf = self.hdr.p.as_ref().unwrap().ttmbf;
         let pquantizer = self.hdr.pquantizer;
         let halfpq = self.hdr.halfpq as i32;
         let mut block = [0i16; 64];
@@ -932,7 +944,7 @@ impl Ctx<'_, '_> {
         }
         if ttblk != tables::TT_8X8 as u32
             && ttblk != tables::TT_4X4 as u32
-            && (p.ttmbf || (ttmb != -1 && (ttmb & 8) != 0 && !first_block)
+            && (ttmbf || (ttmb != -1 && (ttmb & 8) != 0 && !first_block)
                 || (!self.seq.res_rtm_flag && !first_block))
         {
             subblkpat = self.decode012()?;

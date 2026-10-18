@@ -29,8 +29,17 @@ impl Ctx<'_, '_> {
         mv1: bool,
         mb_intra: bool,
     ) -> Result<()> {
-        let p = self.hdr.p.as_ref().unwrap().clone();
-        let qs = p.quarter_sample;
+        // ⚠️ 只取**标量**，不要 `hdr.p.clone()`：`PFrameHeader` 里带着两张位平面
+        // （各一个 `Vec<u8>`），而这个函数**每个块**都进一次 —— 克隆一次就是一次
+        // malloc + 几 KB memcpy，实测占掉解码时间的 10% 上下。
+        let (qs, mixedmv_pic) = {
+            let p = self.hdr.p.as_ref().unwrap();
+            (
+                p.quarter_sample,
+                p.mv_mode == MvMode::MixedMv
+                    || (p.mv_mode == MvMode::IntensityComp && p.mv_mode2 == Some(MvMode::MixedMv)),
+            )
+        };
         let (mut dmv_x, mut dmv_y) = (dmv_x, dmv_y);
         // 差分按**四分之一像素**为单位换算。
         if !qs {
@@ -52,8 +61,7 @@ impl Ctx<'_, '_> {
             return Ok(());
         }
 
-        let mixedmv_pic = p.mv_mode == MvMode::MixedMv
-            || (p.mv_mode == MvMode::IntensityComp && p.mv_mode2 == Some(MvMode::MixedMv));
+        // `mixedmv_pic` 在函数开头就算好了（见 `qs` 那段）。
 
         let a_valid = mby != 0 || (n == 2 || n == 3);
         let mut b_valid = a_valid;
