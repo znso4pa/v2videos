@@ -1052,11 +1052,32 @@ impl PState<'_> {
         // 8 个点（±2 与对角）。菱形只覆盖 `(±2,0)/(0,±2)/(±1,±1)`，
         // 所以每个起点走完还要补一圈全搜 ±2。
         const LDSP: [(i32, i32); 4] = [(0, -2), (2, 0), (0, 2), (-2, 0)];
+
+        // ---- 起点排序：先给每个起点算一次 SAD（很便宜），从最好的那个走菱形 ----
+        //
+        // 原来三个起点**各走一遍**菱形（约 3×30 个候选）。但绝大多数宏块里
+        // 「哪个起点好」一眼就能看出来 —— 走完第一个之后，另外两个起点的
+        // 初始 SAD 往往已经明显差于当前最优，再走一遍几乎不可能翻盘。
+        //
+        // 所以：先按初始 SAD 排序；第一个走完拿到 `best_sad` 之后，
+        // **只有初始 SAD 还在 `best_sad × 11/10` 以内的起点才补走**。
+        // 这是有条件的退化 —— 起点接近时仍走多遍，保持多盆地覆盖。
+        let mut order: [((i32, i32), u64); 3] = [((0, 0), u64::MAX); 3];
+        for i in 0..n_starts {
+            order[i] = (starts[i], sad_of(starts[i]));
+        }
+        let order = &mut order[..n_starts];
+        order.sort_unstable_by_key(|&(_, s)| s);
+
         let mut best = (0i32, 0i32);
         let mut best_sad = u64::MAX;
-        for &start in &starts[..n_starts] {
+        for (rank, &(start, start_sad)) in order.iter().enumerate() {
+            // 第 2 个及以后的起点：初始 SAD 已经比当前最优差一截，跳过。
+            if rank > 0 && start_sad > best_sad / 10 * 11 {
+                break;
+            }
             let mut cur_best = start;
-            let mut cur_sad = sad_of(start);
+            let mut cur_sad = start_sad;
             // 大菱形走到收敛（硬上限只是防御：窗口有限，正常几个来回就收敛）。
             for _ in 0..32 {
                 let mut improved = false;
