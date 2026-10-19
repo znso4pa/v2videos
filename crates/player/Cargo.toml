@@ -1,0 +1,14 @@
+[package]
+name = "v2v-player"
+description = "顺时播放：解封装 + 解码接成一个能逐帧 / 逐样本取数的播放器"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# 容器无关的共用类型（流 / 样本 / 格式）。
+v2v-container = { path = "../container" }
+v2v-asf = { path = "../asf" }
+v2v-vc1 = { path = "../vc1" }
+v2v-msmpeg4 = { path = "../msmpeg4" }
+v2v-wma = { path = "../wma" }
