@@ -24,7 +24,7 @@ crates/
   container 各容器共用的数据模型（流 / 格式 / 样本）—— 零依赖
   asf      ASF（.wmv / .wma）解封装 + **封装** —— 纯 std
   avi      AVI（RIFF）解封装
-  msmpeg4  MS-MPEG-4 v3（MP43）/ WMV1 / WMV2 解码（I / P + **IntraX8**）+ MP43 编码（I / P，含运动估计与帧内/帧间判决）
+  msmpeg4  MS-MPEG-4 v2/v3（MP42 / MP43）/ WMV1 / WMV2 解码（I / P + **IntraX8**）+ MP43 编码（I / P，含运动估计与帧内/帧间判决）
            **兼共享数值内核**：位读写器 / FDCT / IDCT / FFT / VLC 表 —— mp4v、aac、wma 都从这里取
   wma      WMA v1/v2 音频解码（帧头 / LSP 指数 / 系数 / IMDCT）
   vc1      VC-1（**WMV3**）解码：Simple/Main profile、渐进、I/P —— 序列头 → 帧头 → 位平面 →
@@ -105,8 +105,9 @@ v2v convert --mp4 -g 12 in.wmv -o out/
 音频必须解成 PCM 再重编码（默认 AAC，`--pcm` 则是原封不动的 `sowt`）。
 
 **还没做（解码侧）**：VC-1 的 **B 帧 / 隔行 / Advanced profile**、overlap smoothing、
-多分辨率、`rangered`、重同步标记（见下一段）。MP41 / MP42 的帧头已经按版本分叉了，
-但 MB 层还没写（要走 H.263 的 MCBPC 表）—— 输入被明确拒绝，不会静默出错。
+多分辨率、`rangered`、重同步标记（见下一段）。**MP41** 的 MB 层分支写好了，但 ffmpeg
+只有 `msmpeg4v2` / `msmpeg4v3` 两个编码器 —— **造不出 v1 的流**，也就拿不到对账样本，
+所以输入被明确拒绝。（MP42 已经对上了，见能力矩阵。）
 
 **VC-1 走到哪一步**：`v2v-vc1` 已经**整条链路通了** —— 序列头（容器 extradata 里的
 `STRUCT_C`）、帧头（I/P）、帧头里的**位平面**（逐宏块跳过标志那类整帧位图，7 种编码 +
@@ -457,6 +458,8 @@ SSIM 0.969486）对合并前 q=8（1709 kbps / 37.14 dB / 0.963555）—— **�
 | 编码                       | 解码        | 编码        | 边界与原因                                                                        |
 | ------------------------ | --------- | --------- | ---------------------------------------------------------------------------- |
 | **MP43**（MS-MPEG-4 v3）   | ✅ I / P   | ✅ I / P   | 这是 `.wmv` 的主编码。解码有 AC 预测那条路（ffmpeg 编的流里 `ac_pred` 恒 0，靠翻位测试覆盖）                 |
+| **MP42**（MS-MPEG-4 v2）   | ✅ I / P   | ❌         | 与 MP43 差在**三处表**（都不报错、只出错）：DC 走 H.263 那张 **512 项** VLC（符号以 **256** 为中心）、DC 缩放是 `ff_mpeg1_dc_scale_table`（**恒 8**）、运动矢量走 `H263_MV` + **±64 回绕**。自造样本 q=2/6/10/15 各 40 帧逐像素 0 差（`crates/msmpeg4/tests/v2.rs`）—— 低 qscale 分不出 DC 缩放表，必须带高档一起测 |
+| **MP41**（MS-MPEG-4 v1）   | ❌         | ❌         | MB 层分支在代码里（H.263 的 MCBPC + cbpy），但 ffmpeg **没有 v1 编码器**、造不出对账样本 → 输入明确拒绝。等拿到真实 MP41 文件再验 |
 | **WMV1**（WMV7）           | ✅ I / P   | ❌         | 与 MP43 共用 MB 层，分叉在帧头、扫描表、DC 预测/缩放表（见「状态」那行）。**不做错误隐藏** —— 首帧不是 I 帧的流直接报错，ffmpeg 会拿垃圾当参考硬解 |
 | **WMV2**（WMV8）           | ✅ I/P + IntraX8 | ❌         | 帧头与 MB 层是另一套（`wmv2dec.c`）。比 WMV1 多：`parse_mb_skip`（4 种跳帧类型）、按 qscale 挑的 CBP 表、`mspel` 四抽头半像素 + `hshift`、**ABT**（4×8 / 8×4）、**环路滤波**、它自己那份 8×8 IDCT，以及 **IntraX8**（`j_type`，按 8×8 块走的内帧子解码器，WMV2 与 VC-1 共用 —— 见 `intrax8.rs`） |
 | **WMV9 / VC-1**          | ✅ I / P   | ❌         | **ffmpeg 里根本没有 VC-1/wmv3 编码器**（只有解码器），想要 WMV9 得另找路子。解码侧 `v2v-vc1` 已走完整条链路（Main profile / 渐进 / I/P，真 1080p 样本逐帧逐像素 0 差）；缺 **B 帧 / 隔行 / Advanced profile**、overlap smoothing、多分辨率、重同步标记 —— 遇到明确报 `Unsupported`，不静默出错 |

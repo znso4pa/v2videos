@@ -10,3 +10,5 @@ license.workspace = true
 [dev-dependencies]
 # 只给 example / 集成测试用：从 ASF 里取视频样本做验证。
 v2v-asf = { path = "../asf" }
+# MP42 的对账样本只有 AVI 能装（ffmpeg 的 `msmpeg4v2` 编码器出 .avi）。
+v2v-avi = { path = "../avi" }

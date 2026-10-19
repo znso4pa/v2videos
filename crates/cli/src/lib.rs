@@ -4,7 +4,7 @@
 //!
 //! ## 现状
 //!
-//! - 输入：**ASF（`.wmv`）/ AVI（`.avi`）** 里的 **MP43** 视频轨 —— 容器按魔数自动认。
+//! - 输入：**ASF（`.wmv`）/ AVI（`.avi`）** 里的 **MP42 / MP43 / WMV1 / WMV2** 视频轨 —— 容器按魔数自动认。
 //!   别的容器 / codec 会明确报 `Unsupported`，不猜、不静默跳过。
 //! - 输出：**两种容器**（`ConvertOptions::format`）
 //!
@@ -52,7 +52,8 @@ pub use v2v_msmpeg4::{Decoder, Encoder, EncoderConfig, Frame, Version};
 /// | `MP43`（V3） | ✅ 多份真样本逐帧 0 差 |
 /// | `WMV1` | ✅ 四份真样本逐帧 0 差 |
 /// | `WMV2` | ✅ 三份真样本逐帧 0 差（含 `mspel` / ABT / 环路滤波那些分支） |
-/// | `MP41` / `MP42` | ❌ 帧头按版本分叉了，但 **MB 层还没写**（要 H.263 的 MCBPC 表 + `v2_*` 两张私有表） |
+/// | `MP42`（V2） | ✅ 自造样本逐帧 0 差（`crates/msmpeg4/tests/v2.rs`，扫了 q=2/6/10/15 四档 —— 低 qscale 分不出 DC 缩放表，必须带高档） |
+/// | `MP41`（V1） | ❌ 代码分支在，但**没有可造的流**（ffmpeg 只有 `msmpeg4v2`/`msmpeg4v3` 编码器，没有 v1），拿不到对账样本 |
 ///
 /// `WMV3` 不走这里 —— 它不是 MS-MPEG-4 的版本，是**另一套骨架**（`v2v-vc1`），
 /// 见 [`open_video_decoder`]。
@@ -60,9 +61,9 @@ pub use v2v_msmpeg4::{Decoder, Encoder, EncoderConfig, Frame, Version};
 /// 宁可明确拒绝，也不能静默产出错误画面 —— 那比不支持糟得多。
 fn verified_version(fourcc: u32) -> Result<Version, Error> {
     match Version::from_fourcc(fourcc) {
-        Some(v @ (Version::V3 | Version::Wmv1 | Version::Wmv2)) => Ok(v),
+        Some(v @ (Version::V2 | Version::V3 | Version::Wmv1 | Version::Wmv2)) => Ok(v),
         _ => Err(Error::Unsupported(format!(
-            "输入视频是 {}，本工具目前只解 MP43 / WMV1 / WMV2 / WMV3（MP41/MP42 在接）",
+            "输入视频是 {}，本工具目前只解 MP42 / MP43 / WMV1 / WMV2 / WMV3（MP41 没有可对账的样本，暂不支持）",
             v2v_asf::fourcc_string(fourcc)
         ))),
     }

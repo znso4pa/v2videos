@@ -359,7 +359,17 @@ impl RlTable {
             if i > 62 {
                 i -= 192;
                 if i & !63 != 0 {
-                    return Err(Error::Bad("ac coefficient overflow"));
+                    // ⚠️ **上游默认是「容忍」而不是报错**：`ff_msmpeg4_decode_block` 里
+                    // 只有当 `err_recognition` 含 `AV_EF_BITSTREAM|AV_EF_COMPLIANT` 时
+                    // 才返回错误；默认（0）打一行 "ignoring overflow" 就 `i = 63; break`。
+                    //
+                    // ⚠️ 注意 `break` 之前**不写这个系数**（上游也是先 break 再写，
+                    // 那条路根本走不到 `block[scan[i]] = level`）—— 多写一个系数会让
+                    // 那一块多出一个「凭空来的高频」，肉眼看不出来、逐像素一比就现形。
+                    //
+                    // 真实 MP42 流里确实会撞上（第一帧第 293 位），严格报错会把
+                    // ffmpeg 能解的流拒掉。
+                    break;
                 }
                 block[scan[i as usize] as usize] = level as i16;
                 break;

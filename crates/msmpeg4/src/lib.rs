@@ -46,6 +46,7 @@ pub mod tables;
 #[cfg(test)]
 mod testbit;
 mod version;
+mod v12;
 mod vlc;
 
 pub use bitreader::BitReader;

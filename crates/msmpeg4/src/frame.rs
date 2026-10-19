@@ -218,6 +218,12 @@ struct DecodeTables {
     mb_non_intra: Vlc,
     /// `DC[dc_table_index][0=亮度 / 1=色度]`。
     dc: [[Vlc; 2]; 2],
+    /// **V1/V2 的 DC 表**（`[亮度, 色度]`）—— 512 项，符号值以 256 为中心。
+    ///
+    /// ⚠️ 与上面 `dc` 那两张**不是同一套语法**：这四张是「下标即 level + 256」的
+    /// 定长前缀码，那四张是「120 项 + `DC_MAX` 转义」。拿错表的表现是整帧亮度偏一大截、
+    /// 而且位游标从第一个帧内块起就错位（却不一定报错）。
+    v2_dc: [Vlc; 2],
     /// `MV0` / `MV1`。
     mv: [Vlc; 2],
     /// 六张 RL 表（`for_standard` 的 0..5）。
@@ -279,6 +285,7 @@ impl DecodeTables {
                     [vlc(&tables::DC[0][0]), vlc(&tables::DC[0][1])],
                     [vlc(&tables::DC[1][0]), vlc(&tables::DC[1][1])],
                 ],
+                v2_dc: crate::v12::dc_tables(),
                 mv: [
                     mv(&tables::MV0_CODE, &tables::MV0_LEN),
                     mv(&tables::MV1_CODE, &tables::MV1_LEN),
@@ -504,13 +511,19 @@ impl Decoder {
         //
         // V3 用 `OLD_Y` 是因为 MP43 走 `workaround_bugs` 的 autodetect（实测对着真样本
         // 逐像素验证过）；WMV1/WMV2 则明确用 wmv1 那张。色度两边都是 wmv1 的。
+        //
+        // ⚠️ **V1/V2 是第三套**：上游对它们「什么都不设」，于是用 mpegvideo 的默认
+        // `ff_mpeg1_dc_scale_table` —— **恒 8**（`MPEG1_DC_SCALE`）。拿 `OLD_Y` 当它用
+        // 在 qscale <= 4 时碰巧一样（都是 8），从 q=5 起就分叉（10 vs 8）。
         let q = header.qscale as usize;
-        let y_dc_scale = if self.version.is_wmv() {
-            tables::Y_DC_SCALE[q] as i32
+        let (y_dc_scale, c_dc_scale) = if self.version.is_v1_or_v2() {
+            let s = tables::MPEG1_DC_SCALE[q] as i32;
+            (s, s)
+        } else if self.version.is_wmv() {
+            (tables::Y_DC_SCALE[q] as i32, tables::C_DC_SCALE[q] as i32)
         } else {
-            tables::OLD_Y_DC_SCALE[q] as i32
+            (tables::OLD_Y_DC_SCALE[q] as i32, tables::C_DC_SCALE[q] as i32)
         };
-        let c_dc_scale = tables::C_DC_SCALE[q] as i32;
         let slice_height = header.slice_height.max(1) as usize;
 
         // 反量化参数（帧内 / 帧间同一套）：
@@ -603,7 +616,8 @@ impl Decoder {
             let first_slice_line = mby % slice_height == 0;
             for mbx in 0..mb_w {
                 let mb_intra: bool;
-                let cbp: u32;
+                // V1/V2 要就地拼 `cbp`（先 cbpc、再 `|= cbpy << 2`），所以是可变的。
+                let mut cbp: u32;
                 let mut ac_pred = false;
                 let mut mv = (0i32, 0i32);
                 // WMV2 的 `hshift`（mspel 的取整选择）与逐块 ABT 开关 —— 都是**逐宏块**状态。
@@ -648,14 +662,31 @@ impl Decoder {
                         }
                         continue;
                     }
-                    let code = match &wmv2 {
-                        // WMV2 的宏块类型表**按 qscale 换**（`cbp_table_index` 在帧头算好）。
-                        Some(w) => t.wmv2_cbp[w.cbp_table_index].decode(&mut r)? as u32,
-                        None => mb_non_intra_vlc.decode(&mut r)? as u32,
+                    let is_v12 = self.version.is_v1_or_v2();
+                    let code = if is_v12 {
+                        // V1/V2 的宏块类型是**另一套表**：V2 用私有的 8 项 `v2_mb_type`，
+                        // V1 用 H.263 的 `inter_mcbpc`。位布局也不同 ——
+                        // **bit2 = 帧内标志、低 2 位 = cbpc**（V3 是 bit6 + 低 6 位）。
+                        if self.version == Version::V2 {
+                            t.v2_mb_type.decode(&mut r)? as u32
+                        } else {
+                            t.h263_inter_mcbpc.decode(&mut r)? as u32
+                        }
+                    } else {
+                        match &wmv2 {
+                            // WMV2 的宏块类型表**按 qscale 换**（`cbp_table_index` 在帧头算好）。
+                            Some(w) => t.wmv2_cbp[w.cbp_table_index].decode(&mut r)? as u32,
+                            None => mb_non_intra_vlc.decode(&mut r)? as u32,
+                        }
                     };
-                    // `s->mb_intra = (~code & 0x40) >> 6;`
-                    mb_intra = (code & 0x40) == 0;
-                    cbp = code & 0x3f;
+                    if is_v12 {
+                        mb_intra = (code >> 2) != 0;
+                        cbp = code & 3;
+                    } else {
+                        // `s->mb_intra = (~code & 0x40) >> 6;`
+                        mb_intra = (code & 0x40) == 0;
+                        cbp = code & 0x3f;
+                    }
                     if mb_intra {
                         self.stats.mb_intra += 1;
                         self.stats.mb_intra_in_p += 1;
@@ -668,7 +699,19 @@ impl Decoder {
                         // ⚠️ **顺序按版本不同**，而且两边都「读错位置整帧就散」：
                         // - WMV1：先读逐宏块 RL 表下标，再做运动预测；
                         // - WMV2：先做运动预测（它可能多读一位 `type`），再读 RL 下标与 ABT 开关。
-                        if let Some(w) = &wmv2 {
+                        // - V1/V2：先 cbpy 拼 `cbp`（**再按版本异或**），然后才是运动。
+                        if self.version.is_v1_or_v2() {
+                            let cbpy = t.h263_cbpy.decode(&mut r)? as u32;
+                            cbp |= cbpy << 2;
+                            // 异或的意义：V1/V2 里 chroma 的 cbpc 是「反着写的」。
+                            // **V1 无条件异或**，V2 只在色度两位不全（`(cbp & 3) != 3`）时异或。
+                            // ⚠️ 异或的是 `0x3C` —— 也就是 **luma 那四位**，不是 chroma。
+                            if self.version == Version::V1 || (cbp & 3) != 3 {
+                                cbp ^= 0x3C;
+                            }
+                            let pred = pred_motion(&mv_grid, mbx, mby, first_slice_line);
+                            mv = decode_motion_v12(&mut r, &t.h263_mv, pred)?;
+                        } else if let Some(w) = &wmv2 {
                             let pred = wmv2_pred_motion(
                                 &mv_grid,
                                 mbx,
@@ -710,6 +753,17 @@ impl Decoder {
                             let pred = pred_motion(&mv_grid, mbx, mby, first_slice_line);
                             mv = decode_motion(&mut r, &mv_vlc, mv_x, mv_y, pred)?;
                         }
+                    } else if self.version.is_v1_or_v2() {
+                        // P 帧里的**帧内宏块**：`ac_pred` 只有 V2 读一位，V1 **不读**
+                        // （上游 `s->ac_pred = 0`）；然后 cbpy 补 luma 四位。
+                        ac_pred = self.version == Version::V2 && r.bit()? != 0;
+                        let cbpy = t.h263_cbpy.decode(&mut r)? as u32;
+                        cbp |= cbpy << 2;
+                        // V1 在 **P 帧里的帧内宏块**也要异或 luma 四位（与帧间同一条规则；
+                        // 纯 I 帧不异或 —— 判据是 `pict_type`，不是 `mb_intra`）。
+                        if self.version == Version::V1 {
+                            cbp ^= 0x3C;
+                        }
                     } else {
                         let bit_pos = r.bit_pos();
                         ac_pred = r.bit()? != 0;
@@ -730,8 +784,22 @@ impl Decoder {
                             rl_inter_i = 3 + t;
                         }
                     }
+                } else if self.version.is_v1_or_v2() {
+                    // ---- MB 类型（帧内，V1/V2）----
+                    // 只给 **cbpc**（chroma 两位），**没有编码块图预测** ——
+                    // 那张 `coded` 网格是 V3 才有的（V1/V2 的 luma 四位由 cbpy 明文给出）。
+                    mb_intra = true;
+                    self.stats.mb_intra += 1;
+                    cbp = if self.version == Version::V2 {
+                        t.v2_intra_cbpc.decode(&mut r)? as u32
+                    } else {
+                        t.h263_intra_mcbpc.decode(&mut r)? as u32
+                    };
+                    // `ac_pred` 只有 V2 读；V1 恒 0。
+                    ac_pred = self.version == Version::V2 && r.bit()? != 0;
+                    let cbpy = t.h263_cbpy.decode(&mut r)? as u32;
+                    cbp |= cbpy << 2;
                 } else {
-                    // ---- MB 类型（帧内）：只给编码块图，还要做 CBP 预测 ----
                     mb_intra = true;
                     self.stats.mb_intra += 1;
                     let code = mb_intra_vlc.decode(&mut r)? as u32;
@@ -846,17 +914,29 @@ impl Decoder {
 
                     if mb_intra {
                         // ---- DC ----
-                        let dc_v = if luma { &dc_vlc } else { &dc_vlc_c };
-                        let dc_sym = dc_v.decode(&mut r)?;
-                        let mut level = dc_sym as i32;
-                        if level == DC_MAX as i32 {
-                            level = r.u(8)? as i32;
-                            if r.bit()? != 0 {
-                                level = -level;
+                        // ⚠️ **V1/V2 是另一套 DC 语法**：H.263 那张 512 项的表、
+                        // **符号值以 256 为中心**，没有 `DC_MAX` 转义、也没有额外的符号位
+                        // （符号已经在码字里）。拿 V3 的表来解会「不报错但整帧偏亮」——
+                        // 因为第一个帧内块的位游标就已经错位了，后面全靠运气。
+                        let mut level = if self.version.is_v1_or_v2() {
+                            let v = t.v2_dc[usize::from(!luma)].decode(&mut r)? as i32;
+                            v - 256
+                        } else {
+                            let dc_v = if luma { &dc_vlc } else { &dc_vlc_c };
+                            let sym = dc_v.decode(&mut r)? as i32;
+                            if sym == DC_MAX as i32 {
+                                let v = r.u(8)? as i32;
+                                if r.bit()? != 0 {
+                                    -v
+                                } else {
+                                    v
+                                }
+                            } else if sym != 0 && r.bit()? != 0 {
+                                -sym
+                            } else {
+                                sym
                             }
-                        } else if level != 0 && r.bit()? != 0 {
-                            level = -level;
-                        }
+                        };
 
                         // 预测（缩放到 level 域后比较）
                         let mut a = dc_grid.data[xy - 1] as i32;
@@ -1172,6 +1252,34 @@ pub fn mid_pred(a: i32, b: i32, c: i32) -> i32 {
 ///
 /// 邻居是**左(A) / 上(B) / 右上(C)**；片首行特殊：第一个宏块取 0，其余只取左邻
 /// （`if (s->first_slice_line && block<3)` 那一支）。
+/// V1/V2 的运动矢量：**H.263 那张表**、`f_code = 1`、加完预测后按 **±64 回绕**。
+///
+/// 与 V3 的 `decode_motion` **不是同一张表、也不是同一套回绕**：V3 有分片位、表也更大。
+/// 搬错的表现是「画面整体偏移几个像素」，而且只在 P 帧上现形。
+///
+/// `f_code = 1` 意味着 `shift = 0` —— 码字本身就是幅度，没有附加位；只有符号位。
+fn decode_motion_v12(r: &mut BitReader, vlc: &Vlc, pred: (i32, i32)) -> Result<(i32, i32)> {
+    let one = |r: &mut BitReader, pred: i32| -> Result<i32> {
+        let code = vlc.decode(r)? as i32;
+        if code == 0 {
+            return Ok(pred);
+        }
+        let sign = r.bit()? != 0;
+        let mut v = if sign { -code } else { code } + pred;
+        // ⚠️ 是**回绕**不是夹取：`val <= -64 → +64`、`val >= 64 → -64`。
+        // 写成 clamp 的话只有「预测值把 MV 推出范围」的那些宏块会错，很难看出来。
+        if v <= -64 {
+            v += 64;
+        } else if v >= 64 {
+            v -= 64;
+        }
+        Ok(v)
+    };
+    let x = one(r, pred.0)?;
+    let y = one(r, pred.1)?;
+    Ok((x, y))
+}
+
 pub(crate) fn pred_motion(
     g: &Grid<(i32, i32)>,
     mbx: usize,
