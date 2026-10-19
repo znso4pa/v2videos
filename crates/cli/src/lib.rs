@@ -636,8 +636,11 @@ fn convert_to_asf(
             Ok(())
         };
 
-        let mut workers = Vec::with_capacity(nthreads.saturating_sub(1));
-        for _ in 0..nthreads.saturating_sub(1) {
+        // ⚠️ worker 数 = `nthreads`（不是 `nthreads - 1`）：主线程在读循环期间要解码、
+        // 拿不到编码活，少起一个 worker 就等于少一个核。实测 `--threads 2` 因此只有
+        // 1.17× 加速（10.19 vs 11.88 s），改成 2 个 worker 后接近 2×。
+        let mut workers = Vec::with_capacity(nthreads);
+        for _ in 0..nthreads {
             let jrx = std::sync::Arc::clone(&jrx);
             let rtx = rtx.clone();
             workers.push(std::thread::spawn(move || work(&jrx, &rtx)));
@@ -1314,7 +1317,14 @@ fn convert_to_mp4(
     // ⚠️ **至少留一个 worker**：`threads == 1` 时 `nthreads - 1` 是 0，而 GOP 通道是
     // **有界**的（容量 `2 × nthreads`）—— 没有消费者时主线程喂到第 3 块就永久阻塞。
     // （`.wmv` 那条只在 `threads > 1` 时进，所以没这个坑；这条两条都要成立。）
-    let nworkers = nthreads.saturating_sub(1).max(1);
+    // ⚠️ **worker 数 = nthreads**（不是 nthreads-1）。
+    //
+    // 原来留一个核给主线程「最后下场编」，但主线程在**读循环期间**要解码、拿不到活 ——
+    // 实测 `--threads 2` 只跑 1 个编码线程（7.31 → 7.14 s，等于没加速）。改成按
+    // `nthreads` 起 worker 之后，2 线程才真的是 2 个编码线程。
+    // `nthreads == 1` 时仍至少留一个 worker —— 否则有界通道没人消费，读循环会死锁。
+    // 输出不受影响：`nthreads > 1` 时每个 GOP 本来就是全新编码器，worker 数不参与判决。
+    let nworkers = nthreads.max(1);
     let mut vworkers = Vec::with_capacity(nworkers);
     for _ in 0..nworkers {
         let vrx = std::sync::Arc::clone(&vrx);
