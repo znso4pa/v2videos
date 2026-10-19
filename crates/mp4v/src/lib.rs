@@ -31,10 +31,12 @@
 //! 前缀码容器 / 一张 RL 表能复用（见 `encode` 模块文档的对照表）。
 //! 所以这是一个独立 crate，而不是往 `msmpeg4` 里塞第二个编码器。
 
+mod decode;
 mod encode;
 mod header;
 pub mod tables;
 
+pub use decode::{Decoder, Vol};
 pub use encode::{Encoder, EncoderConfig};
 // 错误类型直接用 `msmpeg4` 的 —— 它本来就是「编解码器的通用错误」，
 // 而且 `mp4v` 已经依赖那个 crate 拿 DCT / 位写入器 / RL 表了。

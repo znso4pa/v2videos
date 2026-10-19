@@ -203,8 +203,24 @@ impl RlTable {
         self.run.len()
     }
 
-    /// 解一个 RL 符号。返回 `(run, level, last)`；`run` 的高位（bit7）带 `last`，
-    /// 打包方式见下。`level == 0` 表示解到了 escape。
+    /// 符号下标 → `(run, level, last)`。
+    ///
+    /// ⚠️ 这里的 `run` 是**表里的原值**（0 起），与 `decode_ac` 内部的约定不同 ——
+    /// 那边用的是 `run + 1`（1 起，因为 `i` 从 -1 开始）。给外面的解码器（`v2v-mp4v`）
+    /// 用时按需自己加 1。
+    pub fn symbol(&self, i: usize) -> (usize, i32, bool) {
+        (self.run[i] as usize, self.level[i] as i32, i >= self.last)
+    }
+
+    /// 表里有多少个真符号（escape 的下标就是它）。
+    pub fn len(&self) -> usize {
+        self.n()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.n() == 0
+    }
+
     /// 解一个 RL 符号。返回 `(run, level, last)`，其中 **`run` 已打包**：
     /// `run = table_run + 1`，且 `last` 时再 `+ 192`。
     /// `level` 对帧内（qmul=1/qadd=0）就是表里的值。`level == 0` 表示 escape。

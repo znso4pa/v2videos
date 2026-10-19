@@ -1316,7 +1316,7 @@ fn fastdiv(v: i32, scale: i32) -> i32 {
     ((v as i64 as u64).wrapping_mul(inv) >> 32) as u32 as i32
 }
 #[inline]
-pub(crate) fn dc_unscale(v: i32, scale: i32) -> i32 {
+pub fn dc_unscale(v: i32, scale: i32) -> i32 {
     if scale == 8 {
         // 常见档位走这条：C 的 `/`，**向零取整**。
         (v + 4) / 8

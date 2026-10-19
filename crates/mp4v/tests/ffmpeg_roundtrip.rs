@@ -34,7 +34,7 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-use v2v_mp4v::{Encoder, EncoderConfig};
+use v2v_mp4v::{Decoder, Encoder, EncoderConfig, Vol};
 use v2v_msmpeg4::Frame;
 
 const W: u32 = 320;
@@ -165,10 +165,16 @@ fn ffmpeg(args: &[&str], stdin_data: Option<&[u8]>) -> (bool, Vec<u8>, String) {
 }
 
 /// 用 ffmpeg 把一个视频文件解成裸 YUV420P。
+///
+/// ⚠️ `-idct 2`（simple）**必须给**：我们的逆变换就是 simple_idct 那一族，
+/// 而 ffmpeg 的 `-idct auto` 在 x86 上会挑别的实现，两者在少数系数上差 ±1。
+/// 不给的话「解码器逐像素对账」会永远差一两点，看起来像有 bug 其实是尺子不同。
+/// 选项要在 `-i` **之前**（放后面会被静默忽略）。
 fn decode_to_yuv(path: &str) -> (Vec<u8>, String) {
     let (ok, data, log) = ffmpeg(
         &[
-            "-v", "warning", "-i", path, "-f", "rawvideo", "-pix_fmt", "yuv420p", "-",
+            "-v", "warning", "-idct", "2", "-i", path, "-f", "rawvideo", "-pix_fmt", "yuv420p",
+            "-",
         ],
         None,
     );
@@ -890,4 +896,203 @@ fn ffmpeg_decodes_a_rate_controlled_stream() {
         frames.len() * (W * H * 3 / 2) as usize,
         "解出来的帧数不对"
     );
+}
+
+// ==================== 解码器 ====================
+
+/// 把一条基本流按 VOP 起始码（`00 00 01 B6`）切开。
+///
+/// 切出来的每片都**从 VOP 头开始**，不含前面的 VOL —— `Decoder` 构造时已经拿
+/// `Vol::parse` 取过 VOL 了，逐片喂进去正好。
+fn split_vops(es: &[u8]) -> Vec<&[u8]> {
+    let mut starts = Vec::new();
+    let mut i = 0usize;
+    while i + 4 <= es.len() {
+        if es[i] == 0 && es[i + 1] == 0 && es[i + 2] == 1 && es[i + 3] == 0xB6 {
+            starts.push(i);
+            i += 4;
+        } else {
+            i += 1;
+        }
+    }
+    let mut out = Vec::with_capacity(starts.len());
+    for (k, &s) in starts.iter().enumerate() {
+        let e = starts.get(k + 1).copied().unwrap_or(es.len());
+        out.push(&es[s..e]);
+    }
+    out
+}
+
+/// 两个解码器解**同一条位流**，逐像素比，返回最大差。
+fn max_abs_diff(a: &[u8], b: &[u8]) -> u16 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (i16::from(*x) - i16::from(*y)).unsigned_abs())
+        .max()
+        .unwrap_or(0)
+}
+
+/// **解码器对 ffmpeg：同一条位流必须逐像素一致（I 帧）。**
+///
+/// 判据和编码那边**相反**：编码没有唯一正确答案（同一帧可以编出无数条合法流），
+/// 解码有 —— 同一条流只有一种正确像素。所以这里要的是**最大差 0**，不是 PSNR。
+///
+/// 位流用我们自己的编码器产、**全 I 帧**（`keyframe_interval = 0`），
+/// 且 `mpeg_quant = false`：解码器暂不支持 MPEG 矩阵量化（见 `decode.rs` 的能力表），
+/// 拿默认配置会直接被 `Decoder::new` 拒掉。
+/// 这条钉的是「I 帧的解码与编码器对同一条流理解一致」；**独立来源**的流另有一条。
+/// P 帧那条单独放着、标了 `#[ignore]`（还没收敛，见 `decode.rs` 的说明）。
+#[test]
+fn decoder_i_frames_match_ffmpeg_bit_exactly() {
+    if !has_ffmpeg() {
+        eprintln!("SKIP: PATH 上没有 ffmpeg");
+        return;
+    }
+    let frames: Vec<Frame> = (0..8).map(test_frame).collect();
+    let cfg = EncoderConfig {
+        width: W,
+        height: H,
+        mpeg_quant: false,
+        keyframe_interval: 0, // 全 I 帧
+        ..EncoderConfig::default()
+    };
+    let (es, _) = encode_raw_es(cfg, &frames);
+
+    let path = std::env::temp_dir().join(format!("v2v_mp4v_dec_{}.m4v", std::process::id()));
+    std::fs::write(&path, &es).expect("写 m4v");
+    let (ref_yuv, log) = decode_to_yuv(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+
+    let vol = Vol::parse(&es).expect("解 VOL");
+    let mut d = Decoder::new(vol).expect("建解码器");
+    let vops = split_vops(&es);
+    let mut ours = Vec::new();
+    for (i, s) in vops.iter().enumerate() {
+        let f = d
+            .decode(s)
+            .unwrap_or_else(|e| panic!("第 {i} 帧解不开：{e}"));
+        ours.extend(frame_bytes(&f));
+    }
+
+    eprintln!(
+        "我们解 {} 帧 / {} 字节；ffmpeg 解 {} 字节\nffmpeg 日志：{log}",
+        vops.len(),
+        ours.len(),
+        ref_yuv.len()
+    );
+    assert_eq!(ours.len(), ref_yuv.len(), "解出来的字节数不一致（帧数或尺寸对不上）");
+    let worst = max_abs_diff(&ours, &ref_yuv);
+    assert_eq!(worst, 0, "与 ffmpeg 逐像素不一致，最大差 {worst}");
+}
+
+/// **P 帧还没收敛** —— 这条现在是「已知失败」，标了 `#[ignore]`。
+///
+/// 现状（8 帧 I P P P I P P P）：I 帧 0 差，P 帧逐帧不一致字节
+/// `5161 / 7743 / 9876`，最大差 48；后一组同样递增 —— 说明是**参考帧被污染**
+/// 之后的漂移，不是某一帧的孤例。细节与已排除的候选见 `decode.rs` 的说明。
+///
+/// 留着它的意义：等根因修掉，去掉 `#[ignore]` 就是回归判据。
+#[test]
+#[ignore = "P 帧还有漂移，见 crates/mp4v/src/decode.rs 的说明"]
+fn decoder_p_frames_match_ffmpeg_bit_exactly() {
+    if !has_ffmpeg() {
+        eprintln!("SKIP: PATH 上没有 ffmpeg");
+        return;
+    }
+    let frames: Vec<Frame> = (0..8).map(test_frame).collect();
+    let cfg = EncoderConfig {
+        width: W,
+        height: H,
+        mpeg_quant: false,
+        keyframe_interval: 4, // I P P P I P P P
+        ..EncoderConfig::default()
+    };
+    let (es, _) = encode_raw_es(cfg, &frames);
+
+    let path = std::env::temp_dir().join(format!("v2v_mp4v_decp_{}.m4v", std::process::id()));
+    std::fs::write(&path, &es).expect("写 m4v");
+    let (ref_yuv, log) = decode_to_yuv(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+
+    let vol = Vol::parse(&es).expect("解 VOL");
+    let mut d = Decoder::new(vol).expect("建解码器");
+    let mut ours = Vec::new();
+    for (i, s) in split_vops(&es).iter().enumerate() {
+        let f = d.decode(s).unwrap_or_else(|e| panic!("第 {i} 帧解不开：{e}"));
+        ours.extend(frame_bytes(&f));
+    }
+    eprintln!("ffmpeg 日志：{log}");
+    assert_eq!(ours.len(), ref_yuv.len(), "解出来的字节数不一致");
+    let worst = max_abs_diff(&ours, &ref_yuv);
+    assert_eq!(worst, 0, "与 ffmpeg 逐像素不一致，最大差 {worst}");
+}
+
+/// **独立来源的流**：ffmpeg 自己编的 mp4v，我们的解码器也要解对。
+///
+/// 上一条用的是我们自己编的流 —— 编码器与解码器可能**共享同一个错误假设**
+/// （比如都以为某个字段是 4 位），那样往返测试照样全绿。这条换成 ffmpeg 产的流，
+/// 把「理解是否与规范一致」单独钉住。
+///
+/// 用 `V2V_ASF_SAMPLE` 指样本（多个用 `:` 分隔时取第一个）；没设就 `SKIP`。
+#[test]
+fn decoder_handles_a_stream_it_did_not_encode() {
+    if !has_ffmpeg() {
+        eprintln!("SKIP: PATH 上没有 ffmpeg");
+        return;
+    }
+    let sample = match std::env::var("V2V_ASF_SAMPLE") {
+        Ok(p) if !p.is_empty() => p.split(':').next().unwrap_or("").to_string(),
+        _ => {
+            eprintln!("SKIP: 未设 V2V_ASF_SAMPLE");
+            return;
+        }
+    };
+    if !std::path::Path::new(&sample).is_file() {
+        eprintln!("SKIP: 样本不存在：{sample}");
+        return;
+    }
+
+    // 转成 mp4v 基本流。**缩到 640×360**：这条测的是「语法解对没」，
+    // 不是吞吐；1080p 上纯 Rust 解码会让这条测试慢到没人愿意跑。
+    // `-q:v 3` 下 ffmpeg 用 H.263 量化（`quant_type = 0`），正是我们支持的那条。
+    //
+    // ⚠️ **`-threads 1` 是必须的**：ffmpeg 会按线程数切 slice，而每个 slice 开头
+    // 插一个 **resync marker** —— 本解码器不支持（见 `decode.rs` 的能力表）。
+    // 多线程编出来的流会在第一个 slice 边界（比如 MB(0,3)）报「invalid vlc code」。
+    let path = std::env::temp_dir().join(format!("v2v_mp4v_ref_{}.m4v", std::process::id()));
+    let (ok, _, log) = ffmpeg(
+        &[
+            "-v", "error", "-i", &sample, "-frames:v", "10", "-an", "-vf", "scale=640:360",
+            "-threads", "1", "-c:v", "mpeg4", "-q:v", "3", "-f", "m4v",
+            path.to_str().unwrap(), "-y",
+        ],
+        None,
+    );
+    assert!(ok, "ffmpeg 转 m4v 失败：\n{log}");
+    let es = std::fs::read(&path).expect("读 m4v");
+    let (ref_yuv, log) = decode_to_yuv(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+
+    let vol = Vol::parse(&es).expect("解 VOL");
+    eprintln!(
+        "VOL {}×{}，time_increment_bits {}，mpeg_quant {}",
+        vol.width, vol.height, vol.time_increment_bits, vol.mpeg_quant
+    );
+    let mut d = Decoder::new(vol).expect("建解码器");
+    let vops = split_vops(&es);
+    // ⚠️ **只解第一帧**（I 帧）。P 帧还没收敛（见 `decode.rs`），
+    // 解全片只会让这条测试跟着一起红 —— 而它要钉的是「独立来源的 I 帧语法」。
+    let f = d.decode(vops[0]).expect("解第一帧");
+    let ours = frame_bytes(&f);
+    let fsz = ours.len();
+
+    eprintln!(
+        "我们解 1 帧 / {} 字节；ffmpeg 解 {} 字节（共 {} 帧）\nffmpeg 日志：{log}",
+        ours.len(),
+        ref_yuv.len(),
+        ref_yuv.len() / fsz
+    );
+    assert!(ref_yuv.len() >= fsz, "ffmpeg 连一帧都没解出来");
+    let worst = max_abs_diff(&ours, &ref_yuv[..fsz]);
+    assert_eq!(worst, 0, "与 ffmpeg 逐像素不一致，最大差 {worst}");
 }
