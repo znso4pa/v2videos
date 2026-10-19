@@ -42,7 +42,7 @@ pub use types::{
 };
 
 use std::collections::VecDeque;
-use std::io::Read;
+use std::io::{Read, Seek};
 
 use cursor::{Cursor, StreamReader};
 use types::PayloadExt;
@@ -77,6 +77,10 @@ pub struct AsfDemuxer<R: Read> {
     min_packet_size: u32,
     preroll_ms: u32,
     total_packets: u64,
+    /// 第 0 个数据包在文件里的绝对偏移（seek 用，见 `seek_to_packet`）。
+    data_start: u64,
+    /// 数据对象的结尾（读 Simple Index 用，见 `simple_index`）。
+    data_end: u64,
     packets_read: u64,
     queue: VecDeque<Sample>,
     done: bool,
@@ -112,6 +116,8 @@ impl<R: Read> AsfDemuxer<R> {
             min_packet_size: h.info.min_packet_size,
             preroll_ms: h.info.preroll_ms,
             total_packets: h.total_packets,
+            data_start: h.data_start,
+            data_end: h.data_end,
             info: h.info,
             streams: h.streams,
             states,
@@ -442,4 +448,106 @@ fn read_2bits(c: &mut Cursor, bits: u8) -> Result<Option<u32>> {
         1 => Some(c.u8()? as u32),
         _ => None,
     })
+}
+
+impl<R: Read + Seek> AsfDemuxer<R> {
+    /// 文件大小（seek 到尾拿一次；不缓存）。
+    fn file_end(&mut self) -> u64 {
+        self.reader.seek_from_end(0).unwrap_or(0)
+    }
+}
+
+/// Simple Index 解出来的东西：槽的时间粒度 + 每槽的起始包号。
+///
+/// 槽 `i` 的语义（与 muxer 写入时、ffmpeg 的 `asf_write_index` 一致）：
+/// **seek 到第 `i` 槽该从哪个包起读** —— 是「已见过的、不晚于它」的那个关键帧的包。
+#[derive(Debug, Clone)]
+pub struct SimpleIndex {
+    /// 每槽覆盖的时长（100 ns 单位；通常 = 1 秒）。
+    pub interval_100ns: u64,
+    /// 槽 → 起始包号。
+    pub packet_numbers: Vec<u32>,
+}
+
+/// 从一整段对象字节里解出索引。
+fn parse_simple_index(obj: &[u8]) -> Result<SimpleIndex> {
+    let mut c = Cursor::new(obj);
+    c.skip(24)?; // 对象头：GUID(16) + size(8)
+    let _file_id = c.take(16)?;
+    let interval = c.u64()?;
+    let _max_packet = c.u32()?;
+    let count = c.u32()?;
+    if obj.len() < 24 + 32 + 6 * count as usize {
+        return Err(Error::Bad("Simple Index 条目数与对象长度不符"));
+    }
+    let mut packet_numbers = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let n = c.u32()?;
+        let _count = c.u16()?;
+        packet_numbers.push(n);
+    }
+    Ok(SimpleIndex {
+        interval_100ns: interval,
+        packet_numbers,
+    })
+}
+
+impl<R: Read + Seek> AsfDemuxer<R> {
+    /// 跳到第 `index` 个数据包（0 起）。
+    ///
+    /// ⚠️ 解封装状态要一起重置：未拼完的碎片缓冲、队列、包计数 —— 否则 seek 之后
+    /// 读到的第一个样本会带着上一个位置残留下来的半截数据。
+    pub fn seek_to_packet(&mut self, index: u64) -> Result<()> {
+        let n = index.min(self.total_packets);
+        self.queue.clear();
+        for st in &mut self.states {
+            st.buf.clear();
+            st.frag_offset = 0;
+            st.timestamp_ms = 0;
+            st.key_frame = false;
+        }
+        self.packets_read = n;
+        self.done = false;
+        self.reader
+            .seek_to(self.data_start + n * self.packet_size as u64)
+    }
+
+    /// 读文件尾部的 Simple Index；没有就 `None`（那就没法 seek，调用方自己兜）。
+    ///
+    /// ⚠️ 只认「索引是**最后一个对象**」的布局 —— 我们的 muxer 与 ffmpeg 都是这么
+    /// 写的（实测两个真样本也都是：索引紧跟数据区、紧贴文件尾）。
+    /// 索引在别处的文件会返回 `None`，宁可少一个能力也不猜。
+    pub fn simple_index(&mut self) -> Result<Option<SimpleIndex>> {
+        // 从**数据对象的结尾**开始往后走对象 —— 索引在数据区之后，
+        // 但中间可能还隔着别的对象，而且它的**头在索引开头**（不在文件尾）。
+        //
+        // ⚠️ 文件大小要先拿（`seek_from_end(0)` 会把游标挪到文件尾，
+        // 放在循环里会把遍历位置毁掉 —— 实测踩过，症状是 UnexpectedEof）。
+        let end = self.file_end();
+        self.reader.seek_to(self.data_end)?;
+        loop {
+            let g = match self.reader.guid() {
+                Ok(g) => g,
+                Err(_) => return Ok(None), // 尾部不完整：当没有索引
+            };
+            let size = match self.reader.u64() {
+                Ok(v) => v,
+                Err(_) => return Ok(None),
+            };
+            if size < 24 || self.reader.pos().saturating_sub(24) + size > end {
+                return Ok(None);
+            }
+            if g == guid::SIMPLE_INDEX {
+                // 对象体 = size - 24 头，已经读进了 24，再读剩下的。
+                let body = size as usize - 24;
+                let mut obj = Vec::with_capacity(body);
+                obj.extend_from_slice(&guid::SIMPLE_INDEX);
+                obj.extend_from_slice(&size.to_le_bytes());
+                obj.extend_from_slice(&self.reader.vec(body)?);
+                return Ok(Some(parse_simple_index(&obj)?));
+            }
+            let payload = size as usize - 24;
+            self.reader.vec(payload)?;
+        }
+    }
 }

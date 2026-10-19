@@ -1,7 +1,7 @@
 //! 两个极小的读取器：一个读内存切片（`Cursor`），一个带位置计数的流读取器（`StreamReader`）。
 //! 刻意手写 —— 为的是「越界」返回一个能区分于 EOF 的错误，而不是静默给零。
 
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 
 use crate::error::{Error, Result};
 use crate::guid::Guid;
@@ -149,5 +149,26 @@ impl<R: Read> StreamReader<R> {
             }
         }
         Ok(filled)
+    }
+}
+
+/// 可 seek 的读法 —— **单独一个 impl 块**，`AsfDemuxer` 的主体仍然只要求 `Read`
+/// （顺序读不需要可 seek；要求一收紧，所有非 seek 的读法都被连带拒绝）。
+impl<R: Read + Seek> StreamReader<R> {
+    /// 跳到文件里的绝对位置。
+    pub fn seek_to(&mut self, pos: u64) -> Result<()> {
+        self.inner.seek(SeekFrom::Start(pos)).map_err(Error::Io)?;
+        self.pos = pos;
+        Ok(())
+    }
+
+    /// 从**文件尾**往前偏移 `off` 字节（负数），返回落点的绝对位置。
+    ///
+    /// ASF 的 Simple Index 在文件**最后**，而头解析时并不知道它有多大 ——
+    /// 只能从尾部倒着找。
+    pub fn seek_from_end(&mut self, off: i64) -> Result<u64> {
+        let p = self.inner.seek(SeekFrom::End(off)).map_err(Error::Io)?;
+        self.pos = p;
+        Ok(p)
     }
 }

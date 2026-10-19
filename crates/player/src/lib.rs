@@ -165,24 +165,45 @@ pub struct Player {
     video: VideoTrack,
     audio: Option<AudioTrack>,
     info: Info,
+    /// Simple Index（懒加载 + 缓存）。外层 `None` = 还没读过；
+    /// 内层 `None` = 文件里没有索引（那就不能 seek）。
+    index: Option<Option<v2v_asf::SimpleIndex>>,
 }
 
 /// 视频轨：解封装 + VC-1 解码。
 struct VideoTrack {
     demux: AsfDemuxer<BufReader<File>>,
     stream_num: u8,
+    /// 重建解码器要的序列头 —— seek 之后必须**从关键帧重解**，
+    /// 而重建是唯一干净的办法（解码器内部的网格 / 预测状态没法半途清零）。
+    seq: v2v_vc1::SeqHeader,
+    width: u32,
+    height: u32,
     decoder: v2v_vc1::Decoder,
     done: bool,
     position_ms: i64,
+    /// seek 已经解到关键帧、但还没交给调用方的那一帧。
+    pending_frame: Option<VideoFrame>,
+    /// seek 已经翻到、但还没解的那个**关键帧样本**。
+    ///
+    /// ⚠️ 槽指向的包**不一定正好是帧的起点**（帧可能跨包，前一包装着它的前半），
+    /// 所以 seek 后不能立刻开始解 —— 要先「只翻不解」，翻到下一个关键帧样本，
+    /// 再从这个干净的起点开始解。否则解到的是半截帧，症状是
+    /// 「vc1: pqindex 为 0」这种帧头错。
+    pending_sample: Option<v2v_container::Sample>,
 }
 
 /// 音频轨：解封装 + WMA 解码。
 struct AudioTrack {
     demux: AsfDemuxer<BufReader<File>>,
     stream_num: u8,
+    /// 重建解码器要的参数（seek 之后整个重建，见 `VideoTrack::seq` 的理由）。
+    params: v2v_wma::WmaParams,
     decoder: v2v_wma::WmaDecoder,
     channels: usize,
     sample_rate: u32,
+    /// PTS 基准：这一轨「样本 0」对应的毫秒。开头是 0，seek 之后 = 落点。
+    pts_base_ms: i64,
     /// 还要丢多少个**每声道样本**（WMA 编码器延迟）。
     skip_left: usize,
     /// 已经交出的每声道样本数（PTS 的基准）。
@@ -223,10 +244,15 @@ impl Player {
         let decoder = v2v_vc1::Decoder::new(seq, info.width, info.height)?;
         let video = VideoTrack {
             stream_num: vstream.number,
+            seq,
+            width: info.width,
+            height: info.height,
             decoder,
             demux: video_demux,
             done: false,
             position_ms: 0,
+            pending_frame: None,
+            pending_sample: None,
         };
 
         // ---- 音频轨（有才建；各开一个解封装实例）----
@@ -258,10 +284,12 @@ impl Player {
             let decoder = v2v_wma::WmaDecoder::new(params.clone())?;
             Some(AudioTrack {
                 stream_num: num,
+                params: params.clone(),
                 decoder,
                 demux,
                 channels: af.channels as usize,
                 sample_rate: af.sample_rate,
+                pts_base_ms: 0,
                 skip_left: params.frame_len * 2,
                 emitted: 0,
                 done: false,
@@ -271,7 +299,12 @@ impl Player {
             None
         };
 
-        Ok(Player { video, audio, info })
+        Ok(Player {
+            video,
+            audio,
+            info,
+            index: None,
+        })
     }
 
     /// 静态信息。
@@ -296,35 +329,129 @@ impl Player {
     pub fn position_ms(&self) -> i64 {
         self.video.position_ms
     }
+
+    /// seek 到 `ms`（毫秒）。返回**实际落点**（关键帧的时间戳）。
+    ///
+    /// ## 做法
+    ///
+    /// 1. 读 Simple Index：槽 `i` = 「第 `i` 槽该从哪个**关键帧**包起读」
+    ///    （muxer 写入时、ffmpeg 的 `asf_write_index` 都是这个语义）；
+    /// 2. 取 `ms / interval` 那个槽 → 包号 → `seek_to_packet`（包是定长的，偏移可算）；
+    /// 3. 视频解码器**整个重建**（内部的网格 / 预测状态没法半途清零），
+    ///    然后向前解、**丢弃关键帧之前**的帧，把关键帧留在 `pending` 里
+    ///    —— 下一次 `next_video` 交出的就是它；
+    /// 4. 音频从同一个包起重解，PTS 基准挪到落点。
+    ///
+    /// ## 落点为什么可能不是 `ms`
+    ///
+    /// 索引按秒给槽，槽里是**不晚于它**的关键帧 —— 所以落点 ≤ `ms`，
+    /// 最多差一个 GOP。宿主拿 `actual_ms` 去对时间轴（原版语义 `SeekToFrame(f)`
+    /// 里 `f` 就是毫秒，返回值正好对应 `CurrentIndex`）。
+    pub fn seek_ms(&mut self, ms: u64) -> Result<i64> {
+        let index = match self.index.clone() {
+            Some(i) => i,
+            None => {
+                let i = self.video.demux.simple_index()?;
+                self.index = Some(i.clone());
+                i
+            }
+        };
+        let Some(index) = index else {
+            return Err(Error::Unsupported(
+                "这个文件没有 Simple Index（或不在文件尾），不支持 seek".into(),
+            ));
+        };
+        if index.packet_numbers.is_empty() {
+            return Err(Error::Bad("Simple Index 里一个槽都没有".into()));
+        }
+        let interval_ms = (index.interval_100ns / 10_000).max(1);
+        let slot = ((ms / interval_ms) as usize).min(index.packet_numbers.len() - 1);
+        let packet = u64::from(index.packet_numbers[slot]);
+
+        // 视频先跳：`seek_to_packet` 把游标停在一个**关键帧**样本上 —— 它只是入口，
+        // GOP 里的参考链要从它开始建。
+        self.video.seek_to_packet(packet)?;
+        let mut cur = self
+            .video
+            .next()?
+            .ok_or_else(|| Error::Bad(format!("seek 到包 {packet} 之后没有关键帧")))?;
+        // 需求（§3.2）要的是「关键帧回退 + **前向解码到目标时间**」——
+        // 所以从关键帧继续解，直到第一帧 ≥ 目标，把它留给调用方。
+        // 不这么做的话画面会停在最多一个 GOP 之前（这个样本的 GOP ≈ 4.4 s）。
+        while cur.pts_ms < ms as i64 {
+            match self.video.next()? {
+                Some(f) => cur = f,
+                None => break,
+            }
+        }
+        let actual = cur.pts_ms;
+        // 塞回去 —— 下一次 next_video 交的就是它。
+        self.video.pending_frame = Some(cur);
+        // 音频从同一个包起重解，PTS 基准 = 落点。
+        if let Some(a) = self.audio.as_mut() {
+            a.seek_to_packet(packet, actual)?;
+        }
+        Ok(actual)
+    }
 }
 
 impl VideoTrack {
     fn next(&mut self) -> Result<Option<VideoFrame>> {
-        if self.done {
-            return Ok(None);
+        // seek 已经解到关键帧：先把它交出去，再继续往后解。
+        if let Some(f) = self.pending_frame.take() {
+            self.position_ms = f.pts_ms;
+            return Ok(Some(f));
         }
+        let Some(s) = self.next_sample()? else {
+            self.done = true;
+            return Ok(None);
+        };
+        self.decoder.decode_frame(&s.data)?;
+        let f = self.decoder.frame();
+        let out = VideoFrame {
+            pts_ms: s.timestamp_ms,
+            key_frame: s.key_frame,
+            width: f.width,
+            height: f.height,
+            y: f.y.clone(),
+            u: f.u.clone(),
+            v: f.v.clone(),
+        };
+        self.position_ms = out.pts_ms;
+        Ok(Some(out))
+    }
+
+    /// 本轨的下一个样本（跳过别的轨、先交 seek 时翻到的那个）。
+    fn next_sample(&mut self) -> Result<Option<v2v_container::Sample>> {
+        loop {
+            if let Some(s) = self.pending_sample.take() {
+                return Ok(Some(s));
+            }
+            match self.demux.next_sample().map_err(Error::from)? {
+                None => return Ok(None),
+                Some(s) if s.stream != self.stream_num => continue,
+                Some(s) => return Ok(Some(s)),
+            }
+        }
+    }
+}
+
+impl VideoTrack {
+    /// 跳到某个包，解码器整个重建，再「只翻不解」到下一个关键帧样本。
+    fn seek_to_packet(&mut self, packet: u64) -> Result<()> {
+        self.demux.seek_to_packet(packet).map_err(Error::from)?;
+        self.decoder = v2v_vc1::Decoder::new(self.seq, self.width, self.height)?;
+        self.done = false;
+        self.pending_frame = None;
+        self.pending_sample = None;
         loop {
             match self.demux.next_sample().map_err(Error::from)? {
-                None => {
-                    self.done = true;
-                    return Ok(None);
-                }
-                // 别的轨的载荷直接跳过（本轨用自己的解封装实例，只等自己这条）。
+                None => return Err(Error::Bad("seek 之后没有关键帧".into())),
                 Some(s) if s.stream != self.stream_num => continue,
+                Some(s) if !s.key_frame => continue, // 只翻不解
                 Some(s) => {
-                    self.decoder.decode_frame(&s.data)?;
-                    let f = self.decoder.frame();
-                    let out = VideoFrame {
-                        pts_ms: s.timestamp_ms,
-                        key_frame: s.key_frame,
-                        width: f.width,
-                        height: f.height,
-                        y: f.y.clone(),
-                        u: f.u.clone(),
-                        v: f.v.clone(),
-                    };
-                    self.position_ms = out.pts_ms;
-                    return Ok(Some(out));
+                    self.pending_sample = Some(s);
+                    return Ok(());
                 }
             }
         }
@@ -349,8 +476,8 @@ impl AudioTrack {
                 if kept == 0 {
                     continue;
                 }
-                let pts =
-                    (self.emitted as f64 * 1000.0 / self.sample_rate as f64).round() as i64;
+                let pts = self.pts_base_ms
+                    + (self.emitted as f64 * 1000.0 / self.sample_rate as f64).round() as i64;
                 self.emitted += kept as u64;
                 return Ok(Some(AudioFrame {
                     pts_ms: pts,
@@ -378,6 +505,19 @@ impl AudioTrack {
                 }
             }
         }
+    }
+
+    /// 跳到某个包，解码器整个重建；PTS 基准挪到 `base_ms`。
+    fn seek_to_packet(&mut self, packet: u64, base_ms: i64) -> Result<()> {
+        self.demux.seek_to_packet(packet).map_err(Error::from)?;
+        self.decoder = v2v_wma::WmaDecoder::new(self.params.clone())?;
+        self.emitted = 0;
+        self.pts_base_ms = base_ms;
+        // 编码器延迟的静音只在**流的开头**：seek 到 0 要丢，seek 到别处不丢。
+        self.skip_left = if base_ms == 0 { self.params.frame_len * 2 } else { 0 };
+        self.done = false;
+        self.pending.clear();
+        Ok(())
     }
 }
 

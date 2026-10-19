@@ -36,6 +36,16 @@ pub(crate) struct Header {
     pub payload_exts: Vec<Vec<PayloadExt>>,
     /// Data Object 的包数（`u64::MAX` = 未知）。
     pub total_packets: u64,
+    /// **第 0 个数据包在文件里的绝对偏移**。
+    ///
+    /// seek 要用：`第 n 包的位置 = data_start + n × packet_size`（包是定长的）。
+    /// 头解析读完 Data Object 的 26 字节头之后，读游标正好停在这里。
+    pub data_start: u64,
+    /// **数据对象的结尾**（= 它后面第一个对象的起点）。
+    ///
+    /// Simple Index 在数据对象**之后**，但中间可能还隔着别的对象（实测 sample 就有
+    /// 两个），所以只能从这里开始往后走对象找索引 —— 不能假设它在文件尾。
+    pub data_end: u64,
 }
 
 pub(crate) fn parse<R: Read>(r: &mut StreamReader<R>) -> Result<Header> {
@@ -53,15 +63,21 @@ pub(crate) fn parse<R: Read>(r: &mut StreamReader<R>) -> Result<Header> {
     let mut payload_exts: Vec<Vec<PayloadExt>> = vec![Vec::new(); 128];
 
     // 主循环一直读到 Data Object 为止 —— 它的包数就是数据区的样本包数。
+    let data_start;
+    let data_end;
     let total_packets: u64 = loop {
         let g = r.guid()?;
         let size = r.u64()?;
 
         if g == guid::DATA {
             // Data Object: File ID(16) + Total Data Packets(8) + Reserved(2)，然后才是数据包。
+            let obj_start = r.pos() - 24; // GUID(16) + size(8) 刚读过
             let _file_id = r.guid()?;
             let packets = r.u64()?;
             let _reserved = r.u16()?;
+            data_start = r.pos();
+            // 对象的 size 字段是**含对象头**的总长 —— 所以结尾 = 起点 + size。
+            data_end = obj_start + size;
             break packets;
         }
 
@@ -100,6 +116,8 @@ pub(crate) fn parse<R: Read>(r: &mut StreamReader<R>) -> Result<Header> {
         streams,
         payload_exts,
         total_packets,
+        data_start,
+        data_end,
     })
 }
 
