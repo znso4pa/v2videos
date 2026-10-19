@@ -212,8 +212,17 @@ pub struct ConvertOptions {
     pub ms_stereo: bool,
     /// **编码时用几个线程**（默认 **1** = 不并行）。
     ///
-    /// 现在只有 AAC 的**声道并行**吃这个值（双声道 → 两个声道各一个线程，
-    /// 总工作量不变、输出逐字节相同），线程数会被封顶到声道数。
+    /// `> 1` 时两条输出路都走 **GOP 并行编码**：视频按 GOP 切块、各起一个编码器。
+    /// `.wmv` 的产物仍与 1 线程**逐字节相同**；`.mp4` 不相同（GOP 边界重置运动估计
+    /// 与码控，差几个字节到几十 KB），质量基本不变。
+    ///
+    /// **并行解码**只对 `.mp4` + **WMV3 输入**开：每条 GOP 一条全新解码器、从 I 帧独立解
+    /// （前提「从 I 帧起解 == 整条链」由 `v2v-vc1` 的 `gop_start` 测试钉着）。
+    /// MP43 也验证过等价（`v2v-msmpeg4` 的 `gop_start`），但**开着更慢**（解码只有 VC-1 的
+    /// 1/3 工作量，串行解码本来就与编码 worker 重叠），所以没开；WMV1/WMV2 的跨帧状态
+    /// （WMV2 的 `IntraX8.prediction_table`）会让新解码器解出不同像素，更不开。
+    /// 并行度的上限是 **GOP 数** —— 短视频或默认大 GOP 下 GOP 数 < 线程数，加速就封顶；
+    /// 想要更多并行就把 `-g` 调小或喂长视频。AAC 仍按声道并行（双声道 → 2；封顶到声道数）。
     /// 默认 1：CLI 不替用户猜「这台机器现在还有多少算力」—— 要快就显式给 `--threads 2`。
     pub threads: usize,
     /// `.mp4` 的**视频**目标码率（bit/s）。`None` = 按固定的 `qscale` 编（默认）。
@@ -1243,7 +1252,18 @@ fn convert_to_mp4(
     // 解码池与编码池**分核**。实测 1080p 上「解码 : 编码」约 **1 : 3**
     // （每帧解码 ~10 ms、mp4v 编码 ~30 ms），所以解码拿 1/4 的核才均衡 ——
     // 给多了反而把编码饿死（实测 6 解 / 2 编比 2 解 / 6 编慢一倍多）。
-    let par_decode = opts.threads > 1 && track.fourcc == WMV3 && gop_len > 1;
+    // 并行解码的前提是「从任意 I 帧起解 == 整条链解到那里」，逐个编码器验证过：
+    // - **WMV3（VC-1）**：`crates/vc1/tests/gop_start.rs`（真样本 278 个关键帧全查，0 差）→ **开**。
+    // - **MP43**：`crates/msmpeg4/tests/gop_start.rs`（自编 6 条 GOP 全查，0 差）→ **也正确，
+    //   但不开**：实测开了更慢（300 帧 8 线程：串行解码 2.09/2.24 s，池 2.58/2.93 s，
+    //   产物 md5 相同）。原因是 MP43 的解码只有 VC-1 的 1/3 工作量 —— 串行解码本来就
+    //   在**主线程**上与编码 worker 重叠着跑，再抽核出来反而把编码饿死。
+    //   要开就把它加进下面这行（代码路径是通的，`DecKind::Mp43` 就是它）。
+    // - **WMV1 / WMV2**：WMV2 挂着 `IntraX8.prediction_table`（上游只在初始化清一次、
+    //   **跨帧累积**），新解码器是全零表，j_type 流会解出不同像素；WMV1 的 `bit_rate`
+    //   有可能不在 I 帧上出现（`br == 0` 时延续旧值）—— 两者都没有可验证的流，串行。
+    let dec_can_parallel = track.fourcc == WMV3;
+    let par_decode = opts.threads > 1 && dec_can_parallel && gop_len > 1;
     let n_dec = if par_decode { (opts.threads / 4).max(1) } else { 0 };
     let nthreads = if par_decode {
         opts.threads.saturating_sub(n_dec).max(1)
@@ -1324,12 +1344,19 @@ fn convert_to_mp4(
     let mut dec_workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
     let mut collector: Option<std::thread::JoinHandle<std::result::Result<(), String>>> = None;
     if par_decode {
-        let seq = v2v_vc1::SeqHeader::parse(&track.extra)
-            .map_err(|e| Error::Unsupported(format!("VC-1 序列头解析失败：{e}")))?;
+        #[derive(Clone)]
+        enum DecKind {
+            Vc1,
+            Mp43,
+        }
+        let kind = if track.fourcc == WMV3 { DecKind::Vc1 } else { DecKind::Mp43 };
+        let extra = track.extra.clone();
         // 每个 worker 一条**专用**结果通道：派活与取活都是轮转，收端按同样的轮转顺序
         // 取就天然保持了全局顺序 —— 不需要重排缓冲。
         let mut res_rxs = Vec::new();
         for _ in 0..n_dec {
+            let kind = kind.clone();
+            let extra = extra.clone();
             let (jtx, jrx) = std::sync::mpsc::sync_channel::<Vec<(usize, Vec<u8>, u32)>>(2);
             let (rtx, rrx) =
                 std::sync::mpsc::sync_channel::<std::result::Result<Vec<(usize, Frame, u32)>, String>>(2);
@@ -1339,22 +1366,46 @@ fn convert_to_mp4(
                 while let Ok(gop) = jrx.recv() {
                     let r = (|| -> std::result::Result<Vec<(usize, Frame, u32)>, String> {
                         // 每条 GOP 一条**全新的**解码器（前提就是它和串行链等价）。
-                        let mut d = v2v_vc1::Decoder::new(seq, w, h).map_err(|e| e.to_string())?;
                         let mut out = Vec::with_capacity(gop.len());
-                        for (idx, data, dur) in gop {
-                            d.decode_frame(&data).map_err(|e| e.to_string())?;
-                            let f = d.frame();
-                            out.push((
-                                idx,
-                                Frame {
-                                    width: f.width,
-                                    height: f.height,
-                                    y: f.y,
-                                    u: f.u,
-                                    v: f.v,
-                                },
-                                dur,
-                            ));
+                        match kind {
+                            DecKind::Vc1 => {
+                                let seq = v2v_vc1::SeqHeader::parse(&extra)
+                                    .map_err(|e| e.to_string())?;
+                                let mut d =
+                                    v2v_vc1::Decoder::new(seq, w, h).map_err(|e| e.to_string())?;
+                                for (idx, data, dur) in gop {
+                                    d.decode_frame(&data).map_err(|e| e.to_string())?;
+                                    let f = d.frame();
+                                    out.push((
+                                        idx,
+                                        Frame {
+                                            width: f.width,
+                                            height: f.height,
+                                            y: f.y,
+                                            u: f.u,
+                                            v: f.v,
+                                        },
+                                        dur,
+                                    ));
+                                }
+                            }
+                            DecKind::Mp43 => {
+                                let mut d = Decoder::with_version(Version::V3);
+                                for (idx, data, dur) in gop {
+                                    let f = d.decode(&data, w, h).map_err(|e| e.to_string())?;
+                                    out.push((
+                                        idx,
+                                        Frame {
+                                            width: f.width,
+                                            height: f.height,
+                                            y: f.y,
+                                            u: f.u,
+                                            v: f.v,
+                                        },
+                                        dur,
+                                    ));
+                                }
+                            }
                         }
                         Ok(out)
                     })();
