@@ -23,6 +23,16 @@ pub mod idct;
 mod loopfilter;
 mod mb;
 mod mc;
+/// MC 插值的 NEON 内核（仅 aarch64；与标量逐位一致，见 tests/mc_neon.rs）。
+#[cfg(target_arch = "aarch64")]
+#[doc(hidden)]
+pub mod neon;
+
+/// 测试专用出口（不进公共 API 语义）：`tests/mc_neon.rs` 拿 NEON 内核与缓冲常数。
+#[cfg(target_arch = "aarch64")]
+pub mod test_support {
+    pub use crate::mc::BUF_STRIDE;
+}
 mod mv;
 pub mod tables;
 

@@ -27,7 +27,8 @@ use crate::decoder::Ctx;
 /// 清零一次的栈数组，而 MC 每个宏块至少进一次（4MV 是四次）。24 是「够用且最小」那一档：
 /// mspel 时 `base = BUF_STRIDE + 1`、`k = 19`，最远读到 `(1+19)*BUF_STRIDE + 19 = 499 < 576`。
 const BUF: usize = 24;
-const BUF_STRIDE: usize = BUF;
+#[doc(hidden)]
+pub const BUF_STRIDE: usize = BUF;
 
 /// `vc1_mspel_filter()`：单向插值（`stride` 是跨过边缘的方向）。
 fn mspel_filter(src: &[u8], off: isize, stride: isize, mode: u32, r: i32) -> i32 {
@@ -77,9 +78,12 @@ fn mspel_mc<const W: usize>(
             // （走的是 `mspel_filter16`，那个 `match mode` 在函数里）。
             for j in 0..w {
                 // `src -= 1`：竖直那一趟整体左移一列（与上游一致）。
-                let row0 = b + (j as isize - 1) * BUF_STRIDE as isize - 1;
+                let row0 = (b + (j as isize - 1) * BUF_STRIDE as isize - 1) as usize;
+                #[cfg(target_arch = "aarch64")]
+                crate::neon::vertical_pass(src, row0, w + 3, vmode, shift, r, &mut tmp[j * (w + 3)..]);
+                #[cfg(not(target_arch = "aarch64"))]
                 for i in 0..(w + 3) {
-                    let o = (row0 + i as isize) as usize;
+                    let o = row0 + i;
                     let (a, bb, c, d) = (
                         src[o] as i32,
                         src[o + BUF_STRIDE] as i32,
@@ -98,6 +102,9 @@ fn mspel_mc<const W: usize>(
             for j in 0..w {
                 let t = j * (w + 3) + 1;
                 let drow = (dy + j) * dstride + dx;
+                #[cfg(target_arch = "aarch64")]
+                crate::neon::horizontal_pass(tmp, t, w, hmode, r2, dst, drow);
+                #[cfg(not(target_arch = "aarch64"))]
                 for i in 0..w {
                     // ⚠️ 水平这一趟的系数**按 `hmode` 选**（1/4 位移那组系数只在
                     // `hmode == 1` 时才对）—— 写死成一组，平坦区就会整体偏亮/偏暗。
@@ -119,20 +126,32 @@ fn mspel_mc<const W: usize>(
         } else {
             let r = 1 - rnd;
             for j in 0..w {
+                let row0 = (b + (j * BUF_STRIDE) as isize) as usize;
+                let drow = (dy + j) * dstride + dx;
+                #[cfg(target_arch = "aarch64")]
+                crate::neon::single_vertical(src, row0, w, vmode, r, dst, drow);
+                #[cfg(not(target_arch = "aarch64"))]
                 for i in 0..w {
                     let off = b + (j * BUF_STRIDE + i) as isize;
                     let v = mspel_filter(src, off, BUF_STRIDE as isize, vmode, r);
-                    dst[(dy + j) * dstride + dx + i] = v.clamp(0, 255) as u8;
+                    dst[drow + i] = v.clamp(0, 255) as u8;
                 }
             }
         }
     } else {
         // 只有水平（含 hmode == 0 的整像素拷贝）。
         for j in 0..w {
+            let row = (b + (j * BUF_STRIDE) as isize) as usize;
+            let drow = (dy + j) * dstride + dx;
+            #[cfg(target_arch = "aarch64")]
+            if hmode != 0 {
+                crate::neon::single_horizontal(src, row, w, hmode, rnd, dst, drow);
+                continue;
+            }
             for i in 0..w {
                 let off = b + (j * BUF_STRIDE + i) as isize;
                 let v = mspel_filter(src, off, 1, hmode, rnd);
-                dst[(dy + j) * dstride + dx + i] = v.clamp(0, 255) as u8;
+                dst[drow + i] = v.clamp(0, 255) as u8;
             }
         }
     }
@@ -161,6 +180,7 @@ fn hpel_mc(
     let r2 = if rnd { 0 } else { 1 };
     let r4 = if rnd { 1 } else { 2 };
     let avg2 = |a: i32, b: i32| (a + b + r2) >> 1;
+    #[cfg_attr(target_arch = "aarch64", allow(unused_variables))]
     let avg4 = |a: i32, b: i32, c: i32, d: i32| (a + b + c + d + r4) >> 2;
     // `(hm, vm)` 是**循环不变量**，四条路各自一个紧循环 —— 写在最内层等于每个像素
     // 再分一次支；顺手把目的行的起点也算到行首（省掉每像素一次乘法）。
@@ -176,6 +196,9 @@ fn hpel_mc(
             for j in 0..w {
                 let s = base + j * BUF_STRIDE;
                 let d = (dy + j) * dstride + dx;
+                #[cfg(target_arch = "aarch64")]
+                crate::neon::hpel_avg2_row(src, s, dst, d, w, !rnd);
+                #[cfg(not(target_arch = "aarch64"))]
                 for i in 0..w {
                     dst[d + i] = avg2(src[s + i] as i32, src[s + i + 1] as i32) as u8;
                 }
@@ -185,6 +208,8 @@ fn hpel_mc(
             for j in 0..w {
                 let s = base + j * BUF_STRIDE;
                 let d = (dy + j) * dstride + dx;
+                // 竖直方向的邻居跨行 —— 行拷到本地再走同一套横向内核最省事；
+                // 但逐像素标量保留（这条在采样里占比小）。
                 for i in 0..w {
                     dst[d + i] = avg2(src[s + i] as i32, src[s + i + BUF_STRIDE] as i32) as u8;
                 }
@@ -194,6 +219,9 @@ fn hpel_mc(
             for j in 0..w {
                 let s = base + j * BUF_STRIDE;
                 let d = (dy + j) * dstride + dx;
+                #[cfg(target_arch = "aarch64")]
+                crate::neon::hpel_avg4_row(src, s, dst, d, w, r4 as u32);
+                #[cfg(not(target_arch = "aarch64"))]
                 for i in 0..w {
                     dst[d + i] = avg4(
                         src[s + i] as i32,
@@ -225,6 +253,11 @@ fn chroma_mc(
     let c = (8 - x) * y;
     let d = x * y;
     let bias = if rnd { 32 - 4 } else { 32 };
+    #[cfg(target_arch = "aarch64")]
+    {
+        crate::neon::chroma_mc8(dst, dstride, dx, dy, src, base, a, b, c, d, bias as u32);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     for j in 0..8usize {
         for i in 0..8usize {
             let o = base + j * BUF_STRIDE + i;
