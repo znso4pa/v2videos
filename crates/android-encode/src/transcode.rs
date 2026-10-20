@@ -3,8 +3,9 @@
 //!
 //! 后端按编译目标选：
 //! - **macOS**：VideoToolbox（`c/vt_encoder.c`，产长度前缀 NALU + avcC，
-//!   走 `v2v_mp4::VideoCodec::Avc1`）。**GOP 并行解码**（VC-1 从任意 I 帧起解
-//!   与整链解到那里逐像素一致，gop_start.rs 验过）+ 音频独立线程；
+//!   走 `v2v_mp4::VideoCodec::Avc1`）。**GOP 并行**：每个 worker 解完一段就地
+//!   编一段，通道里只传压缩样本（VC-1 从任意 I 帧起解与整链解到那里逐像素一致，
+//!   gop_start.rs 验过）+ 音频独立线程；
 //! - **Android**：MediaCodec（`c/media_encoder.c`，自带 MediaMuxer），顺序版；
 //! - 其它：`Unsupported`。
 //!
@@ -244,137 +245,212 @@ pub fn wmv_to_mp4_hw(
                 _ => 30,
             };
 
-            // ---- 有序提交的并行解码：worker 并行解，主线程按序喂 VT ----
+            // ---- 把源 GOP 合并成更大的「编码块」----
             //
-            // ⚠️ **提交顺序 = 帧间参考的顺序**（reordering 已关）。worker 解完的帧
-            // 不能乱序喂 —— 实测乱序提交让 P 帧参考错帧，产物 71 → 239 MB。
-            // 所以 worker 只负责**解码**，帧进 `ready`（按序号），主线程按
-            // `next_submit` 顺序取出来喂硬件。in-flight 上限兜住内存
-            // （解码后的帧 1.38 MB/帧，32 帧 ≈ 44 MB）。
-            let mut enc = VideoToolboxEncoder::open(vw, vh, video_bitrate, fps, 4)?;
-
-            struct Pipe {
-                /// seq → (解好的帧, pts_ms)。
-                ready: std::collections::BTreeMap<u64, (v2v_vc1::Frame, i64)>,
-                /// 主线程已消费到哪（滑动窗口的左沿）。
-                next_submit: u64,
-                gops: std::collections::VecDeque<Vec<(Vec<u8>, i64, u64)>>,
+            // GOP 并行要求**每块第一帧是 IDR**（相邻块可能是不同 worker 编的，
+            // 不能跨块参考）。源 GOP 常常只有半秒多 —— 逐 GOP 编就是每秒 1.5~2 个
+            // IDR，同码率下 P 帧的位被 IDR 挤掉（实测 720p 203 个关键帧、1080p 291 个；
+            // 旧版单会话只有 35 / 32 个，差的那 0.2~0.3 dB 就在这里）。
+            //
+            // 合并到 ~3 s 一块：块数仍远多于 worker（并行度不降），IDR 少掉四分之三；
+            // 顺带把「每块一次 VT 会话创建」的次数也砍到四分之一。
+            //
+            // 块边界仍落在源 I 帧上（只在 GOP 之间切），所以「从块首起解 == 整链解到
+            // 那里」这条前提不变。
+            // 块长（秒）。`V2V_HW_CHUNK_SECS` 只用来量「块长 ↔ 并行度/IDR 数」的
+            // 曲线：实测 2 s 会话太多、10 s 并行度不够，3 s 最好；正常别设。
+            let chunk_secs: usize = std::env::var("V2V_HW_CHUNK_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(3);
+            let target_frames = (fps as usize * chunk_secs).max(1);
+            let mut chunks: Vec<Vec<(Vec<u8>, i64, u64)>> = Vec::new();
+            let mut cur: Vec<(Vec<u8>, i64, u64)> = Vec::new();
+            for g in gops {
+                if !cur.is_empty() && cur.len() + g.len() > target_frames {
+                    chunks.push(std::mem::take(&mut cur));
+                }
+                cur.extend(g);
             }
-            // 窗口要装得下**一个完整 GOP**：worker 是整段整段解的，解到一半被窗口
-            // 卡住就退化成「解 32 帧 → 等编码 → 再解 32 帧」，解码与编码根本不重叠。
+            if !cur.is_empty() {
+                chunks.push(cur);
+            }
+            if profile {
+                eprintln!(
+                    "[probe] 合并成 {} 块（目标 {} 帧/块，最大 {} 帧）",
+                    chunks.len(),
+                    target_frames,
+                    chunks.iter().map(|c| c.len()).max().unwrap_or(0)
+                );
+            }
+
+            // ---- 每个 worker 自带硬件编码会话：解完一段就地编一段 ----
             //
-            // 实测（1080p、3719 帧、8 Mbps）：32 帧 47 s / 64 帧 38 s / 128 帧 32 s
-            // —— 源 GOP ≈ 116 帧，128 刚好能整段放下。产物只差 1 个字节（VT 的首帧
-            // 头字段），体积与 PSNR 完全一致。
+            // 为什么**编码也下放**：解码后的 YUV 很大（1080p 一帧 3.1 MB），按「解好的
+            // 帧」做背压，内存随并行度线性涨 —— 4 个 worker 就要 1.4 GB，实测直接被
+            // 系统杀掉（6 个 worker 只剩 2 个能跑，并行度名存实亡）。而**编完的样本**
+            // 只有 ~0.5 KB/帧：编码下放后 worker 之间只传压缩样本，内存从 GB 级掉到
+            // MB 级，6 个 worker 才真正同时跑起来（1080p 47 → 32 → 26 s，见 TODO）。
             //
-            // 上限 128 兜内存：一帧 1080p 约 3.1 MB，128 帧 ≈ 400 MB。
-            let max_gop = gops.iter().map(|g| g.len()).max().unwrap_or(32);
-            // 再加一条**内存预算**：窗口里每一帧都是解好的 YUV（1080p ≈ 3.1 MB）。
-            // 桌面 384 MB、Android 160 MB —— 手机上 1080p 只给到 ~50 帧，
-            // 换来的并行度会低一些，但不至于把整机内存吃掉。
-            let budget: usize = if cfg!(target_os = "macos") {
-                384 << 20
-            } else {
-                160 << 20
-            };
-            let frame_bytes = (vw as usize) * (vh as usize) * 3 / 2;
-            let by_mem = (budget / frame_bytes.max(1)).max(32);
-            let cap = max_gop.clamp(32, 128).min(by_mem);
+            // **每个 GOP 一个新会话**，两个理由：
+            // ① GOP 首帧强制 IDR —— 段与段之间独立，样本按序拼接即可，不用跨段猜
+            //    「这个样本属于哪一帧」；
+            // ② 会话 `finish()` 会把在途样本全部吐出，段的边界就是确定的。
+            // 代价：码控没有跨段历史，码率分布略毛糙（实测体积/PSNR 几乎不变）。
+            //
+            // 顺序保证：worker 把样本挂在该段**首帧的 seq** 上，主线程按 seq 顺序取段
+            // 封装 —— 提交顺序 = 帧间参考的顺序（乱序提交会让 P 帧参考错帧，
+            // 产物 71 → 239 MB，踩过）。
+            struct Pipe {
+                /// 块首帧 seq → 该块的压缩样本（已按 pts 序）。
+                ready: std::collections::BTreeMap<u64, Vec<crate::vt::VtSample>>,
+                chunks: std::collections::VecDeque<Vec<(Vec<u8>, i64, u64)>>,
+                /// 第一个交出 avcC 的会话（所有会话配置相同，任取一份）。
+                avcc: Option<Vec<u8>>,
+                /// 任一 worker 失败的原因。主线程只在「等某一段」上阻塞 ——
+                /// 没有这条通道的话，worker 一死那一段就永远不来，**挂死而不是报错**。
+                failed: Option<String>,
+            }
+            let chunk_first_seq: Vec<u64> = chunks.iter().map(|c| c[0].2).collect();
             let state = Arc::new((
                 Mutex::new(Pipe {
                     ready: std::collections::BTreeMap::new(),
-                    next_submit: 0,
-                    gops: gops.into_iter().collect(),
+                    chunks: chunks.into_iter().collect(),
+                    avcc: None,
+                    failed: None,
                 }),
                 std::sync::Condvar::new(),
             ));
 
-            let n_workers = std::thread::available_parallelism()
-                .map(|n| n.get().max(1))
-                .unwrap_or(4)
-                .min(6);
+            // 并行度：默认按核数，封顶 6（再多只是抢同一个硬件编码器）。
+            // `V2V_HW_WORKERS` 只用来量并行度曲线 —— 正常别设。
+            let n_workers = std::env::var("V2V_HW_WORKERS")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or_else(|| {
+                    std::thread::available_parallelism()
+                        .map(|n| n.get().max(1))
+                        .unwrap_or(4)
+                })
+                .clamp(1, 16);
             let mut handles = Vec::new();
             for _ in 0..n_workers {
                 let state = Arc::clone(&state);
                 let seq0 = seq.clone();
-                handles.push(std::thread::spawn(move || -> std::result::Result<(), String> {
-                    let (lock, cvar) = (&state.0, &state.1);
-                    loop {
-                        let chunk = {
-                            let mut p = lock.lock().map_err(|e| e.to_string())?;
-                            p.gops.pop_front()
-                        };
-                        let Some(chunk) = chunk else { break };
-                        let mut dec =
-                            v2v_vc1::Decoder::new(seq0.clone(), vw, vh).map_err(|e| e.to_string())?;
-                        for (data, pts_ms, seq) in &chunk {
-                            dec.decode_frame(data).map_err(|e| e.to_string())?;
-                            let f = dec.frame();
-                            // 滑动窗口：只准插入 next_submit + cap 之前的帧
-                            //（in_flight 计数被主线程一减就下溢，cap 永远「已满」→ 死等）。
-                            let mut p = lock.lock().map_err(|e| e.to_string())?;
-                            while *seq >= p.next_submit + cap as u64 {
-                                p = cvar.wait(p).map_err(|e| e.to_string())?;
+                handles.push(std::thread::spawn(move || {
+                    let r = (|| -> std::result::Result<(), String> {
+                        let (lock, cvar) = (&state.0, &state.1);
+                        loop {
+                            let chunk = {
+                                let mut p = lock.lock().map_err(|e| e.to_string())?;
+                                p.chunks.pop_front()
+                            };
+                            let Some(chunk) = chunk else { break };
+                            let first_seq = chunk[0].2;
+                            // 每段一个新**解码器**：从 I 帧起解，段间无状态
+                            //（gop_start.rs 验过）。它是纯 Rust 的，建起来几乎不要钱。
+                            let mut dec = v2v_vc1::Decoder::new(seq0.clone(), vw, vh)
+                                .map_err(|e| e.to_string())?;
+                            // 每段一个新**编码会话**。不是为了省事，是**码控**：
+                            // 复用会话 + 每段 `finish()`（CompleteFrames）会让 VT 的码控
+                            // 一路往上飘 —— 实测 720p 70 MB → 365 MB、帧数不变、单帧从
+                            // 3 KB 爬到 140 KB。所以段的边界宁可付一次会话创建/销毁。
+                            let mut enc = VideoToolboxEncoder::open(vw, vh, video_bitrate, fps, 4)
+                                .map_err(|e| e.to_string())?;
+                            let mut samples = Vec::new();
+                            for (i, (data, pts_ms, _)) in chunk.iter().enumerate() {
+                                dec.decode_frame(data).map_err(|e| e.to_string())?;
+                                let f = dec.frame();
+                                // 段首强制 IDR：这一段从此独立可解 —— 相邻段可能是
+                                // 别的 worker 编的，不能跨段参考。
+                                samples.extend(
+                                    enc.encode(&f.y, &f.u, &f.v, pts_ms * 1000, i == 0)
+                                        .map_err(|e| e.to_string())?,
+                                );
                             }
-                            p.ready.insert(*seq, (f, *pts_ms));
-                            drop(p);
+                            // CompleteFrames：本段在途样本全部吐出，边界是确定的。
+                            samples.extend(enc.finish().map_err(|e| e.to_string())?);
+                            let avcc = enc.avcc().map(|a| a.to_vec());
+                            // 先放掉会话再拿锁 —— `vt_free` 要 Invalidate，别占着全局锁。
+                            drop(enc);
+                            {
+                                let mut p = lock.lock().map_err(|e| e.to_string())?;
+                                // 整条流只写**一份** avcC。各会话的 SPS/PPS 必须一致
+                                // （配置相同就该一致）；不一致说明有会话走了另一条编码
+                                // 路径，后半段会用错配置 —— 宁可当场报错，也别静默产出
+                                // 一个解不开的文件。
+                                if let Some(a) = &avcc {
+                                    match &p.avcc {
+                                        None => p.avcc = Some(a.clone()),
+                                        Some(prev) if prev != a => {
+                                            let msg = "各编码会话产出的 avcC 不一致（SPS/PPS 不同）—— 一份 avcC 描述不了整条流";
+                                            if p.failed.is_none() {
+                                                p.failed = Some(msg.into());
+                                            }
+                                            cvar.notify_all();
+                                            return Err(msg.into());
+                                        }
+                                        Some(_) => {}
+                                    }
+                                }
+                                p.ready.insert(first_seq, samples);
+                            }
                             cvar.notify_all();
                         }
+                        Ok(())
+                    })();
+                    // 失败要**主动叫醒**主线程：它可能正阻塞在「等某一段」上。
+                    if let Err(e) = &r {
+                        let (lock, cvar) = (&state.0, &state.1);
+                        if let Ok(mut p) = lock.lock() {
+                            if p.failed.is_none() {
+                                p.failed = Some(e.clone());
+                            }
+                        }
+                        cvar.notify_all();
                     }
-                    Ok(())
+                    r
                 }));
             }
 
-            // ---- 主线程：按序取帧、喂硬件、收样本 ----
-            if profile {
-                eprintln!("[probe] worker 已启动（{} 个）", n_workers);
-            }
+            // ---- 主线程：按段序取压缩样本、收集 ----
             let (lock, cvar) = (&state.0, &state.1);
-            let mut next_seq = 0u64;
+            let mut gi = 0usize;
             let mut t0 = std::time::Instant::now();
-            while next_seq < frames {
-                let f = {
+            while gi < chunk_first_seq.len() {
+                let want = chunk_first_seq[gi];
+                let samples = {
                     let mut p = lock.lock().map_err(|e| Error::Bad(format!("锁: {e}")))?;
-                    let mut last_dbg = std::time::Instant::now();
-                    while !p.ready.contains_key(&next_seq) {
-                        let (np, timeout) = cvar
-                            .wait_timeout(p, std::time::Duration::from_secs(2))
-                            .map_err(|e| Error::Bad(format!("锁: {e}")))?;
-                        p = np;
-                        if timeout.timed_out() && last_dbg.elapsed().as_secs() >= 2 {
-                            eprintln!(
-                                "[debug] 主线程等 seq={} ready 的 seq 范围 {:?}..={:?} gops剩余={}",
-                                next_seq,
-                                p.ready.keys().next(),
-                                p.ready.keys().next_back(),
-                                p.gops.len()
-                            );
-                            last_dbg = std::time::Instant::now();
+                    while !p.ready.contains_key(&want) {
+                        // worker 已经失败就别等了 —— 那一段永远不会来。
+                        if let Some(e) = &p.failed {
+                            return Err(Error::Bad(e.clone()));
                         }
+                        p = cvar.wait(p).map_err(|e| Error::Bad(format!("锁: {e}")))?;
                     }
-                    p.next_submit += 1; // 滑动窗口右移（worker 据此准入）
-                    let out = p.ready.remove(&next_seq).expect("contains_key 刚查过");
-                    cvar.notify_all();
-                    out
+                    p.ready.remove(&want).expect("contains_key 刚查过")
                 };
-                let (f, pts_ms) = f;
-                let out = enc.encode(&f.y, &f.u, &f.v, pts_ms * 1000, false)?;
-                encoded_samples.extend(out);
-                next_seq += 1;
-                if next_seq % 500 == 0 {
+                encoded_samples.extend(samples);
+                gi += 1;
+                if profile && (gi % 4 == 0 || gi == chunk_first_seq.len()) {
                     eprintln!(
-                        "[profile] 进度 {}/{}（本段 {:.2} s）",
-                        next_seq,
-                        frames,
+                        "[profile] 段 {}/{}（本段 {:.2} s）",
+                        gi,
+                        chunk_first_seq.len(),
                         t0.elapsed().as_secs_f64()
                     );
                     t0 = std::time::Instant::now();
                 }
             }
-            let _ = t0;
-            // EOS：吸干在途样本。
-            let tail = enc.finish()?;
-            encoded_samples.extend(tail);
+            for h in handles {
+                h.join()
+                    .map_err(|e| Error::Bad(format!("worker 崩了: {e:?}")))?
+                    .map_err(Error::Bad)?;
+            }
+            let avcc = {
+                let p = lock.lock().map_err(|e| Error::Bad(format!("锁: {e}")))?;
+                p.avcc.clone()
+            };
             drop(state);
 
             // ---- 封装：样本按提交序（= pts 序）写 ----
@@ -383,7 +459,9 @@ pub fn wmv_to_mp4_hw(
                 height: vh as u16,
                 timescale: TIMESCALE,
                 codec: VideoCodec::Avc1 {
-                    avc_config: enc.avcc().expect("编完一整条流 avcC 必然可得").to_vec(),
+                    avc_config: avcc.ok_or_else(|| {
+                        Error::Bad("没有任何视频样本，avcC 拿不到".into())
+                    })?,
                 },
                 avg_bitrate: video_bitrate,
             };
