@@ -50,7 +50,9 @@ use std::ffi::CString;
 pub mod vt;
 
 /// 端到端管线：WMV → MP4（解码纯 Rust + 视频/音频 + 封装），示例与测试共用。
-#[cfg(any(target_os = "macos", target_os = "android"))]
+///
+/// 非 macOS / Android 平台上 [`transcode::wmv_to_mp4_hw`] 返回 `Unsupported`
+/// （模块本身全平台编译 —— CI 在 Linux 上跑 `cargo test`，测试引用不能被 cfg 掉）。
 pub mod transcode;
 
 /// Android 硬件编码的 MP4 写入器。

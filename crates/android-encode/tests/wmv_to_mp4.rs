@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use v2v_android::transcode::wmv_to_mp4_hw;
+use v2v_android::transcode::{hw_supported, wmv_to_mp4_hw};
 
 fn sample(name: &str) -> Option<PathBuf> {
     let p = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -62,6 +62,10 @@ fn psnr(a: &[u8], b: &[u8]) -> Option<f64> {
 /// 判据：转码成功、产物有 h264 轨（ffmpeg 解得开）、解码回的帧数对。
 #[test]
 fn wmv3_to_mp4_hw_black() {
+    if !hw_supported() {
+        eprintln!("SKIP: 此平台没有硬件编码后端");
+        return;
+    }
     if !has_ffmpeg() {
         eprintln!("SKIP: 没有 ffmpeg");
         return;
