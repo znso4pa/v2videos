@@ -94,7 +94,9 @@ fn video_track() -> VideoTrack {
         height: 32,
         timescale: 12800,
         // VOL 头（`00 00 01 B0` 起）—— 内容对封装器无意义，只要非空。
-        decoder_specific_info: vec![0x00, 0x00, 0x01, 0xB0, 0x01, 0x00, 0x00, 0x01],
+        codec: v2v_mp4::VideoCodec::Mp4v {
+            decoder_specific_info: vec![0x00, 0x00, 0x01, 0xB0, 0x01, 0x00, 0x00, 0x01],
+        },
         avg_bitrate: 500_000,
     }
 }

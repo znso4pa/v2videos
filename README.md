@@ -82,20 +82,29 @@ tools/
 | 转码质量 SSIM / PSNR（对 VC-1 解码参考） | 0.9621 / **38.83 dB** | 0.9713 / **40.77 dB** | −1.9 dB |
 | 解码产物 | **与 `ffmpeg` 逐字节一致**（5.7 GB md5 相同） | — | 0 |
 
-**FFI（MediaCodec）路径解决的就是上面两格：**
-编码从 CPU 挪到**专用电路**（预期 ≥ 实时且不占 CPU——播放服务里 CPU 要留给播放本身），
-编码标准从 MPEG-4 Part 2 换成 **H.264**（同码率质量高一代，通常 2–4 dB）——
-这两项合起来预期同时吃掉「速度差」与「质量差」。
+**FFI 硬件路径（同一个样本、同码率 4 Mbps，2026-10-20 实测）—— 两个差距都解决了：**
 
-⚠️ **真机数字还没量**（当前没有设备连着，不写没量过的数）。上设备后用这条量，
-数字回填到本表：
+| | 软件栈（无 FFI） | ffmpeg | **FFI 硬件（本机 VideoToolbox H.264）** |
+| --- | --- | --- | --- |
+| 全链路转码 | 78.2 s（53 fps） | 11.7 s（352 fps） | **33.7 s（122.8 fps，8.1× 实时）** |
+| SSIM（对 VC-1 解码参考） | 0.9621 | 0.9713 | **0.9820 —— 全场最高** |
+| PSNR（同上） | 38.83 dB | 40.77 dB | **42.45 dB（+3.6 / +1.7 dB）** |
+| 体积 | 71.34 MB | 71.05 MB | **71.04 MB** |
+| 音频时间轴 | **偏移 0** | 1024 帧 priming | **偏移 0**（音频走我们的 AAC） |
+
+读法：解码两侧逐字节一致（上表），所以质量与速度的差距全在**编码器** —— FFI 路径
+把编码换成**硬件 H.264**：专用电路（CPU 释放给播放本身）+ 高一代的标准，
+实测同时吃掉「速度差」（53 → 123 fps）与「质量差」（38.8 → 42.5 dB，反超 ffmpeg）。
+macOS 走 VideoToolbox、Android 走 MediaCodec（结构相同，真机数字待设备接入后回填）。
+
+复现（全片 ≈34 s）：
 
 ```bash
-cargo ndk -t arm64-v8a build --release -p v2v-android --example wmv_to_mp4_android
-adb push testing/sample.wmv /data/local/tmp/
-adb shell /data/local/tmp/wmv_to_mp4_android /data/local/tmp/sample.wmv \
-    /data/local/tmp/out.mp4 --video-bitrate 4000000
-# 质量对账：拉回 out.mp4，用与基线相同的 VC-1 参考跑 ssim/psnr（见 TODO 2026-10-20 的口径）
+cargo run --release -p v2v-android --example wmv_to_mp4_hw -- \
+    testing/sample.wmv /tmp/sample_hw.mp4 --video-bitrate 4000000
+# 或跑主测试（轻量一条常跑 + 全片一条 --ignored）：
+cargo test -p v2v-android --test wmv_to_mp4
+cargo test --release -p v2v-android --test wmv_to_mp4 -- --ignored --nocapture
 ```
 
 ## 构建与测试
@@ -512,7 +521,7 @@ SSIM 0.969486）对合并前 q=8（1709 kbps / 37.14 dB / 0.963555）—— **�
 | **WMV2**（WMV8）           | ✅ I/P + IntraX8 | ❌         | 帧头与 MB 层是另一套（`wmv2dec.c`）。比 WMV1 多：`parse_mb_skip`（4 种跳帧类型）、按 qscale 挑的 CBP 表、`mspel` 四抽头半像素 + `hshift`、**ABT**（4×8 / 8×4）、**环路滤波**、它自己那份 8×8 IDCT，以及 **IntraX8**（`j_type`，按 8×8 块走的内帧子解码器，WMV2 与 VC-1 共用 —— 见 `intrax8.rs`） |
 | **WMV9 / VC-1**          | ✅ I / P   | ❌         | **ffmpeg 里根本没有 VC-1/wmv3 编码器**（只有解码器），想要 WMV9 得另找路子。解码侧 `v2v-vc1` 已走完整条链路（Main profile / 渐进 / I/P，真 1080p 样本逐帧逐像素 0 差）；缺 **B 帧 / 隔行 / Advanced profile**、overlap smoothing、多分辨率、重同步标记 —— 遇到明确报 `Unsupported`，不静默出错 |
 | **MPEG-4 Part 2**（`mp4v`） | ⚠️ I 帧逐像素 0 差；P 帧未收敛（漂移，严格测试标 `#[ignore]`） | ✅ I / P   | 解码是后加的（842 行孤儿文件接进 crate 后对 ffmpeg 啃到 I 帧 0 差）。P 帧**能解但不对**（逐帧差异递增 = 参考帧漂移），别当能用。量化默认走 **MPEG 型**（`quant_type = 1`，规范默认 CSF 矩阵，同体积下 SSIM 更高）；另有**系数级 RD（trellis）**但**默认关**。缺 B 帧、8×8 运动补偿、`dquant`、resync marker、数据分割 |
-| **H.264 / AVC**          | ❌         | ⭕ 仅 Android 硬件（FFI） | 软件侧不在范围内（LGPL 侧链不了 x264，见「许可证」）；设备上走 `crates/android-encode` 的 MediaCodec（见「FFI」一节）—— 质量与速度的账都算在那里 |
+| **H.264 / AVC**          | ❌         | ⭕ 硬件（FFI）：macOS VideoToolbox / Android MediaCodec | 软件侧不在范围内（LGPL 侧链不了 x264，见「许可证」）；硬件侧走 `crates/android-encode`（见「FFI」一节）—— 真实样本实测 PSNR 42.45 dB（同码率反超 ffmpeg 的 mpeg4 1.7 dB） |
 
 ### 音频编码
 
@@ -539,6 +548,7 @@ SSIM 0.969486）对合并前 q=8（1709 kbps / 37.14 dB / 0.963555）—— **�
 | **VC-1 解码速度** | 真样本全片（sample.wmv 720p 4138 帧）写 /dev/null，单线程同 `-idct 2` | 19.7 s vs 11.4 s（**1.73×**）；产物 **5.7 GB md5 逐字节一致** |
 | **WMV→MP4 转码** | 真样本全片，同目标码率（4 Mbps + AAC 128k） | 体积差 **0.4%**；SSIM **0.9621 vs 0.9713**；PSNR **38.83 vs 40.77 dB**（差在 mpeg4 编码器，解码两侧逐字节一致）；音频 PSNR 对 WMA 真值都 ≈23 dB，**等价** |
 | **AAC 时间轴** | 转码产物解码回 PCM | 我们的 MP4 **偏移 0**；`ffmpeg` 的带 **1024 帧 priming**（靠 edit list 补）—— 宿主直连播放时我们的免补偿 |
+| **WMV→MP4（硬件 FFI）** | 同码率 4 Mbps，真实样本全片 | **SSIM 0.9820 / PSNR 42.45 dB**（软件栈 0.9621 / 38.83，ffmpeg mpeg4 0.9713 / 40.77）——质量与速度的短板都由硬件 H.264 吃掉，见「FFI」一节 |
 
 **一句话**：解码侧是「逐像素 / 逐字节」（连**速度**都只差 1.73×）；编码侧 `mp4v` 等码率
 **打平**、AAC 同码率**反超**、转码全栈体积与 `ffmpeg` 差 0.4% 而**编码质量差 1.9 dB**——

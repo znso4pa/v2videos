@@ -31,9 +31,9 @@
 //! （`Mp4HwWriter` 是 `!Send`）—— MediaCodec 不是线程安全的，在哪个线程
 //! `open` 就在哪个线程用完。
 
-#![cfg_attr(not(target_os = "android"), forbid(unsafe_code))]
-// Android 目标上有 `ffi.rs`（unsafe 只在那一个模块 + Drop / 调用边界）；
-// 非 Android 目标整个 crate 不允许 unsafe —— 编译期就守住「unsafe 不外漏」。
+#![cfg_attr(not(any(target_os = "android", target_os = "macos")), forbid(unsafe_code))]
+// unsafe 只在两个后端模块里：Android 的 `ffi.rs`（MediaCodec）与
+// macOS 的 `vt.rs`（VideoToolbox）。其余平台整个 crate 不允许 unsafe。
 
 use std::path::Path;
 
@@ -44,6 +44,14 @@ mod ffi;
 
 #[cfg(target_os = "android")]
 use std::ffi::CString;
+
+/// macOS 的 VideoToolbox 后端（硬件 H.264，产样本不封装）。
+#[cfg(target_os = "macos")]
+pub mod vt;
+
+/// 端到端管线：WMV → MP4（解码纯 Rust + 视频/音频 + 封装），示例与测试共用。
+#[cfg(any(target_os = "macos", target_os = "android"))]
+pub mod transcode;
 
 /// Android 硬件编码的 MP4 写入器。
 ///

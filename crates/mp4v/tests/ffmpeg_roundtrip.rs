@@ -350,7 +350,9 @@ fn vol_survives_the_trip_into_an_mp4_esds() {
         width: W as u16,
         height: H as u16,
         timescale: FPS * 512,
-        decoder_specific_info: dsi.clone(),
+        codec: v2v_mp4::VideoCodec::Mp4v {
+            decoder_specific_info: dsi.clone(),
+        },
         avg_bitrate: 0,
     });
     let dur = 512; // timescale = fps*512 → 每帧 512 个 tick

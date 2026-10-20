@@ -376,7 +376,9 @@ fn remuxes_a_real_mpeg4_track() {
         width: r.width,
         height: r.height,
         timescale: r.timescale,
-        decoder_specific_info: r.dsi.clone(),
+        codec: v2v_mp4::VideoCodec::Mp4v {
+            decoder_specific_info: r.dsi.clone(),
+        },
         avg_bitrate: 0,
     });
     for ((s, &dur), &key) in r.samples.iter().zip(&r.durations).zip(&r.keys) {
@@ -483,7 +485,9 @@ fn muxes_video_plus_pcm_audio_and_keeps_both_intact() {
             width: r.width,
             height: r.height,
             timescale: r.timescale,
-            decoder_specific_info: r.dsi.clone(),
+            codec: v2v_mp4::VideoCodec::Mp4v {
+                decoder_specific_info: r.dsi.clone(),
+            },
             avg_bitrate: 0,
         },
         AudioTrack {

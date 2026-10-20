@@ -47,15 +47,33 @@ use crate::{Error, Result};
 /// 影片时间基（`mvhd` / `tkhd` 的时长单位）。1000 = 毫秒。
 const MOVIE_TIMESCALE: u32 = 1000;
 
-/// 视频轨参数 —— 目前只支持 `mp4v`（MPEG-4 Part 2）。
+/// 视频轨的编解码类型 —— 决定 `stsd` 里写哪种 sample entry。
+#[derive(Debug, Clone)]
+pub enum VideoCodec {
+    /// `mp4v` + `esds`：MPEG-4 Part 2。
+    ///
+    /// `decoder_specific_info` 是 `esds` 里的 DecoderSpecificInfo：
+    /// MPEG-4 的 **VOL 头**（含 `00 00 01 B0` 起始码）。
+    Mp4v {
+        decoder_specific_info: Vec<u8>,
+    },
+    /// `avc1` + `avcC`：H.264 / AVC。
+    ///
+    /// `avc_config` 是 **avcC**（AVCDecoderConfigurationRecord）—— SPS / PPS 与
+    /// NALU 长度前缀的字节数都记在里面。样本本身必须是**长度前缀**格式
+    /// （4 字节大端长度 + NALU，**不是** Annex-B 的 `00 00 01` 起始码）——
+    /// VideoToolbox 的输出天生就是这种格式。
+    Avc1 { avc_config: Vec<u8> },
+}
+
+/// 视频轨参数。
 #[derive(Debug, Clone)]
 pub struct VideoTrack {
     pub width: u16,
     pub height: u16,
     /// 时间基（每秒多少 tick）。喂进来的 `duration` 都用这个单位。
     pub timescale: u32,
-    /// `esds` 里的 DecoderSpecificInfo：MPEG-4 的 **VOL 头**（含 `00 00 01 B0` 起始码）。
-    pub decoder_specific_info: Vec<u8>,
+    pub codec: VideoCodec,
     /// 平均码率（bit/s）。写进 `esds` 与 `btrt`。
     pub avg_bitrate: u32,
 }
@@ -114,13 +132,15 @@ struct SampleRec {
 /// MP4 封装器。
 ///
 /// ```no_run
-/// use v2v_mp4::{Mp4Muxer, VideoTrack};
+/// use v2v_mp4::{Mp4Muxer, VideoCodec, VideoTrack};
 ///
 /// let mut m = Mp4Muxer::new(VideoTrack {
 ///     width: 320,
 ///     height: 240,
 ///     timescale: 12800,
-///     decoder_specific_info: vec![0, 0, 1, 0xb0, 0x01], // VOL 头
+///     codec: VideoCodec::Mp4v {
+///         decoder_specific_info: vec![0, 0, 1, 0xb0, 0x01], // VOL 头
+///     },
 ///     avg_bitrate: 300_000,
 /// });
 /// m.write_video(&[0u8; 100], true, 512).unwrap(); // 512 tick @12800 = 25 fps
@@ -429,7 +449,13 @@ fn minf_video(v: &VideoTrack, samples: &[SampleRec]) -> BoxBuilder {
     let mut minf = BoxBuilder::new(b"minf");
     minf.child(vmhd);
     minf.child(dinf());
-    minf.child(stbl(&mp4v_entry(v), samples, true));
+    let entry = match &v.codec {
+        VideoCodec::Mp4v { decoder_specific_info } => {
+            mp4v_entry(v, decoder_specific_info)
+        }
+        VideoCodec::Avc1 { avc_config } => avc1_entry(v, avc_config),
+    };
+    minf.child(stbl(&entry, samples, true));
     minf
 }
 
@@ -622,7 +648,7 @@ fn compressor_name(name: &[u8]) -> [u8; 32] {
     out
 }
 
-fn mp4v_entry(v: &VideoTrack) -> Vec<u8> {
+fn mp4v_entry(v: &VideoTrack, dsi: &[u8]) -> Vec<u8> {
     let mut b = BoxBuilder::new(b"mp4v");
     b.zeros(6); // reserved
     b.u16(1); // data_reference_index
@@ -638,7 +664,34 @@ fn mp4v_entry(v: &VideoTrack) -> Vec<u8> {
     b.bytes(&compressor_name(b"v2video mpeg4"));
     b.u16(0x0018); // depth = 24
     b.i16(-1); // pre_defined
-    b.child(esds(1, 0x20, 0x04, v.avg_bitrate, &v.decoder_specific_info));
+    b.child(esds(1, 0x20, 0x04, v.avg_bitrate, dsi));
+    b.child(btrt(v.avg_bitrate));
+    b.finish()
+}
+
+/// `avc1` sample entry：与 `mp4v` 同样的 VisualSampleEntry 头，后面挂 `avcC`。
+///
+/// 样本是**长度前缀**的 NALU（4 字节大端长度 + NALU），mp4 原生格式；
+/// Annex-B（`00 00 01` 起始码）必须先转换再喂 `write_video`。
+fn avc1_entry(v: &VideoTrack, avc_config: &[u8]) -> Vec<u8> {
+    let mut b = BoxBuilder::new(b"avc1");
+    b.zeros(6); // reserved
+    b.u16(1); // data_reference_index
+    b.u16(0); // pre_defined
+    b.u16(0); // reserved
+    b.zeros(12); // pre_defined[3]
+    b.u16(v.width);
+    b.u16(v.height);
+    b.u32(0x0048_0000); // horizresolution = 72 dpi
+    b.u32(0x0048_0000); // vertresolution
+    b.u32(0); // reserved
+    b.u16(1); // frame_count
+    b.bytes(&compressor_name(b"v2video h264"));
+    b.u16(0x0018); // depth = 24
+    b.i16(-1); // pre_defined
+    let mut avcc = BoxBuilder::new(b"avcC");
+    avcc.bytes(avc_config);
+    b.child(avcc);
     b.child(btrt(v.avg_bitrate));
     b.finish()
 }
@@ -747,7 +800,9 @@ mod tests {
             width: 320,
             height: 240,
             timescale: 12800,
-            decoder_specific_info: vec![0, 0, 1, 0xb0, 0x01, 0x00],
+            codec: VideoCodec::Mp4v {
+                decoder_specific_info: vec![0, 0, 1, 0xb0, 0x01, 0x00],
+            },
             avg_bitrate: 300_000,
         }
     }

@@ -42,7 +42,7 @@
 mod mux;
 mod writer;
 
-pub use mux::{AudioCodec, AudioTrack, Mp4Muxer, VideoTrack};
+pub use mux::{AudioCodec, AudioTrack, Mp4Muxer, VideoCodec, VideoTrack};
 
 /// MP4 封装里的错误。
 #[derive(Debug)]

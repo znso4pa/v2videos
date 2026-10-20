@@ -1055,7 +1055,9 @@ fn convert_to_mp4(
         width: w as u16,
         height: h as u16,
         timescale: VTS,
-        decoder_specific_info: dsi,
+        codec: v2v_mp4::VideoCodec::Mp4v {
+            decoder_specific_info: dsi,
+        },
         avg_bitrate: 0,
     };
     // ---- 音频编码器（只在 `.mp4` + `Mp4Audio::Aac` 时建）----

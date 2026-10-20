@@ -112,7 +112,9 @@ fn main() {
         if let Some(enc) = &mut aac {
             if let Some(a) = player.next_audio().expect("音频解帧出错") {
                 got = true;
-                pcm_buf.extend(a.planes);
+                for (dst, src) in pcm_buf.iter_mut().zip(a.planes) {
+                    dst.extend(src);
+                }
                 // 攒够 1024 帧一段就编一帧 AAC。
                 let samples = pcm_buf.first().map_or(0, |p| p.len());
                 while samples >= 1024 {

@@ -40,7 +40,9 @@ fn video_track() -> VideoTrack {
         width: 1920,
         height: 1080,
         timescale: 30_000,
-        decoder_specific_info: vec![0, 0, 1, 0xb0, 0x01],
+        codec: v2v_mp4::VideoCodec::Mp4v {
+            decoder_specific_info: vec![0, 0, 1, 0xb0, 0x01],
+        },
         avg_bitrate: 1_500_000,
     }
 }

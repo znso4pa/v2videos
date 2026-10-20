@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 v2v-player = { path = "../player" }
 v2v-aac = { path = "../aac" }
+v2v-mp4 = { path = "../mp4" }
 
 [build-dependencies]
 cc = "1"
