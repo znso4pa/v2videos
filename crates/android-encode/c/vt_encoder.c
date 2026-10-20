@@ -200,10 +200,16 @@ struct vt_ctx *vt_open(int w, int h, int bitrate, int fps, int gop_seconds) {
     /* 硬帧的 QP 封顶。默认上限是 51 —— 复杂帧会糊成一片，全局 PSNR 被最差的
      * 那几帧拖住。封到 40：硬帧多拿点位、简单帧少拿点，同码率下总量不变。
      * ⚠️ 文档说「为达成 QP/码率目标，编码器**可能丢帧**」—— 所以这条必须验帧数。 */
-    int32_t max_qp = 35;
+    int32_t max_qp = 32;
     CFNumberRef nqp = CFNumberCreate(NULL, kCFNumberSInt32Type, &max_qp);
     VTSessionSetProperty(c->session, kVTCompressionPropertyKey_MaxAllowedFrameQP, nqp);
     CFRelease(nqp);
+    /* 对称的另一头：简单帧默认可以低到 QP 十几，那是白扔码率。抬个下限把位让给硬帧，
+     * 同体积下总 PSNR 会更好（PSNR 对 QP 是凸的）。 */
+    int32_t min_qp = 20;
+    CFNumberRef nqp_min = CFNumberCreate(NULL, kCFNumberSInt32Type, &min_qp);
+    VTSessionSetProperty(c->session, kVTCompressionPropertyKey_MinAllowedFrameQP, nqp_min);
+    CFRelease(nqp_min);
 
     /* High 比 Main 多了 8×8 变换与自定义量化矩阵 —— 同码率下通常能多攒 0.3~1 dB。
      * 兼容性：High 是 2004 年后的播放器/浏览器标配，手机全支持。 */

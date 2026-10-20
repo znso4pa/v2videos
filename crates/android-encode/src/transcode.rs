@@ -139,10 +139,20 @@ pub fn wmv_to_mp4_hw(
             let aac_thread = af.is_some().then(|| {
                 let af = af.clone().expect("is_some 就该有格式");
                 std::thread::spawn(move || -> std::result::Result<Vec<Vec<u8>>, String> {
+                    // 音频线程自己也要吃几个核：720p 上它已经贴到关键路径
+                    //（视频 ~10.7 s、AAC 编码 ~10 s），逐帧编等于把这条路走成单线程。
+                    // 用库里的**批量并行**接口（先顺序推一遍跨帧状态、再按帧并行），
+                    // 状态链是精确的，只有 λ 搜索的起点不同 —— 所以产物**不逐字节相同**。
+                    let audio_threads = (std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(4)
+                        / 2)
+                    .clamp(2, 4);
                     let mut enc = AacEncoder::new(AacConfig {
                         channels: af.channels as u8,
                         sample_rate: af.sample_rate,
                         bitrate: audio_bitrate,
+                        threads: audio_threads,
                         ..AacConfig::default()
                     })
                     .map_err(|e| e.to_string())?;
@@ -163,11 +173,16 @@ pub fn wmv_to_mp4_hw(
                     // 不丢的话音频段多 4 段 —— 虽然靠 elst 也补得回来，但为了和顺序版
                     // 产物完全同构，这里照丢）。
                     let mut skip_left = params.frame_len * 2;
+                    // 攒够一批再交给 `encode_frames`（块内顺序、块间并行）。
+                    let mut pending: Vec<AacFrame> = Vec::with_capacity(1024);
+                    let (mut t_dec_ns, mut t_enc_ns) = (0u64, 0u64);
                     while let Ok(payload) = aud_rx.recv() {
-                        for planes in dec
+                        let t = std::time::Instant::now();
+                        let supers = dec
                             .decode_superframe(&payload)
-                            .map_err(|e| e.to_string())?
-                        {
+                            .map_err(|e| e.to_string())?;
+                        t_dec_ns += t.elapsed().as_nanos() as u64;
+                        for planes in supers {
                             for (dst, src) in pcm_buf.iter_mut().zip(planes) {
                                 dst.extend(src);
                             }
@@ -187,12 +202,33 @@ pub fn wmv_to_mp4_hw(
                                 for p in &mut pcm_buf {
                                     planes.push(p.drain(..1024).collect::<Vec<_>>());
                                 }
-                                let bytes = enc
-                                    .encode_frame(&AacFrame { planes })
-                                    .map_err(|e| e.to_string())?;
-                                out.push(bytes);
+                                pending.push(AacFrame { planes });
+                                // 一批 1024 帧（约 24 s 音频、8 MB PCM）：块越长，
+                                // 每块首帧那次 λ 冷启动摊得越薄。
+                                if pending.len() >= 1024 {
+                                    let t = std::time::Instant::now();
+                                    out.extend(
+                                        enc.encode_frames(&pending)
+                                            .map_err(|e| e.to_string())?,
+                                    );
+                                    t_enc_ns += t.elapsed().as_nanos() as u64;
+                                    pending.clear();
+                                }
                             }
                         }
+                    }
+                    if !pending.is_empty() {
+                        let t = std::time::Instant::now();
+                        out.extend(enc.encode_frames(&pending).map_err(|e| e.to_string())?);
+                        t_enc_ns += t.elapsed().as_nanos() as u64;
+                    }
+                    if std::env::var("V2V_HW_PROFILE").is_ok() {
+                        eprintln!(
+                            "[probe] 音频线程：WMA 解码 {:.2} s / AAC 编码 {:.2} s（{} 段）",
+                            t_dec_ns as f64 / 1e9,
+                            t_enc_ns as f64 / 1e9,
+                            out.len()
+                        );
                     }
                     Ok(out)
                 })
