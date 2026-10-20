@@ -170,6 +170,12 @@ struct vt_ctx *vt_open(int w, int h, int bitrate, int fps, int gop_seconds) {
      * 不许重排帧（无 B 帧）—— 输出顺序 = 输入顺序，封装的时间轴才是直的。 */
     VTSessionSetProperty(c->session, kVTCompressionPropertyKey_RealTime,
                          kCFBooleanFalse);
+    /* Apple 在 VTCompressionProperties.h 里给的推荐组合：**「用户正在等结果的离线
+     * 转码」= RealTime false + MaximizePowerEfficiency false**。不设后者，系统会按
+     * 「后台转码」处理、偏向省电（编码器降频）—— 这是 720p 上不去的主因。 */
+    VTSessionSetProperty(c->session,
+                         kVTCompressionPropertyKey_MaximizePowerEfficiency,
+                         kCFBooleanFalse);
     VTSessionSetProperty(c->session, kVTCompressionPropertyKey_AllowFrameReordering,
                          kCFBooleanFalse);
     int32_t br = bitrate;
@@ -191,6 +197,14 @@ struct vt_ctx *vt_open(int w, int h, int bitrate, int fps, int gop_seconds) {
     VTSessionSetProperty(c->session, kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
                          ngop);
     CFRelease(ngop);
+    /* 硬帧的 QP 封顶。默认上限是 51 —— 复杂帧会糊成一片，全局 PSNR 被最差的
+     * 那几帧拖住。封到 40：硬帧多拿点位、简单帧少拿点，同码率下总量不变。
+     * ⚠️ 文档说「为达成 QP/码率目标，编码器**可能丢帧**」—— 所以这条必须验帧数。 */
+    int32_t max_qp = 35;
+    CFNumberRef nqp = CFNumberCreate(NULL, kCFNumberSInt32Type, &max_qp);
+    VTSessionSetProperty(c->session, kVTCompressionPropertyKey_MaxAllowedFrameQP, nqp);
+    CFRelease(nqp);
+
     /* High 比 Main 多了 8×8 变换与自定义量化矩阵 —— 同码率下通常能多攒 0.3~1 dB。
      * 兼容性：High 是 2004 年后的播放器/浏览器标配，手机全支持。 */
     VTSessionSetProperty(c->session, kVTCompressionPropertyKey_ProfileLevel,

@@ -94,7 +94,12 @@ impl VideoToolboxEncoder {
         self.drain()
     }
 
-    /// 发 EOS 并取走全部在途样本。之后句柄只能 Drop（样本仍可用 `avcc()` 取）。
+    /// 把在途帧全部编完、取走样本（`VTCompressionSessionCompleteFrames`）。
+    ///
+    /// ⚠️ 它**不是 EOS**（会话之后仍可 `encode()`），但**别**拿它当「段边界屏障」
+    /// 去复用会话：每段调一次会让 VT 的码控一路飘高 —— 实测 720p 4 Mbps
+    /// 70 MB → 365 MB、帧数不变、单帧从 3 KB 爬到 140 KB。段的边界宁可付一次
+    /// 会话创建/销毁。
     pub fn finish(&mut self) -> Result<Vec<VtSample>> {
         unsafe {
             if vt_finish(self.ctx) != 0 {
