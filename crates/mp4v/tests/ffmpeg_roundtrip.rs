@@ -173,8 +173,12 @@ fn ffmpeg(args: &[&str], stdin_data: Option<&[u8]>) -> (bool, Vec<u8>, String) {
 fn decode_to_yuv(path: &str) -> (Vec<u8>, String) {
     let (ok, data, log) = ffmpeg(
         &[
-            "-v", "warning", "-idct", "2", "-i", path, "-f", "rawvideo", "-pix_fmt", "yuv420p",
-            "-",
+            "-v", "warning", "-idct", "2", "-i", path,
+            // ⚠️ **`-fps_mode passthrough` 必须加**：裸 m4v 没有时间戳，ffmpeg 会按
+            // 猜出来的帧率重采样，**静默丢帧**（实测 10 帧的流只吐出 3 帧）。
+            // 少了它，逐像素对账会「只比了前 3 帧」而照样全绿。
+            "-fps_mode", "passthrough",
+            "-f", "rawvideo", "-pix_fmt", "yuv420p", "-",
         ],
         None,
     );
@@ -987,15 +991,14 @@ fn decoder_i_frames_match_ffmpeg_bit_exactly() {
     assert_eq!(worst, 0, "与 ffmpeg 逐像素不一致，最大差 {worst}");
 }
 
-/// **P 帧还没收敛** —— 这条现在是「已知失败」，标了 `#[ignore]`。
+/// **P 帧对 ffmpeg：逐像素 0 差。**
 ///
-/// 现状（8 帧 I P P P I P P P）：I 帧 0 差，P 帧逐帧不一致字节
-/// `5161 / 7743 / 9876`，最大差 48；后一组同样递增 —— 说明是**参考帧被污染**
-/// 之后的漂移，不是某一帧的孤例。细节与已排除的候选见 `decode.rs` 的说明。
-///
-/// 留着它的意义：等根因修掉，去掉 `#[ignore]` 就是回归判据。
+/// 这条曾经标着 `#[ignore]`：P 帧能解完但逐帧漂移（8 帧 I P P P I P P P 的
+/// 不一致字节 `5161 / 7743 / 9876`，最大差 48）。根因是 **escape 的内层 level
+/// 没反量化** —— ffmpeg 的 `rl_vlc[qscale]` 表是预乘过的，所以 escape 里解出的
+/// 那个符号的 level 已经是 `raw*qmul + qadd`。帧内 `qmul=1/qadd=0` 是恒等，
+/// 于是「I 帧全对、P 帧只在用到 escape 的块上差一点」—— 详见 `decode.rs`。
 #[test]
-#[ignore = "P 帧还有漂移，见 crates/mp4v/src/decode.rs 的说明"]
 fn decoder_p_frames_match_ffmpeg_bit_exactly() {
     if !has_ffmpeg() {
         eprintln!("SKIP: PATH 上没有 ffmpeg");
@@ -1082,19 +1085,24 @@ fn decoder_handles_a_stream_it_did_not_encode() {
     );
     let mut d = Decoder::new(vol).expect("建解码器");
     let vops = split_vops(&es);
-    // ⚠️ **只解第一帧**（I 帧）。P 帧还没收敛（见 `decode.rs`），
-    // 解全片只会让这条测试跟着一起红 —— 而它要钉的是「独立来源的 I 帧语法」。
-    let f = d.decode(vops[0]).expect("解第一帧");
-    let ours = frame_bytes(&f);
-    let fsz = ours.len();
+    // **全解**（I 帧 + P 帧）。P 帧曾经漂移，根因是 escape 的内层 level 没反量化
+    // —— 修掉之后这条才是「独立来源的整条流都对」。
+    let mut ours = Vec::new();
+    for (i, s) in vops.iter().enumerate() {
+        let f = d.decode(s).unwrap_or_else(|e| panic!("第 {i} 帧解不开：{e}"));
+        ours.extend(frame_bytes(&f));
+    }
+    let fsz = (vol.width * vol.height * 3 / 2) as usize;
 
     eprintln!(
-        "我们解 1 帧 / {} 字节；ffmpeg 解 {} 字节（共 {} 帧）\nffmpeg 日志：{log}",
+        "我们解 {} 帧 / {} 字节；ffmpeg 解 {} 字节（共 {} 帧）\nffmpeg 日志：{log}",
+        vops.len(),
         ours.len(),
         ref_yuv.len(),
         ref_yuv.len() / fsz
     );
     assert!(ref_yuv.len() >= fsz, "ffmpeg 连一帧都没解出来");
-    let worst = max_abs_diff(&ours, &ref_yuv[..fsz]);
-    assert_eq!(worst, 0, "与 ffmpeg 逐像素不一致，最大差 {worst}");
+    let n = (ours.len() / fsz).min(ref_yuv.len() / fsz);
+    let worst = max_abs_diff(&ours[..n * fsz], &ref_yuv[..n * fsz]);
+    assert_eq!(worst, 0, "与 ffmpeg 逐像素不一致，最大差 {worst}（比了 {n} 帧）");
 }

@@ -4,8 +4,7 @@
 //!
 //! | 项 | 状态 |
 //! |---|---|
-//! | I 帧、矩形 VOL、`progressive_sequence = 1` | ✅ 与 ffmpeg **逐像素 0 差** |
-//! | P 帧（16×16、半像素、skip、帧间残差） | ⚠️ **未收敛** —— 语法能解完、画面接近，但逐帧有漂移（见下） |
+//! | I / P 帧、矩形 VOL、`progressive_sequence = 1` | ✅ 与 ffmpeg **逐像素 0 差** |
 //! | `quant_type = 0`（H.263 量化，ffmpeg 的默认） | ✅ |
 //! | 16×16 运动矢量、半像素（`quarter_sample = 0`） | ✅ |
 //! | `resync_marker_disable = 0`（**允许** marker 但实际不出现） | ✅ 本仓与 ffmpeg 的编码器都不插 |
@@ -16,18 +15,26 @@
 //! 拒绝比猜好：这些分支每一个都「不报错、只出错」，猜出来的实现会把错画面
 //! 当成功交出去。宁可明确说「还不支持」。
 //!
-//! ## P 帧的已知问题（**未收敛，别当成能用**）
+//! ## P 帧漂移那件事（根因值得记）
 //!
-//! I 帧已经对 ffmpeg **逐像素 0 差**（`tests/ffmpeg_roundtrip.rs` 的
-//! `decoder_i_frames_match_ffmpeg_bit_exactly`）。P 帧能解完、不报错，
-//! 但逐帧差异会**累积**：一组 8 帧（I P P P I P P P）实测每帧不一致字节
-//! `[0, 5161, 7743, 9876, 0, 5382, 7866, 9709]`，最大差 48。
+//! 第一版 P 帧能解完、不报错，但逐帧漂移：8 帧 I P P P I P P P 的不一致字节
+//! `5161 / 7743 / 9876`，最大差 48，而且**每个 I 帧都清零、之后重新累积** ——
+//! 典型的「参考帧被一点点污染」。
 //!
-//! 已经排除的：MV 解码（与 `ff_h263_decode_motion` 逐行一致）、
-//! 中值预测（复用 msmpeg4 那份）、`no_rounding`（读到了 0，与编码端一致）、
-//! 转义与 `run` 步进、DC 的亮度/色度表、第三 escape 的符号扩展。
-//! 还没定位的是**残差与运动补偿叠加后的那一点点偏差**（逐帧递增 → 参考帧被污染）。
-//! 在那之前，P 帧那条测试标了 `#[ignore]`，别把「能解」当成「解对」。
+//! 根因只有一行：**escape 里那个内层符号的 level 也要反量化**。
+//! ffmpeg 的 `rl_vlc[qscale]` 表是按 qscale **预乘过**的（`ff_rl_init` 生成 32 档），
+//! 所以 `GET_RL_VLC` 在 escape 分支里拿到的 `level` 已经是 `raw*qmul + qadd`；
+//! 本实现用的是表里的原始 level，于是第一/第二 escape 的块比 ffmpeg 少一个 `qadd`。
+//!
+//! 为什么这么难看出来：**帧内 `qmul = 1`、`qadd = 0`，这一步是恒等** ——
+//! 所以 I 帧全对、P 帧只有「用到 escape 的块」差一点。而 escape 只在
+//! 系数幅度/游程超出普通码表时才出现（本例 300 个宏块里只有 5 个）。
+//! 定位靠的是「把差异块反解出 DC」：我们的 DC=25、ffmpeg 的落在 31..36，
+//! 而 25 = `1 + 3*8` 恰好少了 `qadd=3` —— 一眼就能对上是哪一条公式漏了。
+//!
+//! 另一个坑（测试侧的）：裸 `.m4v` 没有时间戳，ffmpeg 解到 raw 时会按**猜出来的
+//! 帧率重采样、静默丢帧**（10 帧的流只吐 3 帧）。必须加 `-fps_mode passthrough`，
+//! 否则「逐像素对账」只比了前几帧、照样全绿。
 //!
 //! ## 与 MP43（`v2v-msmpeg4`）的关系
 //!
@@ -605,6 +612,12 @@ fn decode_coeffs(
                     return Err(Error::Bad("第二 escape 里又解到 escape".into()));
                 }
                 let (run2, lvl2, last2) = rl.symbol(sym2);
+                // ⚠️ **内层符号的 level 也要反量化**：ffmpeg 的 `rl_vlc[qscale]` 表是按
+                // qscale **预乘过**的（`ff_rl_init` 生成 32 档），所以 escape 分支里拿到的
+                // `level` 已经是 `raw*qmul + qadd`。漏了这一步只有**帧间**会错
+                // （帧内 qmul=1/qadd=0 是恒等）—— 症状正是「I 帧全对、P 帧只在用到
+                // escape 的块上差一点，而且误差随参考帧累积」。
+                let lvl2 = lvl2 * qmul + qadd;
                 let lv = (lvl2 / qmul.max(1)).clamp(0, 63) as usize;
                 // ⚠️ `run2` 是**表里的原值**（0 起），而 `i` 走的是「`run + 1`」那套。
                 // 第二 escape 的 run 是 `max_run[last][level] + 1 + 表里的 run`，
@@ -638,7 +651,8 @@ fn decode_coeffs(
             if last2 {
                 i += 192;
             }
-            let level = lvl2 + rl.max_level_at(usize::from(last2), run2 & 63) * qmul;
+            // 同上：内层 level 已按 qscale 预乘过。
+            let level = lvl2 * qmul + qadd + rl.max_level_at(usize::from(last2), run2 & 63) * qmul;
             let level = if r.bit()? != 0 { -level } else { level };
             if i > 62 {
                 i -= 192;
