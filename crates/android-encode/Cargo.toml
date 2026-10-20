@@ -7,6 +7,11 @@ license.workspace = true
 build = "build.rs"
 publish = false
 
+# `cdylib` 是给宿主 App 用的：`libv2v_android.so` 导出 `src/capi.rs` 里那几个
+# C ABI 函数，JNI 桥 dlopen 它就行。`rlib` 保持不变，测试与 CLI 照旧。
+[lib]
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
 v2v-player = { path = "../player" }
 v2v-aac = { path = "../aac" }

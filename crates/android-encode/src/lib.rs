@@ -49,6 +49,11 @@ use std::ffi::CString;
 #[cfg(target_os = "macos")]
 pub mod vt;
 
+/// 给宿主 App 的 C ABI（JNI 桥 / ctypes 用）。只在真有硬件后端的平台编译 ——
+/// 其它平台整个 crate 是 `forbid(unsafe_code)`，而这一层必须碰裸指针。
+#[cfg(any(target_os = "android", target_os = "macos"))]
+pub mod capi;
+
 /// 端到端管线：WMV → MP4（解码纯 Rust + 视频/音频 + 封装），示例与测试共用。
 ///
 /// 非 macOS / Android 平台上 [`transcode::wmv_to_mp4_hw`] 返回 `Unsupported`
