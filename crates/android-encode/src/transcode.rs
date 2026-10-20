@@ -30,7 +30,8 @@ pub fn hw_supported() -> bool {
     false
 }
 
-#[cfg(any(target_os = "macos", target_os = "android"))]
+/// 只有 macOS 那条路用（Android 走 MediaMuxer，不碰 `v2v_mp4`）。
+#[cfg(target_os = "macos")]
 fn mux_err(e: v2v_mp4::Error) -> Error {
     Error::Bad(format!("mp4 mux: {e}"))
 }
@@ -546,7 +547,11 @@ pub fn wmv_to_mp4_hw(
         #[cfg(target_os = "android")]
         {
             use crate::Mp4HwWriter;
-            use v2v_aac::{Encoder as AacEncoder, EncoderConfig as AacConfig, Frame as AacFrame};
+            // ⚠️ 这两行以前是漏的：整块被 `#[cfg(target_os = "android")]` 挡着，
+            // 在 macOS / Linux 上根本不参与编译，于是「引用不存在的 `info` / `player`」
+            // 一直没被发现 —— 直到真的为 Android target 编一次。
+            let mut player = v2v_player::Player::open(input)?;
+            let info = player.info().clone();
             let fps = infer_fps(input);
             let mut hw = Mp4HwWriter::open(
                 output,
@@ -628,6 +633,7 @@ pub fn wmv_to_mp4_hw(
 /// 用**一次性的 Player** 探 —— 不能用主 player：它会把前 100 帧消费掉。
 #[cfg(target_os = "android")]
 fn infer_fps(path: &Path) -> u32 {
+    use v2v_player::Player;
     let Ok(mut p) = Player::open(path) else {
         return 30;
     };
