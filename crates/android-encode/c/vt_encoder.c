@@ -191,8 +191,10 @@ struct vt_ctx *vt_open(int w, int h, int bitrate, int fps, int gop_seconds) {
     VTSessionSetProperty(c->session, kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
                          ngop);
     CFRelease(ngop);
+    /* High 比 Main 多了 8×8 变换与自定义量化矩阵 —— 同码率下通常能多攒 0.3~1 dB。
+     * 兼容性：High 是 2004 年后的播放器/浏览器标配，手机全支持。 */
     VTSessionSetProperty(c->session, kVTCompressionPropertyKey_ProfileLevel,
-                         kVTProfileLevel_H264_Main_AutoLevel);
+                         kVTProfileLevel_H264_High_AutoLevel);
 
     if (VTCompressionSessionPrepareToEncodeFrames(c->session) != noErr) {
         set_err(c, "PrepareToEncode 失败");
