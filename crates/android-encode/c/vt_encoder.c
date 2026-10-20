@@ -35,7 +35,6 @@ struct sample {
 
 struct vt_ctx {
     VTCompressionSessionRef session;
-    CVPixelBufferPoolRef pool; /* session 持有的池，这里只缓存 */
     int w, h;
     pthread_mutex_t lock;
 
@@ -161,12 +160,11 @@ struct vt_ctx *vt_open(int w, int h, int bitrate, int fps, int gop_seconds) {
         vt_free(c);
         return NULL;
     }
-    c->pool = VTCompressionSessionGetPixelBufferPool(c->session);
-    if (!c->pool) {
-        set_err(c, "拿不到 pixel buffer 池");
-        vt_free(c);
-        return NULL;
-    }
+    /* ⚠️ **不要缓存 `VTCompressionSessionGetPixelBufferPool` 的返回值**：
+     * 那是 Get 语义（不持有），而且 session 会在内部**重建**池 —— 缓存的指针
+     * 过一会儿就悬空。实测：窗口调大（在飞帧变多）后 `vt_encode` 里
+     * `CVPixelBufferPoolCreatePixelBuffer` 直接 SIGSEGV（崩溃栈停在 objc_msgSend）。
+     * 改成每次用时现取（见 `vt_encode`）。 */
 
     /* 质量优先：RealTime = false（离线模式，编码器可以多花时间换质量）；
      * 不许重排帧（无 B 帧）—— 输出顺序 = 输入顺序，封装的时间轴才是直的。 */
@@ -208,7 +206,8 @@ int vt_encode(struct vt_ctx *c, const uint8_t *y, const uint8_t *u, const uint8_
               int64_t pts_us, int force_keyframe) {
     if (!c || !c->session) return -1;
     CVPixelBufferRef pix = NULL;
-    if (CVPixelBufferPoolCreatePixelBuffer(NULL, c->pool, &pix) != kCVReturnSuccess ||
+    CVPixelBufferPoolRef pool = VTCompressionSessionGetPixelBufferPool(c->session);
+    if (!pool || CVPixelBufferPoolCreatePixelBuffer(NULL, pool, &pix) != kCVReturnSuccess ||
         !pix) {
         set_err(c, "取不到 pixel buffer");
         return -1;
