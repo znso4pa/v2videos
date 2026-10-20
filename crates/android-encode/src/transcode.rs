@@ -260,7 +260,26 @@ pub fn wmv_to_mp4_hw(
                 next_submit: u64,
                 gops: std::collections::VecDeque<Vec<(Vec<u8>, i64, u64)>>,
             }
-            let cap = 32usize;
+            // 窗口要装得下**一个完整 GOP**：worker 是整段整段解的，解到一半被窗口
+            // 卡住就退化成「解 32 帧 → 等编码 → 再解 32 帧」，解码与编码根本不重叠。
+            //
+            // 实测（1080p、3719 帧、8 Mbps）：32 帧 47 s / 64 帧 38 s / 128 帧 32 s
+            // —— 源 GOP ≈ 116 帧，128 刚好能整段放下。产物只差 1 个字节（VT 的首帧
+            // 头字段），体积与 PSNR 完全一致。
+            //
+            // 上限 128 兜内存：一帧 1080p 约 3.1 MB，128 帧 ≈ 400 MB。
+            let max_gop = gops.iter().map(|g| g.len()).max().unwrap_or(32);
+            // 再加一条**内存预算**：窗口里每一帧都是解好的 YUV（1080p ≈ 3.1 MB）。
+            // 桌面 384 MB、Android 160 MB —— 手机上 1080p 只给到 ~50 帧，
+            // 换来的并行度会低一些，但不至于把整机内存吃掉。
+            let budget: usize = if cfg!(target_os = "macos") {
+                384 << 20
+            } else {
+                160 << 20
+            };
+            let frame_bytes = (vw as usize) * (vh as usize) * 3 / 2;
+            let by_mem = (budget / frame_bytes.max(1)).max(32);
+            let cap = max_gop.clamp(32, 128).min(by_mem);
             let state = Arc::new((
                 Mutex::new(Pipe {
                     ready: std::collections::BTreeMap::new(),
