@@ -98,6 +98,10 @@ impl Vol {
 /// 一帧解码器。
 pub struct Decoder {
     vol: Vol,
+    /// 有没有拿到过 VOL。`new_from_stream()` 建出来的解码器靠**流里自带**的
+    /// VOL 初始化（AVI 的 `strf` 里常常没有 extradata —— ffmpeg 把 VOL 写在
+    /// 第一个样本的 VOP 前面）。
+    have_vol: bool,
     prev: Option<Planes>,
     pw: usize,
     ph: usize,
@@ -128,12 +132,40 @@ impl Decoder {
         let mb_h = (vol.height as usize).div_ceil(16);
         Ok(Self {
             vol,
+            have_vol: true,
             prev: None,
             pw: mb_w * 16,
             ph: mb_h * 16,
             mb_w,
             mb_h,
         })
+    }
+
+    /// 建一个**等流里自带 VOL** 的解码器（容器的 extradata 里没有序列头时用）。
+    ///
+    /// AVI 的 `strf` 常常是空的 40 字节 —— ffmpeg 把 VOL 写在第一个样本的 VOP 前面。
+    /// 这种情况下只能先建解码器、等第一个样本到了再配置尺寸。
+    pub fn new_from_stream() -> Self {
+        Self {
+            vol: Vol {
+                width: 0,
+                height: 0,
+                time_increment_bits: 1,
+                mpeg_quant: false,
+                quarter_sample: false,
+                progressive: true,
+                sprite: 0,
+                data_partitioning: false,
+                quant_precision: 5,
+                interlaced: false,
+            },
+            have_vol: false,
+            prev: None,
+            pw: 0,
+            ph: 0,
+            mb_w: 0,
+            mb_h: 0,
+        }
     }
 
     /// 解一个样本（可以带 VOL 头；`00 00 01 B6` 之前的都跳过）。
@@ -153,6 +185,7 @@ impl Decoder {
                         self.mb_h = mb_h;
                         self.pw = mb_w * 16;
                         self.ph = mb_h * 16;
+                        self.have_vol = true;
                     }
                     SC_VOP => return self.decode_vop(&data[start..end]),
                     // 视觉对象序列 / 视觉对象 / 用户数据：都不影响解码，跳过。
@@ -168,6 +201,9 @@ impl Decoder {
     }
 
     fn decode_vop(&mut self, data: &[u8]) -> Result<Frame> {
+        if !self.have_vol {
+            return Err(Error::Bad("流里还没有 VOL（序列头）".into()));
+        }
         let mut r = BitReader::new(data);
         let pict_type = r.u(2)?;
         if pict_type == 2 {

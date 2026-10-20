@@ -56,7 +56,7 @@ v2v —— WMV/ASF 批量转码（纯 Rust：解封装 → 解码 → 编码 →
       --no-verify       跳过输出校验（默认解码回来与源比 PSNR）—— 只对 .wmv 有效
   -h, --help            显示本帮助
 
-输入支持：ASF（.wmv）/ AVI 里的 MP42 / MP43 / WMV1 / WMV2 视频轨 + WMA 音频轨。
+输入支持：ASF（.wmv）/ AVI 里的 MP42 / MP43 / WMV1 / WMV2 / mp4v（FMP4·DIVX·XVID）视频轨 + WMA 音频轨。
 
 两条输出路：
   .wmv  视频重编码成 MP43，音频**直通**（零损失）。会做 PSNR 校验。

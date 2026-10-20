@@ -63,7 +63,7 @@ fn verified_version(fourcc: u32) -> Result<Version, Error> {
     match Version::from_fourcc(fourcc) {
         Some(v @ (Version::V2 | Version::V3 | Version::Wmv1 | Version::Wmv2)) => Ok(v),
         _ => Err(Error::Unsupported(format!(
-            "输入视频是 {}，本工具目前只解 MP42 / MP43 / WMV1 / WMV2 / WMV3（MP41 没有可对账的样本，暂不支持）",
+            "输入视频是 {}，本工具目前只解 MP42 / MP43 / WMV1 / WMV2 / WMV3 / mp4v（MP41 没有可对账的样本，暂不支持）",
             v2v_asf::fourcc_string(fourcc)
         ))),
     }
@@ -82,6 +82,12 @@ fn make_decoder(version: Version, extra: &[u8]) -> Result<Decoder, Error> {
 
 /// MP43 的 FourCC（`.wmv` 输出用的编码）。
 pub const MP43: u32 = u32::from_le_bytes(*b"MP43");
+
+/// MPEG-4 Part 2 的四个别名（见 [`open_video_decoder`]）。
+const FMP4: u32 = u32::from_le_bytes(*b"FMP4");
+const MP4V: u32 = u32::from_le_bytes(*b"mp4v");
+const DIVX: u32 = u32::from_le_bytes(*b"DIVX");
+const XVID: u32 = u32::from_le_bytes(*b"XVID");
 
 /// WMV3（VC-1）的 FourCC —— **只做输入**，不做出编码。
 ///
@@ -102,6 +108,8 @@ pub enum VideoDecoder {
     Msmpeg4(Decoder),
     /// VC-1（WMV3）。
     Vc1(v2v_vc1::Decoder),
+    /// MPEG-4 Part 2（`mp4v`）—— I / P、H.263 量化。
+    Mp4v(v2v_mp4v::Decoder),
 }
 
 impl VideoDecoder {
@@ -121,6 +129,7 @@ impl VideoDecoder {
                     v: f.v,
                 })
             }
+            Self::Mp4v(d) => Ok(d.decode(data)?),
         }
     }
 }
@@ -139,6 +148,21 @@ fn open_video_decoder(
     w: u32,
     h: u32,
 ) -> Result<VideoDecoder, Error> {
+    // MPEG-4 Part 2 的 FourCC 有一堆别名：AVI 里 ffmpeg 写 `FMP4`，MP4 里是 `mp4v`，
+    // DivX / Xvid 编码器写 `DIVX` / `XVID` —— 都是同一条语法，交给同一个解码器。
+    if matches!(fourcc, FMP4 | MP4V | DIVX | XVID) {
+        // ⚠️ **extradata 可能是空的**：AVI 的 `strf` 常只有 40 字节，ffmpeg 把 VOL
+        // 写在第一个样本的 VOP 前面。所以拿不到 VOL 时不报错，改成「等流里的 VOL」
+        // —— 第一个样本到了自然就配上尺寸了（`Decoder::new_from_stream`）。
+        return match v2v_mp4v::Vol::parse(extra) {
+            Ok(vol) => {
+                let dec = v2v_mp4v::Decoder::new(vol)
+                    .map_err(|e| Error::Unsupported(format!("mp4v 解码器建不起来：{e}")))?;
+                Ok(VideoDecoder::Mp4v(dec))
+            }
+            Err(_) => Ok(VideoDecoder::Mp4v(v2v_mp4v::Decoder::new_from_stream())),
+        };
+    }
     if fourcc == WMV3 {
         let seq = v2v_vc1::SeqHeader::parse(extra)
             .map_err(|e| Error::Unsupported(format!("VC-1 序列头解析失败：{e}")))?;
