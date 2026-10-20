@@ -11,6 +11,9 @@ publish = false
 v2v-player = { path = "../player" }
 v2v-aac = { path = "../aac" }
 v2v-mp4 = { path = "../mp4" }
+v2v-asf = { path = "../asf" }
+v2v-vc1 = { path = "../vc1" }
+v2v-wma = { path = "../wma" }
 
 [build-dependencies]
 cc = "1"
