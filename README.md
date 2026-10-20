@@ -29,8 +29,7 @@ crates/
   wma      WMA v1/v2 音频解码（帧头 / LSP 指数 / 系数 / IMDCT）
   vc1      VC-1（**WMV3**）解码：Simple/Main profile、渐进、I/P —— 序列头 → 帧头 → 位平面 →
            宏块层 → 逆变换（8×8 + ABT）→ 运动补偿（¼ 像素）→ 环路滤波 → YUV420P
-  mp4v     MPEG-4 Part 2（mp4v）编码：I / P + 码率控制；**解码**（I 帧对 ffmpeg 逐像素 0 差，
-           P 帧未收敛、严格测试标 `#[ignore]`）
+  mp4v     MPEG-4 Part 2（mp4v）编码：I / P + 码率控制；**解码**：I / P 对 ffmpeg 逐像素 0 差
   aac      **AAC-LC 编码**：MDCT（长/短窗）+ TNS + Huffman 码本 + 码率控制
   mp4      MP4 / ISOBMFF **封装**（ftyp / mdat / moov；音频 AAC 或 PCM）
   player   顺时播放层：逐帧取视频、逐样本取音频、两轨独立、`seek(ms)`（Simple Index +
@@ -147,7 +146,7 @@ V2V_ASF_SAMPLE=/path/to/sample.wmv cargo test --release -- --ignored
 | **解码**   | **VC-1 / WMV3**（`v2v-vc1`）：**整条链路**——序列头（容器 extradata 的 `STRUCT_C`）→ 帧头（含位平面）→ 宏块层（I / P：DC/AC 预测、系数解码）→ 逆变换（8×8 与 **ABT** 三种 8×4 / 4×8 / 4×4）→ 运动补偿（**四分之一 / 半像素**插值、亮度补偿 IC）→ 环路滤波 → YUV420P。范围限定 **Main profile / 渐进 / I-P**；Advanced profile、B 帧、隔行明确报错 | 两条**外部**判据：① 位游标 —— I 帧宏块层解完落在帧尾（差一位就跑偏几十位），把「语法解对」与「像素重建对不对」分开；② `ffmpeg` 吐 `yuv420p` 裸帧边解边比，**整片 3719 帧逐帧逐像素 0 差**（`crates/vc1/tests/frames.rs`）。帧头那层另对 `ffmpeg -debug pict`：真样本 1920×1080 **3719 帧的 `pict_type` 与两张位平面 `(imode, invert)` 全同** |
 | **编码**   | MP43 **I 帧 + P 帧**：正向 DCT + 量化 + DC / RL 熵编码、运动估计（整像素粗搜 + 半像素细化）、skip 宏块                                    | 编出来的 I+P 序列交给 `ffmpeg` 解，与自己的解码器**逐像素一致**                                                       |
 | **编码**   | MPEG-4 Part 2（`v2v-mp4v`）**I 帧 + P 帧**：DC / AC 预测（逐宏块比位数择优）、运动估计（**三起点菱形搜索 + 时间预测**，半像素细化）、中值 MV 预测、skip 宏块、逐宏块帧内/帧间判决；量化走 **MPEG 型**（`quant_type = 1`，规范默认 CSF 矩阵）+ **系数级 RD（trellis，默认关）**；`--video-bitrate` 时**逐帧调 qscale** 的码率控制 | 编出来的流交给 `ffmpeg` 解；与它的 mpeg4 同 qscale 比：**体积 0.96–1.06×、PSNR 在 ±0.1 dB 内、SSIM 每档更高**（§6 按分辨率扫了一遍）；**视频载荷比全 I 帧小 2.3 倍**；码率控制实测命中目标（371→373、621→618 kbps） |
-| **解码**   | MPEG-4 Part 2（`v2v-mp4v` 的 `decode`）：I / P、H.263 量化、16×16 半像素 —— 修了六个「能跑但不对」的 bug（`^` 优先级、亮度用错色度 DC 表、escape 步进、符号扩展、伪中值、resync 误拒） | 两条判据同一把尺（`ffmpeg -idct 2`）：自己编的全 I 流**逐像素 0 差**；**ffmpeg 自己编的流**（独立来源）第一帧也 0 差。P 帧**没收敛**（逐帧差异递增 = 参考帧漂移），严格测试标 `#[ignore]` |
+| **解码**   | MPEG-4 Part 2（`v2v-mp4v` 的 `decode`）：I / P、H.263 量化、16×16 半像素 —— 修了七个「能跑但不对」的 bug（`^` 优先级、亮度用错色度 DC 表、escape 步进、符号扩展、伪中值、resync 误拒、**escape 内层 level 没反量化**） | 两条判据同一把尺（`ffmpeg -idct 2 -fps_mode passthrough`）：自己编的 I P P P I P P P **逐像素 0 差**；**ffmpeg 自己编的流**（独立来源）10 帧全解、也 0 差 |
 | **播放**   | `v2v-player`：顺时取帧（视频逐帧、音频逐样本）、两轨独立、`seek(ms)`（Simple Index + 关键帧回退 + **前向解码到目标**） | black 首帧 PTS=0（preroll 真扣掉）、EOS 稳定返回 `None`；sample 全片两轨到 EOS、PTS 单调（修过一个不报错的坑：superframe 多帧只交第一帧 → 音频只剩 1/4）；seek(69.2 s) 实际落位 **69.2 s** |
 | **硬件编码** | `v2v-android`（**全仓唯一 FFI**，见「FFI」一节）：MediaCodec H.264 + MediaMuxer MP4，音频走我们的 AAC | C shim 用真 NDK 28.2（API 26）0 警告编译、双端 `cargo check` 0 错 0 警；真机实测**待补**（无设备连接，不写没量过的数） |
 | **音频直通** | 转换时原样搬音频轨（ASF 多流复用）                                                                                         | 真样本整条音轨：输出音频与源**逐样本 0 差异**（整轨字节完全一致）                                           |
@@ -531,7 +530,7 @@ SSIM 0.969486）对合并前 q=8（1709 kbps / 37.14 dB / 0.963555）—— **�
 | **WMV1**（WMV7）           | ✅ I / P   | ❌         | 与 MP43 共用 MB 层，分叉在帧头、扫描表、DC 预测/缩放表（见「状态」那行）。**不做错误隐藏** —— 首帧不是 I 帧的流直接报错，ffmpeg 会拿垃圾当参考硬解 |
 | **WMV2**（WMV8）           | ✅ I/P + IntraX8 | ❌         | 帧头与 MB 层是另一套（`wmv2dec.c`）。比 WMV1 多：`parse_mb_skip`（4 种跳帧类型）、按 qscale 挑的 CBP 表、`mspel` 四抽头半像素 + `hshift`、**ABT**（4×8 / 8×4）、**环路滤波**、它自己那份 8×8 IDCT，以及 **IntraX8**（`j_type`，按 8×8 块走的内帧子解码器，WMV2 与 VC-1 共用 —— 见 `intrax8.rs`） |
 | **WMV9 / VC-1**          | ✅ I / P   | ❌         | **ffmpeg 里根本没有 VC-1/wmv3 编码器**（只有解码器），想要 WMV9 得另找路子。解码侧 `v2v-vc1` 已走完整条链路（Main profile / 渐进 / I/P，真 1080p 样本逐帧逐像素 0 差）；缺 **B 帧 / 隔行 / Advanced profile**、overlap smoothing、多分辨率、重同步标记 —— 遇到明确报 `Unsupported`，不静默出错 |
-| **MPEG-4 Part 2**（`mp4v`） | ⚠️ I 帧逐像素 0 差；P 帧未收敛（漂移，严格测试标 `#[ignore]`） | ✅ I / P   | 解码是后加的（842 行孤儿文件接进 crate 后对 ffmpeg 啃到 I 帧 0 差）。P 帧**能解但不对**（逐帧差异递增 = 参考帧漂移），别当能用。量化默认走 **MPEG 型**（`quant_type = 1`，规范默认 CSF 矩阵，同体积下 SSIM 更高）；另有**系数级 RD（trellis）**但**默认关**。缺 B 帧、8×8 运动补偿、`dquant`、resync marker、数据分割 |
+| **MPEG-4 Part 2**（`mp4v`） | ✅ I / P（H.263 量化） | ✅ I / P   | 解码：AVI 里的 `FMP4` / `mp4v` / `DIVX` / `XVID` 都认，I / P 对 ffmpeg **逐像素 0 差**（`crates/mp4v/tests/ffmpeg_roundtrip.rs`，含独立来源的流）。**不支持**：`quant_type = 1`（MPEG 矩阵量化 —— 我们自己编的 `.mp4` 就是这一档，所以「读回自己写的」还没通）、B / S 帧、4MV、`dquant`、隔行、GMC、数据分割、resync marker。编码默认走 **MPEG 型**（同体积下 SSIM 更高）+ 可选的**系数级 RD（trellis，默认关）** |
 | **H.264 / AVC**          | ❌         | ⭕ 硬件（FFI）：macOS VideoToolbox / Android MediaCodec | 软件侧不在范围内（LGPL 侧链不了 x264，见「许可证」）；硬件侧走 `crates/android-encode`（见「FFI」一节）—— 真实样本实测 PSNR 42.45 dB（同码率反超 ffmpeg 的 mpeg4 1.7 dB） |
 
 ### 音频编码
