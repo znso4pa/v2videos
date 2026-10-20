@@ -126,10 +126,12 @@ fn mspel_mc<const W: usize>(
         } else {
             let r = 1 - rnd;
             for j in 0..w {
-                let row0 = (b + (j * BUF_STRIDE) as isize) as usize;
                 let drow = (dy + j) * dstride + dx;
                 #[cfg(target_arch = "aarch64")]
-                crate::neon::single_vertical(src, row0, w, vmode, r, dst, drow);
+                {
+                    let row0 = (b + (j * BUF_STRIDE) as isize) as usize;
+                    crate::neon::single_vertical(src, row0, w, vmode, r, dst, drow);
+                }
                 #[cfg(not(target_arch = "aarch64"))]
                 for i in 0..w {
                     let off = b + (j * BUF_STRIDE + i) as isize;
@@ -141,12 +143,14 @@ fn mspel_mc<const W: usize>(
     } else {
         // 只有水平（含 hmode == 0 的整像素拷贝）。
         for j in 0..w {
-            let row = (b + (j * BUF_STRIDE) as isize) as usize;
             let drow = (dy + j) * dstride + dx;
             #[cfg(target_arch = "aarch64")]
-            if hmode != 0 {
-                crate::neon::single_horizontal(src, row, w, hmode, rnd, dst, drow);
-                continue;
+            {
+                if hmode != 0 {
+                    let row = (b + (j * BUF_STRIDE) as isize) as usize;
+                    crate::neon::single_horizontal(src, row, w, hmode, rnd, dst, drow);
+                    continue;
+                }
             }
             for i in 0..w {
                 let off = b + (j * BUF_STRIDE + i) as isize;
