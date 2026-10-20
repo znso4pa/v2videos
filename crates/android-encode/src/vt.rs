@@ -86,6 +86,14 @@ impl VideoToolboxEncoder {
         self.drain()
     }
 
+    /// 只收已就绪的样本（不喂新帧）—— 多 worker 共享会话时用：
+    /// **队列是全会话共享的**，drain 出来的样本可能来自任何 worker 喂的帧，
+    /// 调用方必须把所有 worker 的收成都汇到同一个收集器（否则样本会按
+    /// worker 被复制 —— 实测 369 MB 产物就是这么来的）。
+    pub fn drain_ready(&mut self) -> Result<Vec<VtSample>> {
+        self.drain()
+    }
+
     /// 发 EOS 并取走全部在途样本。之后句柄只能 Drop（样本仍可用 `avcc()` 取）。
     pub fn finish(&mut self) -> Result<Vec<VtSample>> {
         unsafe {
@@ -142,6 +150,12 @@ impl VideoToolboxEncoder {
         }
     }
 }
+
+// # Safety
+// `VTCompressionSession` 允许多线程调用 `VTCompressionSessionEncodeFrame`
+// （Apple 文档：session 内部有锁），且本 crate 的所有调用点都用互斥锁
+// **串行化**了 encode + drain。跨线程移动句柄因此是安全的。
+unsafe impl Send for VideoToolboxEncoder {}
 
 impl Drop for VideoToolboxEncoder {
     fn drop(&mut self) {
