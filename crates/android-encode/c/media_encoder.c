@@ -257,18 +257,31 @@ int ame_add_audio_track(struct ame_ctx *c, const uint8_t *asc, int asc_len,
     return 0;
 }
 
+/* 取一个 input buffer。
+ *
+ * `AMediaCodec_dequeueInputBuffer` 在「暂时没有空闲缓冲」时返回 -1
+ * （= AMEDIACODEC_INFO_TRY_AGAIN_LATER），这是**正常现象**：软件编码器、
+ * 低端 SoC、或系统繁忙时都可能出现。只等 10 ms 就判失败，会让转码在这类
+ * 设备上直接放弃（模拟器的软件 AAC 编码器就是这么暴露的）—— 所以在 5 s
+ * 内重试，超时才当错误。 */
+static ssize_t dequeue_input_wait(struct ame_ctx *c, const char *what) {
+    for (int waited = 0; waited < 5000; waited += 10) {
+        ssize_t idx = AMediaCodec_dequeueInputBuffer(c->codec, 10 /* ms */);
+        if (idx >= 0) return idx;
+        if (idx != AMEDIACODEC_INFO_TRY_AGAIN_LATER) {
+            set_err(c, "%s dequeueInputBuffer: %zd", what, idx);
+            return -1;
+        }
+    }
+    set_err(c, "%s 5 s 内拿不到 input buffer（编码器卡住）", what);
+    return -1;
+}
+
 int ame_write_video(struct ame_ctx *c, const uint8_t *y, const uint8_t *u,
                     const uint8_t *v, int64_t pts_us, int force_keyframe) {
     if (!c) return -1;
-    ssize_t idx = AMediaCodec_dequeueInputBuffer(c->codec, 10000 /* 10 ms */);
-    if (idx == AMEDIACODEC_INFO_TRY_AGAIN_LATER) {
-        set_err(c, "编码器 10 ms 内没给出 input buffer（负载过重）");
-        return -1;
-    }
-    if (idx < 0) {
-        set_err(c, "dequeueInputBuffer: %zd", idx);
-        return -1;
-    }
+    ssize_t idx = dequeue_input_wait(c, "视频");
+    if (idx < 0) return -1;
     size_t cap = 0;
     uint8_t *buf = AMediaCodec_getInputBuffer(c->codec, (size_t)idx, &cap);
     if (!buf || (size_t)(c->y_size + 2 * c->uv_size) > cap) {
@@ -302,11 +315,8 @@ int ame_write_video(struct ame_ctx *c, const uint8_t *y, const uint8_t *u,
 
 int ame_write_audio(struct ame_ctx *c, const uint8_t *data, int len, int64_t pts_us) {
     if (!c) return -1;
-    ssize_t idx = AMediaCodec_dequeueInputBuffer(c->codec, 10000);
-    if (idx < 0) {
-        set_err(c, "音频 dequeueInputBuffer: %zd", idx);
-        return -1;
-    }
+    ssize_t idx = dequeue_input_wait(c, "音频");
+    if (idx < 0) return -1;
     size_t cap = 0;
     uint8_t *buf = AMediaCodec_getInputBuffer(c->codec, (size_t)idx, &cap);
     if (!buf || (size_t)len > cap) {
