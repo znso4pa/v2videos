@@ -81,10 +81,12 @@ pub extern "C" fn v2v_transcode(
     let vbr = if video_bitrate == 0 { 4_000_000 } else { video_bitrate };
     let abr = if audio_bitrate == 0 { 128_000 } else { audio_bitrate };
 
-    match wmv_to_mp4_hw(Path::new(inp), Path::new(out), vbr, abr) {
+    match guard("转码", || {
+        wmv_to_mp4_hw(Path::new(inp), Path::new(out), vbr, abr)
+    }) {
         Ok(_) => 0,
         Err(e) => {
-            set_err(&e.to_string());
+            set_err(&e);
             3
         }
     }
@@ -120,13 +122,26 @@ pub extern "C" fn v2v_has_wma_audio(input: *const c_char) -> i32 {
             }
         }
     };
-    match crate::wma_wav::has_wma_audio(Path::new(inp)) {
+    match guard("读取 ASF 头", || crate::wma_wav::has_wma_audio(Path::new(inp))) {
         Ok(true) => 1,
         Ok(false) => 0,
         Err(e) => {
-            set_err(&e.to_string());
+            set_err(&e);
             3
         }
+    }
+}
+
+/// 把可能 panic 的解码/转码包起来 —— `extern "C"` 里 unwind 出去会直接 abort 进程，
+/// 一个损坏的 WMV 不该让整个 App 挂掉。
+fn guard<T, E: std::fmt::Display>(
+    what: &str,
+    f: impl FnOnce() -> std::result::Result<T, E>,
+) -> std::result::Result<T, String> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err(format!("{what} 时发生 panic（文件可能损坏）")),
     }
 }
 
@@ -163,12 +178,18 @@ pub extern "C" fn v2v_wma_to_wav(
             }
         }
     };
-    match crate::wma_wav::wma_to_wav_bytes(Path::new(inp)) {
-        Ok(mut vec) => {
-            vec.shrink_to_fit();
-            let ptr = vec.as_mut_ptr();
-            let len = vec.len();
-            std::mem::forget(vec); // 所有权移交调用方，靠 v2v_free 回收
+    match guard("解码 WMA 音轨", || {
+        crate::wma_wav::wma_to_wav_bytes(Path::new(inp))
+    }) {
+        Ok(vec) => {
+            // 用 `into_boxed_slice` 而不是 `shrink_to_fit`：前者**保证**多余容量被搬进
+            // 精确大小的分配（文档明说），这样 `v2v_free` 按 `len` 重建 `Box<[u8]>`
+            // 时，释放布局必然与分配一致。
+            // 反例：`shrink_to_fit` 不保证容量 == len（分配器可拒绝收缩），
+            // 那样 `Vec::from_raw_parts(ptr, len, len)` 就会按更小的布局释放更大的块 —— UB。
+            let boxed: Box<[u8]> = vec.into_boxed_slice();
+            let len = boxed.len();
+            let ptr = Box::into_raw(boxed) as *mut u8; // 瘦指针，长度另带
             unsafe {
                 *out_ptr = ptr;
                 *out_len = len;
@@ -176,7 +197,7 @@ pub extern "C" fn v2v_wma_to_wav(
             0
         }
         Err(e) => {
-            set_err(&e.to_string());
+            set_err(&e);
             3
         }
     }
@@ -194,7 +215,9 @@ pub extern "C" fn v2v_free(ptr: *mut u8, len: usize) {
         return;
     }
     unsafe {
-        // 与 v2v_wma_to_wav 里的 shrink_to_fit + forget 配对：容量 == 长度。
-        let _ = Vec::from_raw_parts(ptr, len, len);
+        // 与 `v2v_wma_to_wav` 里的 `Box::into_raw` 配对：`into_boxed_slice` 保证了
+        // 分配大小恰好是 `len`，所以这里用 `len` 重建胖指针释放是合法的。
+        let slice = std::ptr::slice_from_raw_parts_mut(ptr, len);
+        drop(Box::from_raw(slice));
     }
 }
