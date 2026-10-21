@@ -1,6 +1,7 @@
 //! 给宿主 App 的 C ABI —— JNI 桥（或 ctypes / 任何 FFI）都走这一层。
 //!
-//! 只暴露三件事：**转码**、**取最后一次错误**、**问硬件后端在不在**。
+//! 只暴露四件事：**转码**、**取最后一次错误**、**问硬件后端在不在**，
+//! 以及 **把 WMA 音轨抽成 WAV 字节**（给解码器太慢的引擎替换音频路径用）。
 //! 路径用 UTF-8 C 字符串；`v2v_transcode` 返回 0 表示成功。
 //!
 //! 为什么单独一层而不是直接给 JNI 写：JNI 那层要在 C 里拼 `jstring` → `char*`，
@@ -99,4 +100,101 @@ pub extern "C" fn v2v_last_error() -> *const c_char {
 #[no_mangle]
 pub extern "C" fn v2v_hw_supported() -> i32 {
     i32::from(hw_supported())
+}
+
+/// 这个文件里有没有我们能解的 WMA 音轨（1 有 / 0 没有）。
+///
+/// 只读 ASF 头，不解码——给调用方做「值不值得走 WMA→WAV 这条路」的快速判断。
+/// 参数非法时返回 `1` 并把原因写进 [`v2v_last_error`]；其它情况只回 0/1。
+///
+/// # Safety
+/// `input` 必须是 NUL 结尾的可读字符串；调用期间不能被释放。
+#[no_mangle]
+pub extern "C" fn v2v_has_wma_audio(input: *const c_char) -> i32 {
+    let inp = unsafe {
+        match cstr(input, "input") {
+            Ok(a) => a,
+            Err(e) => {
+                set_err(&e);
+                return 1;
+            }
+        }
+    };
+    match crate::wma_wav::has_wma_audio(Path::new(inp)) {
+        Ok(true) => 1,
+        Ok(false) => 0,
+        Err(e) => {
+            set_err(&e.to_string());
+            3
+        }
+    }
+}
+
+/// 把整个 WMV/ASF 的 WMA 音轨解成 PCM16LE 的 WAV 字节，写到 `*out_ptr`/`*out_len`。
+///
+/// 这条比 [`v2v_transcode`] 轻得多：**不解视频、不重编码**，只把音轨解出来——
+/// 引擎拿到字节直接当「解好的 WAV」用（标准 RIFF/WAVE、PCM16LE、声道交织，
+/// 与常见引擎自己的实现逐字段一致）。适合「自带 WMA 解码器慢到没法用、只能靠预转 MP4 绕开」的场景。
+///
+/// 返回码：
+/// * `0` 成功（`*out_ptr`/`*out_len` 已填，必须用 [`v2v_free`] 释放）
+/// * `1` 参数非法（空指针、非 UTF-8、`out_ptr`/`out_len` 为 NULL）
+/// * `3` 解码失败（具体原因看 [`v2v_last_error`]；没有 WMA 音轨也走这里）
+///
+/// # Safety
+/// `input` 必须是 NUL 结尾的可读字符串；`out_ptr`/`out_len` 必须指向可写地址。
+/// 返回的缓冲区所有权转移给调用方，用完后调 [`v2v_free`] 释放，否则泄漏。
+#[no_mangle]
+pub extern "C" fn v2v_wma_to_wav(
+    input: *const c_char,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    if out_ptr.is_null() || out_len.is_null() {
+        set_err("out_ptr / out_len 是空指针");
+        return 1;
+    }
+    let inp = unsafe {
+        match cstr(input, "input") {
+            Ok(a) => a,
+            Err(e) => {
+                set_err(&e);
+                return 1;
+            }
+        }
+    };
+    match crate::wma_wav::wma_to_wav_bytes(Path::new(inp)) {
+        Ok(mut vec) => {
+            vec.shrink_to_fit();
+            let ptr = vec.as_mut_ptr();
+            let len = vec.len();
+            std::mem::forget(vec); // 所有权移交调用方，靠 v2v_free 回收
+            unsafe {
+                *out_ptr = ptr;
+                *out_len = len;
+            }
+            0
+        }
+        Err(e) => {
+            set_err(&e.to_string());
+            3
+        }
+    }
+}
+
+/// 释放 [`v2v_wma_to_wav`] 返回的缓冲区。
+///
+/// 必须配对调用：`ptr` / `len` 就是 `v2v_wma_to_wav` 写入的值。空指针或长度 0 直接忽略。
+///
+/// # Safety
+/// `ptr` / `len` 必须来自一次成功的 [`v2v_wma_to_wav`] 调用，且只释放一次。
+#[no_mangle]
+pub extern "C" fn v2v_free(ptr: *mut u8, len: usize) {
+    if ptr.is_null() || len == 0 {
+        return;
+    }
+    unsafe {
+        // 与 v2v_wma_to_wav 里的 shrink_to_fit + forget 配对：容量 == 长度。
+        let _ = Vec::from_raw_parts(ptr, len, len);
+    }
 }

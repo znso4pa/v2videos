@@ -49,6 +49,13 @@ use std::ffi::CString;
 #[cfg(target_os = "macos")]
 pub mod vt;
 
+/// WMV / ASF 里的 **WMA 音轨 → PCM16LE WAV**（纯安全 Rust，全平台）。
+///
+/// 给宿主引擎替换「慢到没法用」的 WMA 解码器：同一样本上本仓的解码器是
+/// 110× 实时，而引擎自带的那套是 0.19×（比实时慢 5.3×）——所以 WMV 一直
+/// 「能播画面没声音」，只能靠预转码 MP4 绕开。这条路径只解音轨，不解视频。
+pub mod wma_wav;
+
 /// 给宿主 App 的 C ABI（JNI 桥 / ctypes 用）。只在真有硬件后端的平台编译 ——
 /// 其它平台整个 crate 是 `forbid(unsafe_code)`，而这一层必须碰裸指针。
 #[cfg(any(target_os = "android", target_os = "macos"))]
