@@ -80,7 +80,17 @@ pub fn wma_to_wav_bytes(input: &Path) -> Result<Vec<u8>> {
     let mut dec = v2v_wma::WmaDecoder::new(params)?;
 
     let ch = af.channels as usize;
-    let mut pcm: Vec<i16> = Vec::new();
+    let byte_rate = af.sample_rate as u64 * ch as u64 * 2;
+
+    // 直接往最终缓冲里写，不先攒 `Vec<i16>` 再拷贝 —— 峰值内存从「2 倍数据量」
+    // 降到「1 倍」。手机上一次抽取 2 分钟 OP 约 23 MB（原先 46 MB）。
+    //
+    // 预分配用 ASF 头里的播放时长估：留 1 秒余量吸收块对齐误差；超过 64 MB 就
+    // 不再一次性预占（长片用增量增长，宁可慢一点也不赌分配成功）。
+    let est = (demux.info().duration_ms() as u64 * byte_rate / 1000) as usize;
+    let mut out: Vec<u8> = Vec::with_capacity(44 + est.min(64 << 20) + byte_rate as usize);
+    out.resize(44, 0); // 先占位，末尾回填头
+
     loop {
         let s = match demux.next_sample()? {
             Some(s) => s,
@@ -92,51 +102,88 @@ pub fn wma_to_wav_bytes(input: &Path) -> Result<Vec<u8>> {
         for frame in dec.decode_superframe(&s.data)? {
             // 各声道等长；交织成 L R L R …（与 WAV 的 data 布局一致）。
             let n = frame.first().map_or(0, |p| p.len());
-            pcm.reserve(n * ch);
+            out.reserve(n * ch * 2);
             for i in 0..n {
                 for plane in &frame {
                     // 解码器输出的值域就是 `[-32768, 32767]` 的 f32（见 `AudioFrame`），
                     // 所以这里是「取整 + 夹紧」，不是缩放。
                     let v = plane[i].round().clamp(-32768.0, 32767.0) as i16;
-                    pcm.push(v);
+                    out.extend_from_slice(&v.to_le_bytes());
                 }
             }
         }
     }
 
-    if pcm.is_empty() {
+    if out.len() <= 44 {
         return Err(Error::Bad("WMA 音轨解出来是空的".into()));
     }
-    Ok(wav_pcm16le(&pcm, af.channels, af.sample_rate))
+    let data_size = (out.len() - 44) as u32;
+    out[..44].copy_from_slice(&wav_header(af.channels, af.sample_rate, data_size));
+    Ok(out)
 }
 
-/// RIFF/WAVE + `fmt `(PCM) + `data`，16 bit 小端交织。
+/// 44 字节 RIFF/WAVE 头（`fmt ` PCM + `data`），16 bit 小端。
 ///
 /// 与常见引擎自己的 WAV 实现逐字段一致 —— 调用方不需要知道这个 WAV 是谁产的。
-fn wav_pcm16le(samples: &[i16], channels: u16, sample_rate: u32) -> Vec<u8> {
+fn wav_header(channels: u16, sample_rate: u32, data_size: u32) -> [u8; 44] {
     const BYTES_PER_SAMPLE: u16 = 2;
     let block_align = channels.saturating_mul(BYTES_PER_SAMPLE);
     let byte_rate = sample_rate.saturating_mul(u32::from(block_align));
-    let data_size = (samples.len() as u32).saturating_mul(2);
 
-    let mut out = Vec::with_capacity(44 + data_size as usize);
-    out.extend_from_slice(b"RIFF");
-    out.extend_from_slice(&(36u32.saturating_add(data_size)).to_le_bytes());
-    out.extend_from_slice(b"WAVE");
+    let mut h = [0u8; 44];
+    h[0..4].copy_from_slice(b"RIFF");
+    h[4..8].copy_from_slice(&(36u32.saturating_add(data_size)).to_le_bytes());
+    h[8..12].copy_from_slice(b"WAVE");
 
-    out.extend_from_slice(b"fmt ");
-    out.extend_from_slice(&16u32.to_le_bytes()); // fmt chunk 长度
-    out.extend_from_slice(&1u16.to_le_bytes()); // audio_format = PCM
-    out.extend_from_slice(&channels.to_le_bytes());
-    out.extend_from_slice(&sample_rate.to_le_bytes());
-    out.extend_from_slice(&byte_rate.to_le_bytes());
-    out.extend_from_slice(&block_align.to_le_bytes());
-    out.extend_from_slice(&16u16.to_le_bytes()); // bits_per_sample
+    h[12..16].copy_from_slice(b"fmt ");
+    h[16..20].copy_from_slice(&16u32.to_le_bytes()); // fmt chunk 长度
+    h[20..22].copy_from_slice(&1u16.to_le_bytes()); // audio_format = PCM
+    h[22..24].copy_from_slice(&channels.to_le_bytes());
+    h[24..28].copy_from_slice(&sample_rate.to_le_bytes());
+    h[28..32].copy_from_slice(&byte_rate.to_le_bytes());
+    h[32..34].copy_from_slice(&block_align.to_le_bytes());
+    h[34..36].copy_from_slice(&16u16.to_le_bytes()); // bits_per_sample
 
-    out.extend_from_slice(b"data");
-    out.extend_from_slice(&data_size.to_le_bytes());
-    for &s in samples {
-        out.extend_from_slice(&s.to_le_bytes());
+    h[36..40].copy_from_slice(b"data");
+    h[40..44].copy_from_slice(&data_size.to_le_bytes());
+    h
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn u16_at(h: &[u8; 44], i: usize) -> u16 {
+        u16::from_le_bytes([h[i], h[i + 1]])
     }
-    out
+
+    fn u32_at(h: &[u8; 44], i: usize) -> u32 {
+        u32::from_le_bytes([h[i], h[i + 1], h[i + 2], h[i + 3]])
+    }
+
+    /// 44 字节头必须逐字段正确 —— 单声道/48k 没有真实样本可对拍，只能靠这个兜住。
+    #[test]
+    fn wav_header_layout() {
+        let h = wav_header(2, 44_100, 1000);
+        assert_eq!(&h[0..4], b"RIFF");
+        assert_eq!(u32_at(&h, 4), 36 + 1000); // RIFF chunk size
+        assert_eq!(&h[8..12], b"WAVE");
+        assert_eq!(&h[12..16], b"fmt ");
+        assert_eq!(u32_at(&h, 16), 16); // fmt chunk size
+        assert_eq!(u16_at(&h, 20), 1); // PCM
+        assert_eq!(u16_at(&h, 22), 2); // 声道
+        assert_eq!(u32_at(&h, 24), 44_100);
+        assert_eq!(u32_at(&h, 28), 44_100 * 4); // byte rate
+        assert_eq!(u16_at(&h, 32), 4); // block align
+        assert_eq!(u16_at(&h, 34), 16); // bits per sample
+        assert_eq!(&h[36..40], b"data");
+        assert_eq!(u32_at(&h, 40), 1000);
+
+        // 单声道 48 kHz：block_align / byte_rate 都要跟着变
+        let h = wav_header(1, 48_000, 2000);
+        assert_eq!(u16_at(&h, 22), 1);
+        assert_eq!(u32_at(&h, 28), 48_000 * 2);
+        assert_eq!(u16_at(&h, 32), 2);
+        assert_eq!(u32_at(&h, 40), 2000);
+    }
 }
