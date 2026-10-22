@@ -325,7 +325,9 @@ pub mod tables;
 
 #[cfg(test)]
 mod table_tests {
-    use super::tables::{EOB_BITS, EOB_CODE, ESCAPE_BITS, ESCAPE_CODE, MPEG1_RL};
+    use super::tables::{
+        EOB_BITS, EOB_CODE, ESCAPE_BITS, ESCAPE_CODE, MPEG1_RL, MV_CODE, P_MB_TYPE,
+    };
 
     /// 前缀无关：没有一条码字是另一条的前缀。
     #[test]
@@ -383,6 +385,36 @@ mod table_tests {
                 !(entry.bits >= ESCAPE_BITS && entry.code >> (entry.bits - ESCAPE_BITS) == ESCAPE_CODE),
                 "an entry starts with the escape code"
             );
+        }
+    }
+
+    /// 运动矢量码必须是前缀码 —— 否则「哪个码先匹配」会随表序漂。
+    #[test]
+    fn mv_code_is_prefix_free() {
+        for (i, a) in MV_CODE.iter().enumerate() {
+            for (j, b) in MV_CODE.iter().enumerate() {
+                if i == j || a.bits > b.bits {
+                    continue;
+                }
+                assert_ne!(b.code >> (b.bits - a.bits), a.code, "mv {i} is a prefix of {j}");
+            }
+        }
+    }
+
+    /// P 帧 `macroblock_type` 也必须是前缀码。
+    #[test]
+    fn p_mb_type_is_prefix_free() {
+        for (i, a) in P_MB_TYPE.iter().enumerate() {
+            for (j, b) in P_MB_TYPE.iter().enumerate() {
+                if i == j || a.bits > b.bits {
+                    continue;
+                }
+                assert_ne!(
+                    b.code >> (b.bits - a.bits),
+                    a.code,
+                    "p mb_type {i} is a prefix of {j}"
+                );
+            }
         }
     }
 }

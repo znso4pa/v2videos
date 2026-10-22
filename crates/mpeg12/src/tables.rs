@@ -16,6 +16,18 @@ pub const INTRA_MATRIX: [u8; 64] = [
     27, 29, 35, 38, 46, 56, 69, 83,
 ];
 
+/// 默认帧间量化矩阵（8×8，行优先）。P 帧残差用它反量化。
+pub const NON_INTRA_MATRIX: [u8; 64] = [
+    16, 16, 16, 16, 16, 16, 16, 16,
+    16, 16, 16, 16, 16, 16, 16, 16,
+    16, 16, 16, 16, 16, 16, 16, 16,
+    16, 16, 16, 16, 16, 16, 16, 16,
+    16, 16, 16, 16, 16, 16, 16, 16,
+    16, 16, 16, 16, 16, 16, 16, 16,
+    16, 16, 16, 16, 16, 16, 16, 16,
+    16, 16, 16, 16, 16, 16, 16, 16,
+];
+
 /// 一条前缀码：`bits` 位码 `code`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Code {
@@ -163,6 +175,27 @@ pub const MB_PATTERN: [Code; 64] = [
     Code { code: 0x000c, bits: 6 },
 ];
 
+/// 运动矢量码，下标即 `|motion_code|`（0..=16）。
+pub const MV_CODE: [Code; 17] = [
+    Code { code: 0x0001, bits: 1 },
+    Code { code: 0x0001, bits: 2 },
+    Code { code: 0x0001, bits: 3 },
+    Code { code: 0x0001, bits: 4 },
+    Code { code: 0x0003, bits: 6 },
+    Code { code: 0x0005, bits: 7 },
+    Code { code: 0x0004, bits: 7 },
+    Code { code: 0x0003, bits: 7 },
+    Code { code: 0x000b, bits: 9 },
+    Code { code: 0x000a, bits: 9 },
+    Code { code: 0x0009, bits: 9 },
+    Code { code: 0x0011, bits: 10 },
+    Code { code: 0x0010, bits: 10 },
+    Code { code: 0x000f, bits: 10 },
+    Code { code: 0x000e, bits: 10 },
+    Code { code: 0x000d, bits: 10 },
+    Code { code: 0x000c, bits: 10 },
+];
+
 /// 一条 run/level 码字。level 的符号是码字之后的**独立 1 位**。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RlEntry {
@@ -293,3 +326,37 @@ pub const EOB_BITS: u8 = 2;
 /// 逃逸码 `000001`，后跟定长的 run / level。
 pub const ESCAPE_CODE: u16 = 0b000001;
 pub const ESCAPE_BITS: u8 = 6;
+
+/// P 帧宏块的运动来源。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Motion {
+    /// 帧内宏块，不做运动补偿。
+    None,
+    /// 前向预测但运动矢量为 0（不读矢量位）。
+    Zero,
+    /// 前向预测，运动矢量从码流里读。
+    Forward,
+}
+
+/// P 帧的一条 `macroblock_type`：码字 + 语义。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PMbType {
+    pub code: u16,
+    pub bits: u8,
+    pub intra: bool,
+    /// 后面跟 `coded_block_pattern`（决定哪些块有残差）。
+    pub coded: bool,
+    pub motion: Motion,
+    pub quant: bool,
+}
+
+/// P 帧 `macroblock_type` 表（下标即 VLC 符号）。
+pub const P_MB_TYPE: [PMbType; 7] = [
+    PMbType { code: 0x0003, bits: 5, intra: true, coded: false, motion: Motion::None, quant: false },
+    PMbType { code: 0x0001, bits: 2, intra: false, coded: true, motion: Motion::Zero, quant: false },
+    PMbType { code: 0x0001, bits: 3, intra: false, coded: false, motion: Motion::Forward, quant: false },
+    PMbType { code: 0x0001, bits: 1, intra: false, coded: true, motion: Motion::Forward, quant: false },
+    PMbType { code: 0x0001, bits: 6, intra: true, coded: false, motion: Motion::None, quant: true },
+    PMbType { code: 0x0001, bits: 5, intra: false, coded: true, motion: Motion::Zero, quant: true },
+    PMbType { code: 0x0002, bits: 5, intra: false, coded: true, motion: Motion::Forward, quant: true },
+];
