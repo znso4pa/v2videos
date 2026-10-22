@@ -68,6 +68,27 @@ def mb_ptype_semantics(text):
     return out
 
 
+def mb_btype_semantics(text):
+    """把 `btype2mb_type` 的每个条目翻成 `(intra, coded, forward, backward, quant)`。
+
+    `MB_TYPE_BIDIR_MV` 同时意味着前向与后向。
+    """
+    out = []
+    for item in text.strip().strip("{}").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        bidir = "MB_TYPE_BIDIR_MV" in item
+        out.append((
+            "MB_TYPE_INTRA" in item,
+            "MB_TYPE_CBP" in item,
+            "MB_TYPE_FORWARD_MV" in item or bidir,
+            "MB_TYPE_BACKWARD_MV" in item or bidir,
+            "MB_TYPE_QUANT" in item,
+        ))
+    return out
+
+
 def main():
     src = open(SRC).read()
     src2 = open(SRC2).read()
@@ -89,6 +110,10 @@ def main():
     psem = mb_ptype_semantics(body(src2, "ptype2mb_type"))
     if len(ptype) != len(psem):
         raise SystemExit(f"P mb_type: {len(ptype)} codes vs {len(psem)} semantics")
+    btype = pairs(body(src2, "table_mb_btype"))
+    bsem = mb_btype_semantics(body(src2, "btype2mb_type"))
+    if len(btype) != len(bsem):
+        raise SystemExit(f"B mb_type: {len(btype)} codes vs {len(bsem)} semantics")
 
     out = []
     w = out.append
@@ -185,10 +210,30 @@ def main():
         w(f"    PMbType {{ code: 0x{code:04x}, bits: {bits}, intra: {str(intra_f).lower()}, "
           f"coded: {str(coded).lower()}, motion: Motion::{motion}, quant: {str(quant).lower()} }},")
     w("];")
+    w("")
+    w("/// B 帧的一条 `macroblock_type`：前向 / 后向 / 双向预测。")
+    w("#[derive(Debug, Clone, Copy, PartialEq, Eq)]")
+    w("pub struct BMbType {")
+    w("    pub code: u16,")
+    w("    pub bits: u8,")
+    w("    pub intra: bool,")
+    w("    pub coded: bool,")
+    w("    pub forward: bool,")
+    w("    pub backward: bool,")
+    w("    pub quant: bool,")
+    w("}")
+    w("")
+    w("/// B 帧 `macroblock_type` 表（下标即 VLC 符号）。")
+    w(f"pub const B_MB_TYPE: [BMbType; {len(btype)}] = [")
+    for (code, bits), (intra_f, coded, fwd, bwd, quant) in zip(btype, bsem):
+        w(f"    BMbType {{ code: 0x{code:04x}, bits: {bits}, intra: {str(intra_f).lower()}, "
+          f"coded: {str(coded).lower()}, forward: {str(fwd).lower()}, backward: {str(bwd).lower()}, "
+          f"quant: {str(quant).lower()} }},")
+    w("];")
 
     open(OUT, "w").write("\n".join(out) + "\n")
     print(f"wrote {OUT}: {len(level)} rl, {len(mb_addr)} mb_addr, {len(mb_pat)} mb_pat, "
-          f"{len(mv)} mv, {len(ptype)} p_mb_type")
+          f"{len(mv)} mv, {len(ptype)} p_mb_type, {len(btype)} b_mb_type")
 
 
 if __name__ == "__main__":
