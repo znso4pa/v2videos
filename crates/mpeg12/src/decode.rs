@@ -9,6 +9,7 @@
 use crate::tables::{
     Code, DC_CHROMA, DC_LUM, EOB_BITS, EOB_CODE, ESCAPE_BITS, ESCAPE_CODE, INTRA_MATRIX,
     MB_ADDR_INCR, MB_PATTERN, MPEG1_RL, MV_CODE, NON_INTRA_MATRIX, P_MB_TYPE, B_MB_TYPE, Motion,
+    ALT_SCAN, MPEG2_RL, NON_LINEAR_QSCALE, RlEntry,
 };
 use crate::{BitReader, PictureHeader, PictureType, SequenceHeader};
 
@@ -56,14 +57,14 @@ fn decode_vlc(r: &mut BitReader, table: &[Code]) -> Option<usize> {
 }
 
 /// 在 run/level 表里按最长前缀找码。
-fn decode_rl(r: &mut BitReader) -> Option<usize> {
-    let max_bits = MPEG1_RL.iter().map(|e| e.bits).max().unwrap_or(0) as u32;
+fn decode_rl(r: &mut BitReader, table: &[RlEntry]) -> Option<usize> {
+    let max_bits = table.iter().map(|e| e.bits).max().unwrap_or(0) as u32;
     for len in 1..=max_bits {
         if r.bits_left() < len as usize {
             return None;
         }
         let value = r.peek_u(len);
-        for (index, entry) in MPEG1_RL.iter().enumerate() {
+        for (index, entry) in table.iter().enumerate() {
             if entry.bits as u32 == len && entry.code as u32 == value {
                 r.skip(len).ok()?;
                 return Some(index);
@@ -139,39 +140,93 @@ const fn build_zigzag() -> [usize; 64] {
     table
 }
 
-/// 反量化：帧内 DC 是 `8 × diff`（不乘 scale），交流是 `(2·level·matrix·scale)/16`。
-fn dequantise_intra(quantised: &[i32; 64], scale: i32) -> [i32; 64] {
+/// 反量化参数：MPEG-1 / MPEG-2、线性 / 非线性量化只在这里分叉。
+///
+/// MPEG-2 的量化器在反量化前被 `<<1`（线性）或查非线性表，所以它的移位比
+/// MPEG-1 多一位，且**没有 oddification**（`2|level|+1` 已经把奇偶钉死）。
+#[derive(Clone, Copy)]
+struct Quant {
+    q: i32,
+    intra_shift: u32,
+    inter_shift: u32,
+    oddify: bool,
+    dc_scale: i32,
+    /// MPEG-2 的逃逸 level 是 12 位补码；MPEG-1 是 8 位 + 哨兵。
+    mpeg2: bool,
+}
+
+impl Quant {
+    fn new(scale: i32, mpeg2: bool, non_linear: bool, intra_dc_precision: u8) -> Self {
+        if mpeg2 {
+            let q = if non_linear {
+                NON_LINEAR_QSCALE[scale as usize] as i32
+            } else {
+                scale << 1
+            };
+            Self {
+                q,
+                intra_shift: 4,
+                inter_shift: 5,
+                oddify: false,
+                dc_scale: 8 >> intra_dc_precision,
+                mpeg2: true,
+            }
+        } else {
+            Self {
+                q: scale,
+                intra_shift: 3,
+                inter_shift: 4,
+                oddify: true,
+                dc_scale: 8,
+                mpeg2: false,
+            }
+        }
+    }
+}
+
+/// 帧内反量化：DC 乘 `dc_scale`，交流 `(|level|·q·W) >> intra_shift`。
+fn dequantise_intra(quantised: &[i32; 64], quant: Quant) -> [i32; 64] {
     let mut out = [0i32; 64];
-    out[0] = quantised[0] * 8;
+    out[0] = quantised[0] * quant.dc_scale;
+    // MPEG-2 的 mismatch control：把块内系数和的奇偶钉住。
+    let mut mismatch = out[0] ^ 1;
     for i in 1..64 {
         let level = quantised[i];
         if level == 0 {
             continue;
         }
-        // 交流系数按 `(|level| * scale * W) >> 3` 反量化，然后**强制奇数**
-        // （MPEG-1 的 oddification：`(v - 1) | 1`）。少了这一步，偶数结果会差 1，
-        // 高频块经过 IDCT 之后误差被放大成可见的错。
-        let magnitude = (level.abs() * scale * INTRA_MATRIX[i] as i32) >> 3;
-        let odd = (magnitude - 1) | 1;
-        out[i] = if level < 0 { -odd } else { odd };
+        let mut magnitude = (level.abs() * quant.q * INTRA_MATRIX[i] as i32) >> quant.intra_shift;
+        if quant.oddify {
+            magnitude = (magnitude - 1) | 1;
+        }
+        out[i] = if level < 0 { -magnitude } else { magnitude };
+        mismatch ^= out[i];
+    }
+    if quant.mpeg2 {
+        out[63] ^= mismatch & 1;
     }
     out
 }
 
-/// 帧间反量化：`((2|level|+1) · scale · W) >> 4`，然后强制奇数。
-///
-/// 帧间块没有 DC 特例 —— 第 0 个系数和其余一样走这条公式。`2|level|+1`
-/// 是 MPEG-1 非帧内反量化的定义，`(v-1)|1` 再把它钉成奇数。
-fn dequantise_inter(quantised: &[i32; 64], scale: i32) -> [i32; 64] {
+/// 帧间反量化：`((2|level|+1)·q·W) >> inter_shift`，DC 无特例。
+fn dequantise_inter(quantised: &[i32; 64], quant: Quant) -> [i32; 64] {
     let mut out = [0i32; 64];
+    let mut mismatch = 1;
     for i in 0..64 {
         let level = quantised[i];
         if level == 0 {
             continue;
         }
-        let magnitude = ((level.abs() * 2 + 1) * scale * NON_INTRA_MATRIX[i] as i32) >> 4;
-        let odd = (magnitude - 1) | 1;
-        out[i] = if level < 0 { -odd } else { odd };
+        let mut magnitude =
+            ((level.abs() * 2 + 1) * quant.q * NON_INTRA_MATRIX[i] as i32) >> quant.inter_shift;
+        if quant.oddify {
+            magnitude = (magnitude - 1) | 1;
+        }
+        out[i] = if level < 0 { -magnitude } else { magnitude };
+        mismatch ^= out[i];
+    }
+    if quant.mpeg2 {
+        out[63] ^= mismatch & 1;
     }
     out
 }
@@ -266,9 +321,11 @@ fn store_pred(pred: &[i32; 64], residual: &[i32; 64], out: &mut [u8], stride: us
 /// 解一个帧内块。
 fn decode_intra_block(
     r: &mut BitReader,
-    scale: i32,
+    quant: Quant,
     dc_table: &[Code],
     dc_predictor: &mut i32,
+    rl: &[RlEntry],
+    scan: &[usize; 64],
 ) -> Result<[i32; 64], DecodeError> {
     let mut coeffs = [0i32; 64];
 
@@ -303,45 +360,53 @@ fn decode_intra_block(
             let run = r
                 .u(6)
                 .map_err(|_| DecodeError::new("escape_run", r.bit_pos(), 0))? as usize;
-            // 逃逸的 level 是**8 位补码**，不是「8 位 + 一个符号位」——
-            // 多读那一位会让后面全部错位。
-            let raw = r
-                .u(8)
-                .map_err(|_| DecodeError::new("escape_level", r.bit_pos(), 0))? as i32;
-            // 8 位补码，然后两个**哨兵值**各有专门含义（照参考实现）：
-            //   -128 → 再读 8 位，值减 256（覆盖 -256..-1）
-            //      0 → 再读 8 位，值即 level（覆盖 1..255）
-            let mut level = if raw & 0x80 != 0 { raw - 256 } else { raw };
-            if level == -128 {
-                let extra = r
-                    .u(8)
-                    .map_err(|_| DecodeError::new("escape_neg", r.bit_pos(), 0))? as i32;
-                level = extra - 256;
-            } else if level == 0 {
-                level = r
-                    .u(8)
-                    .map_err(|_| DecodeError::new("escape_pos", r.bit_pos(), 0))?
+            // MPEG-2 的逃逸 level 是 **12 位补码**；MPEG-1 是 8 位 + 哨兵。
+            let level = if quant.mpeg2 {
+                let raw = r
+                    .u(12)
+                    .map_err(|_| DecodeError::new("escape_level12", r.bit_pos(), 0))?
                     as i32;
-            }
+                if raw & 0x800 != 0 { raw - 4096 } else { raw }
+            } else {
+                // 8 位补码，然后两个**哨兵值**各有专门含义（照参考实现）：
+                //   -128 → 再读 8 位，值减 256（覆盖 -256..-1）
+                //      0 → 再读 8 位，值即 level（覆盖 1..255）
+                let raw = r
+                    .u(8)
+                    .map_err(|_| DecodeError::new("escape_level", r.bit_pos(), 0))? as i32;
+                let mut level = if raw & 0x80 != 0 { raw - 256 } else { raw };
+                if level == -128 {
+                    let extra = r
+                        .u(8)
+                        .map_err(|_| DecodeError::new("escape_neg", r.bit_pos(), 0))? as i32;
+                    level = extra - 256;
+                } else if level == 0 {
+                    level = r
+                        .u(8)
+                        .map_err(|_| DecodeError::new("escape_pos", r.bit_pos(), 0))?
+                        as i32;
+                }
+                level
+            };
             index += run;
             if index < 64 {
-                coeffs[ZIGZAG[index]] = level;
+                coeffs[scan[index]] = level;
             }
             index += 1;
             continue;
         }
 
         let entry =
-            decode_rl(r).ok_or_else(|| DecodeError::new("rl", r.bit_pos(), index as i64))?;
-        let run = MPEG1_RL[entry].run as usize;
-        let level = MPEG1_RL[entry].level as i32;
+            decode_rl(r, rl).ok_or_else(|| DecodeError::new("rl", r.bit_pos(), index as i64))?;
+        let run = rl[entry].run as usize;
+        let level = rl[entry].level as i32;
         let negative = r
             .u(1)
             .map_err(|_| DecodeError::new("rl_sign", r.bit_pos(), 0))?
             == 1;
         index += run;
         if index < 64 {
-            coeffs[ZIGZAG[index]] = if negative { -level } else { level };
+            coeffs[scan[index]] = if negative { -level } else { level };
         }
         index += 1;
     }
@@ -355,11 +420,16 @@ fn decode_intra_block(
             .map_err(|_| DecodeError::new("eob_full", r.bit_pos(), 0))?;
     }
 
-    Ok(dequantise_intra(&coeffs, scale))
+    Ok(dequantise_intra(&coeffs, quant))
 }
 
-/// 解一个帧间块（P 帧残差）。没有 DC 预测，系数从 zigzag 第 0 位开始。
-fn decode_inter_block(r: &mut BitReader, scale: i32) -> Result<[i32; 64], DecodeError> {
+/// 解一个帧间块（P/B 帧残差）。没有 DC 预测，系数从扫描第 0 位开始。
+fn decode_inter_block(
+    r: &mut BitReader,
+    quant: Quant,
+    rl: &[RlEntry],
+    scan: &[usize; 64],
+) -> Result<[i32; 64], DecodeError> {
     let mut coeffs = [0i32; 64];
     let mut index = 0usize;
 
@@ -368,12 +438,12 @@ fn decode_inter_block(r: &mut BitReader, scale: i32) -> Result<[i32; 64], Decode
     if r.bits_left() >= 2 && r.peek_u(1) == 1 {
         let negative = (r.peek_u(2) & 1) == 1;
         r.skip(2).ok();
-        coeffs[ZIGZAG[0]] = if negative { -1 } else { 1 };
+        coeffs[scan[0]] = if negative { -1 } else { 1 };
         index = 1;
         if r.bits_left() >= EOB_BITS as usize && r.peek_u(EOB_BITS as u32) == EOB_CODE as u32 {
             r.skip(EOB_BITS as u32)
                 .map_err(|_| DecodeError::new("eob_fast", r.bit_pos(), 0))?;
-            return Ok(dequantise_inter(&coeffs, scale));
+            return Ok(dequantise_inter(&coeffs, quant));
         }
     }
 
@@ -395,42 +465,51 @@ fn decode_inter_block(r: &mut BitReader, scale: i32) -> Result<[i32; 64], Decode
                 .u(6)
                 .map_err(|_| DecodeError::new("escape_run_inter", r.bit_pos(), 0))?
                 as usize;
-            let raw = r
-                .u(8)
-                .map_err(|_| DecodeError::new("escape_level_inter", r.bit_pos(), 0))?
-                as i32;
-            let mut level = if raw & 0x80 != 0 { raw - 256 } else { raw };
-            if level == -128 {
-                let extra = r
-                    .u(8)
-                    .map_err(|_| DecodeError::new("escape_neg_inter", r.bit_pos(), 0))?
+            let level = if quant.mpeg2 {
+                let raw = r
+                    .u(12)
+                    .map_err(|_| DecodeError::new("escape_level12_inter", r.bit_pos(), 0))?
                     as i32;
-                level = extra - 256;
-            } else if level == 0 {
-                level = r
+                if raw & 0x800 != 0 { raw - 4096 } else { raw }
+            } else {
+                let raw = r
                     .u(8)
-                    .map_err(|_| DecodeError::new("escape_pos_inter", r.bit_pos(), 0))?
+                    .map_err(|_| DecodeError::new("escape_level_inter", r.bit_pos(), 0))?
                     as i32;
-            }
+                let mut level = if raw & 0x80 != 0 { raw - 256 } else { raw };
+                if level == -128 {
+                    let extra = r
+                        .u(8)
+                        .map_err(|_| DecodeError::new("escape_neg_inter", r.bit_pos(), 0))?
+                        as i32;
+                    level = extra - 256;
+                } else if level == 0 {
+                    level = r
+                        .u(8)
+                        .map_err(|_| DecodeError::new("escape_pos_inter", r.bit_pos(), 0))?
+                        as i32;
+                }
+                level
+            };
             index += run;
             if index < 64 {
-                coeffs[ZIGZAG[index]] = level;
+                coeffs[scan[index]] = level;
             }
             index += 1;
             continue;
         }
 
-        let entry = decode_rl(r)
+        let entry = decode_rl(r, rl)
             .ok_or_else(|| DecodeError::new("rl_inter", r.bit_pos(), index as i64))?;
-        let run = MPEG1_RL[entry].run as usize;
-        let level = MPEG1_RL[entry].level as i32;
+        let run = rl[entry].run as usize;
+        let level = rl[entry].level as i32;
         let negative = r
             .u(1)
             .map_err(|_| DecodeError::new("rl_sign_inter", r.bit_pos(), 0))?
             == 1;
         index += run;
         if index < 64 {
-            coeffs[ZIGZAG[index]] = if negative { -level } else { level };
+            coeffs[scan[index]] = if negative { -level } else { level };
         }
         index += 1;
     }
@@ -443,7 +522,7 @@ fn decode_inter_block(r: &mut BitReader, scale: i32) -> Result<[i32; 64], Decode
             .map_err(|_| DecodeError::new("eob_full_inter", r.bit_pos(), 0))?;
     }
 
-    Ok(dequantise_inter(&coeffs, scale))
+    Ok(dequantise_inter(&coeffs, quant))
 }
 
 /// 把 `val` 当 `bits` 位补码解释（MPEG 运动矢量的模运算）。
@@ -528,6 +607,69 @@ fn predict_block(
     out
 }
 
+/// 每幅图不变的块级配置：RL 表与扫描顺序。
+struct BlockTables<'a> {
+    intra_rl: &'a [RlEntry],
+    inter_rl: &'a [RlEntry],
+    scan: &'a [usize; 64],
+}
+
+fn block_tables(ext: Option<&crate::PictureCodingExtension>) -> BlockTables<'static> {
+    match ext {
+        Some(ext) => BlockTables {
+            // `ff_mpeg2_vlc_table` 只服务 `intra_vlc_format=1` 的**帧内**块；
+            // MPEG-2 的帧间块仍用 MPEG-1 的 RL 表（参考实现里 `mpeg2_decode_block_non_intra`
+            // 就是 `ff_mpeg1_rl_vlc`）。
+            intra_rl: if ext.intra_vlc_format { &MPEG2_RL } else { &MPEG1_RL },
+            inter_rl: &MPEG1_RL,
+            scan: if ext.alternate_scan { &ALT_SCAN } else { &ZIGZAG },
+        },
+        None => BlockTables {
+            intra_rl: &MPEG1_RL,
+            inter_rl: &MPEG1_RL,
+            scan: &ZIGZAG,
+        },
+    }
+}
+
+/// 在图像数据里找 picture coding extension（`00 00 01 B5`，id = 8）。
+fn picture_extension(data: &[u8]) -> Option<crate::PictureCodingExtension> {
+    crate::split_units(data)
+        .iter()
+        .find(|(code, _)| *code == 0xB5)
+        .and_then(|(_, payload)| crate::PictureCodingExtension::parse(payload))
+}
+
+/// MPEG-2 扩展头校验：只支持 progressive 帧图、4:2:0、`frame_pred_frame_dct`。
+fn mpeg2_extension(
+    sequence: &SequenceHeader,
+    data: &[u8],
+) -> Result<Option<crate::PictureCodingExtension>, DecodeError> {
+    if !sequence.mpeg2_stream() {
+        return Ok(None);
+    }
+    let ext = picture_extension(data)
+        .ok_or_else(|| DecodeError::new("missing_picture_extension", 0, 0))?;
+    if ext.picture_structure != 3 {
+        return Err(DecodeError::new(
+            "field_picture_unsupported",
+            0,
+            ext.picture_structure as i64,
+        ));
+    }
+    if !ext.frame_pred_frame_dct {
+        return Err(DecodeError::new("field_prediction_unsupported", 0, 0));
+    }
+    if sequence.chroma_format != 1 {
+        return Err(DecodeError::new(
+            "chroma_format_unsupported",
+            0,
+            sequence.chroma_format as i64,
+        ));
+    }
+    Ok(Some(ext))
+}
+
 /// 解一帧 I 图像。
 pub fn decode_i_frame(
     sequence: &SequenceHeader,
@@ -537,11 +679,10 @@ pub fn decode_i_frame(
     if !matches!(picture.picture_type, PictureType::I) {
         return Err(DecodeError::new("picture_type", 0, 0));
     }
-    // 目前只做 MPEG-1。MPEG-2 的 macroblock_type 是另一套码表（还多了帧/场预测的
-    // 类型），沿用这套会解出**错帧**而不是报错 —— 所以宁可明确拒绝。
-    if sequence.mpeg2_stream() {
-        return Err(DecodeError::new("mpeg2_unsupported", 0, 0));
-    }
+    let ext = mpeg2_extension(sequence, data)?;
+    let tables = block_tables(ext.as_ref());
+    let non_linear = ext.as_ref().map_or(false, |e| e.q_scale_type);
+    let precision = ext.as_ref().map_or(0, |e| e.intra_dc_precision);
 
     let width = sequence.width as usize;
     let height = sequence.height as usize;
@@ -628,11 +769,18 @@ pub fn decode_i_frame(
                 }
             }
 
+            let quant = Quant::new(scale, sequence.mpeg2_stream(), non_linear, precision);
             for block in 0..6 {
                 let dc_table = if block < 4 { &DC_LUM } else { &DC_CHROMA };
                 let component = if block < 4 { 0 } else { block - 3 };
-                let coeffs =
-                    decode_intra_block(&mut r, scale, dc_table, &mut dc_predictor[component])?;
+                let coeffs = decode_intra_block(
+                    &mut r,
+                    quant,
+                    dc_table,
+                    &mut dc_predictor[component],
+                    tables.intra_rl,
+                    tables.scan,
+                )?;
                 let residual = idct_residual(&coeffs);
                 let (_, origin_x, origin_y) = block_origin(block, column, mb_row);
                 let (plane, stride) = match block {
@@ -661,9 +809,10 @@ pub fn decode_p_frame(
     if !matches!(picture.picture_type, PictureType::P) {
         return Err(DecodeError::new("picture_type", 0, 0));
     }
-    if sequence.mpeg2_stream() {
-        return Err(DecodeError::new("mpeg2_unsupported", 0, 0));
-    }
+    let ext = mpeg2_extension(sequence, data)?;
+    let tables = block_tables(ext.as_ref());
+    let non_linear = ext.as_ref().map_or(false, |e| e.q_scale_type);
+    let precision = ext.as_ref().map_or(0, |e| e.intra_dc_precision);
     if reference.width != sequence.width || reference.height != sequence.height {
         return Err(DecodeError::new("reference_size", 0, 0));
     }
@@ -685,7 +834,10 @@ pub fn decode_p_frame(
     let mb_w = width.div_ceil(16);
     let mb_h = height.div_ceil(16);
     let total_mb = mb_w * mb_h;
-    let fcode = picture.forward_f_code;
+    let (fcode_h, fcode_v) = match ext.as_ref() {
+        Some(e) => (e.f_code[0][0], e.f_code[0][1]),
+        None => (picture.forward_f_code, picture.forward_f_code),
+    };
     let mut decoded_slices = 0usize;
 
     for (code, slice) in crate::split_units(data) {
@@ -750,6 +902,7 @@ pub fn decode_p_frame(
                     return Err(DecodeError::new("mb_scale_zero", r.bit_pos(), column as i64));
                 }
             }
+            let quant = Quant::new(scale, sequence.mpeg2_stream(), non_linear, precision);
 
             if mb.intra {
                 last_mv = (0, 0);
@@ -758,9 +911,11 @@ pub fn decode_p_frame(
                     let component = if block < 4 { 0 } else { block - 3 };
                     let coeffs = decode_intra_block(
                         &mut r,
-                        scale,
+                        quant,
                         dc_table,
                         &mut dc_predictor[component],
+                        tables.intra_rl,
+                        tables.scan,
                     )?;
                     let residual = idct_residual(&coeffs);
                     let (_, origin_x, origin_y) = block_origin(block, column, mb_row);
@@ -778,9 +933,9 @@ pub fn decode_p_frame(
             let (mut mv_x, mut mv_y) = (0i32, 0i32);
             match mb.motion {
                 Motion::Forward => {
-                    let decoded_x = decode_motion(&mut r, fcode, last_mv.0)
+                    let decoded_x = decode_motion(&mut r, fcode_h, last_mv.0)
                         .ok_or_else(|| DecodeError::new("mv_x", r.bit_pos(), column as i64))?;
-                    let decoded_y = decode_motion(&mut r, fcode, last_mv.1)
+                    let decoded_y = decode_motion(&mut r, fcode_v, last_mv.1)
                         .ok_or_else(|| DecodeError::new("mv_y", r.bit_pos(), column as i64))?;
                     last_mv = (decoded_x, decoded_y);
                     mv_x = decoded_x;
@@ -810,7 +965,7 @@ pub fn decode_p_frame(
                 let coded = mb.coded && (cbp & (1 << (5 - block))) != 0;
                 let (chroma, origin_x, origin_y) = block_origin(block, column, mb_row);
                 let residual = if coded {
-                    let coeffs = decode_inter_block(&mut r, scale)?;
+                    let coeffs = decode_inter_block(&mut r, quant, tables.inter_rl, tables.scan)?;
                     idct_residual(&coeffs)
                 } else {
                     [0i32; 64]
@@ -951,9 +1106,10 @@ pub fn decode_b_frame(
     if !matches!(picture.picture_type, PictureType::B) {
         return Err(DecodeError::new("picture_type", 0, 0));
     }
-    if sequence.mpeg2_stream() {
-        return Err(DecodeError::new("mpeg2_unsupported", 0, 0));
-    }
+    let ext = mpeg2_extension(sequence, data)?;
+    let tables = block_tables(ext.as_ref());
+    let non_linear = ext.as_ref().map_or(false, |e| e.q_scale_type);
+    let precision = ext.as_ref().map_or(0, |e| e.intra_dc_precision);
     if forward.width != sequence.width
         || forward.height != sequence.height
         || backward.width != sequence.width
@@ -979,6 +1135,10 @@ pub fn decode_b_frame(
     let total_mb = mb_w * mb_h;
     let fcode_f = picture.forward_f_code;
     let fcode_b = picture.backward_f_code;
+    let (fcode_fh, fcode_fv, fcode_bh, fcode_bv) = match ext.as_ref() {
+        Some(e) => (e.f_code[0][0], e.f_code[0][1], e.f_code[1][0], e.f_code[1][1]),
+        None => (fcode_f, fcode_f, fcode_b, fcode_b),
+    };
     let mut decoded_slices = 0usize;
 
     for (code, slice) in crate::split_units(data) {
@@ -1059,6 +1219,7 @@ pub fn decode_b_frame(
                     return Err(DecodeError::new("mb_scale_zero", r.bit_pos(), column as i64));
                 }
             }
+            let quant = Quant::new(scale, sequence.mpeg2_stream(), non_linear, precision);
 
             if mb.intra {
                 last_mv_f = (0, 0);
@@ -1068,9 +1229,11 @@ pub fn decode_b_frame(
                     let component = if block < 4 { 0 } else { block - 3 };
                     let coeffs = decode_intra_block(
                         &mut r,
-                        scale,
+                        quant,
                         dc_table,
                         &mut dc_predictor[component],
+                        tables.intra_rl,
+                        tables.scan,
                     )?;
                     let residual = idct_residual(&coeffs);
                     let (_, origin_x, origin_y) = block_origin(block, column, mb_row);
@@ -1088,9 +1251,9 @@ pub fn decode_b_frame(
             // 运动矢量：前向、后向各自独立解码，各自累加预测。
             let (mut mv_f, mut mv_b) = ((0i32, 0i32), (0i32, 0i32));
             if mb.forward {
-                let x = decode_motion(&mut r, fcode_f, last_mv_f.0)
+                let x = decode_motion(&mut r, fcode_fh, last_mv_f.0)
                     .ok_or_else(|| DecodeError::new("mv_fx", r.bit_pos(), column as i64))?;
-                let y = decode_motion(&mut r, fcode_f, last_mv_f.1)
+                let y = decode_motion(&mut r, fcode_fv, last_mv_f.1)
                     .ok_or_else(|| DecodeError::new("mv_fy", r.bit_pos(), column as i64))?;
                 last_mv_f = (x, y);
                 mv_f = (x, y);
@@ -1099,9 +1262,9 @@ pub fn decode_b_frame(
                 }
             }
             if mb.backward {
-                let x = decode_motion(&mut r, fcode_b, last_mv_b.0)
+                let x = decode_motion(&mut r, fcode_bh, last_mv_b.0)
                     .ok_or_else(|| DecodeError::new("mv_bx", r.bit_pos(), column as i64))?;
-                let y = decode_motion(&mut r, fcode_b, last_mv_b.1)
+                let y = decode_motion(&mut r, fcode_bv, last_mv_b.1)
                     .ok_or_else(|| DecodeError::new("mv_by", r.bit_pos(), column as i64))?;
                 last_mv_b = (x, y);
                 mv_b = (x, y);
@@ -1122,7 +1285,7 @@ pub fn decode_b_frame(
             for block in 0..6 {
                 let coded = mb.coded && (cbp & (1 << (5 - block))) != 0;
                 let residual = if coded {
-                    let coeffs = decode_inter_block(&mut r, scale)?;
+                    let coeffs = decode_inter_block(&mut r, quant, tables.inter_rl, tables.scan)?;
                     idct_residual(&coeffs)
                 } else {
                     [0i32; 64]
