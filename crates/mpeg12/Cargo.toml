@@ -1,0 +1,11 @@
+[package]
+name = "v2v-mpeg12"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MPEG-1/2 video elementary stream parser"
+
+[dependencies]
+v2v-mpegps = { path = "../mpegps" }
+v2v-msmpeg4 = { path = "../msmpeg4" }
