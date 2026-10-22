@@ -369,7 +369,7 @@ fn store_pred_block(
         _ => &reference.v,
     };
     let pred = predict_block(
-        ref_plane, plane_width, rw, rh, origin_x, origin_y, mv_x, mv_y, chroma, row_step,
+        ref_plane, plane_width, rw, rh, origin_x, origin_y, mv_x, mv_y, chroma, row_step, 1,
     );
     let plane = match block {
         0..=3 => &mut frame.y,
@@ -654,10 +654,11 @@ fn predict_block(
     mv_y: i32,
     chroma: bool,
     row_step: i32,
+    mv_y_scale: i32,
 ) -> [i32; 64] {
     let (mx, my) = if chroma { (mv_x / 2, mv_y / 2) } else { (mv_x, mv_y) };
     let ix = mx >> 1;
-    let iy = my >> 1;
+    let iy = (my >> 1) * mv_y_scale;
     let fx = mx & 1;
     let fy = my & 1;
     let mut out = [0i32; 64];
@@ -674,8 +675,8 @@ fn predict_block(
             out[y * 8 + x] = match (fx, fy) {
                 (0, 0) => a,
                 (1, 0) => (a + at(1, 0) + 1) >> 1,
-                (0, 1) => (a + at(0, 1) + 1) >> 1,
-                _ => (a + at(1, 0) + at(0, 1) + at(1, 1) + 2) >> 2,
+                (0, 1) => (a + at(0, row_step) + 1) >> 1,
+                _ => (a + at(1, 0) + at(0, row_step) + at(1, row_step) + 2) >> 2,
             };
         }
     }
@@ -876,6 +877,83 @@ pub fn decode_i_frame(
     Ok(frame)
 }
 
+/// 把场运动的预测写进整帧：亮度每个场两个 8×8、色度每个场 8×4，都隔行写。
+#[allow(clippy::too_many_arguments)]
+fn write_field_prediction(
+    frame: &mut Frame,
+    reference: &Frame,
+    column: usize,
+    mb_row: usize,
+    width: usize,
+    height: usize,
+    cw: usize,
+    ch: usize,
+    field_select: [u8; 2],
+    mv: [[i32; 2]; 2],
+) {
+    // 亮度：场 j 的两个 8×8 左右块。源取 `field_select[j]` 场，目标写第 j 场（偶/奇行）。
+    for j in 0..2 {
+        for bx in 0..2 {
+            let origin_x = column * 16 + bx * 8;
+            let src_y = mb_row * 16 + field_select[j] as usize;
+            let dst_y = mb_row * 16 + j;
+            let pred = predict_block(
+                &reference.y, width, width, height, origin_x, src_y, mv[j][0], mv[j][1],
+                false, 2, 2,
+            );
+            store_block(&pred, 0, &mut frame.y, 2 * width, dst_y * width + origin_x);
+        }
+    }
+    // 色度：场 j 的 8×4（只取前 4 行）。
+    for j in 0..2 {
+        let origin_x = column * 8;
+        let src_y = mb_row * 8 + field_select[j] as usize;
+        let dst_y = mb_row * 8 + j;
+        let pred_u = predict_block(
+            &reference.u, cw, cw, ch, origin_x, src_y, mv[j][0], mv[j][1], true, 2, 2,
+        );
+        let pred_v = predict_block(
+            &reference.v, cw, cw, ch, origin_x, src_y, mv[j][0], mv[j][1], true, 2, 2,
+        );
+        for y in 0..4 {
+            for x in 0..8 {
+                let idx = dst_y * cw + origin_x + y * (2 * cw) + x;
+                frame.u[idx] = pred_u[y * 8 + x].clamp(0, 255) as u8;
+                frame.v[idx] = pred_v[y * 8 + x].clamp(0, 255) as u8;
+            }
+        }
+    }
+}
+
+/// 把残差加到已写好的预测上（场运动用）。
+#[allow(clippy::too_many_arguments)]
+fn add_mb_block(
+    frame: &mut Frame,
+    block: usize,
+    column: usize,
+    mb_row: usize,
+    width: usize,
+    cw: usize,
+    interlaced_dct: bool,
+    residual: &[i32; 64],
+) {
+    let (chroma, origin_x, origin_y, stride, _) =
+        block_geometry(block, column, mb_row, width, cw, interlaced_dct);
+    let plane_width = if chroma { cw } else { width };
+    let plane = match block {
+        0..=3 => &mut frame.y,
+        4 => &mut frame.u,
+        _ => &mut frame.v,
+    };
+    let at = origin_y * plane_width + origin_x;
+    for y in 0..8 {
+        for x in 0..8 {
+            let idx = at + y * stride + x;
+            plane[idx] = (plane[idx] as i32 + residual[y * 8 + x]).clamp(0, 255) as u8;
+        }
+    }
+}
+
 /// 解一帧 P 图像：以 `reference` 为底做前向运动补偿 + 残差。
 pub fn decode_p_frame(
     sequence: &SequenceHeader,
@@ -947,8 +1025,8 @@ pub fn decode_p_frame(
         // 帧内 DC 预测器：每个 slice 从 0 起；遇到帧间宏块重置（对应参考实现的
         // `last_dc = 128`，与我们的 0 基准等价）。
         let mut dc_predictor = [0i32; 3];
-        // 运动矢量预测器：每个 slice 从 0 起；帧内 / 零矢量 / 跳过宏块都归零。
-        let mut last_mv = (0i32, 0i32);
+        // 运动矢量预测器：每个 slice 从 0 起；按场分开存（帧运动时两场同值）。
+        let mut last_mv_f = [[0i32; 2]; 2];
         let mut mb_index = (row * mb_w) as isize - 1;
         loop {
             let Some(increment) = decode_vlc(&mut r, &MB_ADDR_INCR) else {
@@ -962,7 +1040,7 @@ pub fn decode_p_frame(
             // 跳过的宏块：已经是参考帧原位拷贝（帧初始化时克隆好了），
             // 只需把运动矢量预测器归零。
             if mb_index > previous + 1 {
-                last_mv = (0, 0);
+                last_mv_f = [[0, 0], [0, 0]];
             }
             let column = mb_index as usize % mb_w;
             let mb_row = mb_index as usize / mb_w;
@@ -1011,9 +1089,9 @@ pub fn decode_p_frame(
             } else {
                 (2, false)
             };
-            if !mb.intra && motion_type != 2 {
+            if !mb.intra && motion_type != 2 && motion_type != 1 {
                 return Err(DecodeError::new(
-                    "field_motion_unsupported",
+                    "motion_type_unsupported",
                     r.bit_pos(),
                     motion_type as i64,
                 ));
@@ -1031,7 +1109,7 @@ pub fn decode_p_frame(
             let quant = Quant::new(scale, sequence.mpeg2_stream(), non_linear, precision);
 
             if mb.intra {
-                last_mv = (0, 0);
+                last_mv_f = [[0, 0], [0, 0]];
                 for block in 0..6 {
                     let dc_table = if block < 4 { &DC_LUM } else { &DC_CHROMA };
                     let component = if block < 4 { 0 } else { block - 3 };
@@ -1053,24 +1131,51 @@ pub fn decode_p_frame(
             }
 
             // 帧间：先运动矢量，再 cbp，再各块残差。
-            let (mut mv_x, mut mv_y) = (0i32, 0i32);
+            let mut field_motion = false;
+            let mut field_select = [0u8; 2];
+            let mut mv_f = [[0i32; 2]; 2];
             match mb.motion {
                 Motion::Forward => {
-                    let decoded_x = decode_motion(&mut r, fcode_h, last_mv.0)
-                        .ok_or_else(|| DecodeError::new("mv_x", r.bit_pos(), column as i64))?;
-                    let decoded_y = decode_motion(&mut r, fcode_v, last_mv.1)
-                        .ok_or_else(|| DecodeError::new("mv_y", r.bit_pos(), column as i64))?;
-                    last_mv = (decoded_x, decoded_y);
-                    mv_x = decoded_x;
-                    mv_y = decoded_y;
+                    if motion_type == 1 {
+                        // 场运动：每个场一个 field_select + 一对矢量；垂直分量按场存储。
+                        field_motion = true;
+                        for j in 0..2 {
+                            field_select[j] = r
+                                .u(1)
+                                .map_err(|_| {
+                                    DecodeError::new("field_select", r.bit_pos(), column as i64)
+                                })? as u8;
+                            let x = decode_motion(&mut r, fcode_h, last_mv_f[j][0]).ok_or_else(
+                                || DecodeError::new("mv_x", r.bit_pos(), column as i64),
+                            )?;
+                            last_mv_f[j][0] = x;
+                            let y = decode_motion(&mut r, fcode_v, last_mv_f[j][1] >> 1)
+                                .ok_or_else(|| {
+                                    DecodeError::new("mv_y", r.bit_pos(), column as i64)
+                                })?;
+                            last_mv_f[j][1] = 2 * y;
+                            mv_f[j] = [x, y];
+                        }
+                    } else {
+                        let x = decode_motion(&mut r, fcode_h, last_mv_f[0][0])
+                            .ok_or_else(|| DecodeError::new("mv_x", r.bit_pos(), column as i64))?;
+                        let y = decode_motion(&mut r, fcode_v, last_mv_f[0][1])
+                            .ok_or_else(|| DecodeError::new("mv_y", r.bit_pos(), column as i64))?;
+                        last_mv_f[0] = [x, y];
+                        last_mv_f[1] = [x, y];
+                        mv_f[0] = [x, y];
+                        mv_f[1] = [x, y];
+                    }
                     if picture.full_pel_forward {
                         // full_pel 的矢量是整像素，换成半像素单位再补偿。
-                        mv_x *= 2;
-                        mv_y *= 2;
+                        for j in 0..2 {
+                            mv_f[j][0] *= 2;
+                            mv_f[j][1] *= 2;
+                        }
                     }
                 }
                 Motion::Zero | Motion::None => {
-                    last_mv = (0, 0);
+                    last_mv_f = [[0, 0], [0, 0]];
                 }
             }
             // 帧间宏块之后，帧内 DC 预测器归零。
@@ -1084,18 +1189,39 @@ pub fn decode_p_frame(
                 0
             };
 
-            for block in 0..6 {
-                let coded = mb.coded && (cbp & (1 << (5 - block))) != 0;
-                let residual = if coded {
-                    let coeffs = decode_inter_block(&mut r, quant, tables.inter_rl, tables.scan)?;
-                    idct_residual(&coeffs)
-                } else {
-                    [0i32; 64]
-                };
-                store_pred_block(
-                    &mut frame, reference, block, column, mb_row, width, height, cw, ch,
-                    interlaced_dct, mv_x, mv_y, &residual,
+            if field_motion {
+                // 场运动：先把两场预测写进整帧，再逐块叠残差。
+                write_field_prediction(
+                    &mut frame, reference, column, mb_row, width, height, cw, ch, field_select,
+                    mv_f,
                 );
+                for block in 0..6 {
+                    let coded = mb.coded && (cbp & (1 << (5 - block))) != 0;
+                    if coded {
+                        let coeffs =
+                            decode_inter_block(&mut r, quant, tables.inter_rl, tables.scan)?;
+                        let residual = idct_residual(&coeffs);
+                        add_mb_block(
+                            &mut frame, block, column, mb_row, width, cw, interlaced_dct,
+                            &residual,
+                        );
+                    }
+                }
+            } else {
+                for block in 0..6 {
+                    let coded = mb.coded && (cbp & (1 << (5 - block))) != 0;
+                    let residual = if coded {
+                        let coeffs =
+                            decode_inter_block(&mut r, quant, tables.inter_rl, tables.scan)?;
+                        idct_residual(&coeffs)
+                    } else {
+                        [0i32; 64]
+                    };
+                    store_pred_block(
+                        &mut frame, reference, block, column, mb_row, width, height, cw, ch,
+                        interlaced_dct, mv_f[0][0], mv_f[0][1], &residual,
+                    );
+                }
             }
         }
     }
@@ -1139,14 +1265,14 @@ fn write_b_block(
     };
     let pf = if fwd {
         Some(predict_block(
-            f_plane, plane_width, rw, rh, origin_x, origin_y, mv_f.0, mv_f.1, chroma, row_step,
+            f_plane, plane_width, rw, rh, origin_x, origin_y, mv_f.0, mv_f.1, chroma, row_step, 1,
         ))
     } else {
         None
     };
     let pb = if bwd {
         Some(predict_block(
-            b_plane, plane_width, rw, rh, origin_x, origin_y, mv_b.0, mv_b.1, chroma, row_step,
+            b_plane, plane_width, rw, rh, origin_x, origin_y, mv_b.0, mv_b.1, chroma, row_step, 1,
         ))
     } else {
         None
@@ -1194,6 +1320,110 @@ fn write_predicted_mb(
             height, cw, ch, interlaced_dct,
         );
     }
+}
+
+/// 合并前向 / 后向两路预测（双向取平均）。
+fn combine_pred(pf: &Option<[i32; 64]>, pb: &Option<[i32; 64]>) -> [i32; 64] {
+    let mut out = [0i32; 64];
+    for i in 0..64 {
+        out[i] = match (pf, pb) {
+            (Some(a), Some(b)) => (a[i] + b[i] + 1) >> 1,
+            (Some(a), None) => a[i],
+            (None, Some(b)) => b[i],
+            (None, None) => 0,
+        };
+    }
+    out
+}
+
+/// 写一个 B 帧场运动宏块的预测（两场各自前向 / 后向 / 双向）。
+#[allow(clippy::too_many_arguments)]
+fn write_b_field_prediction(
+    frame: &mut Frame,
+    forward: &Frame,
+    backward: &Frame,
+    column: usize,
+    mb_row: usize,
+    width: usize,
+    height: usize,
+    cw: usize,
+    ch: usize,
+    fwd: bool,
+    bwd: bool,
+    fs_f: [u8; 2],
+    mv_f: [[i32; 2]; 2],
+    fs_b: [u8; 2],
+    mv_b: [[i32; 2]; 2],
+) {
+    for j in 0..2 {
+        // 亮度：场 j 的两个 8×8。
+        for bx in 0..2 {
+            let origin_x = column * 16 + bx * 8;
+            let dst_y = mb_row * 16 + j;
+            let pf = if fwd {
+                let src_y = mb_row * 16 + fs_f[j] as usize;
+                Some(predict_block(
+                    &forward.y, width, width, height, origin_x, src_y, mv_f[j][0], mv_f[j][1],
+                    false, 2, 2,
+                ))
+            } else {
+                None
+            };
+            let pb = if bwd {
+                let src_y = mb_row * 16 + fs_b[j] as usize;
+                Some(predict_block(
+                    &backward.y, width, width, height, origin_x, src_y, mv_b[j][0], mv_b[j][1],
+                    false, 2, 2,
+                ))
+            } else {
+                None
+            };
+            let pred = combine_pred(&pf, &pb);
+            store_block(&pred, 0, &mut frame.y, 2 * width, dst_y * width + origin_x);
+        }
+        // 色度：场 j 的 8×4。
+        let origin_x = column * 8;
+        let dst_y = mb_row * 8 + j;
+        let pred = |plane_f: &[u8], plane_b: &[u8]| -> [i32; 64] {
+            let pf = if fwd {
+                let src_y = mb_row * 8 + fs_f[j] as usize;
+                Some(predict_block(
+                    plane_f, cw, cw, ch, origin_x, src_y, mv_f[j][0], mv_f[j][1], true, 2, 2,
+                ))
+            } else {
+                None
+            };
+            let pb = if bwd {
+                let src_y = mb_row * 8 + fs_b[j] as usize;
+                Some(predict_block(
+                    plane_b, cw, cw, ch, origin_x, src_y, mv_b[j][0], mv_b[j][1], true, 2, 2,
+                ))
+            } else {
+                None
+            };
+            combine_pred(&pf, &pb)
+        };
+        let pu = pred(&forward.u, &backward.u);
+        let pv = pred(&forward.v, &backward.v);
+        for y in 0..4 {
+            for x in 0..8 {
+                let idx = dst_y * cw + origin_x + y * (2 * cw) + x;
+                frame.u[idx] = pu[y * 8 + x].clamp(0, 255) as u8;
+                frame.v[idx] = pv[y * 8 + x].clamp(0, 255) as u8;
+            }
+        }
+    }
+}
+
+/// B 帧「上一个已编码宏块」的完整状态（跳过宏块沿用）。
+#[derive(Clone, Copy)]
+struct BPrev {
+    kind: crate::tables::BMbType,
+    field_motion: bool,
+    fs_f: [u8; 2],
+    mv_f: [[i32; 2]; 2],
+    fs_b: [u8; 2],
+    mv_b: [[i32; 2]; 2],
 }
 
 /// 解一帧 B 图像：前向 / 后向 / 双向运动补偿 + 残差。
@@ -1273,11 +1503,11 @@ pub fn decode_b_frame(
         }
 
         let mut dc_predictor = [0i32; 3];
-        // 前向 / 后向的运动矢量预测器，各自独立。
-        let mut last_mv_f = (0i32, 0i32);
-        let mut last_mv_b = (0i32, 0i32);
-        // 上一个已编码宏块：跳过宏块沿用它（类型 + 两路矢量）。
-        let mut prev: Option<(crate::tables::BMbType, (i32, i32), (i32, i32))> = None;
+        // 前向 / 后向的运动矢量预测器，各自按场独立。
+        let mut last_mv_f = [[0i32; 2]; 2];
+        let mut last_mv_b = [[0i32; 2]; 2];
+        // 上一个已编码宏块：跳过宏块沿用它（类型 + 两路矢量 + 场信息）。
+        let mut prev: Option<BPrev> = None;
         let mut mb_index = (row * mb_w) as isize - 1;
         loop {
             let Some(increment) = decode_vlc(&mut r, &MB_ADDR_INCR) else {
@@ -1291,10 +1521,10 @@ pub fn decode_b_frame(
 
             // 跳过的宏块：沿用上一个已编码宏块的类型与矢量，无残差。
             for skipped in (previous + 1)..mb_index {
-                let Some((kind, mv_f, mv_b)) = prev else {
+                let Some(p) = prev else {
                     return Err(DecodeError::new("b_skip_no_prev", r.bit_pos(), skipped as i64));
                 };
-                if kind.intra {
+                if p.kind.intra {
                     return Err(DecodeError::new(
                         "b_skip_after_intra",
                         r.bit_pos(),
@@ -1303,10 +1533,18 @@ pub fn decode_b_frame(
                 }
                 let col = skipped as usize % mb_w;
                 let row_s = skipped as usize / mb_w;
-                write_predicted_mb(
-                    &mut frame, forward, backward, col, row_s, kind.forward, kind.backward, mv_f,
-                    mv_b, width, height, cw, ch, false,
-                );
+                if p.field_motion {
+                    write_b_field_prediction(
+                        &mut frame, forward, backward, col, row_s, width, height, cw, ch,
+                        p.kind.forward, p.kind.backward, p.fs_f, p.mv_f, p.fs_b, p.mv_b,
+                    );
+                } else {
+                    write_predicted_mb(
+                        &mut frame, forward, backward, col, row_s, p.kind.forward,
+                        p.kind.backward, (p.mv_f[0][0], p.mv_f[0][1]),
+                        (p.mv_b[0][0], p.mv_b[0][1]), width, height, cw, ch, false,
+                    );
+                }
             }
 
             let column = mb_index as usize % mb_w;
@@ -1340,9 +1578,9 @@ pub fn decode_b_frame(
             } else {
                 (2, false)
             };
-            if !mb.intra && motion_type != 2 {
+            if !mb.intra && motion_type != 2 && motion_type != 1 {
                 return Err(DecodeError::new(
-                    "field_motion_unsupported",
+                    "motion_type_unsupported",
                     r.bit_pos(),
                     motion_type as i64,
                 ));
@@ -1360,8 +1598,8 @@ pub fn decode_b_frame(
             let quant = Quant::new(scale, sequence.mpeg2_stream(), non_linear, precision);
 
             if mb.intra {
-                last_mv_f = (0, 0);
-                last_mv_b = (0, 0);
+                last_mv_f = [[0, 0], [0, 0]];
+                last_mv_b = [[0, 0], [0, 0]];
                 for block in 0..6 {
                     let dc_table = if block < 4 { &DC_LUM } else { &DC_CHROMA };
                     let component = if block < 4 { 0 } else { block - 3 };
@@ -1379,32 +1617,93 @@ pub fn decode_b_frame(
                         128,
                     );
                 }
-                prev = Some((mb, (0, 0), (0, 0)));
+                prev = Some(BPrev {
+                    kind: mb,
+                    field_motion: false,
+                    fs_f: [0, 0],
+                    mv_f: [[0, 0], [0, 0]],
+                    fs_b: [0, 0],
+                    mv_b: [[0, 0], [0, 0]],
+                });
                 continue;
             }
 
             // 运动矢量：前向、后向各自独立解码，各自累加预测。
-            let (mut mv_f, mut mv_b) = ((0i32, 0i32), (0i32, 0i32));
+            let field_motion = motion_type == 1;
+            let mut fs_f = [0u8; 2];
+            let mut fs_b = [0u8; 2];
+            let mut mv_f = [[0i32; 2]; 2];
+            let mut mv_b = [[0i32; 2]; 2];
             if mb.forward {
-                let x = decode_motion(&mut r, fcode_fh, last_mv_f.0)
-                    .ok_or_else(|| DecodeError::new("mv_fx", r.bit_pos(), column as i64))?;
-                let y = decode_motion(&mut r, fcode_fv, last_mv_f.1)
-                    .ok_or_else(|| DecodeError::new("mv_fy", r.bit_pos(), column as i64))?;
-                last_mv_f = (x, y);
-                mv_f = (x, y);
+                if field_motion {
+                    for j in 0..2 {
+                        fs_f[j] = r
+                            .u(1)
+                            .map_err(|_| {
+                                DecodeError::new("field_select", r.bit_pos(), column as i64)
+                            })? as u8;
+                        let x = decode_motion(&mut r, fcode_fh, last_mv_f[j][0]).ok_or_else(
+                            || DecodeError::new("mv_fx", r.bit_pos(), column as i64),
+                        )?;
+                        last_mv_f[j][0] = x;
+                        let y = decode_motion(&mut r, fcode_fv, last_mv_f[j][1] >> 1)
+                            .ok_or_else(|| {
+                                DecodeError::new("mv_fy", r.bit_pos(), column as i64)
+                            })?;
+                        last_mv_f[j][1] = 2 * y;
+                        mv_f[j] = [x, y];
+                    }
+                } else {
+                    let x = decode_motion(&mut r, fcode_fh, last_mv_f[0][0])
+                        .ok_or_else(|| DecodeError::new("mv_fx", r.bit_pos(), column as i64))?;
+                    let y = decode_motion(&mut r, fcode_fv, last_mv_f[0][1])
+                        .ok_or_else(|| DecodeError::new("mv_fy", r.bit_pos(), column as i64))?;
+                    last_mv_f[0] = [x, y];
+                    last_mv_f[1] = [x, y];
+                    mv_f[0] = [x, y];
+                    mv_f[1] = [x, y];
+                }
                 if picture.full_pel_forward {
-                    mv_f = (mv_f.0 * 2, mv_f.1 * 2);
+                    for j in 0..2 {
+                        mv_f[j][0] *= 2;
+                        mv_f[j][1] *= 2;
+                    }
                 }
             }
             if mb.backward {
-                let x = decode_motion(&mut r, fcode_bh, last_mv_b.0)
-                    .ok_or_else(|| DecodeError::new("mv_bx", r.bit_pos(), column as i64))?;
-                let y = decode_motion(&mut r, fcode_bv, last_mv_b.1)
-                    .ok_or_else(|| DecodeError::new("mv_by", r.bit_pos(), column as i64))?;
-                last_mv_b = (x, y);
-                mv_b = (x, y);
+                if field_motion {
+                    for j in 0..2 {
+                        fs_b[j] = r
+                            .u(1)
+                            .map_err(|_| {
+                                DecodeError::new("field_select", r.bit_pos(), column as i64)
+                            })? as u8;
+                        let x = decode_motion(&mut r, fcode_bh, last_mv_b[j][0]).ok_or_else(
+                            || DecodeError::new("mv_bx", r.bit_pos(), column as i64),
+                        )?;
+                        last_mv_b[j][0] = x;
+                        let y = decode_motion(&mut r, fcode_bv, last_mv_b[j][1] >> 1)
+                            .ok_or_else(|| {
+                                DecodeError::new("mv_by", r.bit_pos(), column as i64)
+                            })?;
+                        last_mv_b[j][1] = 2 * y;
+                        mv_b[j] = [x, y];
+                    }
+                } else {
+                    let x = decode_motion(&mut r, fcode_bh, last_mv_b[0][0])
+                        .ok_or_else(|| DecodeError::new("mv_bx", r.bit_pos(), column as i64))?;
+                    let y = decode_motion(&mut r, fcode_bv, last_mv_b[0][1])
+                        .ok_or_else(|| DecodeError::new("mv_by", r.bit_pos(), column as i64))?;
+                    last_mv_b[0] = [x, y];
+                    last_mv_b[1] = [x, y];
+                    mv_b[0] = [x, y];
+                    mv_b[1] = [x, y];
+                }
                 if picture.full_pel_backward {
-                    mv_b = (mv_b.0 * 2, mv_b.1 * 2);
+                    for j in 0..2 {
+                        mv_b[j][0] *= 2;
+                        mv_b[j][1] *= 2;
+                    }
                 }
             }
             dc_predictor = [0i32; 3];
@@ -1417,20 +1716,48 @@ pub fn decode_b_frame(
                 0
             };
 
-            for block in 0..6 {
-                let coded = mb.coded && (cbp & (1 << (5 - block))) != 0;
-                let residual = if coded {
-                    let coeffs = decode_inter_block(&mut r, quant, tables.inter_rl, tables.scan)?;
-                    idct_residual(&coeffs)
-                } else {
-                    [0i32; 64]
-                };
-                write_b_block(
-                    &mut frame, forward, backward, block, column, mb_row, mb.forward,
-                    mb.backward, mv_f, mv_b, &residual, width, height, cw, ch, interlaced_dct,
+            if field_motion {
+                write_b_field_prediction(
+                    &mut frame, forward, backward, column, mb_row, width, height, cw, ch,
+                    mb.forward, mb.backward, fs_f, mv_f, fs_b, mv_b,
                 );
+                for block in 0..6 {
+                    let coded = mb.coded && (cbp & (1 << (5 - block))) != 0;
+                    if coded {
+                        let coeffs =
+                            decode_inter_block(&mut r, quant, tables.inter_rl, tables.scan)?;
+                        let residual = idct_residual(&coeffs);
+                        add_mb_block(
+                            &mut frame, block, column, mb_row, width, cw, interlaced_dct,
+                            &residual,
+                        );
+                    }
+                }
+            } else {
+                for block in 0..6 {
+                    let coded = mb.coded && (cbp & (1 << (5 - block))) != 0;
+                    let residual = if coded {
+                        let coeffs =
+                            decode_inter_block(&mut r, quant, tables.inter_rl, tables.scan)?;
+                        idct_residual(&coeffs)
+                    } else {
+                        [0i32; 64]
+                    };
+                    write_b_block(
+                        &mut frame, forward, backward, block, column, mb_row, mb.forward,
+                        mb.backward, (mv_f[0][0], mv_f[0][1]), (mv_b[0][0], mv_b[0][1]),
+                        &residual, width, height, cw, ch, interlaced_dct,
+                    );
+                }
             }
-            prev = Some((mb, mv_f, mv_b));
+            prev = Some(BPrev {
+                kind: mb,
+                field_motion,
+                fs_f,
+                mv_f,
+                fs_b,
+                mv_b,
+            });
         }
     }
 
