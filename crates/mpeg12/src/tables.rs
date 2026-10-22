@@ -360,3 +360,30 @@ pub const P_MB_TYPE: [PMbType; 7] = [
     PMbType { code: 0x0001, bits: 5, intra: false, coded: true, motion: Motion::Zero, quant: true },
     PMbType { code: 0x0002, bits: 5, intra: false, coded: true, motion: Motion::Forward, quant: true },
 ];
+
+/// B 帧的一条 `macroblock_type`：前向 / 后向 / 双向预测。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BMbType {
+    pub code: u16,
+    pub bits: u8,
+    pub intra: bool,
+    pub coded: bool,
+    pub forward: bool,
+    pub backward: bool,
+    pub quant: bool,
+}
+
+/// B 帧 `macroblock_type` 表（下标即 VLC 符号）。
+pub const B_MB_TYPE: [BMbType; 11] = [
+    BMbType { code: 0x0003, bits: 5, intra: true, coded: false, forward: false, backward: false, quant: false },
+    BMbType { code: 0x0002, bits: 3, intra: false, coded: false, forward: false, backward: true, quant: false },
+    BMbType { code: 0x0003, bits: 3, intra: false, coded: true, forward: false, backward: true, quant: false },
+    BMbType { code: 0x0002, bits: 4, intra: false, coded: false, forward: true, backward: false, quant: false },
+    BMbType { code: 0x0003, bits: 4, intra: false, coded: true, forward: true, backward: false, quant: false },
+    BMbType { code: 0x0002, bits: 2, intra: false, coded: false, forward: true, backward: true, quant: false },
+    BMbType { code: 0x0003, bits: 2, intra: false, coded: true, forward: true, backward: true, quant: false },
+    BMbType { code: 0x0001, bits: 6, intra: true, coded: false, forward: false, backward: false, quant: true },
+    BMbType { code: 0x0002, bits: 6, intra: false, coded: true, forward: false, backward: true, quant: true },
+    BMbType { code: 0x0003, bits: 6, intra: false, coded: true, forward: true, backward: false, quant: true },
+    BMbType { code: 0x0002, bits: 5, intra: false, coded: true, forward: true, backward: true, quant: true },
+];

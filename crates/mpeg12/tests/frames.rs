@@ -97,33 +97,51 @@ fn every_frame_matches_the_reference() {
     let expected = std::fs::read(&reference).expect("read the reference frames");
     let available = expected.len() / frame_size;
 
-    let mut previous: Option<v2v_mpeg12::decode::Frame> = None;
-    let mut index = 0usize;
+    // 解码序 ≠ 显示序：I/P 先解、B 后解。按解码序维护两路参考帧，
+    // 最后按 temporal_reference 排序得到显示序，再与参考件比。
+    let mut prev_ip: Option<v2v_mpeg12::decode::Frame> = None;
+    let mut last_ip: Option<v2v_mpeg12::decode::Frame> = None;
+    let mut decoded: Vec<(u32, PictureType, v2v_mpeg12::decode::Frame)> = Vec::new();
     for (header, data) in split_pictures(&es) {
-        if index >= available {
-            break;
-        }
-        if matches!(header.picture_type, PictureType::B | PictureType::D) {
+        let kind = header.picture_type;
+        let tr = header.temporal_reference;
+        if matches!(kind, PictureType::D) {
             continue;
         }
-        let kind = header.picture_type;
-        let frame = decode_frame(&sequence, header, data, previous.as_ref())
-            .expect("decode a picture");
+        let forward = if matches!(kind, PictureType::B) {
+            prev_ip.as_ref()
+        } else {
+            last_ip.as_ref()
+        };
+        let backward = last_ip.as_ref();
+        let frame =
+            decode_frame(&sequence, header, data, forward, backward).expect("decode a picture");
+        if matches!(kind, PictureType::I | PictureType::P) {
+            prev_ip = last_ip.take();
+            last_ip = Some(frame.clone());
+        }
+        decoded.push((tr, kind, frame));
+    }
+    decoded.sort_by_key(|(tr, _, _)| *tr);
 
+    for (i, (tr, kind, frame)) in decoded.iter().enumerate() {
+        if i >= available {
+            break;
+        }
         let mut ours = Vec::new();
         ours.extend_from_slice(&frame.y);
         ours.extend_from_slice(&frame.u);
         ours.extend_from_slice(&frame.v);
-        let want = &expected[index * frame_size..(index + 1) * frame_size];
+        let want = &expected[i * frame_size..(i + 1) * frame_size];
 
         let (mut worst, mut at) = (0i32, 0usize);
         let mut sum_sq = 0.0f64;
-        for (i, (&a, &b)) in ours.iter().zip(want).enumerate() {
+        for (j, (&a, &b)) in ours.iter().zip(want).enumerate() {
             let diff = (a as i32 - b as i32).abs();
             sum_sq += (diff * diff) as f64;
             if diff > worst {
                 worst = diff;
-                at = i;
+                at = j;
             }
         }
         let mse = sum_sq / ours.len() as f64;
@@ -132,24 +150,25 @@ fn every_frame_matches_the_reference() {
         } else {
             10.0 * (255.0 * 255.0 / mse).log10()
         };
-        eprintln!("frame {index} ({:?}): worst {worst} at {at}, psnr {psnr:.1} dB", kind);
+        eprintln!("display {i} (tr={tr}, {kind:?}): worst {worst} at {at}, psnr {psnr:.1} dB");
 
-        // I 帧是单帧重建，逐像素卡 ≤2；P 帧把 ±1 的 IDCT 舍入逐帧累积，
+        // I 帧是单帧重建，逐像素卡 ≤2；P/B 帧把 ±1 的 IDCT 舍入逐帧累积，
         // 所以用 PSNR + 一个较宽的硬上限，而不是逐像素 ≤2。
         match kind {
             PictureType::I => assert!(
                 worst <= 2,
-                "frame {index} pixel {at} differs by {worst}: the reconstruction is wrong"
+                "display {i} pixel {at} differs by {worst}: the reconstruction is wrong"
             ),
             _ => assert!(
                 psnr >= 50.0 && worst <= 4,
-                "frame {index}: psnr {psnr:.1} dB, worst {worst} at {at}"
+                "display {i}: psnr {psnr:.1} dB, worst {worst} at {at}"
             ),
         }
-
-        previous = Some(frame);
-        index += 1;
     }
 
-    assert!(index >= 2, "only decoded {index} frames; need at least an I and a P");
+    assert!(
+        decoded.len() >= 2,
+        "only decoded {} frames; need at least an I and a P",
+        decoded.len()
+    );
 }

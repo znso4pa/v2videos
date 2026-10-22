@@ -1,19 +1,20 @@
-//! MPEG-1 帧内（I）/ 前向预测（P）帧重建。
+//! MPEG-1 帧内（I）/ 前向（P）/ 双向（B）帧重建。
 //!
-//! 只做 I / P：slice → 宏块 → 块 → 反量化 → IDCT，P 帧再加运动补偿。
-//! B 帧要双向预测与重排序，不在这里。
+//! slice → 宏块 → 块 → 反量化 → IDCT；P 帧加前向运动补偿，B 帧加前向/后向/双向补偿。
+//! **重排序**（解码序 ≠ 显示序）不在这里 —— 由调用方按 `temporal_reference` 处理。
 //!
 //! 每个失败点都带上「在哪一步、第几位」，因为位对齐错一位的表现只是「后面全错」，
 //! 没有位偏移就无从下手。
 
 use crate::tables::{
     Code, DC_CHROMA, DC_LUM, EOB_BITS, EOB_CODE, ESCAPE_BITS, ESCAPE_CODE, INTRA_MATRIX,
-    MB_ADDR_INCR, MB_PATTERN, MPEG1_RL, MV_CODE, NON_INTRA_MATRIX, P_MB_TYPE, Motion,
+    MB_ADDR_INCR, MB_PATTERN, MPEG1_RL, MV_CODE, NON_INTRA_MATRIX, P_MB_TYPE, B_MB_TYPE, Motion,
 };
 use crate::{BitReader, PictureHeader, PictureType, SequenceHeader};
 
 
 /// 解码出来的一帧（I420）。
+#[derive(Clone)]
 pub struct Frame {
     pub width: u32,
     pub height: u32,
@@ -81,6 +82,24 @@ fn decode_p_mb_type(r: &mut BitReader) -> Option<usize> {
         }
         let value = r.peek_u(len);
         for (index, entry) in P_MB_TYPE.iter().enumerate() {
+            if entry.bits as u32 == len && entry.code as u32 == value {
+                r.skip(len).ok()?;
+                return Some(index);
+            }
+        }
+    }
+    None
+}
+
+/// B 帧 `macroblock_type`。
+fn decode_b_mb_type(r: &mut BitReader) -> Option<usize> {
+    let max_bits = B_MB_TYPE.iter().map(|c| c.bits).max().unwrap_or(0) as u32;
+    for len in 1..=max_bits {
+        if r.bits_left() < len as usize {
+            return None;
+        }
+        let value = r.peek_u(len);
+        for (index, entry) in B_MB_TYPE.iter().enumerate() {
             if entry.bits as u32 == len && entry.code as u32 == value {
                 r.skip(len).ok()?;
                 return Some(index);
@@ -833,19 +852,317 @@ pub fn decode_p_frame(
     Ok(frame)
 }
 
-/// 按图像类型分派。P 帧必须给参考帧。
+/// 写一个 B 帧块：按前向 / 后向 / 双向取预测，再叠残差。
+#[allow(clippy::too_many_arguments)]
+fn write_b_block(
+    frame: &mut Frame,
+    forward: &Frame,
+    backward: &Frame,
+    block: usize,
+    column: usize,
+    mb_row: usize,
+    fwd: bool,
+    bwd: bool,
+    mv_f: (i32, i32),
+    mv_b: (i32, i32),
+    residual: &[i32; 64],
+    width: usize,
+    height: usize,
+    cw: usize,
+    ch: usize,
+) {
+    let (chroma, origin_x, origin_y) = block_origin(block, column, mb_row);
+    let (out_plane, stride) = match block {
+        0..=3 => (&mut frame.y, width),
+        4 => (&mut frame.u, cw),
+        _ => (&mut frame.v, cw),
+    };
+    let (f_plane, b_plane, rstride, rw, rh): (&[u8], &[u8], usize, usize, usize) = if chroma {
+        let f = if block == 4 { &forward.u } else { &forward.v };
+        let b = if block == 4 { &backward.u } else { &backward.v };
+        (f, b, cw, cw, ch)
+    } else {
+        (&forward.y, &backward.y, width, width, height)
+    };
+    let pf = if fwd {
+        Some(predict_block(
+            f_plane, rstride, rw, rh, origin_x, origin_y, mv_f.0, mv_f.1, chroma,
+        ))
+    } else {
+        None
+    };
+    let pb = if bwd {
+        Some(predict_block(
+            b_plane, rstride, rw, rh, origin_x, origin_y, mv_b.0, mv_b.1, chroma,
+        ))
+    } else {
+        None
+    };
+    let mut pred = [0i32; 64];
+    for i in 0..64 {
+        pred[i] = match (&pf, &pb) {
+            // 双向预测取两路平均（四舍五入）。
+            (Some(a), Some(b)) => (a[i] + b[i] + 1) >> 1,
+            (Some(a), None) => a[i],
+            (None, Some(b)) => b[i],
+            (None, None) => 0,
+        };
+    }
+    store_pred(&pred, residual, out_plane, stride, origin_y * stride + origin_x);
+}
+
+/// 一个只有预测、没有残差的 B 帧宏块（跳过宏块）。
+#[allow(clippy::too_many_arguments)]
+fn write_predicted_mb(
+    frame: &mut Frame,
+    forward: &Frame,
+    backward: &Frame,
+    column: usize,
+    mb_row: usize,
+    fwd: bool,
+    bwd: bool,
+    mv_f: (i32, i32),
+    mv_b: (i32, i32),
+    width: usize,
+    height: usize,
+    cw: usize,
+    ch: usize,
+) {
+    let zero = [0i32; 64];
+    for block in 0..6 {
+        write_b_block(
+            frame, forward, backward, block, column, mb_row, fwd, bwd, mv_f, mv_b, &zero, width,
+            height, cw, ch,
+        );
+    }
+}
+
+/// 解一帧 B 图像：前向 / 后向 / 双向运动补偿 + 残差。
+///
+/// 参考帧由调用方按**解码序**维护：`forward` 是前一个 I/P，`backward` 是紧随其后的
+/// I/P（在码流里它比 B 帧先出现）。
+pub fn decode_b_frame(
+    sequence: &SequenceHeader,
+    picture: PictureHeader,
+    data: &[u8],
+    forward: &Frame,
+    backward: &Frame,
+) -> Result<Frame, DecodeError> {
+    if !matches!(picture.picture_type, PictureType::B) {
+        return Err(DecodeError::new("picture_type", 0, 0));
+    }
+    if sequence.mpeg2_stream() {
+        return Err(DecodeError::new("mpeg2_unsupported", 0, 0));
+    }
+    if forward.width != sequence.width
+        || forward.height != sequence.height
+        || backward.width != sequence.width
+        || backward.height != sequence.height
+    {
+        return Err(DecodeError::new("reference_size", 0, 0));
+    }
+
+    let width = sequence.width as usize;
+    let height = sequence.height as usize;
+    let cw = width.div_ceil(2);
+    let ch = height.div_ceil(2);
+    let mut frame = Frame {
+        width: sequence.width,
+        height: sequence.height,
+        y: forward.y.clone(),
+        u: forward.u.clone(),
+        v: forward.v.clone(),
+    };
+
+    let mb_w = width.div_ceil(16);
+    let mb_h = height.div_ceil(16);
+    let total_mb = mb_w * mb_h;
+    let fcode_f = picture.forward_f_code;
+    let fcode_b = picture.backward_f_code;
+    let mut decoded_slices = 0usize;
+
+    for (code, slice) in crate::split_units(data) {
+        if !(0x01..=0xAF).contains(&code) {
+            continue;
+        }
+        let row = (code as usize) - 1;
+        if row >= mb_h {
+            continue;
+        }
+        decoded_slices += 1;
+
+        let mut r = BitReader::new(slice);
+        let mut scale = r
+            .u(5)
+            .map_err(|_| DecodeError::new("slice_scale", r.bit_pos(), code as i64))? as i32;
+        if scale == 0 {
+            return Err(DecodeError::new("slice_scale_zero", r.bit_pos(), code as i64));
+        }
+        while r
+            .u(1)
+            .map_err(|_| DecodeError::new("extra_bit_slice", r.bit_pos(), code as i64))?
+            == 1
+        {
+            r.u(8)
+                .map_err(|_| DecodeError::new("extra_info_slice", r.bit_pos(), code as i64))?;
+        }
+
+        let mut dc_predictor = [0i32; 3];
+        // 前向 / 后向的运动矢量预测器，各自独立。
+        let mut last_mv_f = (0i32, 0i32);
+        let mut last_mv_b = (0i32, 0i32);
+        // 上一个已编码宏块：跳过宏块沿用它（类型 + 两路矢量）。
+        let mut prev: Option<(crate::tables::BMbType, (i32, i32), (i32, i32))> = None;
+        let mut mb_index = (row * mb_w) as isize - 1;
+        loop {
+            let Some(increment) = decode_vlc(&mut r, &MB_ADDR_INCR) else {
+                break;
+            };
+            let previous = mb_index;
+            mb_index += increment as isize + 1;
+            if mb_index < 0 || mb_index as usize >= total_mb {
+                break;
+            }
+
+            // 跳过的宏块：沿用上一个已编码宏块的类型与矢量，无残差。
+            for skipped in (previous + 1)..mb_index {
+                let Some((kind, mv_f, mv_b)) = prev else {
+                    return Err(DecodeError::new("b_skip_no_prev", r.bit_pos(), skipped as i64));
+                };
+                if kind.intra {
+                    return Err(DecodeError::new(
+                        "b_skip_after_intra",
+                        r.bit_pos(),
+                        skipped as i64,
+                    ));
+                }
+                let col = skipped as usize % mb_w;
+                let row_s = skipped as usize / mb_w;
+                write_predicted_mb(
+                    &mut frame, forward, backward, col, row_s, kind.forward, kind.backward, mv_f,
+                    mv_b, width, height, cw, ch,
+                );
+            }
+
+            let column = mb_index as usize % mb_w;
+            let mb_row = mb_index as usize / mb_w;
+
+            let Some(entry) = decode_b_mb_type(&mut r) else { break; };
+            let mb = B_MB_TYPE[entry];
+
+            if mb.quant {
+                scale = r
+                    .u(5)
+                    .map_err(|_| DecodeError::new("mb_scale", r.bit_pos(), column as i64))?
+                    as i32;
+                if scale == 0 {
+                    return Err(DecodeError::new("mb_scale_zero", r.bit_pos(), column as i64));
+                }
+            }
+
+            if mb.intra {
+                last_mv_f = (0, 0);
+                last_mv_b = (0, 0);
+                for block in 0..6 {
+                    let dc_table = if block < 4 { &DC_LUM } else { &DC_CHROMA };
+                    let component = if block < 4 { 0 } else { block - 3 };
+                    let coeffs = decode_intra_block(
+                        &mut r,
+                        scale,
+                        dc_table,
+                        &mut dc_predictor[component],
+                    )?;
+                    let residual = idct_residual(&coeffs);
+                    let (_, origin_x, origin_y) = block_origin(block, column, mb_row);
+                    let (plane, stride) = match block {
+                        0..=3 => (&mut frame.y, width),
+                        4 => (&mut frame.u, cw),
+                        _ => (&mut frame.v, cw),
+                    };
+                    store_block(&residual, 128, plane, stride, origin_y * stride + origin_x);
+                }
+                prev = Some((mb, (0, 0), (0, 0)));
+                continue;
+            }
+
+            // 运动矢量：前向、后向各自独立解码，各自累加预测。
+            let (mut mv_f, mut mv_b) = ((0i32, 0i32), (0i32, 0i32));
+            if mb.forward {
+                let x = decode_motion(&mut r, fcode_f, last_mv_f.0)
+                    .ok_or_else(|| DecodeError::new("mv_fx", r.bit_pos(), column as i64))?;
+                let y = decode_motion(&mut r, fcode_f, last_mv_f.1)
+                    .ok_or_else(|| DecodeError::new("mv_fy", r.bit_pos(), column as i64))?;
+                last_mv_f = (x, y);
+                mv_f = (x, y);
+                if picture.full_pel_forward {
+                    mv_f = (mv_f.0 * 2, mv_f.1 * 2);
+                }
+            }
+            if mb.backward {
+                let x = decode_motion(&mut r, fcode_b, last_mv_b.0)
+                    .ok_or_else(|| DecodeError::new("mv_bx", r.bit_pos(), column as i64))?;
+                let y = decode_motion(&mut r, fcode_b, last_mv_b.1)
+                    .ok_or_else(|| DecodeError::new("mv_by", r.bit_pos(), column as i64))?;
+                last_mv_b = (x, y);
+                mv_b = (x, y);
+                if picture.full_pel_backward {
+                    mv_b = (mv_b.0 * 2, mv_b.1 * 2);
+                }
+            }
+            dc_predictor = [0i32; 3];
+
+            let cbp = if mb.coded {
+                decode_vlc(&mut r, &MB_PATTERN)
+                    .ok_or_else(|| DecodeError::new("cbp", r.bit_pos(), column as i64))?
+                    as u32
+            } else {
+                0
+            };
+
+            for block in 0..6 {
+                let coded = mb.coded && (cbp & (1 << (5 - block))) != 0;
+                let residual = if coded {
+                    let coeffs = decode_inter_block(&mut r, scale)?;
+                    idct_residual(&coeffs)
+                } else {
+                    [0i32; 64]
+                };
+                write_b_block(
+                    &mut frame, forward, backward, block, column, mb_row, mb.forward,
+                    mb.backward, mv_f, mv_b, &residual, width, height, cw, ch,
+                );
+            }
+            prev = Some((mb, mv_f, mv_b));
+        }
+    }
+
+    if decoded_slices == 0 {
+        return Err(DecodeError::new("no_slices", 0, 0));
+    }
+    Ok(frame)
+}
+
+/// 按图像类型分派。P 帧给 `forward`；B 帧给 `forward` 与 `backward`。
 pub fn decode_frame(
     sequence: &SequenceHeader,
     picture: PictureHeader,
     data: &[u8],
-    reference: Option<&Frame>,
+    forward: Option<&Frame>,
+    backward: Option<&Frame>,
 ) -> Result<Frame, DecodeError> {
     match picture.picture_type {
         PictureType::I => decode_i_frame(sequence, picture, data),
         PictureType::P => {
-            let reference =
-                reference.ok_or_else(|| DecodeError::new("missing_reference", 0, 0))?;
-            decode_p_frame(sequence, picture, data, reference)
+            let forward =
+                forward.ok_or_else(|| DecodeError::new("missing_reference", 0, 0))?;
+            decode_p_frame(sequence, picture, data, forward)
+        }
+        PictureType::B => {
+            let forward =
+                forward.ok_or_else(|| DecodeError::new("missing_reference", 0, 0))?;
+            let backward =
+                backward.ok_or_else(|| DecodeError::new("missing_backward_reference", 0, 0))?;
+            decode_b_frame(sequence, picture, data, forward, backward)
         }
         _ => Err(DecodeError::new("unsupported_picture_type", 0, 0)),
     }

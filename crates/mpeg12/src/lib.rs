@@ -122,6 +122,9 @@ pub struct PictureHeader {
     /// 仅 P/B 帧：前向运动矢量精度（0 = 半像素）。
     pub full_pel_forward: bool,
     pub forward_f_code: u32,
+    /// 仅 B 帧：后向运动矢量精度与 f_code。
+    pub full_pel_backward: bool,
+    pub backward_f_code: u32,
 }
 
 impl PictureHeader {
@@ -137,12 +140,19 @@ impl PictureHeader {
         } else {
             (false, 0)
         };
+        let (full_pel_backward, backward_f_code) = if matches!(picture_type, PictureType::B) {
+            (r.u(1).ok()? == 1, r.u(3).ok()?)
+        } else {
+            (false, 0)
+        };
         Some(Self {
             temporal_reference,
             picture_type,
             vbv_delay,
             full_pel_forward,
             forward_f_code,
+            full_pel_backward,
+            backward_f_code,
         })
     }
 }
@@ -326,7 +336,7 @@ pub mod tables;
 #[cfg(test)]
 mod table_tests {
     use super::tables::{
-        EOB_BITS, EOB_CODE, ESCAPE_BITS, ESCAPE_CODE, MPEG1_RL, MV_CODE, P_MB_TYPE,
+        EOB_BITS, EOB_CODE, ESCAPE_BITS, ESCAPE_CODE, MPEG1_RL, B_MB_TYPE, MV_CODE, P_MB_TYPE,
     };
 
     /// 前缀无关：没有一条码字是另一条的前缀。
@@ -413,6 +423,23 @@ mod table_tests {
                     b.code >> (b.bits - a.bits),
                     a.code,
                     "p mb_type {i} is a prefix of {j}"
+                );
+            }
+        }
+    }
+
+    /// B 帧 `macroblock_type` 同样是前缀码。
+    #[test]
+    fn b_mb_type_is_prefix_free() {
+        for (i, a) in B_MB_TYPE.iter().enumerate() {
+            for (j, b) in B_MB_TYPE.iter().enumerate() {
+                if i == j || a.bits > b.bits {
+                    continue;
+                }
+                assert_ne!(
+                    b.code >> (b.bits - a.bits),
+                    a.code,
+                    "b mb_type {i} is a prefix of {j}"
                 );
             }
         }
