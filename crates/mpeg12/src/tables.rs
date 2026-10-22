@@ -1,11 +1,169 @@
-//! MPEG-1 的 DCT 系数 VLC 表（run/level → 码字）。
+//! MPEG-1 的码表与量化矩阵。**本文件由 `tools/gen_mpeg12_tables.py` 生成，不要手改。**
 //!
-//! **这张表不是手写的**：它由脚本从一份已知正确的实现里机械抽取，
-//! 抽取后立刻做了「前缀无关 + Kraft 和 = 1」自检（见 `tests`）。
-//! 手抄这种表最容易出的错是「整体对、个别条目错」，而这种错只会表现为
-//! 画面局部花掉，反推代价极高 —— 所以宁可不写，也不凭记忆写。
+//! 数据从一份已知正确的实现里机械抽取，抽取后由本 crate 的 `table_tests`
+//! 做前缀无关 / Kraft 自检 —— 手抄这种表最容易出「整体对、个别错」，
+//! 而那种错只表现为画面局部花掉，反推代价极高。
 
-/// 一条 run/level 码字。`bits` 位码 `code`（不含符号位）。
+/// 默认帧内量化矩阵（8×8，行优先）。
+pub const INTRA_MATRIX: [u8; 64] = [
+    8, 16, 19, 22, 26, 27, 29, 34,
+    16, 16, 22, 24, 27, 29, 34, 37,
+    19, 22, 26, 27, 29, 34, 34, 38,
+    22, 22, 26, 27, 29, 34, 37, 40,
+    22, 26, 27, 29, 32, 35, 40, 48,
+    26, 27, 29, 32, 35, 40, 48, 58,
+    26, 27, 29, 34, 38, 46, 56, 69,
+    27, 29, 35, 38, 46, 56, 69, 83,
+];
+
+/// 一条前缀码：`bits` 位码 `code`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Code {
+    pub code: u16,
+    pub bits: u8,
+}
+
+/// 亮度块 DC 尺寸码，下标即 `dct_dc_size`。
+pub const DC_LUM: [Code; 12] = [
+    Code { code: 0x0004, bits: 3 },
+    Code { code: 0x0000, bits: 2 },
+    Code { code: 0x0001, bits: 2 },
+    Code { code: 0x0005, bits: 3 },
+    Code { code: 0x0006, bits: 3 },
+    Code { code: 0x000e, bits: 4 },
+    Code { code: 0x001e, bits: 5 },
+    Code { code: 0x003e, bits: 6 },
+    Code { code: 0x007e, bits: 7 },
+    Code { code: 0x00fe, bits: 8 },
+    Code { code: 0x01fe, bits: 9 },
+    Code { code: 0x01ff, bits: 9 },
+];
+
+/// 色度块 DC 尺寸码，下标即 `dct_dc_size`。
+pub const DC_CHROMA: [Code; 12] = [
+    Code { code: 0x0000, bits: 2 },
+    Code { code: 0x0001, bits: 2 },
+    Code { code: 0x0002, bits: 2 },
+    Code { code: 0x0006, bits: 3 },
+    Code { code: 0x000e, bits: 4 },
+    Code { code: 0x001e, bits: 5 },
+    Code { code: 0x003e, bits: 6 },
+    Code { code: 0x007e, bits: 7 },
+    Code { code: 0x00fe, bits: 8 },
+    Code { code: 0x01fe, bits: 9 },
+    Code { code: 0x03fe, bits: 10 },
+    Code { code: 0x03ff, bits: 10 },
+];
+
+/// 宏块地址增量码，下标 + 1 即增量值。
+pub const MB_ADDR_INCR: [Code; 36] = [
+    Code { code: 0x0001, bits: 1 },
+    Code { code: 0x0003, bits: 3 },
+    Code { code: 0x0002, bits: 3 },
+    Code { code: 0x0003, bits: 4 },
+    Code { code: 0x0002, bits: 4 },
+    Code { code: 0x0003, bits: 5 },
+    Code { code: 0x0002, bits: 5 },
+    Code { code: 0x0007, bits: 7 },
+    Code { code: 0x0006, bits: 7 },
+    Code { code: 0x000b, bits: 8 },
+    Code { code: 0x000a, bits: 8 },
+    Code { code: 0x0009, bits: 8 },
+    Code { code: 0x0008, bits: 8 },
+    Code { code: 0x0007, bits: 8 },
+    Code { code: 0x0006, bits: 8 },
+    Code { code: 0x0017, bits: 10 },
+    Code { code: 0x0016, bits: 10 },
+    Code { code: 0x0015, bits: 10 },
+    Code { code: 0x0014, bits: 10 },
+    Code { code: 0x0013, bits: 10 },
+    Code { code: 0x0012, bits: 10 },
+    Code { code: 0x0023, bits: 11 },
+    Code { code: 0x0022, bits: 11 },
+    Code { code: 0x0021, bits: 11 },
+    Code { code: 0x0020, bits: 11 },
+    Code { code: 0x001f, bits: 11 },
+    Code { code: 0x001e, bits: 11 },
+    Code { code: 0x001d, bits: 11 },
+    Code { code: 0x001c, bits: 11 },
+    Code { code: 0x001b, bits: 11 },
+    Code { code: 0x001a, bits: 11 },
+    Code { code: 0x0019, bits: 11 },
+    Code { code: 0x0018, bits: 11 },
+    Code { code: 0x0008, bits: 11 },
+    Code { code: 0x000f, bits: 11 },
+    Code { code: 0x0000, bits: 8 },
+];
+
+/// `coded_block_pattern` 码，下标即 CBP。
+pub const MB_PATTERN: [Code; 64] = [
+    Code { code: 0x0001, bits: 9 },
+    Code { code: 0x000b, bits: 5 },
+    Code { code: 0x0009, bits: 5 },
+    Code { code: 0x000d, bits: 6 },
+    Code { code: 0x000d, bits: 4 },
+    Code { code: 0x0017, bits: 7 },
+    Code { code: 0x0013, bits: 7 },
+    Code { code: 0x001f, bits: 8 },
+    Code { code: 0x000c, bits: 4 },
+    Code { code: 0x0016, bits: 7 },
+    Code { code: 0x0012, bits: 7 },
+    Code { code: 0x001e, bits: 8 },
+    Code { code: 0x0013, bits: 5 },
+    Code { code: 0x001b, bits: 8 },
+    Code { code: 0x0017, bits: 8 },
+    Code { code: 0x0013, bits: 8 },
+    Code { code: 0x000b, bits: 4 },
+    Code { code: 0x0015, bits: 7 },
+    Code { code: 0x0011, bits: 7 },
+    Code { code: 0x001d, bits: 8 },
+    Code { code: 0x0011, bits: 5 },
+    Code { code: 0x0019, bits: 8 },
+    Code { code: 0x0015, bits: 8 },
+    Code { code: 0x0011, bits: 8 },
+    Code { code: 0x000f, bits: 6 },
+    Code { code: 0x000f, bits: 8 },
+    Code { code: 0x000d, bits: 8 },
+    Code { code: 0x0003, bits: 9 },
+    Code { code: 0x000f, bits: 5 },
+    Code { code: 0x000b, bits: 8 },
+    Code { code: 0x0007, bits: 8 },
+    Code { code: 0x0007, bits: 9 },
+    Code { code: 0x000a, bits: 4 },
+    Code { code: 0x0014, bits: 7 },
+    Code { code: 0x0010, bits: 7 },
+    Code { code: 0x001c, bits: 8 },
+    Code { code: 0x000e, bits: 6 },
+    Code { code: 0x000e, bits: 8 },
+    Code { code: 0x000c, bits: 8 },
+    Code { code: 0x0002, bits: 9 },
+    Code { code: 0x0010, bits: 5 },
+    Code { code: 0x0018, bits: 8 },
+    Code { code: 0x0014, bits: 8 },
+    Code { code: 0x0010, bits: 8 },
+    Code { code: 0x000e, bits: 5 },
+    Code { code: 0x000a, bits: 8 },
+    Code { code: 0x0006, bits: 8 },
+    Code { code: 0x0006, bits: 9 },
+    Code { code: 0x0012, bits: 5 },
+    Code { code: 0x001a, bits: 8 },
+    Code { code: 0x0016, bits: 8 },
+    Code { code: 0x0012, bits: 8 },
+    Code { code: 0x000d, bits: 5 },
+    Code { code: 0x0009, bits: 8 },
+    Code { code: 0x0005, bits: 8 },
+    Code { code: 0x0005, bits: 9 },
+    Code { code: 0x000c, bits: 5 },
+    Code { code: 0x0008, bits: 8 },
+    Code { code: 0x0004, bits: 8 },
+    Code { code: 0x0004, bits: 9 },
+    Code { code: 0x0007, bits: 3 },
+    Code { code: 0x000a, bits: 5 },
+    Code { code: 0x0008, bits: 5 },
+    Code { code: 0x000c, bits: 6 },
+];
+
+/// 一条 run/level 码字。level 的符号是码字之后的**独立 1 位**。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RlEntry {
     pub code: u16,
@@ -14,7 +172,7 @@ pub struct RlEntry {
     pub level: i16,
 }
 
-/// `(run, level)` 到码字的表。level 的符号是码字之后的**独立 1 位**。
+/// `(run, level)` 到码字的表。
 pub const MPEG1_RL: [RlEntry; 111] = [
     RlEntry { code: 0x0003, bits: 2, run: 0, level: 1 },
     RlEntry { code: 0x0004, bits: 4, run: 0, level: 2 },
@@ -129,10 +287,9 @@ pub const MPEG1_RL: [RlEntry; 111] = [
     RlEntry { code: 0x001b, bits: 16, run: 31, level: 1 },
 ];
 
-/// 块结束码 `10`（2 位）。
+/// 块结束码 `10`。
 pub const EOB_CODE: u16 = 0b10;
 pub const EOB_BITS: u8 = 2;
-
-/// 逃逸码 `000001`（6 位），后跟 run / level 的定长编码。
+/// 逃逸码 `000001`，后跟定长的 run / level。
 pub const ESCAPE_CODE: u16 = 0b000001;
 pub const ESCAPE_BITS: u8 = 6;
