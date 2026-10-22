@@ -318,6 +318,67 @@ fn store_pred(pred: &[i32; 64], residual: &[i32; 64], out: &mut [u8], stride: us
     }
 }
 
+/// 把帧内残差写到宏块的某个块（按帧 / 场 DCT 的几何）。
+#[allow(clippy::too_many_arguments)]
+fn store_mb_block(
+    frame: &mut Frame,
+    block: usize,
+    column: usize,
+    mb_row: usize,
+    width: usize,
+    cw: usize,
+    interlaced_dct: bool,
+    residual: &[i32; 64],
+    offset: i32,
+) {
+    let (chroma, origin_x, origin_y, stride, _) =
+        block_geometry(block, column, mb_row, width, cw, interlaced_dct);
+    let plane_width = if chroma { cw } else { width };
+    let plane = match block {
+        0..=3 => &mut frame.y,
+        4 => &mut frame.u,
+        _ => &mut frame.v,
+    };
+    store_block(residual, offset, plane, stride, origin_y * plane_width + origin_x);
+}
+
+/// 取预测 + 叠残差，写到宏块的某个块（按帧 / 场 DCT 的几何）。
+#[allow(clippy::too_many_arguments)]
+fn store_pred_block(
+    frame: &mut Frame,
+    reference: &Frame,
+    block: usize,
+    column: usize,
+    mb_row: usize,
+    width: usize,
+    height: usize,
+    cw: usize,
+    ch: usize,
+    interlaced_dct: bool,
+    mv_x: i32,
+    mv_y: i32,
+    residual: &[i32; 64],
+) {
+    let (chroma, origin_x, origin_y, stride, row_step) =
+        block_geometry(block, column, mb_row, width, cw, interlaced_dct);
+    let plane_width = if chroma { cw } else { width };
+    let (rw, rh) = if chroma { (cw, ch) } else { (width, height) };
+    let ref_plane = match block {
+        0..=3 => &reference.y,
+        4 => &reference.u,
+        _ => &reference.v,
+    };
+    let pred = predict_block(
+        ref_plane, plane_width, rw, rh, origin_x, origin_y, mv_x, mv_y, chroma, row_step,
+    );
+    let plane = match block {
+        0..=3 => &mut frame.y,
+        4 => &mut frame.u,
+        _ => &mut frame.v,
+    };
+    store_pred(&pred, residual, plane, stride, origin_y * plane_width + origin_x);
+}
+
 /// 解一个帧内块。
 fn decode_intra_block(
     r: &mut BitReader,
@@ -551,16 +612,29 @@ fn decode_motion(r: &mut BitReader, fcode: u32, pred: i32) -> Option<i32> {
     Some(sign_extend(val + pred, 5 + shift))
 }
 
-/// 宏块内第 `block` 个块在平面上的原点。
+/// 宏块内第 `block` 个块的几何：`(是否色度, 原点 x, 原点 y, 写步长, 取行步长)`。
 ///
-/// 0..=3 是亮度 8×8 子块（宏块内 2×2 排列），4 / 5 是 Cb / Cr。
-fn block_origin(block: usize, column: usize, mb_row: usize) -> (bool, usize, usize) {
+/// 场 DCT（`interlaced_dct=1`）时亮度块隔行写 / 取：块 0/1 在偶行、2/3 在奇行，
+/// 行步长 2；色度在 4:2:0 下始终按帧 DCT 摆放。
+fn block_geometry(
+    block: usize,
+    column: usize,
+    mb_row: usize,
+    width: usize,
+    cw: usize,
+    interlaced_dct: bool,
+) -> (bool, usize, usize, usize, i32) {
     match block {
         0..=3 => {
             let (bx, by) = (block % 2, block / 2);
-            (false, column * 16 + bx * 8, mb_row * 16 + by * 8)
+            let origin_x = column * 16 + bx * 8;
+            if interlaced_dct {
+                (false, origin_x, mb_row * 16 + by, 2 * width, 2)
+            } else {
+                (false, origin_x, mb_row * 16 + by * 8, width, 1)
+            }
         }
-        _ => (true, column * 8, mb_row * 8),
+        _ => (true, column * 8, mb_row * 8, cw, 1),
     }
 }
 
@@ -579,6 +653,7 @@ fn predict_block(
     mv_x: i32,
     mv_y: i32,
     chroma: bool,
+    row_step: i32,
 ) -> [i32; 64] {
     let (mx, my) = if chroma { (mv_x / 2, mv_y / 2) } else { (mv_x, mv_y) };
     let ix = mx >> 1;
@@ -589,7 +664,7 @@ fn predict_block(
     for y in 0..8 {
         for x in 0..8 {
             let sx = origin_x as i32 + ix + x as i32;
-            let sy = origin_y as i32 + iy + y as i32;
+            let sy = origin_y as i32 + row_step * y as i32 + iy;
             let at = |dx: i32, dy: i32| -> i32 {
                 let px = (sx + dx).clamp(0, width as i32 - 1) as usize;
                 let py = (sy + dy).clamp(0, height as i32 - 1) as usize;
@@ -657,9 +732,6 @@ fn mpeg2_extension(
             ext.picture_structure as i64,
         ));
     }
-    if !ext.frame_pred_frame_dct {
-        return Err(DecodeError::new("field_prediction_unsupported", 0, 0));
-    }
     if sequence.chroma_format != 1 {
         return Err(DecodeError::new(
             "chroma_format_unsupported",
@@ -683,6 +755,7 @@ pub fn decode_i_frame(
     let tables = block_tables(ext.as_ref());
     let non_linear = ext.as_ref().map_or(false, |e| e.q_scale_type);
     let precision = ext.as_ref().map_or(0, |e| e.intra_dc_precision);
+    let need_motion = ext.as_ref().map_or(false, |e| !e.frame_pred_frame_dct);
 
     let width = sequence.width as usize;
     let height = sequence.height as usize;
@@ -759,6 +832,14 @@ pub fn decode_i_frame(
             } else {
                 return Err(DecodeError::new("mb_type_00", r.bit_pos(), column as i64));
             };
+            // MPEG-2 隔行：帧内宏块在量化器之前有一个 interlaced_dct 位。
+            let interlaced_dct = if need_motion {
+                r.u(1)
+                    .map_err(|_| DecodeError::new("interlaced_dct", r.bit_pos(), column as i64))?
+                    == 1
+            } else {
+                false
+            };
             if quantised_mb {
                 scale = r
                     .u(5)
@@ -782,13 +863,9 @@ pub fn decode_i_frame(
                     tables.scan,
                 )?;
                 let residual = idct_residual(&coeffs);
-                let (_, origin_x, origin_y) = block_origin(block, column, mb_row);
-                let (plane, stride) = match block {
-                    0..=3 => (&mut frame.y, width),
-                    4 => (&mut frame.u, cw),
-                    _ => (&mut frame.v, cw),
-                };
-                store_block(&residual, 128, plane, stride, origin_y * stride + origin_x);
+                store_mb_block(
+                    &mut frame, block, column, mb_row, width, cw, interlaced_dct, &residual, 128,
+                );
             }
         }
     }
@@ -813,6 +890,7 @@ pub fn decode_p_frame(
     let tables = block_tables(ext.as_ref());
     let non_linear = ext.as_ref().map_or(false, |e| e.q_scale_type);
     let precision = ext.as_ref().map_or(0, |e| e.intra_dc_precision);
+    let need_motion = ext.as_ref().map_or(false, |e| !e.frame_pred_frame_dct);
     if reference.width != sequence.width || reference.height != sequence.height {
         return Err(DecodeError::new("reference_size", 0, 0));
     }
@@ -893,6 +971,54 @@ pub fn decode_p_frame(
             let Some(entry) = decode_p_mb_type(&mut r) else { break; };
             let mb = P_MB_TYPE[entry];
 
+            // MPEG-2 隔行：帧内读 interlaced_dct；零矢量只读 interlaced_dct；
+            // 非零矢量先读 motion_type 再读 interlaced_dct。
+            let (motion_type, interlaced_dct) = if mb.intra {
+                let dct = if need_motion {
+                    r.u(1)
+                        .map_err(|_| DecodeError::new("interlaced_dct", r.bit_pos(), column as i64))?
+                        == 1
+                } else {
+                    false
+                };
+                (2u32, dct)
+            } else if need_motion {
+                match mb.motion {
+                    Motion::Zero => {
+                        let dct = r
+                            .u(1)
+                            .map_err(|_| DecodeError::new("interlaced_dct", r.bit_pos(), column as i64))?
+                            == 1;
+                        (2u32, dct)
+                    }
+                    Motion::Forward => {
+                        let mt = r.u(2).map_err(|_| {
+                            DecodeError::new("motion_type", r.bit_pos(), column as i64)
+                        })?;
+                        let dct = if mb.coded {
+                            r.u(1)
+                                .map_err(|_| {
+                                    DecodeError::new("interlaced_dct", r.bit_pos(), column as i64)
+                                })?
+                                == 1
+                        } else {
+                            false
+                        };
+                        (mt, dct)
+                    }
+                    Motion::None => (2, false),
+                }
+            } else {
+                (2, false)
+            };
+            if !mb.intra && motion_type != 2 {
+                return Err(DecodeError::new(
+                    "field_motion_unsupported",
+                    r.bit_pos(),
+                    motion_type as i64,
+                ));
+            }
+
             if mb.quant {
                 scale = r
                     .u(5)
@@ -918,13 +1044,10 @@ pub fn decode_p_frame(
                         tables.scan,
                     )?;
                     let residual = idct_residual(&coeffs);
-                    let (_, origin_x, origin_y) = block_origin(block, column, mb_row);
-                    let (plane, stride) = match block {
-                        0..=3 => (&mut frame.y, width),
-                        4 => (&mut frame.u, cw),
-                        _ => (&mut frame.v, cw),
-                    };
-                    store_block(&residual, 128, plane, stride, origin_y * stride + origin_x);
+                    store_mb_block(
+                        &mut frame, block, column, mb_row, width, cw, interlaced_dct, &residual,
+                        128,
+                    );
                 }
                 continue;
             }
@@ -963,40 +1086,16 @@ pub fn decode_p_frame(
 
             for block in 0..6 {
                 let coded = mb.coded && (cbp & (1 << (5 - block))) != 0;
-                let (chroma, origin_x, origin_y) = block_origin(block, column, mb_row);
                 let residual = if coded {
                     let coeffs = decode_inter_block(&mut r, quant, tables.inter_rl, tables.scan)?;
                     idct_residual(&coeffs)
                 } else {
                     [0i32; 64]
                 };
-                match block {
-                    0..=3 => {
-                        let pred = predict_block(
-                            &reference.y, width, width, height, origin_x, origin_y, mv_x, mv_y,
-                            chroma,
-                        );
-                        store_pred(
-                            &pred,
-                            &residual,
-                            &mut frame.y,
-                            width,
-                            origin_y * width + origin_x,
-                        );
-                    }
-                    4 => {
-                        let pred = predict_block(
-                            &reference.u, cw, cw, ch, origin_x, origin_y, mv_x, mv_y, chroma,
-                        );
-                        store_pred(&pred, &residual, &mut frame.u, cw, origin_y * cw + origin_x);
-                    }
-                    _ => {
-                        let pred = predict_block(
-                            &reference.v, cw, cw, ch, origin_x, origin_y, mv_x, mv_y, chroma,
-                        );
-                        store_pred(&pred, &residual, &mut frame.v, cw, origin_y * cw + origin_x);
-                    }
-                }
+                store_pred_block(
+                    &mut frame, reference, block, column, mb_row, width, height, cw, ch,
+                    interlaced_dct, mv_x, mv_y, &residual,
+                );
             }
         }
     }
@@ -1025,30 +1124,29 @@ fn write_b_block(
     height: usize,
     cw: usize,
     ch: usize,
+    interlaced_dct: bool,
 ) {
-    let (chroma, origin_x, origin_y) = block_origin(block, column, mb_row);
-    let (out_plane, stride) = match block {
-        0..=3 => (&mut frame.y, width),
-        4 => (&mut frame.u, cw),
-        _ => (&mut frame.v, cw),
-    };
-    let (f_plane, b_plane, rstride, rw, rh): (&[u8], &[u8], usize, usize, usize) = if chroma {
+    let (chroma, origin_x, origin_y, stride, row_step) =
+        block_geometry(block, column, mb_row, width, cw, interlaced_dct);
+    let plane_width = if chroma { cw } else { width };
+    let (rw, rh) = if chroma { (cw, ch) } else { (width, height) };
+    let (f_plane, b_plane): (&[u8], &[u8]) = if chroma {
         let f = if block == 4 { &forward.u } else { &forward.v };
         let b = if block == 4 { &backward.u } else { &backward.v };
-        (f, b, cw, cw, ch)
+        (f, b)
     } else {
-        (&forward.y, &backward.y, width, width, height)
+        (&forward.y, &backward.y)
     };
     let pf = if fwd {
         Some(predict_block(
-            f_plane, rstride, rw, rh, origin_x, origin_y, mv_f.0, mv_f.1, chroma,
+            f_plane, plane_width, rw, rh, origin_x, origin_y, mv_f.0, mv_f.1, chroma, row_step,
         ))
     } else {
         None
     };
     let pb = if bwd {
         Some(predict_block(
-            b_plane, rstride, rw, rh, origin_x, origin_y, mv_b.0, mv_b.1, chroma,
+            b_plane, plane_width, rw, rh, origin_x, origin_y, mv_b.0, mv_b.1, chroma, row_step,
         ))
     } else {
         None
@@ -1063,7 +1161,12 @@ fn write_b_block(
             (None, None) => 0,
         };
     }
-    store_pred(&pred, residual, out_plane, stride, origin_y * stride + origin_x);
+    let out_plane = match block {
+        0..=3 => &mut frame.y,
+        4 => &mut frame.u,
+        _ => &mut frame.v,
+    };
+    store_pred(&pred, residual, out_plane, stride, origin_y * plane_width + origin_x);
 }
 
 /// 一个只有预测、没有残差的 B 帧宏块（跳过宏块）。
@@ -1082,12 +1185,13 @@ fn write_predicted_mb(
     height: usize,
     cw: usize,
     ch: usize,
+    interlaced_dct: bool,
 ) {
     let zero = [0i32; 64];
     for block in 0..6 {
         write_b_block(
             frame, forward, backward, block, column, mb_row, fwd, bwd, mv_f, mv_b, &zero, width,
-            height, cw, ch,
+            height, cw, ch, interlaced_dct,
         );
     }
 }
@@ -1110,6 +1214,7 @@ pub fn decode_b_frame(
     let tables = block_tables(ext.as_ref());
     let non_linear = ext.as_ref().map_or(false, |e| e.q_scale_type);
     let precision = ext.as_ref().map_or(0, |e| e.intra_dc_precision);
+    let need_motion = ext.as_ref().map_or(false, |e| !e.frame_pred_frame_dct);
     if forward.width != sequence.width
         || forward.height != sequence.height
         || backward.width != sequence.width
@@ -1200,7 +1305,7 @@ pub fn decode_b_frame(
                 let row_s = skipped as usize / mb_w;
                 write_predicted_mb(
                     &mut frame, forward, backward, col, row_s, kind.forward, kind.backward, mv_f,
-                    mv_b, width, height, cw, ch,
+                    mv_b, width, height, cw, ch, false,
                 );
             }
 
@@ -1209,6 +1314,39 @@ pub fn decode_b_frame(
 
             let Some(entry) = decode_b_mb_type(&mut r) else { break; };
             let mb = B_MB_TYPE[entry];
+
+            // MPEG-2 隔行：与 P 帧同样的 motion_type / interlaced_dct 位置。
+            let (motion_type, interlaced_dct) = if mb.intra {
+                let dct = if need_motion {
+                    r.u(1)
+                        .map_err(|_| DecodeError::new("interlaced_dct", r.bit_pos(), column as i64))?
+                        == 1
+                } else {
+                    false
+                };
+                (2u32, dct)
+            } else if need_motion {
+                let mt = r
+                    .u(2)
+                    .map_err(|_| DecodeError::new("motion_type", r.bit_pos(), column as i64))?;
+                let dct = if mb.coded {
+                    r.u(1)
+                        .map_err(|_| DecodeError::new("interlaced_dct", r.bit_pos(), column as i64))?
+                        == 1
+                } else {
+                    false
+                };
+                (mt, dct)
+            } else {
+                (2, false)
+            };
+            if !mb.intra && motion_type != 2 {
+                return Err(DecodeError::new(
+                    "field_motion_unsupported",
+                    r.bit_pos(),
+                    motion_type as i64,
+                ));
+            }
 
             if mb.quant {
                 scale = r
@@ -1236,13 +1374,10 @@ pub fn decode_b_frame(
                         tables.scan,
                     )?;
                     let residual = idct_residual(&coeffs);
-                    let (_, origin_x, origin_y) = block_origin(block, column, mb_row);
-                    let (plane, stride) = match block {
-                        0..=3 => (&mut frame.y, width),
-                        4 => (&mut frame.u, cw),
-                        _ => (&mut frame.v, cw),
-                    };
-                    store_block(&residual, 128, plane, stride, origin_y * stride + origin_x);
+                    store_mb_block(
+                        &mut frame, block, column, mb_row, width, cw, interlaced_dct, &residual,
+                        128,
+                    );
                 }
                 prev = Some((mb, (0, 0), (0, 0)));
                 continue;
@@ -1292,7 +1427,7 @@ pub fn decode_b_frame(
                 };
                 write_b_block(
                     &mut frame, forward, backward, block, column, mb_row, mb.forward,
-                    mb.backward, mv_f, mv_b, &residual, width, height, cw, ch,
+                    mb.backward, mv_f, mv_b, &residual, width, height, cw, ch, interlaced_dct,
                 );
             }
             prev = Some((mb, mv_f, mv_b));
