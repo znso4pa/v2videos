@@ -34,6 +34,18 @@ pub struct SequenceHeader {
     pub frame_rate_milli: u32,
     pub bit_rate: u32,
     pub vbv_buffer_size: u32,
+    /// 由调用方根据 sequence extension 判定（见 [`SequenceHeader::mpeg2_stream`]）。
+    pub mpeg2: bool,
+}
+
+impl SequenceHeader {
+    /// 这条流是不是 MPEG-2。
+    ///
+    /// 解析器本身不知道版本（sequence header 里没有版本位），由调用方在拿到
+    /// 整条 elementary stream 时用 [`has_sequence_extension`] 判出来再传进来。
+    pub fn mpeg2_stream(&self) -> bool {
+        self.mpeg2
+    }
 }
 
 impl SequenceHeader {
@@ -65,6 +77,7 @@ impl SequenceHeader {
             frame_rate_milli,
             bit_rate,
             vbv_buffer_size,
+            mpeg2: false,
         })
     }
 }
@@ -307,6 +320,7 @@ mod tests {
     }
 }
 
+pub mod decode;
 pub mod tables;
 
 #[cfg(test)]
@@ -370,5 +384,20 @@ mod table_tests {
                 "an entry starts with the escape code"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod zigzag_tests {
+    /// zigzag 必须是 0..63 的一个置换 —— 漏一个或重一个都会让块内系数错位。
+    #[test]
+    fn zigzag_is_a_permutation() {
+        let mut seen = [false; 64];
+        for value in super::decode::ZIGZAG {
+            assert!(value < 64, "index out of range: {value}");
+            assert!(!seen[value], "duplicate index {value}");
+            seen[value] = true;
+        }
+        assert!(seen.iter().all(|&v| v));
     }
 }
