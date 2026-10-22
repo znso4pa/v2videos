@@ -29,12 +29,7 @@ fn the_first_i_frame_matches_the_reference() {
         }
     }
 
-    let mut sequence = split_units(&es)
-        .iter()
-        .find(|(code, _)| *code == 0xB3)
-        .and_then(|(_, payload)| SequenceHeader::parse(payload))
-        .expect("a sequence header");
-    sequence.mpeg2 = v2v_mpeg12::has_sequence_extension(&es);
+    let sequence = parse_sequence(&es);
 
     let mut decoded = None;
     for (header, data) in split_pictures(&es) {
@@ -86,12 +81,7 @@ fn every_frame_matches_the_reference() {
         }
     }
 
-    let mut sequence = split_units(&es)
-        .iter()
-        .find(|(code, _)| *code == 0xB3)
-        .and_then(|(_, payload)| SequenceHeader::parse(payload))
-        .expect("a sequence header");
-    sequence.mpeg2 = v2v_mpeg12::has_sequence_extension(&es);
+    let sequence = parse_sequence(&es);
 
     let frame_size = (sequence.width * sequence.height * 3 / 2) as usize;
     let expected = std::fs::read(&reference).expect("read the reference frames");
@@ -171,4 +161,25 @@ fn every_frame_matches_the_reference() {
         "only decoded {} frames; need at least an I and a P",
         decoded.len()
     );
+}
+
+/// 解析 sequence header，并把 MPEG-2 的 sequence extension 并进来。
+fn parse_sequence(es: &[u8]) -> SequenceHeader {
+    let units = split_units(es);
+    let mut sequence = units
+        .iter()
+        .find(|(code, _)| *code == 0xB3)
+        .and_then(|(_, payload)| SequenceHeader::parse(payload))
+        .expect("a sequence header");
+    sequence.mpeg2 = v2v_mpeg12::has_sequence_extension(es);
+    if sequence.mpeg2 {
+        if let Some(ext) = units
+            .iter()
+            .find(|(code, _)| *code == 0xB5)
+            .and_then(|(_, payload)| v2v_mpeg12::SequenceExtension::parse(payload))
+        {
+            sequence.apply_sequence_extension(&ext);
+        }
+    }
+    sequence
 }

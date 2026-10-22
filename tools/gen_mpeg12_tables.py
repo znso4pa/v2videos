@@ -2,10 +2,11 @@
 """从 FFmpeg 的数据文件生成 `crates/mpeg12/src/tables.rs`。
 
 用法：
-`python3 tools/gen_mpeg12_tables.py <ffmpeg 源码根>/libavcodec/mpeg12data.c <ffmpeg 源码根>/libavcodec/mpeg12.c`
+`python3 tools/gen_mpeg12_tables.py <ffmpeg 源码根>/libavcodec/mpeg12data.c <ffmpeg 源码根>/libavcodec/mpeg12.c <ffmpeg 源码根>/libavcodec/mpegvideodata.c`
 
 - `mpeg12data.c`：量化矩阵、DC / RL / 宏块地址 / 模式 / 运动矢量码表。
-- `mpeg12.c`：P 帧 `macroblock_type` 码表与语义（`table_mb_ptype` / `ptype2mb_type`）。
+- `mpeg12.c`：P / B 帧 `macroblock_type` 码表与语义。
+- `mpegvideodata.c`：非线性量化表、交替扫描表。
 
 **为什么不手写**：这几张表加起来两百多条，手抄最容易出「整体对、个别错」，
 而那种错只表现为画面局部花掉，反推代价极高。生成 + 自检（前缀无关、Kraft 和）
@@ -17,6 +18,7 @@ import sys
 
 SRC = sys.argv[1] if len(sys.argv) > 1 else "libavcodec/mpeg12data.c"
 SRC2 = sys.argv[2] if len(sys.argv) > 2 else "libavcodec/mpeg12.c"
+SRC3 = sys.argv[3] if len(sys.argv) > 3 else "libavcodec/mpegvideodata.c"
 OUT = "crates/mpeg12/src/tables.rs"
 
 
@@ -92,6 +94,7 @@ def mb_btype_semantics(text):
 def main():
     src = open(SRC).read()
     src2 = open(SRC2).read()
+    src3 = open(SRC3).read()
 
     intra = ints(body(src, "ff_mpeg1_default_intra_matrix"))[:64]
     non_intra = ints(body(src, "ff_mpeg1_default_non_intra_matrix"))[:64]
@@ -105,6 +108,9 @@ def main():
     rl_vlc = pairs(body(src, "ff_mpeg1_vlc_table"))
     level = ints(body(src, "ff_mpeg12_level"))
     run = ints(body(src, "ff_mpeg12_run"))
+    mpeg2_rl_vlc = pairs(body(src, "ff_mpeg2_vlc_table"))
+    non_linear = ints(body(src3, "ff_mpeg2_non_linear_qscale"))
+    alt_scan = ints(body(src3, "ff_alternate_horizontal_scan"))
 
     ptype = pairs(body(src2, "table_mb_ptype"))
     psem = mb_ptype_semantics(body(src2, "ptype2mb_type"))
@@ -171,6 +177,25 @@ def main():
     for i in range(len(level)):
         code, bits = rl_vlc[i]
         w(f"    RlEntry {{ code: 0x{code:04x}, bits: {bits}, run: {run[i]}, level: {level[i]} }},")
+    w("];")
+    w("")
+    w("/// MPEG-2 的**非帧内** run/level 表（帧内仍用 `MPEG1_RL`，除非 `intra_vlc_format=1`）。")
+    w(f"pub const MPEG2_RL: [RlEntry; {len(level)}] = [")
+    for i in range(len(level)):
+        code, bits = mpeg2_rl_vlc[i]
+        w(f"    RlEntry {{ code: 0x{code:04x}, bits: {bits}, run: {run[i]}, level: {level[i]} }},")
+    w("];")
+    w("")
+    w("/// `q_scale_type=1` 时的非线性量化表。")
+    w(f"pub const NON_LINEAR_QSCALE: [u8; {len(non_linear)}] = [")
+    for i in range(0, len(non_linear), 8):
+        w("    " + ", ".join(str(v) for v in non_linear[i:i + 8]) + ",")
+    w("];")
+    w("")
+    w("/// 交替扫描（隔行帧）。")
+    w(f"pub const ALT_SCAN: [usize; {len(alt_scan)}] = [")
+    for i in range(0, len(alt_scan), 8):
+        w("    " + ", ".join(str(v) for v in alt_scan[i:i + 8]) + ",")
     w("];")
     w("")
     w("/// 块结束码 `10`。")

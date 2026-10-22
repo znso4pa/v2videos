@@ -36,6 +36,10 @@ pub struct SequenceHeader {
     pub vbv_buffer_size: u32,
     /// 由调用方根据 sequence extension 判定（见 [`SequenceHeader::mpeg2_stream`]）。
     pub mpeg2: bool,
+    /// MPEG-2 的色度格式：1 = 4:2:0（默认），2 = 4:2:2，3 = 4:4:4。
+    pub chroma_format: u8,
+    /// MPEG-2 的 progressive_sequence；MPEG-1 恒为 true。
+    pub progressive_sequence: bool,
 }
 
 impl SequenceHeader {
@@ -45,6 +49,100 @@ impl SequenceHeader {
     /// 整条 elementary stream 时用 [`has_sequence_extension`] 判出来再传进来。
     pub fn mpeg2_stream(&self) -> bool {
         self.mpeg2
+    }
+
+    /// 把 MPEG-2 sequence extension 的字段并进来。
+    pub fn apply_sequence_extension(&mut self, ext: &SequenceExtension) {
+        self.progressive_sequence = ext.progressive_sequence;
+        self.chroma_format = ext.chroma_format;
+    }
+}
+
+/// MPEG-2 sequence extension（`00 00 01 B5`，extension id = 1）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SequenceExtension {
+    pub profile_and_level: u8,
+    pub progressive_sequence: bool,
+    pub chroma_format: u8,
+    pub horizontal_size_ext: u8,
+    pub vertical_size_ext: u8,
+}
+
+impl SequenceExtension {
+    /// 解析 `00 00 01 B5` **之后**的字节。
+    pub fn parse(payload: &[u8]) -> Option<Self> {
+        let mut r = BitReader::new(payload);
+        if r.u(4).ok()? != 1 {
+            return None;
+        }
+        let profile_and_level = r.u(8).ok()? as u8;
+        let progressive_sequence = r.u(1).ok()? == 1;
+        let chroma_format = r.u(2).ok()? as u8;
+        let horizontal_size_ext = r.u(2).ok()? as u8;
+        let vertical_size_ext = r.u(2).ok()? as u8;
+        Some(Self {
+            profile_and_level,
+            progressive_sequence,
+            chroma_format,
+            horizontal_size_ext,
+            vertical_size_ext,
+        })
+    }
+}
+
+/// MPEG-2 picture coding extension（`00 00 01 B5`，extension id = 8）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PictureCodingExtension {
+    /// `f_code[forward/backward][horizontal/vertical]`。
+    pub f_code: [[u32; 2]; 2],
+    pub intra_dc_precision: u8,
+    /// 1 = top field，2 = bottom field，3 = frame。
+    pub picture_structure: u8,
+    pub top_field_first: bool,
+    pub frame_pred_frame_dct: bool,
+    pub concealment_motion_vectors: bool,
+    pub q_scale_type: bool,
+    pub intra_vlc_format: bool,
+    pub alternate_scan: bool,
+    pub repeat_first_field: bool,
+    pub progressive_frame: bool,
+}
+
+impl PictureCodingExtension {
+    /// 解析 `00 00 01 B5` **之后**的字节。
+    pub fn parse(payload: &[u8]) -> Option<Self> {
+        let mut r = BitReader::new(payload);
+        if r.u(4).ok()? != 8 {
+            return None;
+        }
+        let f_code = [
+            [r.u(4).ok()?, r.u(4).ok()?],
+            [r.u(4).ok()?, r.u(4).ok()?],
+        ];
+        let intra_dc_precision = r.u(2).ok()? as u8;
+        let picture_structure = r.u(2).ok()? as u8;
+        let top_field_first = r.u(1).ok()? == 1;
+        let frame_pred_frame_dct = r.u(1).ok()? == 1;
+        let concealment_motion_vectors = r.u(1).ok()? == 1;
+        let q_scale_type = r.u(1).ok()? == 1;
+        let intra_vlc_format = r.u(1).ok()? == 1;
+        let alternate_scan = r.u(1).ok()? == 1;
+        let repeat_first_field = r.u(1).ok()? == 1;
+        let _chroma_420_type = r.u(1).ok()?;
+        let progressive_frame = r.u(1).ok()? == 1;
+        Some(Self {
+            f_code,
+            intra_dc_precision,
+            picture_structure,
+            top_field_first,
+            frame_pred_frame_dct,
+            concealment_motion_vectors,
+            q_scale_type,
+            intra_vlc_format,
+            alternate_scan,
+            repeat_first_field,
+            progressive_frame,
+        })
     }
 }
 
@@ -78,6 +176,8 @@ impl SequenceHeader {
             bit_rate,
             vbv_buffer_size,
             mpeg2: false,
+            chroma_format: 1,
+            progressive_sequence: true,
         })
     }
 }
@@ -336,7 +436,8 @@ pub mod tables;
 #[cfg(test)]
 mod table_tests {
     use super::tables::{
-        EOB_BITS, EOB_CODE, ESCAPE_BITS, ESCAPE_CODE, MPEG1_RL, B_MB_TYPE, MV_CODE, P_MB_TYPE,
+        EOB_BITS, EOB_CODE, ESCAPE_BITS, ESCAPE_CODE, MPEG1_RL, B_MB_TYPE, MPEG2_RL, MV_CODE,
+        P_MB_TYPE,
     };
 
     /// 前缀无关：没有一条码字是另一条的前缀。
@@ -440,6 +541,23 @@ mod table_tests {
                     b.code >> (b.bits - a.bits),
                     a.code,
                     "b mb_type {i} is a prefix of {j}"
+                );
+            }
+        }
+    }
+
+    /// MPEG-2 的 `intra_vlc_format=1` 码表也必须是前缀码。
+    #[test]
+    fn mpeg2_rl_is_prefix_free() {
+        for (i, a) in MPEG2_RL.iter().enumerate() {
+            for (j, b) in MPEG2_RL.iter().enumerate() {
+                if i == j || a.bits > b.bits {
+                    continue;
+                }
+                assert_ne!(
+                    b.code >> (b.bits - a.bits),
+                    a.code,
+                    "mpeg2 rl {i} is a prefix of {j}"
                 );
             }
         }
