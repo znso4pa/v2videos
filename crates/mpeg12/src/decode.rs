@@ -606,6 +606,30 @@ fn sign_extend(val: i32, bits: u32) -> i32 {
 }
 
 /// 解一个运动矢量分量（`motion_code` + 残差 + 预测），返回**半像素**单位。
+/// 读 `macroblock_address_increment`：返回**要从当前位置前进多少个宏块**；
+/// `None` = 这个 slice 到此结束。
+///
+/// ⚠️ 表里有三个**不是增量**的符号（下标 33 / 34 / 35）：
+/// - 33 = `macroblock_escape`：**再加 33** 后继续读下一个增量（一帧里连续跳过的
+///   宏块可能超过 33 个）；
+/// - 34 = stuffing：跳过，继续读；
+/// - 35 = 片结束（后面还会跟一串 0 位）。
+///
+/// 把它们当成「增量 34 / 35 / 36」会让位游标整体错位 —— 症状是解到某一片时
+/// `coded_block_pattern` 的 VLC 突然解不出来。实测 MPEG-1 的 B 帧末行必现
+/// （那里正好是一长串跳过宏块 + escape）。
+fn decode_mb_increment(r: &mut BitReader) -> Option<isize> {
+    let mut total = 0isize;
+    loop {
+        match decode_vlc(r, &MB_ADDR_INCR)? {
+            33 => total += 33,
+            34 => {}
+            35 => return None,
+            code => return Some(total + code as isize + 1),
+        }
+    }
+}
+
 fn decode_motion(r: &mut BitReader, fcode: u32, pred: i32) -> Option<i32> {
     let code = decode_vlc(r, &MV_CODE)? as i32;
     if code == 0 {
@@ -875,10 +899,10 @@ pub fn decode_i_frame(
         let mut mb_index = (row * mb_w) as isize - 1;
         let total_mb = mb_w * mb_h;
         loop {
-            let Some(increment) = decode_vlc(&mut r, &MB_ADDR_INCR) else {
+            let Some(increment) = decode_mb_increment(&mut r) else {
                 break;
             };
-            mb_index += increment as isize + 1;
+            mb_index += increment;
             if mb_index < 0 || mb_index as usize >= total_mb {
                 break;
             }
@@ -1204,11 +1228,11 @@ pub fn decode_p_frame(
         let mut last_mv_f = [[0i32; 2]; 2];
         let mut mb_index = (row * mb_w) as isize - 1;
         loop {
-            let Some(increment) = decode_vlc(&mut r, &MB_ADDR_INCR) else {
+            let Some(increment) = decode_mb_increment(&mut r) else {
                 break;
             };
             let previous = mb_index;
-            mb_index += increment as isize + 1;
+            mb_index += increment;
             if mb_index < 0 || mb_index as usize >= total_mb {
                 break;
             }
@@ -1801,11 +1825,11 @@ pub fn decode_b_frame(
         let mut prev: Option<BPrev> = None;
         let mut mb_index = (row * mb_w) as isize - 1;
         loop {
-            let Some(increment) = decode_vlc(&mut r, &MB_ADDR_INCR) else {
+            let Some(increment) = decode_mb_increment(&mut r) else {
                 break;
             };
             let previous = mb_index;
-            mb_index += increment as isize + 1;
+            mb_index += increment;
             if mb_index < 0 || mb_index as usize >= total_mb {
                 break;
             }
@@ -1894,9 +1918,6 @@ pub fn decode_b_frame(
                 last_mv_f = [[0, 0], [0, 0]];
                 last_mv_b = [[0, 0], [0, 0]];
                 for block in 0..mb_blocks {
-                    if mb_index == 21 {
-                        eprintln!("intra21 block={block} bit={}", r.bit_pos());
-                    }
                     let dc_table = if block < 4 { &DC_LUM } else { &DC_CHROMA };
                     let component = if block < 4 { 0 } else { (block - 4) % 2 + 1 };
                     let coeffs = decode_intra_block(
