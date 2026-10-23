@@ -1,0 +1,19 @@
+[package]
+name = "v2v-mpeg12-simd"
+description = "MPEG-1/2 解码内核：允许 unsafe 与 FFI 的加速变体（可单独编 .so）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# 既能当库用，也能单独编出 .so / .a —— 宿主（rfvp / 引擎）链最小体积时用这个。
+[lib]
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[features]
+default = []
+# 打开后走 unsafe 内核；不开就完全走安全路径（逐字节与 `v2v-mpeg12` 一致）。
+unsafe-kernels = []
+
+[dependencies]
+v2v-mpeg12 = { path = "../mpeg12" }
+v2v-mpegps = { path = "../mpegps" }
