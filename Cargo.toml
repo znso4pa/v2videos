@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/container", "crates/asf", "crates/avi", "crates/mpegps", "crates/mpeg12", "crates/msmpeg4", "crates/wma", "crates/mp4", "crates/mp4v", "crates/aac", "crates/vc1", "crates/player", "crates/android-encode", "crates/cli"]
+members = ["crates/container", "crates/asf", "crates/avi", "crates/mpegps", "crates/mpeg12", "crates/mpeg12-simd", "crates/msmpeg4", "crates/wma", "crates/mp4", "crates/mp4v", "crates/aac", "crates/vc1", "crates/player", "crates/android-encode", "crates/cli"]
 resolver = "2"
 
 [workspace.package]

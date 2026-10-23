@@ -33,8 +33,10 @@ crates/
   aac      **AAC-LC 编码**：MDCT（长/短窗）+ TNS + Huffman 码本 + 码率控制
   mp4      MP4 / ISOBMFF **封装**（ftyp / mdat / moov；音频 AAC 或 PCM）
   mpegps   MPEG-1/2 **program stream** 解封装（`.mpg` / `.dat` / `.vob` 那类 PS 容器）
-  mpeg12   MPEG-1/2 **解码**：MPEG-1 的 I/P/B；MPEG-2 的 progressive 帧图、隔行帧图的
-           场 DCT / 场运动（field_select / dual prime）、4:2:2 / 4:4:4 色度
+  mpeg12   MPEG-1/2 **解码**（纯安全、零 unsafe，作为参考实现/oracle）：MPEG-1 的 I/P/B；
+           MPEG-2 的 progressive 帧图、隔行帧图的场 DCT / 场运动、4:2:2 / 4:4:4 色度
+  mpeg12-simd  同一个解码内核的 **unsafe / FFI 变体**：可单独编 `.so` / `.a` 给宿主链，
+           unsafe 只允许出现在这个 crate；每个内核都要逐字节对 `mpeg12` 验
   player   顺时播放层：逐帧取视频、逐样本取音频、两轨独立、`seek(ms)`（Simple Index +
            关键帧回退 + 前向解码到目标）—— 对应 Android 播放服务需求的 Rust 侧。
            另有 `mpeg12` feature 下的 `MpgPlayer`（MPEG-1/2，**只有视频**，默认不编）
