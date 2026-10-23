@@ -24,8 +24,13 @@ fn main() {
         std::process::exit(2);
     };
     let Some(reference) = it.next().map(PathBuf::from) else {
-        eprintln!("用法: compare <sample.mpg> <ref.yuv>");
+        eprintln!("用法: compare <sample.mpg> <ref.yuv> [--dump <out.yuv>]");
         std::process::exit(2);
+    };
+    // `--dump`：把**我们解出来的**帧按显示序写成 YUV，方便拿去做宏块级的排查。
+    let dump = match (it.next().as_deref(), it.next()) {
+        (Some("--dump"), Some(p)) => Some(PathBuf::from(p)),
+        _ => None,
     };
 
     let bytes = std::fs::read(&sample).expect("读样本");
@@ -91,6 +96,7 @@ fn main() {
     }
     decoded.sort_by_key(|(g, tr, _, _)| (*g, *tr));
 
+    let mut dumped: Vec<u8> = Vec::new();
     let mut worst_all = 0i32;
     let mut sum_sq = 0f64;
     let mut pixels = 0usize;
@@ -104,6 +110,9 @@ fn main() {
         ours.extend_from_slice(&frame.y);
         ours.extend_from_slice(&frame.u);
         ours.extend_from_slice(&frame.v);
+        if dump.is_some() {
+            dumped.extend_from_slice(&ours);
+        }
         let theirs = &want[i * frame_size..(i + 1) * frame_size];
         let mut worst = 0i32;
         let mut se = 0f64;
@@ -150,6 +159,9 @@ fn main() {
         }
     }
 
+    if let Some(path) = &dump {
+        std::fs::write(path, &dumped).expect("写 dump");
+    }
     let mut sorted: Vec<f64> = per_frame.iter().map(|(_, _, _, _, p)| *p).collect();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let median = sorted.get(sorted.len() / 2).copied().unwrap_or(0.0);
