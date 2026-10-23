@@ -17,8 +17,92 @@ use v2v_mpeg12::{
 };
 use v2v_mpegps::PsDemuxer;
 
+/// 纯解码基准：解 `rounds` 遍，报 ms/帧（不读参考件、不逐像素比）。
+fn run_bench(sample: &str, rounds: usize, threads: usize) -> std::process::ExitCode {
+    let bytes = std::fs::read(sample).expect("read the program stream");
+    let mut demux = PsDemuxer::new(bytes);
+    let mut es = Vec::new();
+    while let Some(packet) = demux.next_packet() {
+        if packet.is_video() {
+            es.extend_from_slice(&demux.data()[packet.range.clone()]);
+        }
+    }
+    let units = split_units(&es);
+    let mut sequence = units
+        .iter()
+        .find(|(code, _)| *code == 0xB3)
+        .and_then(|(_, payload)| SequenceHeader::parse(payload))
+        .expect("a sequence header");
+    sequence.mpeg2 = v2v_mpeg12::has_sequence_extension(&es);
+    if sequence.mpeg2 {
+        if let Some(ext) = units
+            .iter()
+            .find(|(code, _)| *code == 0xB5)
+            .and_then(|(_, payload)| v2v_mpeg12::SequenceExtension::parse(payload))
+        {
+            sequence.apply_sequence_extension(&ext);
+        }
+    }
+    let pictures: Vec<_> = split_pictures(&es)
+        .into_iter()
+        .filter(|(h, _)| !matches!(h.picture_type, PictureType::D))
+        .collect();
+    let t0 = std::time::Instant::now();
+    let mut frames = 0usize;
+    for _ in 0..rounds {
+        let mut last_ip: Option<v2v_mpeg12::decode::Frame> = None;
+        let mut prev_ip: Option<v2v_mpeg12::decode::Frame> = None;
+        for (header, data) in &pictures {
+            let kind = header.picture_type;
+            let forward = if matches!(kind, PictureType::B) {
+                prev_ip.as_ref()
+            } else {
+                last_ip.as_ref()
+            };
+            let f = if threads > 1 {
+                v2v_mpeg12::decode::decode_frame_mt(
+                    &sequence,
+                    header.clone(),
+                    data,
+                    forward,
+                    last_ip.as_ref(),
+                    threads,
+                )
+            } else {
+                decode_frame(&sequence, header.clone(), data, forward, last_ip.as_ref())
+            }
+            .expect("解码");
+            if matches!(kind, PictureType::I | PictureType::P) {
+                prev_ip = last_ip.take();
+                last_ip = Some(f);
+            }
+            frames += 1;
+        }
+    }
+    let ms = t0.elapsed().as_secs_f64() * 1000.0 / frames as f64;
+    let (w, h) = (sequence.width, sequence.height);
+    eprintln!(
+        "[bench] {} {w}x{h} {frames} 帧 / {} 遍：**{ms:.2} ms/帧**（threads={threads}）",
+        sample, rounds
+    );
+    std::process::ExitCode::SUCCESS
+}
+
 fn main() {
     v2v_mpeg12::decode::prof::init_from_env();
+    // `--bench=N` 要在读参考件**之前**判掉：基准模式不读那 135 MB。
+    let argv: Vec<String> = std::env::args().collect();
+    if let Some(n) = argv.iter().find_map(|a| a.strip_prefix("--bench=")) {
+        let rounds: usize = n.parse().unwrap_or(1);
+        let threads: usize = argv
+            .iter()
+            .find_map(|a| a.strip_prefix("--threads="))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        let sample = argv.get(1).cloned().unwrap_or_default();
+        run_bench(&sample, rounds, threads);
+        return;
+    }
     let mut it = std::env::args().skip(1);
     let Some(sample) = it.next().map(PathBuf::from) else {
         eprintln!("用法: compare <sample.mpg> <ref.yuv>");

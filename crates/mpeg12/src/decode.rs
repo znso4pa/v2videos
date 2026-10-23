@@ -87,7 +87,7 @@ pub mod prof {
 /// 做法：按前 `LUT_BITS` 位建一张 2^LUT_BITS 的表，命中即得 (符号, 位数)；
 /// 比 `LUT_BITS` 长的码字（极少）回退到原来的线性路径。表在首次使用时建一次
 /// （`OnceLock`，零依赖），之后每个符号只做**一次查表 + 一次跳位**。
-const LUT_BITS: u32 = 12;
+const LUT_BITS: u32 = 16;
 
 /// 能建 LUT 的码字（`Code` 与 `RlEntry` 的前两个字段正好一样）。
 trait VlcCode {
@@ -112,6 +112,26 @@ impl VlcCode for RlEntry {
     #[inline]
     fn vlc_bits(&self) -> u8 {
         self.bits
+    }
+}
+
+/// 帧间 RL 表的查找表（**进程内只建一次**）。
+///
+/// ⚠️ 曾经是「每张图建一次」：180 帧 × 2 张表 × 65536 格 = 两千多万次写入，
+/// 白白吃掉一截。表来自 `const`，本来就可以共享。
+fn inter_lut() -> &'static VlcLut {
+    static LUT: std::sync::OnceLock<VlcLut> = std::sync::OnceLock::new();
+    LUT.get_or_init(|| build_lut(&MPEG1_RL))
+}
+
+/// 帧内 RL 表的查找表（`intra_vlc_format` 决定用 MPEG-1 还是 MPEG-2 的表）。
+fn intra_lut_for(mpeg2_table: bool) -> &'static VlcLut {
+    static M1: std::sync::OnceLock<VlcLut> = std::sync::OnceLock::new();
+    static M2: std::sync::OnceLock<VlcLut> = std::sync::OnceLock::new();
+    if mpeg2_table {
+        M2.get_or_init(|| build_lut(&MPEG2_RL))
+    } else {
+        M1.get_or_init(|| build_lut(&MPEG1_RL))
     }
 }
 
@@ -926,9 +946,9 @@ fn predict_block(
 struct BlockTables<'a> {
     intra_rl: &'a [RlEntry],
     inter_rl: &'a [RlEntry],
-    /// 上面两张 RL 表的查找表（每个 picture 建一次，Arc 以便跨线程共用）。
-    intra_lut: std::sync::Arc<VlcLut>,
-    inter_lut: std::sync::Arc<VlcLut>,
+    /// 上面两张 RL 表的查找表（进程内建一次，见 `inter_lut` / `intra_lut_for`）。
+    intra_lut: &'static VlcLut,
+    inter_lut: &'static VlcLut,
     scan: &'a [usize; 64],
     intra_eob: (u16, u8),
     inter_eob: (u16, u8),
@@ -942,8 +962,8 @@ fn block_tables(ext: Option<&crate::PictureCodingExtension>) -> BlockTables<'sta
             // 就是 `ff_mpeg1_rl_vlc`）。
             intra_rl: if ext.intra_vlc_format { &MPEG2_RL } else { &MPEG1_RL },
             inter_rl: &MPEG1_RL,
-            intra_lut: std::sync::Arc::new(build_lut(if ext.intra_vlc_format { &MPEG2_RL } else { &MPEG1_RL })),
-            inter_lut: std::sync::Arc::new(build_lut(&MPEG1_RL)),
+            intra_lut: intra_lut_for(ext.intra_vlc_format),
+            inter_lut: inter_lut(),
             scan: if ext.alternate_scan { &ALT_SCAN } else { &ZIGZAG },
             // **EOB 码不同**：MPEG-2 的 RL 表是 `0110`（4 位），MPEG-1 是 `10`（2 位）。
             intra_eob: if ext.intra_vlc_format {
@@ -956,8 +976,8 @@ fn block_tables(ext: Option<&crate::PictureCodingExtension>) -> BlockTables<'sta
         None => BlockTables {
             intra_rl: &MPEG1_RL,
             inter_rl: &MPEG1_RL,
-            intra_lut: std::sync::Arc::new(build_lut(&MPEG1_RL)),
-            inter_lut: std::sync::Arc::new(build_lut(&MPEG1_RL)),
+            intra_lut: intra_lut_for(false),
+            inter_lut: inter_lut(),
             scan: &ZIGZAG,
             intra_eob: (EOB_CODE, EOB_BITS),
             inter_eob: (EOB_CODE, EOB_BITS),
@@ -2504,7 +2524,7 @@ mod lut_tests {
                 let want = linear_scan(&bits, table);
                 let (symbol, len) = lut.slots[prefix as usize];
                 match (len, want) {
-                    (1..=12, Some((i, l))) => assert!(
+                    (1..=16, Some((i, l))) if len as u32 <= LUT_BITS => assert!(
                         symbol as usize == i && len as u32 == l,
                         "{name}: 前缀 {prefix:012b} LUT 给 ({symbol},{len})，线性给 ({i},{l})"
                     ),
@@ -2536,7 +2556,7 @@ mod lut_tests {
                     }
                 }
                 match (len, want) {
-                    (1..=12, Some((i, l))) => assert!(
+                    (1..=16, Some((i, l))) if len as u32 <= LUT_BITS => assert!(
                         symbol as usize == i && len as u32 == l,
                         "RL: 前缀 {prefix:012b} LUT 给 ({symbol},{len})，线性给 ({i},{l})"
                     ),
