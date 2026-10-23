@@ -18,6 +18,7 @@ use v2v_mpeg12::{
 use v2v_mpegps::PsDemuxer;
 
 fn main() {
+    v2v_mpeg12::decode::prof::init_from_env();
     let mut it = std::env::args().skip(1);
     let Some(sample) = it.next().map(PathBuf::from) else {
         eprintln!("用法: compare <sample.mpg> <ref.yuv>");
@@ -177,6 +178,7 @@ fn main() {
     if let Some(path) = &dump {
         std::fs::write(path, &dumped).expect("写 dump");
     }
+    v2v_mpeg12::decode::prof::report();
     let mut sorted: Vec<f64> = per_frame.iter().map(|(_, _, _, _, p)| *p).collect();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let median = sorted.get(sorted.len() / 2).copied().unwrap_or(0.0);
