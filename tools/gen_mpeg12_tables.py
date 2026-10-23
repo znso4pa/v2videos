@@ -110,7 +110,9 @@ def main():
     run = ints(body(src, "ff_mpeg12_run"))
     mpeg2_rl_vlc = pairs(body(src, "ff_mpeg2_vlc_table"))
     non_linear = ints(body(src3, "ff_mpeg2_non_linear_qscale"))
-    alt_scan = ints(body(src3, "ff_alternate_horizontal_scan"))
+    # ffmpeg 在 `alternate_scan=1` 时用的是 **vertical** 表（见 mpeg12dec.c 的
+    # `ff_permute_scantable(..., alternate_scan ? ff_alternate_vertical_scan : ...)`）。
+    alt_scan = ints(body(src3, "ff_alternate_vertical_scan"))
 
     ptype = pairs(body(src2, "table_mb_ptype"))
     psem = mb_ptype_semantics(body(src2, "ptype2mb_type"))
