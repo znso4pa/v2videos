@@ -32,6 +32,15 @@ fn main() {
         (Some("--dump"), Some(p)) => Some(PathBuf::from(p)),
         _ => None,
     };
+    let mut threads = 1usize;
+    let mut rest: Vec<String> = Vec::new();
+    for a in it {
+        if let Some(n) = a.strip_prefix("--threads=") {
+            threads = n.parse().unwrap_or(1);
+        } else {
+            rest.push(a);
+        }
+    }
 
     let bytes = std::fs::read(&sample).expect("读样本");
     let mut demux = PsDemuxer::new(bytes);
@@ -86,8 +95,14 @@ fn main() {
         } else {
             last_ip.as_ref()
         };
-        let frame = decode_frame(&sequence, header, data, forward, last_ip.as_ref())
-            .unwrap_or_else(|e| panic!("解码失败：{e:?}"));
+        let frame = if threads > 1 {
+            v2v_mpeg12::decode::decode_frame_mt(
+                &sequence, header, data, forward, last_ip.as_ref(), threads,
+            )
+        } else {
+            decode_frame(&sequence, header, data, forward, last_ip.as_ref())
+        }
+        .unwrap_or_else(|e| panic!("解码失败：{e:?}"));
         if matches!(kind, PictureType::I | PictureType::P) {
             prev_ip = last_ip.take();
             last_ip = Some(frame.clone());

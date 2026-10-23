@@ -2102,6 +2102,158 @@ pub fn decode_b_frame(
     Ok(frame)
 }
 
+/// 多线程解码：**按 slice 切给多个线程**，各自解自己那几行，最后按行合并。
+///
+/// ## 为什么能按 slice 切
+///
+/// MPEG-1/2 的 slice 从 `slice_vertical_position` 指定的**宏块行**开始，
+/// 宏块按光栅序连续排到下一个 slice —— 所以每个 slice 覆盖一段**互不重叠的整行**，
+/// 写进输出缓冲区不会打架。而 slice 内的全部状态（DC 预测器、MV 预测器、
+/// 量化尺度）都以 slice 为单位复位，**slice 之间没有依赖**。
+///
+/// ## 实现要点
+///
+/// 不为每个线程单独写一份解码逻辑 —— 那必然漂。做法是给每个线程**重组一段只含
+/// 自己那些 slice 的码流**，直接调既有的 `decode_frame`，再把解出来的行按范围
+/// 拷回主帧。每个线程的输出帧本身就是「参考帧副本 + 自己那几行」，
+/// 所以没被任何 slice 覆盖的行天然就是参考帧内容。
+///
+/// 代价：每个线程多一份帧缓冲（1080p ≈ 3.1 MB）。6 个线程约 19 MB，换来的是
+/// 解码时间按线程数近线性下降。
+pub fn decode_frame_mt(
+    sequence: &SequenceHeader,
+    picture: PictureHeader,
+    data: &[u8],
+    forward: Option<&Frame>,
+    backward: Option<&Frame>,
+    threads: usize,
+) -> Result<Frame, DecodeError> {
+    // 收集这一帧的所有 slice（连同起始码，方便重组码流）。
+    let units = crate::split_units(data);
+    let mut slices: Vec<(u8, Vec<u8>)> = Vec::new();
+    // ⚠️ **图像头 / 扩展要一起带上**：MPEG-2 的 picture coding extension 就在图像头
+    // 后面、第一个 slice 前面，`mpeg2_extension()` 是从 `data` 里扫它的。只把 slice
+    // 拼给线程，扩展就丢了 → MPEG-2 会按 MPEG-1 的表解，直接报错。
+    let mut head: &[u8] = &[];
+    for (code, payload) in &units {
+        if (0x01..=0xAF).contains(code) {
+            if head.is_empty() {
+                let off = (payload.as_ptr() as usize)
+                    .wrapping_sub(data.as_ptr() as usize)
+                    .saturating_sub(4) // 去掉这个 slice 自己的起始码（下面会重新拼）
+                    .min(data.len());
+                head = &data[..off];
+            }
+            let mut raw = Vec::with_capacity(payload.len() + 4);
+            raw.extend_from_slice(&[0, 0, 1, *code]);
+            raw.extend_from_slice(payload);
+            slices.push((*code, raw));
+        }
+    }
+    let mb_h = (sequence.height as usize).div_ceil(16);
+    // 单线程 / 只有一片 / 帧太小 —— 直接走原路径，别为线程开销买单。
+    if threads <= 1 || slices.len() <= 1 || mb_h < 4 {
+        return decode_frame(sequence, picture, data, forward, backward);
+    }
+
+    // 按行把 slice 分成 `threads` 组（连续的 slice 并到一组，减少线程数）。
+    let mut groups: Vec<(usize, usize, Vec<u8>)> = Vec::new(); // (起始行, 结束行, 码流)
+    let target = slices.len().div_ceil(threads).max(1);
+    let mut cur: Vec<(u8, Vec<u8>)> = Vec::new();
+    let flush = |cur: &mut Vec<(u8, Vec<u8>)>, groups: &mut Vec<(usize, usize, Vec<u8>)>| {
+        if cur.is_empty() {
+            return;
+        }
+        let first = (cur[0].0 as usize).saturating_sub(1);
+        let last = (cur[cur.len() - 1].0 as usize).saturating_sub(1) + 1;
+        let mut raw = Vec::new();
+        for (_, r) in cur.drain(..) {
+            raw.extend_from_slice(&r);
+        }
+        let mut with_head = Vec::with_capacity(head.len() + raw.len());
+        with_head.extend_from_slice(head);
+        with_head.extend_from_slice(&raw);
+        groups.push((first, last, with_head));
+    };
+    for s in slices {
+        cur.push(s);
+        if cur.len() >= target {
+            flush(&mut cur, &mut groups);
+        }
+    }
+    flush(&mut cur, &mut groups);
+
+    // ⚠️ **组的结束行 = 下一组的起始行**（最后一组到帧底）。一个 slice 覆盖到
+    // 下一个 slice 的起始行为止；写成「本组最后一个 slice 的起始行 + 1」会把
+    // 最后一个 slice 之后的行漏掉 —— I 帧那些行没人写，就留着初值。
+    for i in 0..groups.len() {
+        groups[i].1 = if i + 1 < groups.len() {
+            groups[i + 1].0
+        } else {
+            mb_h
+        };
+    }
+
+    // 主帧：先铺参考帧（I 帧铺 128），再把各组解出来的行盖上。
+    let base = match forward {
+        Some(f) => f.clone(),
+        None => Frame {
+            width: sequence.width,
+            height: sequence.height,
+            y: vec![128u8; (sequence.width * sequence.height) as usize],
+            u: vec![128u8; ((sequence.width / 2) * (sequence.height / 2)) as usize],
+            v: vec![128u8; ((sequence.width / 2) * (sequence.height / 2)) as usize],
+        },
+    };
+    let mut out = base;
+    if groups.is_empty() {
+        return Ok(out);
+    }
+
+    let mut results: Vec<(usize, usize, Result<Frame, DecodeError>)> = Vec::new();
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for (row_start, row_end, raw) in groups {
+            let f = forward;
+            let b = backward;
+            let pic = picture.clone();
+            handles.push((
+                row_start,
+                row_end,
+                scope.spawn(move || decode_frame(sequence, pic, &raw, f, b)),
+            ));
+        }
+        for (rs, re, h) in handles {
+            results.push((rs, re, h.join().unwrap_or_else(|_| Err(DecodeError::new("worker panic", 0, 0)))));
+        }
+    });
+
+    // 按行合并。⚠️ **行号要乘平面宽度才是字节偏移** —— 直接拿 `rs * 16` 当下标，
+    // 会把「第 20 个宏块行」当成「第 20 个字节」，整片错位（实测表现为零星几个
+    // 宏块变成 0）。
+    let lw = out.y.len() / (out.height as usize).max(1);
+    let ch = match sequence.chroma_format {
+        2 => out.height as usize,
+        _ => out.height as usize / 2,
+    };
+    let cw = out.u.len() / ch.max(1);
+    for (rs, re, res) in results {
+        let f = res?;
+        let y0 = (rs * 16 * lw).min(out.y.len());
+        let y1 = (re * 16 * lw).min(out.y.len());
+        out.y[y0..y1].copy_from_slice(&f.y[y0..y1]);
+        // 色度行按 4:2:0 减半；4:2:2 / 4:4:4 不减半。
+        let shift = if sequence.chroma_format == 2 { 0 } else { 1 };
+        let c0 = ((rs << (4 - shift)) * cw).min(out.u.len());
+        let c1 = ((re << (4 - shift)) * cw).min(out.u.len());
+        if c0 < c1 {
+            out.u[c0..c1].copy_from_slice(&f.u[c0..c1]);
+            out.v[c0..c1].copy_from_slice(&f.v[c0..c1]);
+        }
+    }
+    Ok(out)
+}
+
 /// 按图像类型分派。P 帧给 `forward`；B 帧给 `forward` 与 `backward`。
 pub fn decode_frame(
     sequence: &SequenceHeader,
