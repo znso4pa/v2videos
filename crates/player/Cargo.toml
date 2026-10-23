@@ -5,6 +5,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# MPEG-1/2（`.mpg` / `.dat` 的 program stream），**只有视频**（MP2 音频本仓没有解码器）。
+# **非默认**：只吃 WMV 的宿主打 `.so` 时不该背上这套码表 —— 这是「最小体积」的开关。
+mpeg12 = ["dep:v2v-mpeg12", "dep:v2v-mpegps"]
+
 [dependencies]
 # 容器无关的共用类型（流 / 样本 / 格式）。
 v2v-container = { path = "../container" }
@@ -12,3 +18,5 @@ v2v-asf = { path = "../asf" }
 v2v-vc1 = { path = "../vc1" }
 v2v-msmpeg4 = { path = "../msmpeg4" }
 v2v-wma = { path = "../wma" }
+v2v-mpeg12 = { path = "../mpeg12", optional = true }
+v2v-mpegps = { path = "../mpegps", optional = true }
