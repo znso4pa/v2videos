@@ -495,6 +495,7 @@ fn decode_inter_block(
     rl: &[RlEntry],
     scan: &[usize; 64],
     eob: (u16, u8),
+    field_picture: bool,
 ) -> Result<[i32; 64], DecodeError> {
     let mut coeffs = [0i32; 64];
     let mut index = 0usize;
@@ -506,8 +507,15 @@ fn decode_inter_block(
         r.skip(2).ok();
         coeffs[scan[0]] = if negative { -1 } else { 1 };
         index = 1;
-        if r.bits_left() >= eob.1 as usize && r.peek_u(eob.1 as u32) == eob.0 as u32 {
-            r.skip(eob.1 as u32)
+        // 场图的参考实现用 `GET_CACHE <= 0xBFFFFFFF`（下两位不是 `11`）判 EOB；
+        // 帧图用显式的 `10`。两者不能混用，否则整段位流会偏。
+        let eob_hit = if field_picture {
+            r.bits_left() >= 2 && r.peek_u(2) != 0b11
+        } else {
+            r.bits_left() >= eob.1 as usize && r.peek_u(eob.1 as u32) == eob.0 as u32
+        };
+        if eob_hit {
+            r.skip(2)
                 .map_err(|_| DecodeError::new("eob_fast", r.bit_pos(), 0))?;
             return Ok(dequantise_inter(&coeffs, quant));
         }
@@ -1428,7 +1436,7 @@ pub fn decode_p_frame(
                     let coded = mb.coded && (cbp & (1 << (mb_blocks - 1 - block))) != 0;
                     if coded {
                         let coeffs =
-                            decode_inter_block(&mut r, quant, tables.inter_rl, tables.scan, tables.inter_eob)?;
+                            decode_inter_block(&mut r, quant, tables.inter_rl, tables.scan, tables.inter_eob, !frame_picture)?;
                         let residual = idct_residual(&coeffs);
                         add_mb_block(
                             &mut frame, block, column, mb_row, width, cw, interlaced_dct,
@@ -1464,7 +1472,7 @@ pub fn decode_p_frame(
                     let coded = mb.coded && (cbp & (1 << (mb_blocks - 1 - block))) != 0;
                     if coded {
                         let coeffs =
-                            decode_inter_block(&mut r, quant, tables.inter_rl, tables.scan, tables.inter_eob)?;
+                            decode_inter_block(&mut r, quant, tables.inter_rl, tables.scan, tables.inter_eob, !frame_picture)?;
                         let residual = idct_residual(&coeffs);
                         add_mb_block(
                             &mut frame, block, column, mb_row, width, cw, interlaced_dct,
@@ -1477,7 +1485,7 @@ pub fn decode_p_frame(
                     let coded = mb.coded && (cbp & (1 << (mb_blocks - 1 - block))) != 0;
                     let residual = if coded {
                         let coeffs =
-                            decode_inter_block(&mut r, quant, tables.inter_rl, tables.scan, tables.inter_eob)?;
+                            decode_inter_block(&mut r, quant, tables.inter_rl, tables.scan, tables.inter_eob, !frame_picture)?;
                         idct_residual(&coeffs)
                     } else {
                         [0i32; 64]
@@ -1886,6 +1894,9 @@ pub fn decode_b_frame(
                 last_mv_f = [[0, 0], [0, 0]];
                 last_mv_b = [[0, 0], [0, 0]];
                 for block in 0..mb_blocks {
+                    if mb_index == 21 {
+                        eprintln!("intra21 block={block} bit={}", r.bit_pos());
+                    }
                     let dc_table = if block < 4 { &DC_LUM } else { &DC_CHROMA };
                     let component = if block < 4 { 0 } else { (block - 4) % 2 + 1 };
                     let coeffs = decode_intra_block(
@@ -2020,7 +2031,7 @@ pub fn decode_b_frame(
                     let coded = mb.coded && (cbp & (1 << (mb_blocks - 1 - block))) != 0;
                     if coded {
                         let coeffs =
-                            decode_inter_block(&mut r, quant, tables.inter_rl, tables.scan, tables.inter_eob)?;
+                            decode_inter_block(&mut r, quant, tables.inter_rl, tables.scan, tables.inter_eob, !frame_picture)?;
                         let residual = idct_residual(&coeffs);
                         add_mb_block(
                             &mut frame, block, column, mb_row, width, cw, interlaced_dct,
@@ -2033,7 +2044,7 @@ pub fn decode_b_frame(
                     let coded = mb.coded && (cbp & (1 << (mb_blocks - 1 - block))) != 0;
                     let residual = if coded {
                         let coeffs =
-                            decode_inter_block(&mut r, quant, tables.inter_rl, tables.scan, tables.inter_eob)?;
+                            decode_inter_block(&mut r, quant, tables.inter_rl, tables.scan, tables.inter_eob, !frame_picture)?;
                         idct_residual(&coeffs)
                     } else {
                         [0i32; 64]
