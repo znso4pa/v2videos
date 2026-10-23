@@ -787,13 +787,6 @@ fn mpeg2_extension(
     }
     let ext = picture_extension(data)
         .ok_or_else(|| DecodeError::new("missing_picture_extension", 0, 0))?;
-    if ext.picture_structure != 3 {
-        return Err(DecodeError::new(
-            "field_picture_unsupported",
-            0,
-            ext.picture_structure as i64,
-        ));
-    }
     Ok(Some(ext))
 }
 
@@ -810,7 +803,9 @@ pub fn decode_i_frame(
     let tables = block_tables(ext.as_ref());
     let non_linear = ext.as_ref().map_or(false, |e| e.q_scale_type);
     let precision = ext.as_ref().map_or(0, |e| e.intra_dc_precision);
-    let need_motion = ext.as_ref().map_or(false, |e| !e.frame_pred_frame_dct);
+    let frame_picture = ext.as_ref().map_or(true, |e| e.picture_structure == 3);
+    let read_interlaced_dct =
+        frame_picture && ext.as_ref().map_or(false, |e| !e.frame_pred_frame_dct);
 
     let width = sequence.width as usize;
     let height = sequence.height as usize;
@@ -889,7 +884,7 @@ pub fn decode_i_frame(
                 return Err(DecodeError::new("mb_type_00", r.bit_pos(), column as i64));
             };
             // MPEG-2 隔行：帧内宏块在量化器之前有一个 interlaced_dct 位。
-            let interlaced_dct = if need_motion {
+            let interlaced_dct = if read_interlaced_dct {
                 r.u(1)
                     .map_err(|_| DecodeError::new("interlaced_dct", r.bit_pos(), column as i64))?
                     == 1
@@ -1032,7 +1027,12 @@ pub fn decode_p_frame(
     let tables = block_tables(ext.as_ref());
     let non_linear = ext.as_ref().map_or(false, |e| e.q_scale_type);
     let precision = ext.as_ref().map_or(0, |e| e.intra_dc_precision);
-    let need_motion = ext.as_ref().map_or(false, |e| !e.frame_pred_frame_dct);
+    let (frame_picture, fpfd) = match ext.as_ref() {
+        Some(e) => (e.picture_structure == 3, e.frame_pred_frame_dct),
+        None => (true, true),
+    };
+    let read_motion_type = !(frame_picture && fpfd);
+    let read_interlaced_dct = frame_picture && !fpfd;
     if reference.width != sequence.width || reference.height != sequence.height {
         return Err(DecodeError::new("reference_size", 0, 0));
     }
@@ -1117,7 +1117,7 @@ pub fn decode_p_frame(
             // MPEG-2 隔行：帧内读 interlaced_dct；零矢量只读 interlaced_dct；
             // 非零矢量先读 motion_type 再读 interlaced_dct。
             let (motion_type, interlaced_dct) = if mb.intra {
-                let dct = if need_motion {
+                let dct = if read_interlaced_dct {
                     r.u(1)
                         .map_err(|_| DecodeError::new("interlaced_dct", r.bit_pos(), column as i64))?
                         == 1
@@ -1125,7 +1125,7 @@ pub fn decode_p_frame(
                     false
                 };
                 (2u32, dct)
-            } else if need_motion {
+            } else if read_motion_type {
                 match mb.motion {
                     Motion::Zero => {
                         let dct = r
@@ -1138,7 +1138,7 @@ pub fn decode_p_frame(
                         let mt = r.u(2).map_err(|_| {
                             DecodeError::new("motion_type", r.bit_pos(), column as i64)
                         })?;
-                        let dct = if mb.coded {
+                        let dct = if read_interlaced_dct && mb.coded {
                             r.u(1)
                                 .map_err(|_| {
                                     DecodeError::new("interlaced_dct", r.bit_pos(), column as i64)
@@ -1531,7 +1531,12 @@ pub fn decode_b_frame(
     let tables = block_tables(ext.as_ref());
     let non_linear = ext.as_ref().map_or(false, |e| e.q_scale_type);
     let precision = ext.as_ref().map_or(0, |e| e.intra_dc_precision);
-    let need_motion = ext.as_ref().map_or(false, |e| !e.frame_pred_frame_dct);
+    let (frame_picture, fpfd) = match ext.as_ref() {
+        Some(e) => (e.picture_structure == 3, e.frame_pred_frame_dct),
+        None => (true, true),
+    };
+    let read_motion_type = !(frame_picture && fpfd);
+    let read_interlaced_dct = frame_picture && !fpfd;
     if forward.width != sequence.width
         || forward.height != sequence.height
         || backward.width != sequence.width
@@ -1645,7 +1650,7 @@ pub fn decode_b_frame(
 
             // MPEG-2 隔行：与 P 帧同样的 motion_type / interlaced_dct 位置。
             let (motion_type, interlaced_dct) = if mb.intra {
-                let dct = if need_motion {
+                let dct = if read_interlaced_dct {
                     r.u(1)
                         .map_err(|_| DecodeError::new("interlaced_dct", r.bit_pos(), column as i64))?
                         == 1
@@ -1653,11 +1658,11 @@ pub fn decode_b_frame(
                     false
                 };
                 (2u32, dct)
-            } else if need_motion {
+            } else if read_motion_type {
                 let mt = r
                     .u(2)
                     .map_err(|_| DecodeError::new("motion_type", r.bit_pos(), column as i64))?;
-                let dct = if mb.coded {
+                let dct = if read_interlaced_dct && mb.coded {
                     r.u(1)
                         .map_err(|_| DecodeError::new("interlaced_dct", r.bit_pos(), column as i64))?
                         == 1
@@ -1875,6 +1880,11 @@ pub fn decode_frame(
     forward: Option<&Frame>,
     backward: Option<&Frame>,
 ) -> Result<Frame, DecodeError> {
+    if let Some(ext) = mpeg2_extension(sequence, data)? {
+        if ext.picture_structure != 3 {
+            return Err(DecodeError::new("field_picture_in_frame_path", 0, 0));
+        }
+    }
     match picture.picture_type {
         PictureType::I => decode_i_frame(sequence, picture, data),
         PictureType::P => {
@@ -1888,6 +1898,42 @@ pub fn decode_frame(
             let backward =
                 backward.ok_or_else(|| DecodeError::new("missing_backward_reference", 0, 0))?;
             decode_b_frame(sequence, picture, data, forward, backward)
+        }
+        _ => Err(DecodeError::new("unsupported_picture_type", 0, 0)),
+    }
+}
+
+/// 解一个**场**（`picture_structure = 1/2`）：半高画面。
+///
+/// 参考是**上一场**（调用方按同奇偶维护）。输出是半高的 `Frame`，
+/// 上下两场由调用方交织成整帧。
+pub fn decode_field(
+    sequence: &SequenceHeader,
+    picture: PictureHeader,
+    data: &[u8],
+    forward: Option<&Frame>,
+    backward: Option<&Frame>,
+) -> Result<Frame, DecodeError> {
+    let ext = mpeg2_extension(sequence, data)?
+        .ok_or_else(|| DecodeError::new("missing_picture_extension", 0, 0))?;
+    if ext.picture_structure == 3 {
+        return Err(DecodeError::new("not_a_field", 0, 0));
+    }
+    let mut field_seq = sequence.clone();
+    field_seq.height /= 2;
+    match picture.picture_type {
+        PictureType::I => decode_i_frame(&field_seq, picture, data),
+        PictureType::P => {
+            let forward =
+                forward.ok_or_else(|| DecodeError::new("missing_reference", 0, 0))?;
+            decode_p_frame(&field_seq, picture, data, forward)
+        }
+        PictureType::B => {
+            let forward =
+                forward.ok_or_else(|| DecodeError::new("missing_reference", 0, 0))?;
+            let backward =
+                backward.ok_or_else(|| DecodeError::new("missing_backward_reference", 0, 0))?;
+            decode_b_frame(&field_seq, picture, data, forward, backward)
         }
         _ => Err(DecodeError::new("unsupported_picture_type", 0, 0)),
     }
