@@ -24,6 +24,122 @@ pub struct Frame {
     pub v: Vec<u8>,
 }
 
+/// 极简热点剖析（**只在设了 `V2V_PROF` 时开**，否则零开销）。
+///
+/// 目的是回答「下一个 unsafe 内核该上哪儿」—— 不凭感觉。四个桶：
+/// 码流/反量化、逆变换、运动补偿预测、其它（总时间减前三）。
+pub mod prof {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+
+    pub const BITS: usize = 0; // 位读取 + VLC + 反量化
+    pub const IDCT: usize = 1;
+    pub const MC: usize = 2;
+    pub const DEQUANT: usize = 3;
+    pub const BUCKETS: usize = 4;
+
+    static NS: [AtomicU64; BUCKETS] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+    static ON: AtomicU64 = AtomicU64::new(0);
+
+    pub fn enabled() -> bool {
+        ON.load(Ordering::Relaxed) != 0
+    }
+
+    /// 在 main 里调一次（读环境变量）。
+    pub fn init_from_env() {
+        let on = std::env::var("V2V_PROF").is_ok() as u64;
+        ON.store(on, Ordering::Relaxed);
+    }
+
+    /// RAII 计时器：drop 时把耗时加进桶。
+    pub struct Guard(usize, Instant);
+    impl Guard {
+        pub fn new(bucket: usize) -> Self {
+            Guard(bucket, Instant::now())
+        }
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            NS[self.0].fetch_add(self.1.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+    }
+
+    pub fn report() {
+        if !enabled() {
+            return;
+        }
+        let bits = NS[BITS].load(Ordering::Relaxed) as f64 / 1e9;
+        let idct = NS[IDCT].load(Ordering::Relaxed) as f64 / 1e9;
+        let mc = NS[MC].load(Ordering::Relaxed) as f64 / 1e9;
+        let deq = NS[DEQUANT].load(Ordering::Relaxed) as f64 / 1e9;
+        eprintln!(
+            "[prof] 位读取+VLC {bits:.3}s | 反量化 {deq:.3}s | 逆变换 {idct:.3}s | 运动补偿 {mc:.3}s"
+        );
+    }
+}
+
+/// VLC 查表：把「按长度逐层扫全表」换成**一次 LUT 命中**。
+///
+/// 剖析（`V2V_PROF=1`）显示 MPEG-1/2 解码 **85~90%** 的时间花在位读取 + VLC + 反量化上，
+/// 而原来的 `decode_vlc` / `decode_rl` 是线性扫描 —— 每个符号要试 1..=max_bits 种长度、
+/// 每种长度再扫一遍全表（RL 表 111 项、最长 16 位）。这里是那一块的大头。
+///
+/// 做法：按前 `LUT_BITS` 位建一张 2^LUT_BITS 的表，命中即得 (符号, 位数)；
+/// 比 `LUT_BITS` 长的码字（极少）回退到原来的线性路径。表在首次使用时建一次
+/// （`OnceLock`，零依赖），之后每个符号只做**一次查表 + 一次跳位**。
+const LUT_BITS: u32 = 12;
+
+/// 能建 LUT 的码字（`Code` 与 `RlEntry` 的前两个字段正好一样）。
+trait VlcCode {
+    fn vlc_code(&self) -> u16;
+    fn vlc_bits(&self) -> u8;
+}
+impl VlcCode for Code {
+    #[inline]
+    fn vlc_code(&self) -> u16 {
+        self.code
+    }
+    #[inline]
+    fn vlc_bits(&self) -> u8 {
+        self.bits
+    }
+}
+impl VlcCode for RlEntry {
+    #[inline]
+    fn vlc_code(&self) -> u16 {
+        self.code
+    }
+    #[inline]
+    fn vlc_bits(&self) -> u8 {
+        self.bits
+    }
+}
+
+/// 一张码表的查找表。`slots[i]` = (符号下标, 码长)；码长 0 表示「这一格只有长码字」。
+struct VlcLut {
+    slots: Vec<(u16, u8)>,
+}
+
+fn build_lut<T: VlcCode>(table: &[T]) -> VlcLut {
+    let mut slots = vec![(u16::MAX, 0u8); 1usize << LUT_BITS];
+    for (index, entry) in table.iter().enumerate() {
+        let bits = entry.vlc_bits() as u32;
+        if bits > LUT_BITS {
+            continue; // 长码字走回退路径
+        }
+        let shift = LUT_BITS - bits;
+        let base = (entry.vlc_code() as usize) << shift;
+        for slot in slots.iter_mut().skip(base).take(1usize << shift) {
+            // **先到先得**：线性扫描是按表序返回第一个命中的，LUT 也必须一样，
+            // 否则同一格被后一个码字覆盖，行为就和回退路径不一致了。
+            if slot.1 == 0 {
+                *slot = (index as u16, entry.vlc_bits());
+            }
+        }
+    }
+    VlcLut { slots }
+}
+
 /// 解码失败的位置。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodeError {
@@ -54,6 +170,29 @@ fn decode_vlc(r: &mut BitReader, table: &[Code]) -> Option<usize> {
         }
     }
     None
+}
+
+/// 用 LUT 解一个 VLC 符号。`None` = 这一格没有短码字（让调用方走回退路径）。
+#[inline]
+fn lut_decode(r: &mut BitReader, lut: &VlcLut) -> Option<usize> {
+    if r.bits_left() < LUT_BITS as usize {
+        return None; // 尾部不足 12 位：走线性扫描
+    }
+    let (symbol, bits) = lut.slots[r.peek_u(LUT_BITS) as usize];
+    if bits == 0 {
+        return None; // 码字比 12 位长：走线性扫描
+    }
+    r.skip(bits as u32).ok()?;
+    Some(symbol as usize)
+}
+
+/// 在 run/level 表里按最长前缀找码（带 LUT 快路）。
+#[inline]
+fn decode_rl_lut(r: &mut BitReader, lut: &VlcLut, table: &[RlEntry]) -> Option<usize> {
+    if let Some(hit) = lut_decode(r, lut) {
+        return Some(hit);
+    }
+    decode_rl(r, table)
 }
 
 /// 在 run/level 表里按最长前缀找码。
@@ -186,6 +325,7 @@ impl Quant {
 
 /// 帧内反量化：DC 乘 `dc_scale`，交流 `(|level|·q·W) >> intra_shift`。
 fn dequantise_intra(quantised: &[i32; 64], quant: Quant) -> [i32; 64] {
+    let _g = prof::enabled().then(|| prof::Guard::new(prof::DEQUANT));
     let mut out = [0i32; 64];
     out[0] = quantised[0] * quant.dc_scale;
     // MPEG-2 的 mismatch control：把块内系数和的奇偶钉住。
@@ -210,6 +350,7 @@ fn dequantise_intra(quantised: &[i32; 64], quant: Quant) -> [i32; 64] {
 
 /// 帧间反量化：`((2|level|+1)·q·W) >> inter_shift`，DC 无特例。
 fn dequantise_inter(quantised: &[i32; 64], quant: Quant) -> [i32; 64] {
+    let _g = prof::enabled().then(|| prof::Guard::new(prof::DEQUANT));
     let mut out = [0i32; 64];
     let mut mismatch = 1;
     for i in 0..64 {
@@ -275,6 +416,7 @@ const fn build_cos() -> [[f64; 8]; 8] {
 
 /// 8×8 逆变换，返回**残差**（未加 128、未夹取）。
 fn idct_residual(block: &[i32; 64]) -> [i32; 64] {
+    let _g = prof::enabled().then(|| prof::Guard::new(prof::IDCT));
     let mut tmp = [[0f64; 8]; 8];
     for v in 0..8 {
         for x in 0..8 {
@@ -386,12 +528,14 @@ fn store_pred_block(
 fn decode_intra_block(
     r: &mut BitReader,
     quant: Quant,
+    lut: &VlcLut,
     dc_table: &[Code],
     dc_predictor: &mut i32,
     rl: &[RlEntry],
     scan: &[usize; 64],
     eob: (u16, u8),
 ) -> Result<[i32; 64], DecodeError> {
+    let _g = prof::enabled().then(|| prof::Guard::new(prof::BITS));
     let mut coeffs = [0i32; 64];
 
     let size = decode_vlc(r, dc_table)
@@ -462,7 +606,8 @@ fn decode_intra_block(
         }
 
         let entry =
-            decode_rl(r, rl).ok_or_else(|| DecodeError::new("rl", r.bit_pos(), index as i64))?;
+            decode_rl_lut(r, lut, rl)
+                .ok_or_else(|| DecodeError::new("rl", r.bit_pos(), index as i64))?;
         let run = rl[entry].run as usize;
         let level = rl[entry].level as i32;
         let negative = r
@@ -492,11 +637,13 @@ fn decode_intra_block(
 fn decode_inter_block(
     r: &mut BitReader,
     quant: Quant,
+    lut: &VlcLut,
     rl: &[RlEntry],
     scan: &[usize; 64],
     eob: (u16, u8),
     field_picture: bool,
 ) -> Result<[i32; 64], DecodeError> {
+    let _g = prof::enabled().then(|| prof::Guard::new(prof::BITS));
     let mut coeffs = [0i32; 64];
     let mut index = 0usize;
 
@@ -573,7 +720,7 @@ fn decode_inter_block(
             continue;
         }
 
-        let entry = decode_rl(r, rl)
+        let entry = decode_rl_lut(r, lut, rl)
             .ok_or_else(|| DecodeError::new("rl_inter", r.bit_pos(), index as i64))?;
         let run = rl[entry].run as usize;
         let level = rl[entry].level as i32;
@@ -738,6 +885,7 @@ fn predict_block(
     mv_y_scale: i32,
     chroma_format: u8,
 ) -> [i32; 64] {
+    let _g = prof::enabled().then(|| prof::Guard::new(prof::MC));
     let (mx, my) = if chroma {
         let (hs, vs) = match chroma_format {
             1 => (2, 2),
@@ -778,6 +926,9 @@ fn predict_block(
 struct BlockTables<'a> {
     intra_rl: &'a [RlEntry],
     inter_rl: &'a [RlEntry],
+    /// 上面两张 RL 表的查找表（每个 picture 建一次，Arc 以便跨线程共用）。
+    intra_lut: std::sync::Arc<VlcLut>,
+    inter_lut: std::sync::Arc<VlcLut>,
     scan: &'a [usize; 64],
     intra_eob: (u16, u8),
     inter_eob: (u16, u8),
@@ -791,6 +942,8 @@ fn block_tables(ext: Option<&crate::PictureCodingExtension>) -> BlockTables<'sta
             // 就是 `ff_mpeg1_rl_vlc`）。
             intra_rl: if ext.intra_vlc_format { &MPEG2_RL } else { &MPEG1_RL },
             inter_rl: &MPEG1_RL,
+            intra_lut: std::sync::Arc::new(build_lut(if ext.intra_vlc_format { &MPEG2_RL } else { &MPEG1_RL })),
+            inter_lut: std::sync::Arc::new(build_lut(&MPEG1_RL)),
             scan: if ext.alternate_scan { &ALT_SCAN } else { &ZIGZAG },
             // **EOB 码不同**：MPEG-2 的 RL 表是 `0110`（4 位），MPEG-1 是 `10`（2 位）。
             intra_eob: if ext.intra_vlc_format {
@@ -803,6 +956,8 @@ fn block_tables(ext: Option<&crate::PictureCodingExtension>) -> BlockTables<'sta
         None => BlockTables {
             intra_rl: &MPEG1_RL,
             inter_rl: &MPEG1_RL,
+            intra_lut: std::sync::Arc::new(build_lut(&MPEG1_RL)),
+            inter_lut: std::sync::Arc::new(build_lut(&MPEG1_RL)),
             scan: &ZIGZAG,
             intra_eob: (EOB_CODE, EOB_BITS),
             inter_eob: (EOB_CODE, EOB_BITS),
@@ -949,6 +1104,7 @@ pub fn decode_i_frame(
                 let coeffs = decode_intra_block(
                     &mut r,
                     quant,
+                    &tables.intra_lut,
                     dc_table,
                     &mut dc_predictor[component],
                     tables.intra_rl,
@@ -1321,6 +1477,7 @@ pub fn decode_p_frame(
                     let coeffs = decode_intra_block(
                         &mut r,
                         quant,
+                        &tables.intra_lut,
                         dc_table,
                         &mut dc_predictor[component],
                         tables.intra_rl,
@@ -1465,8 +1622,10 @@ pub fn decode_p_frame(
                 for block in 0..mb_blocks {
                     let coded = mb.coded && (cbp & (1 << (mb_blocks - 1 - block))) != 0;
                     if coded {
-                        let coeffs =
-                            decode_inter_block(&mut r, quant, tables.inter_rl, tables.scan, tables.inter_eob, !frame_picture)?;
+                        let coeffs = decode_inter_block(
+                            &mut r, quant, &tables.inter_lut, tables.inter_rl, tables.scan,
+                            tables.inter_eob, !frame_picture,
+                        )?;
                         let residual = idct_residual(&coeffs);
                         add_mb_block(
                             &mut frame, block, column, mb_row, width, cw, interlaced_dct,
@@ -1501,8 +1660,10 @@ pub fn decode_p_frame(
                 for block in 0..mb_blocks {
                     let coded = mb.coded && (cbp & (1 << (mb_blocks - 1 - block))) != 0;
                     if coded {
-                        let coeffs =
-                            decode_inter_block(&mut r, quant, tables.inter_rl, tables.scan, tables.inter_eob, !frame_picture)?;
+                        let coeffs = decode_inter_block(
+                            &mut r, quant, &tables.inter_lut, tables.inter_rl, tables.scan,
+                            tables.inter_eob, !frame_picture,
+                        )?;
                         let residual = idct_residual(&coeffs);
                         add_mb_block(
                             &mut frame, block, column, mb_row, width, cw, interlaced_dct,
@@ -1514,8 +1675,10 @@ pub fn decode_p_frame(
                 for block in 0..mb_blocks {
                     let coded = mb.coded && (cbp & (1 << (mb_blocks - 1 - block))) != 0;
                     let residual = if coded {
-                        let coeffs =
-                            decode_inter_block(&mut r, quant, tables.inter_rl, tables.scan, tables.inter_eob, !frame_picture)?;
+                        let coeffs = decode_inter_block(
+                            &mut r, quant, &tables.inter_lut, tables.inter_rl, tables.scan,
+                            tables.inter_eob, !frame_picture,
+                        )?;
                         idct_residual(&coeffs)
                     } else {
                         [0i32; 64]
@@ -1931,6 +2094,7 @@ pub fn decode_b_frame(
                     let coeffs = decode_intra_block(
                         &mut r,
                         quant,
+                        &tables.intra_lut,
                         dc_table,
                         &mut dc_predictor[component],
                         tables.intra_rl,
@@ -2059,8 +2223,10 @@ pub fn decode_b_frame(
                 for block in 0..mb_blocks {
                     let coded = mb.coded && (cbp & (1 << (mb_blocks - 1 - block))) != 0;
                     if coded {
-                        let coeffs =
-                            decode_inter_block(&mut r, quant, tables.inter_rl, tables.scan, tables.inter_eob, !frame_picture)?;
+                        let coeffs = decode_inter_block(
+                            &mut r, quant, &tables.inter_lut, tables.inter_rl, tables.scan,
+                            tables.inter_eob, !frame_picture,
+                        )?;
                         let residual = idct_residual(&coeffs);
                         add_mb_block(
                             &mut frame, block, column, mb_row, width, cw, interlaced_dct,
@@ -2072,8 +2238,10 @@ pub fn decode_b_frame(
                 for block in 0..mb_blocks {
                     let coded = mb.coded && (cbp & (1 << (mb_blocks - 1 - block))) != 0;
                     let residual = if coded {
-                        let coeffs =
-                            decode_inter_block(&mut r, quant, tables.inter_rl, tables.scan, tables.inter_eob, !frame_picture)?;
+                        let coeffs = decode_inter_block(
+                            &mut r, quant, &tables.inter_lut, tables.inter_rl, tables.scan,
+                            tables.inter_eob, !frame_picture,
+                        )?;
                         idct_residual(&coeffs)
                     } else {
                         [0i32; 64]
@@ -2316,5 +2484,90 @@ pub fn decode_field(
             decode_b_frame(&field_seq, picture, data, same, other)
         }
         _ => Err(DecodeError::new("unsupported_picture_type", 0, 0)),
+    }
+}
+
+#[cfg(test)]
+mod lut_tests {
+    use super::*;
+    use crate::tables::{MPEG1_RL, MV_CODE, MB_ADDR_INCR, MB_PATTERN};
+
+    /// LUT 与线性扫描必须在**每一个 12 位前缀**上给出一致结果。
+    #[test]
+    fn lut_agrees_with_linear_scan() {
+        fn check(name: &str, table: &[Code]) {
+            let lut = build_lut(table);
+            for prefix in 0u32..(1 << LUT_BITS) {
+                // 左对齐：让 `prefix` 的 12 个位正好是码流的前 12 位。
+                let raw = (prefix << (32 - LUT_BITS)).to_be_bytes();
+                let bits = BitReader::new(&raw);
+                let want = linear_scan(&bits, table);
+                let (symbol, len) = lut.slots[prefix as usize];
+                match (len, want) {
+                    (1..=12, Some((i, l))) => assert!(
+                        symbol as usize == i && len as u32 == l,
+                        "{name}: 前缀 {prefix:012b} LUT 给 ({symbol},{len})，线性给 ({i},{l})"
+                    ),
+                    (0, w) => assert!(
+                        w.map_or(true, |(_, l)| l > LUT_BITS),
+                        "{name}: 前缀 {prefix:012b} LUT 未命中，但线性给出 {w:?}"
+                    ),
+                    _ => unreachable!(),
+                }
+            }
+        }
+        fn check_rl(table: &[RlEntry]) {
+            let lut = build_lut(table);
+            for prefix in 0u32..(1 << LUT_BITS) {
+                let (symbol, len) = lut.slots[prefix as usize];
+                let raw = (prefix << (32 - LUT_BITS)).to_be_bytes();
+                let r = BitReader::new(&raw);
+                let mut want = None;
+                'outer: for l in 1..=16u32 {
+                    if r.bits_left() < l as usize {
+                        break;
+                    }
+                    let v = r.peek_u(l);
+                    for (i, e) in table.iter().enumerate() {
+                        if e.bits as u32 == l && e.code as u32 == v {
+                            want = Some((i, l));
+                            break 'outer;
+                        }
+                    }
+                }
+                match (len, want) {
+                    (1..=12, Some((i, l))) => assert!(
+                        symbol as usize == i && len as u32 == l,
+                        "RL: 前缀 {prefix:012b} LUT 给 ({symbol},{len})，线性给 ({i},{l})"
+                    ),
+                    (0, w) => assert!(
+                        w.map_or(true, |(_, l)| l > LUT_BITS),
+                        "RL: 前缀 {prefix:012b} LUT 未命中，但线性给出 {w:?}"
+                    ),
+                    _ => unreachable!(),
+                }
+            }
+        }
+        check("MV_CODE", &MV_CODE);
+        check("MB_ADDR_INCR", &MB_ADDR_INCR);
+        check("MB_PATTERN", &MB_PATTERN);
+        check_rl(&MPEG1_RL);
+    }
+
+    /// 线性扫描的参考实现（和改之前的 `decode_vlc` 一样）。
+    fn linear_scan(r: &BitReader, table: &[Code]) -> Option<(usize, u32)> {
+        let max_bits = table.iter().map(|e| e.bits).max().unwrap_or(0) as u32;
+        for len in 1..=max_bits {
+            if r.bits_left() < len as usize {
+                return None;
+            }
+            let value = r.peek_u(len);
+            for (index, entry) in table.iter().enumerate() {
+                if entry.bits as u32 == len && entry.code as u32 == value {
+                    return Some((index, len));
+                }
+            }
+        }
+        None
     }
 }
