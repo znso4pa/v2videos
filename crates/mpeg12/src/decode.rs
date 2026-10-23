@@ -1238,8 +1238,14 @@ pub fn decode_p_frame(
             }
             // 跳过的宏块：已经是参考帧原位拷贝（帧初始化时克隆好了），
             // 只需把运动矢量预测器归零。
+            //
+            // ⚠️ **帧内 DC 预测器也要归零**：跳过宏块按定义是「非帧内」，
+            // 而规范要求每个非帧内宏块之后 DC 预测器清零。漏了这一步，
+            // 下一个帧内宏块的 DC 会带着上一次的值 → 整块恒定偏移
+            // （亮度 4 块共用一路预测器，所以亮度整块偏、色度不受影响）。
             if mb_index > previous + 1 {
                 last_mv_f = [[0, 0], [0, 0]];
+                dc_predictor = [0i32; 3];
             }
             let column = mb_index as usize % mb_w;
             let mb_row = mb_index as usize / mb_w;
@@ -1846,6 +1852,8 @@ pub fn decode_b_frame(
                         skipped as i64,
                     ));
                 }
+                // 跳过宏块 = 非帧内，DC 预测器要清零（同 P 帧那条，见那边的注释）。
+                dc_predictor = [0i32; 3];
                 let col = skipped as usize % mb_w;
                 let row_s = skipped as usize / mb_w;
                 if p.field_motion {
