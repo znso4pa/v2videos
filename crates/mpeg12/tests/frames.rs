@@ -238,7 +238,14 @@ fn field_pictures_match_the_reference() {
         } else {
             last_bottom.as_ref().or(last_top.as_ref())
         };
-        let field = decode_field(&sequence, header, data, forward, None).expect("decode a field");
+        // dual prime / field_select 的异场参考。
+        let other = if structure == 1 {
+            last_bottom.as_ref()
+        } else {
+            last_top.as_ref()
+        };
+        let field =
+            decode_field(&sequence, header, data, forward, other).expect("decode a field");
         if structure == 1 {
             last_top = Some(field.clone());
         } else {
