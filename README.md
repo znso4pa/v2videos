@@ -36,7 +36,8 @@ crates/
   mpeg12   MPEG-1/2 **解码**：MPEG-1 的 I/P/B；MPEG-2 的 progressive 帧图、隔行帧图的
            场 DCT / 场运动（field_select / dual prime）、4:2:2 / 4:4:4 色度
   player   顺时播放层：逐帧取视频、逐样本取音频、两轨独立、`seek(ms)`（Simple Index +
-           关键帧回退 + 前向解码到目标）—— 对应 Android 播放服务需求的 Rust 侧
+           关键帧回退 + 前向解码到目标）—— 对应 Android 播放服务需求的 Rust 侧。
+           另有 `mpeg12` feature 下的 `MpgPlayer`（MPEG-1/2，**只有视频**，默认不编）
   android-encode  **Android 硬件编码路径（全仓唯一的 FFI crate）**：MediaCodec H.264 +
            MediaMuxer MP4。unsafe 全部收在 `c/media_encoder.c` + `src/ffi.rs`（详见
            下面「FFI」一节）
