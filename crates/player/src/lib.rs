@@ -36,6 +36,13 @@
 //! 视频 WMV3（VC-1 Main profile）、音频 WMA v1 / v2 —— 正是宿主要的那两样。
 //! 其它 fourcc 明确报「不支持」，不静默跳过。**seek 未做**（见 TODO）。
 
+/// MPEG-1/2 的顺时播放（**只有视频**，见模块文档）。
+///
+/// 挂在 `mpeg12` feature 下：默认不编 —— 只吃 WMV 的宿主打 `.so` 时
+/// 不该背上这套码表（这是「最小体积」的开关）。
+#[cfg(feature = "mpeg12")]
+pub mod mpeg;
+
 use std::fmt;
 use std::fs::File;
 use std::io::BufReader;
