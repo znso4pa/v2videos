@@ -83,7 +83,11 @@ fn every_frame_matches_the_reference() {
 
     let sequence = parse_sequence(&es);
 
-    let frame_size = (sequence.width * sequence.height * 3 / 2) as usize;
+    let frame_size = match sequence.chroma_format {
+        2 => (sequence.width * sequence.height * 2) as usize,
+        3 => (sequence.width * sequence.height * 3) as usize,
+        _ => (sequence.width * sequence.height * 3 / 2) as usize,
+    };
     let expected = std::fs::read(&reference).expect("read the reference frames");
     let available = expected.len() / frame_size;
 

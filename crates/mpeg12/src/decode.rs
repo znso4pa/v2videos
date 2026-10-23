@@ -330,13 +330,14 @@ fn store_mb_block(
     interlaced_dct: bool,
     residual: &[i32; 64],
     offset: i32,
+    chroma_format: u8,
 ) {
     let (chroma, origin_x, origin_y, stride, _) =
-        block_geometry(block, column, mb_row, width, cw, interlaced_dct);
+        block_geometry(block, column, mb_row, width, cw, interlaced_dct, chroma_format);
     let plane_width = if chroma { cw } else { width };
     let plane = match block {
         0..=3 => &mut frame.y,
-        4 => &mut frame.u,
+        4 | 6 | 8 | 10 => &mut frame.u,
         _ => &mut frame.v,
     };
     store_block(residual, offset, plane, stride, origin_y * plane_width + origin_x);
@@ -358,22 +359,24 @@ fn store_pred_block(
     mv_x: i32,
     mv_y: i32,
     residual: &[i32; 64],
+    chroma_format: u8,
 ) {
     let (chroma, origin_x, origin_y, stride, row_step) =
-        block_geometry(block, column, mb_row, width, cw, interlaced_dct);
+        block_geometry(block, column, mb_row, width, cw, interlaced_dct, chroma_format);
     let plane_width = if chroma { cw } else { width };
     let (rw, rh) = if chroma { (cw, ch) } else { (width, height) };
     let ref_plane = match block {
         0..=3 => &reference.y,
-        4 => &reference.u,
+        4 | 6 | 8 | 10 => &reference.u,
         _ => &reference.v,
     };
     let pred = predict_block(
         ref_plane, plane_width, rw, rh, origin_x, origin_y, mv_x, mv_y, chroma, row_step, 1,
+        chroma_format,
     );
     let plane = match block {
         0..=3 => &mut frame.y,
-        4 => &mut frame.u,
+        4 | 6 | 8 | 10 => &mut frame.u,
         _ => &mut frame.v,
     };
     store_pred(&pred, residual, plane, stride, origin_y * plane_width + origin_x);
@@ -614,6 +617,20 @@ fn decode_motion(r: &mut BitReader, fcode: u32, pred: i32) -> Option<i32> {
     Some(sign_extend(val + pred, 5 + shift))
 }
 
+/// 色度平面的尺寸。
+fn chroma_dims(chroma_format: u8, width: usize, height: usize) -> (usize, usize) {
+    match chroma_format {
+        2 => (width.div_ceil(2), height),
+        3 => (width, height),
+        _ => (width.div_ceil(2), height.div_ceil(2)),
+    }
+}
+
+/// 一个宏块的块数：4:2:0 = 6，4:2:2 = 8，4:4:4 = 12。
+fn mb_block_count(chroma_format: u8) -> usize {
+    4 + (1 << chroma_format)
+}
+
 /// 宏块内第 `block` 个块的几何：`(是否色度, 原点 x, 原点 y, 写步长, 取行步长)`。
 ///
 /// 场 DCT（`interlaced_dct=1`）时亮度块隔行写 / 取：块 0/1 在偶行、2/3 在奇行，
@@ -625,6 +642,7 @@ fn block_geometry(
     width: usize,
     cw: usize,
     interlaced_dct: bool,
+    chroma_format: u8,
 ) -> (bool, usize, usize, usize, i32) {
     match block {
         0..=3 => {
@@ -636,7 +654,27 @@ fn block_geometry(
                 (false, origin_x, mb_row * 16 + by * 8, width, 1)
             }
         }
-        _ => (true, column * 8, mb_row * 8, cw, 1),
+        _ => {
+            // 4:2:0：一个 Cb / Cr；4:2:2：上下两个；4:4:4：2×2 四个。
+            let (bx, by) = match chroma_format {
+                2 => (0, if block >= 6 { 1 } else { 0 }),
+                3 => (
+                    if block >= 8 { 1 } else { 0 },
+                    if (block % 4) >= 2 { 1 } else { 0 },
+                ),
+                _ => (0, 0),
+            };
+            let chroma_mb_w = if chroma_format == 3 { 16 } else { 8 };
+            let origin_x = column * chroma_mb_w + bx * 8;
+            if chroma_format == 1 {
+                // 4:2:0 的色度始终帧基（参考实现也只用 uvlinesize）。
+                (true, origin_x, mb_row * 8, cw, 1)
+            } else if interlaced_dct {
+                (true, origin_x, mb_row * 16 + by, 2 * cw, 2)
+            } else {
+                (true, origin_x, mb_row * 16 + by * 8, cw, 1)
+            }
+        }
     }
 }
 
@@ -657,8 +695,18 @@ fn predict_block(
     chroma: bool,
     row_step: i32,
     mv_y_scale: i32,
+    chroma_format: u8,
 ) -> [i32; 64] {
-    let (mx, my) = if chroma { (mv_x / 2, mv_y / 2) } else { (mv_x, mv_y) };
+    let (mx, my) = if chroma {
+        let (hs, vs) = match chroma_format {
+            1 => (2, 2),
+            2 => (2, 1),
+            _ => (1, 1),
+        };
+        (mv_x / hs, mv_y / vs)
+    } else {
+        (mv_x, mv_y)
+    };
     let ix = mx >> 1;
     let iy = (my >> 1) * mv_y_scale;
     let fx = mx & 1;
@@ -746,13 +794,6 @@ fn mpeg2_extension(
             ext.picture_structure as i64,
         ));
     }
-    if sequence.chroma_format != 1 {
-        return Err(DecodeError::new(
-            "chroma_format_unsupported",
-            0,
-            sequence.chroma_format as i64,
-        ));
-    }
     Ok(Some(ext))
 }
 
@@ -773,8 +814,9 @@ pub fn decode_i_frame(
 
     let width = sequence.width as usize;
     let height = sequence.height as usize;
-    let cw = width.div_ceil(2);
-    let ch = height.div_ceil(2);
+    let chroma_format = sequence.chroma_format;
+    let (cw, ch) = chroma_dims(chroma_format, width, height);
+    let mb_blocks = mb_block_count(chroma_format);
     let mut frame = Frame {
         width: sequence.width,
         height: sequence.height,
@@ -865,9 +907,9 @@ pub fn decode_i_frame(
             }
 
             let quant = Quant::new(scale, sequence.mpeg2_stream(), non_linear, precision);
-            for block in 0..6 {
+            for block in 0..mb_blocks {
                 let dc_table = if block < 4 { &DC_LUM } else { &DC_CHROMA };
-                let component = if block < 4 { 0 } else { block - 3 };
+                let component = if block < 4 { 0 } else { (block - 4) % 2 + 1 };
                 let coeffs = decode_intra_block(
                     &mut r,
                     quant,
@@ -880,6 +922,7 @@ pub fn decode_i_frame(
                 let residual = idct_residual(&coeffs);
                 store_mb_block(
                     &mut frame, block, column, mb_row, width, cw, interlaced_dct, &residual, 128,
+                    chroma_format,
                 );
             }
         }
@@ -904,6 +947,7 @@ fn write_field_prediction(
     ch: usize,
     field_select: [u8; 2],
     mv: [[i32; 2]; 2],
+    chroma_format: u8,
 ) {
     // 亮度：场 j 的两个 8×8 左右块。源取 `field_select[j]` 场，目标写第 j 场（偶/奇行）。
     for j in 0..2 {
@@ -913,23 +957,28 @@ fn write_field_prediction(
             let dst_y = mb_row * 16 + j;
             let pred = predict_block(
                 &reference.y, width, width, height, origin_x, src_y, mv[j][0], mv[j][1],
-                false, 2, 2,
+                false, 2, 2, chroma_format,
             );
             store_block(&pred, 0, &mut frame.y, 2 * width, dst_y * width + origin_x);
         }
     }
-    // 色度：场 j 的 8×4（只取前 4 行）。
+    // 色度：4:2:0 每个场 8×4；4:2:2 / 4:4:4 每个场 8×8。
+    let chroma_rows = if chroma_format == 1 { 4 } else { 8 };
+    let chroma_mb_h = if chroma_format == 1 { 8 } else { 16 };
+    let chroma_mb_w = if chroma_format == 3 { 16 } else { 8 };
     for j in 0..2 {
-        let origin_x = column * 8;
-        let src_y = mb_row * 8 + field_select[j] as usize;
-        let dst_y = mb_row * 8 + j;
+        let origin_x = column * chroma_mb_w;
+        let src_y = mb_row * chroma_mb_h + field_select[j] as usize;
+        let dst_y = mb_row * chroma_mb_h + j;
         let pred_u = predict_block(
             &reference.u, cw, cw, ch, origin_x, src_y, mv[j][0], mv[j][1], true, 2, 2,
+            chroma_format,
         );
         let pred_v = predict_block(
             &reference.v, cw, cw, ch, origin_x, src_y, mv[j][0], mv[j][1], true, 2, 2,
+            chroma_format,
         );
-        for y in 0..4 {
+        for y in 0..chroma_rows {
             for x in 0..8 {
                 let idx = dst_y * cw + origin_x + y * (2 * cw) + x;
                 frame.u[idx] = pred_u[y * 8 + x].clamp(0, 255) as u8;
@@ -950,13 +999,14 @@ fn add_mb_block(
     cw: usize,
     interlaced_dct: bool,
     residual: &[i32; 64],
+    chroma_format: u8,
 ) {
     let (chroma, origin_x, origin_y, stride, _) =
-        block_geometry(block, column, mb_row, width, cw, interlaced_dct);
+        block_geometry(block, column, mb_row, width, cw, interlaced_dct, chroma_format);
     let plane_width = if chroma { cw } else { width };
     let plane = match block {
         0..=3 => &mut frame.y,
-        4 => &mut frame.u,
+        4 | 6 | 8 | 10 => &mut frame.u,
         _ => &mut frame.v,
     };
     let at = origin_y * plane_width + origin_x;
@@ -989,8 +1039,9 @@ pub fn decode_p_frame(
 
     let width = sequence.width as usize;
     let height = sequence.height as usize;
-    let cw = width.div_ceil(2);
-    let ch = height.div_ceil(2);
+    let chroma_format = sequence.chroma_format;
+    let (cw, ch) = chroma_dims(chroma_format, width, height);
+    let mb_blocks = mb_block_count(chroma_format);
     // 以参考帧为底：**被跳过的宏块天然就是「零运动矢量、无残差」的预测**，
     // 不需要单独处理 —— 后面解到的宏块再覆盖它。
     let mut frame = Frame {
@@ -1124,9 +1175,9 @@ pub fn decode_p_frame(
 
             if mb.intra {
                 last_mv_f = [[0, 0], [0, 0]];
-                for block in 0..6 {
+                for block in 0..mb_blocks {
                     let dc_table = if block < 4 { &DC_LUM } else { &DC_CHROMA };
-                    let component = if block < 4 { 0 } else { block - 3 };
+                    let component = if block < 4 { 0 } else { (block - 4) % 2 + 1 };
                     let coeffs = decode_intra_block(
                         &mut r,
                         quant,
@@ -1139,7 +1190,7 @@ pub fn decode_p_frame(
                     let residual = idct_residual(&coeffs);
                     store_mb_block(
                         &mut frame, block, column, mb_row, width, cw, interlaced_dct, &residual,
-                        128,
+                        128, chroma_format,
                     );
                 }
                 continue;
@@ -1197,9 +1248,18 @@ pub fn decode_p_frame(
             dc_predictor = [0i32; 3];
 
             let cbp = if mb.coded {
-                decode_vlc(&mut r, &MB_PATTERN)
+                let base = decode_vlc(&mut r, &MB_PATTERN)
                     .ok_or_else(|| DecodeError::new("cbp", r.bit_pos(), column as i64))?
-                    as u32
+                    as u32;
+                if mb_blocks > 6 {
+                    let extra = r
+                        .u((mb_blocks - 6) as u32)
+                        .map_err(|_| DecodeError::new("cbp_ext", r.bit_pos(), column as i64))?
+                        as u32;
+                    (base << (mb_blocks - 6)) | extra
+                } else {
+                    base
+                }
             } else {
                 0
             };
@@ -1208,23 +1268,23 @@ pub fn decode_p_frame(
                 // 场运动：先把两场预测写进整帧，再逐块叠残差。
                 write_field_prediction(
                     &mut frame, reference, column, mb_row, width, height, cw, ch, field_select,
-                    mv_f,
+                    mv_f, chroma_format,
                 );
-                for block in 0..6 {
-                    let coded = mb.coded && (cbp & (1 << (5 - block))) != 0;
+                for block in 0..mb_blocks {
+                    let coded = mb.coded && (cbp & (1 << (mb_blocks - 1 - block))) != 0;
                     if coded {
                         let coeffs =
                             decode_inter_block(&mut r, quant, tables.inter_rl, tables.scan, tables.inter_eob)?;
                         let residual = idct_residual(&coeffs);
                         add_mb_block(
                             &mut frame, block, column, mb_row, width, cw, interlaced_dct,
-                            &residual,
+                            &residual, chroma_format,
                         );
                     }
                 }
             } else {
-                for block in 0..6 {
-                    let coded = mb.coded && (cbp & (1 << (5 - block))) != 0;
+                for block in 0..mb_blocks {
+                    let coded = mb.coded && (cbp & (1 << (mb_blocks - 1 - block))) != 0;
                     let residual = if coded {
                         let coeffs =
                             decode_inter_block(&mut r, quant, tables.inter_rl, tables.scan, tables.inter_eob)?;
@@ -1234,7 +1294,7 @@ pub fn decode_p_frame(
                     };
                     store_pred_block(
                         &mut frame, reference, block, column, mb_row, width, height, cw, ch,
-                        interlaced_dct, mv_f[0][0], mv_f[0][1], &residual,
+                        interlaced_dct, mv_f[0][0], mv_f[0][1], &residual, chroma_format,
                     );
                 }
             }
@@ -1266,14 +1326,16 @@ fn write_b_block(
     cw: usize,
     ch: usize,
     interlaced_dct: bool,
+    chroma_format: u8,
 ) {
     let (chroma, origin_x, origin_y, stride, row_step) =
-        block_geometry(block, column, mb_row, width, cw, interlaced_dct);
+        block_geometry(block, column, mb_row, width, cw, interlaced_dct, chroma_format);
     let plane_width = if chroma { cw } else { width };
     let (rw, rh) = if chroma { (cw, ch) } else { (width, height) };
     let (f_plane, b_plane): (&[u8], &[u8]) = if chroma {
-        let f = if block == 4 { &forward.u } else { &forward.v };
-        let b = if block == 4 { &backward.u } else { &backward.v };
+        let is_u = matches!(block, 4 | 6 | 8 | 10);
+        let f = if is_u { &forward.u } else { &forward.v };
+        let b = if is_u { &backward.u } else { &backward.v };
         (f, b)
     } else {
         (&forward.y, &backward.y)
@@ -1281,6 +1343,7 @@ fn write_b_block(
     let pf = if fwd {
         Some(predict_block(
             f_plane, plane_width, rw, rh, origin_x, origin_y, mv_f.0, mv_f.1, chroma, row_step, 1,
+            chroma_format,
         ))
     } else {
         None
@@ -1288,6 +1351,7 @@ fn write_b_block(
     let pb = if bwd {
         Some(predict_block(
             b_plane, plane_width, rw, rh, origin_x, origin_y, mv_b.0, mv_b.1, chroma, row_step, 1,
+            chroma_format,
         ))
     } else {
         None
@@ -1304,7 +1368,7 @@ fn write_b_block(
     }
     let out_plane = match block {
         0..=3 => &mut frame.y,
-        4 => &mut frame.u,
+        4 | 6 | 8 | 10 => &mut frame.u,
         _ => &mut frame.v,
     };
     store_pred(&pred, residual, out_plane, stride, origin_y * plane_width + origin_x);
@@ -1327,12 +1391,14 @@ fn write_predicted_mb(
     cw: usize,
     ch: usize,
     interlaced_dct: bool,
+    chroma_format: u8,
+    mb_blocks: usize,
 ) {
     let zero = [0i32; 64];
-    for block in 0..6 {
+    for block in 0..mb_blocks {
         write_b_block(
             frame, forward, backward, block, column, mb_row, fwd, bwd, mv_f, mv_b, &zero, width,
-            height, cw, ch, interlaced_dct,
+            height, cw, ch, interlaced_dct, chroma_format,
         );
     }
 }
@@ -1369,6 +1435,7 @@ fn write_b_field_prediction(
     mv_f: [[i32; 2]; 2],
     fs_b: [u8; 2],
     mv_b: [[i32; 2]; 2],
+    chroma_format: u8,
 ) {
     for j in 0..2 {
         // 亮度：场 j 的两个 8×8。
@@ -1379,7 +1446,7 @@ fn write_b_field_prediction(
                 let src_y = mb_row * 16 + fs_f[j] as usize;
                 Some(predict_block(
                     &forward.y, width, width, height, origin_x, src_y, mv_f[j][0], mv_f[j][1],
-                    false, 2, 2,
+                    false, 2, 2, chroma_format,
                 ))
             } else {
                 None
@@ -1388,7 +1455,7 @@ fn write_b_field_prediction(
                 let src_y = mb_row * 16 + fs_b[j] as usize;
                 Some(predict_block(
                     &backward.y, width, width, height, origin_x, src_y, mv_b[j][0], mv_b[j][1],
-                    false, 2, 2,
+                    false, 2, 2, chroma_format,
                 ))
             } else {
                 None
@@ -1396,22 +1463,27 @@ fn write_b_field_prediction(
             let pred = combine_pred(&pf, &pb);
             store_block(&pred, 0, &mut frame.y, 2 * width, dst_y * width + origin_x);
         }
-        // 色度：场 j 的 8×4。
-        let origin_x = column * 8;
-        let dst_y = mb_row * 8 + j;
+        // 色度：4:2:0 每个场 8×4；4:2:2 / 4:4:4 每个场 8×8。
+        let chroma_rows = if chroma_format == 1 { 4 } else { 8 };
+        let chroma_mb_h = if chroma_format == 1 { 8 } else { 16 };
+        let chroma_mb_w = if chroma_format == 3 { 16 } else { 8 };
+        let origin_x = column * chroma_mb_w;
+        let dst_y = mb_row * chroma_mb_h + j;
         let pred = |plane_f: &[u8], plane_b: &[u8]| -> [i32; 64] {
             let pf = if fwd {
-                let src_y = mb_row * 8 + fs_f[j] as usize;
+                let src_y = mb_row * chroma_mb_h + fs_f[j] as usize;
                 Some(predict_block(
                     plane_f, cw, cw, ch, origin_x, src_y, mv_f[j][0], mv_f[j][1], true, 2, 2,
+                    chroma_format,
                 ))
             } else {
                 None
             };
             let pb = if bwd {
-                let src_y = mb_row * 8 + fs_b[j] as usize;
+                let src_y = mb_row * chroma_mb_h + fs_b[j] as usize;
                 Some(predict_block(
                     plane_b, cw, cw, ch, origin_x, src_y, mv_b[j][0], mv_b[j][1], true, 2, 2,
+                    chroma_format,
                 ))
             } else {
                 None
@@ -1420,7 +1492,7 @@ fn write_b_field_prediction(
         };
         let pu = pred(&forward.u, &backward.u);
         let pv = pred(&forward.v, &backward.v);
-        for y in 0..4 {
+        for y in 0..chroma_rows {
             for x in 0..8 {
                 let idx = dst_y * cw + origin_x + y * (2 * cw) + x;
                 frame.u[idx] = pu[y * 8 + x].clamp(0, 255) as u8;
@@ -1470,8 +1542,9 @@ pub fn decode_b_frame(
 
     let width = sequence.width as usize;
     let height = sequence.height as usize;
-    let cw = width.div_ceil(2);
-    let ch = height.div_ceil(2);
+    let chroma_format = sequence.chroma_format;
+    let (cw, ch) = chroma_dims(chroma_format, width, height);
+    let mb_blocks = mb_block_count(chroma_format);
     let mut frame = Frame {
         width: sequence.width,
         height: sequence.height,
@@ -1552,12 +1625,14 @@ pub fn decode_b_frame(
                     write_b_field_prediction(
                         &mut frame, forward, backward, col, row_s, width, height, cw, ch,
                         p.kind.forward, p.kind.backward, p.fs_f, p.mv_f, p.fs_b, p.mv_b,
+                        chroma_format,
                     );
                 } else {
                     write_predicted_mb(
                         &mut frame, forward, backward, col, row_s, p.kind.forward,
                         p.kind.backward, (p.mv_f[0][0], p.mv_f[0][1]),
                         (p.mv_b[0][0], p.mv_b[0][1]), width, height, cw, ch, false,
+                        chroma_format, mb_blocks,
                     );
                 }
             }
@@ -1615,9 +1690,9 @@ pub fn decode_b_frame(
             if mb.intra {
                 last_mv_f = [[0, 0], [0, 0]];
                 last_mv_b = [[0, 0], [0, 0]];
-                for block in 0..6 {
+                for block in 0..mb_blocks {
                     let dc_table = if block < 4 { &DC_LUM } else { &DC_CHROMA };
-                    let component = if block < 4 { 0 } else { block - 3 };
+                    let component = if block < 4 { 0 } else { (block - 4) % 2 + 1 };
                     let coeffs = decode_intra_block(
                         &mut r,
                         quant,
@@ -1630,7 +1705,7 @@ pub fn decode_b_frame(
                     let residual = idct_residual(&coeffs);
                     store_mb_block(
                         &mut frame, block, column, mb_row, width, cw, interlaced_dct, &residual,
-                        128,
+                        128, chroma_format,
                     );
                 }
                 prev = Some(BPrev {
@@ -1725,9 +1800,18 @@ pub fn decode_b_frame(
             dc_predictor = [0i32; 3];
 
             let cbp = if mb.coded {
-                decode_vlc(&mut r, &MB_PATTERN)
+                let base = decode_vlc(&mut r, &MB_PATTERN)
                     .ok_or_else(|| DecodeError::new("cbp", r.bit_pos(), column as i64))?
-                    as u32
+                    as u32;
+                if mb_blocks > 6 {
+                    let extra = r
+                        .u((mb_blocks - 6) as u32)
+                        .map_err(|_| DecodeError::new("cbp_ext", r.bit_pos(), column as i64))?
+                        as u32;
+                    (base << (mb_blocks - 6)) | extra
+                } else {
+                    base
+                }
             } else {
                 0
             };
@@ -1735,23 +1819,23 @@ pub fn decode_b_frame(
             if field_motion {
                 write_b_field_prediction(
                     &mut frame, forward, backward, column, mb_row, width, height, cw, ch,
-                    mb.forward, mb.backward, fs_f, mv_f, fs_b, mv_b,
+                    mb.forward, mb.backward, fs_f, mv_f, fs_b, mv_b, chroma_format,
                 );
-                for block in 0..6 {
-                    let coded = mb.coded && (cbp & (1 << (5 - block))) != 0;
+                for block in 0..mb_blocks {
+                    let coded = mb.coded && (cbp & (1 << (mb_blocks - 1 - block))) != 0;
                     if coded {
                         let coeffs =
                             decode_inter_block(&mut r, quant, tables.inter_rl, tables.scan, tables.inter_eob)?;
                         let residual = idct_residual(&coeffs);
                         add_mb_block(
                             &mut frame, block, column, mb_row, width, cw, interlaced_dct,
-                            &residual,
+                            &residual, chroma_format,
                         );
                     }
                 }
             } else {
-                for block in 0..6 {
-                    let coded = mb.coded && (cbp & (1 << (5 - block))) != 0;
+                for block in 0..mb_blocks {
+                    let coded = mb.coded && (cbp & (1 << (mb_blocks - 1 - block))) != 0;
                     let residual = if coded {
                         let coeffs =
                             decode_inter_block(&mut r, quant, tables.inter_rl, tables.scan, tables.inter_eob)?;
@@ -1762,7 +1846,7 @@ pub fn decode_b_frame(
                     write_b_block(
                         &mut frame, forward, backward, block, column, mb_row, mb.forward,
                         mb.backward, (mv_f[0][0], mv_f[0][1]), (mv_b[0][0], mv_b[0][1]),
-                        &residual, width, height, cw, ch, interlaced_dct,
+                        &residual, width, height, cw, ch, interlaced_dct, chroma_format,
                     );
                 }
             }
