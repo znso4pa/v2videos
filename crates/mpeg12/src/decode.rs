@@ -387,6 +387,7 @@ fn decode_intra_block(
     dc_predictor: &mut i32,
     rl: &[RlEntry],
     scan: &[usize; 64],
+    eob: (u16, u8),
 ) -> Result<[i32; 64], DecodeError> {
     let mut coeffs = [0i32; 64];
 
@@ -408,8 +409,8 @@ fn decode_intra_block(
         if r.bits_left() == 0 {
             break;
         }
-        if r.bits_left() >= EOB_BITS as usize && r.peek_u(EOB_BITS as u32) == EOB_CODE as u32 {
-            r.skip(EOB_BITS as u32)
+        if r.bits_left() >= eob.1 as usize && r.peek_u(eob.1 as u32) == eob.0 as u32 {
+            r.skip(eob.1 as u32)
                 .map_err(|_| DecodeError::new("eob", r.bit_pos(), 0))?;
             break;
         }
@@ -474,10 +475,10 @@ fn decode_intra_block(
 
     // 块被 64 个系数填满时，EOB 仍然在码流里 —— 不消费它，后面全部错位。
     if index >= 64
-        && r.bits_left() >= EOB_BITS as usize
-        && r.peek_u(EOB_BITS as u32) == EOB_CODE as u32
+        && r.bits_left() >= eob.1 as usize
+        && r.peek_u(eob.1 as u32) == eob.0 as u32
     {
-        r.skip(EOB_BITS as u32)
+        r.skip(eob.1 as u32)
             .map_err(|_| DecodeError::new("eob_full", r.bit_pos(), 0))?;
     }
 
@@ -490,6 +491,7 @@ fn decode_inter_block(
     quant: Quant,
     rl: &[RlEntry],
     scan: &[usize; 64],
+    eob: (u16, u8),
 ) -> Result<[i32; 64], DecodeError> {
     let mut coeffs = [0i32; 64];
     let mut index = 0usize;
@@ -501,8 +503,8 @@ fn decode_inter_block(
         r.skip(2).ok();
         coeffs[scan[0]] = if negative { -1 } else { 1 };
         index = 1;
-        if r.bits_left() >= EOB_BITS as usize && r.peek_u(EOB_BITS as u32) == EOB_CODE as u32 {
-            r.skip(EOB_BITS as u32)
+        if r.bits_left() >= eob.1 as usize && r.peek_u(eob.1 as u32) == eob.0 as u32 {
+            r.skip(eob.1 as u32)
                 .map_err(|_| DecodeError::new("eob_fast", r.bit_pos(), 0))?;
             return Ok(dequantise_inter(&coeffs, quant));
         }
@@ -512,8 +514,8 @@ fn decode_inter_block(
         if r.bits_left() == 0 {
             break;
         }
-        if r.bits_left() >= EOB_BITS as usize && r.peek_u(EOB_BITS as u32) == EOB_CODE as u32 {
-            r.skip(EOB_BITS as u32)
+        if r.bits_left() >= eob.1 as usize && r.peek_u(eob.1 as u32) == eob.0 as u32 {
+            r.skip(eob.1 as u32)
                 .map_err(|_| DecodeError::new("eob_inter", r.bit_pos(), 0))?;
             break;
         }
@@ -576,10 +578,10 @@ fn decode_inter_block(
     }
 
     if index >= 64
-        && r.bits_left() >= EOB_BITS as usize
-        && r.peek_u(EOB_BITS as u32) == EOB_CODE as u32
+        && r.bits_left() >= eob.1 as usize
+        && r.peek_u(eob.1 as u32) == eob.0 as u32
     {
-        r.skip(EOB_BITS as u32)
+        r.skip(eob.1 as u32)
             .map_err(|_| DecodeError::new("eob_full_inter", r.bit_pos(), 0))?;
     }
 
@@ -683,11 +685,13 @@ fn predict_block(
     out
 }
 
-/// 每幅图不变的块级配置：RL 表与扫描顺序。
+/// 每幅图不变的块级配置：RL 表、扫描顺序、EOB 码。
 struct BlockTables<'a> {
     intra_rl: &'a [RlEntry],
     inter_rl: &'a [RlEntry],
     scan: &'a [usize; 64],
+    intra_eob: (u16, u8),
+    inter_eob: (u16, u8),
 }
 
 fn block_tables(ext: Option<&crate::PictureCodingExtension>) -> BlockTables<'static> {
@@ -699,11 +703,20 @@ fn block_tables(ext: Option<&crate::PictureCodingExtension>) -> BlockTables<'sta
             intra_rl: if ext.intra_vlc_format { &MPEG2_RL } else { &MPEG1_RL },
             inter_rl: &MPEG1_RL,
             scan: if ext.alternate_scan { &ALT_SCAN } else { &ZIGZAG },
+            // **EOB 码不同**：MPEG-2 的 RL 表是 `0110`（4 位），MPEG-1 是 `10`（2 位）。
+            intra_eob: if ext.intra_vlc_format {
+                (0b0110, 4)
+            } else {
+                (EOB_CODE, EOB_BITS)
+            },
+            inter_eob: (EOB_CODE, EOB_BITS),
         },
         None => BlockTables {
             intra_rl: &MPEG1_RL,
             inter_rl: &MPEG1_RL,
             scan: &ZIGZAG,
+            intra_eob: (EOB_CODE, EOB_BITS),
+            inter_eob: (EOB_CODE, EOB_BITS),
         },
     }
 }
@@ -862,6 +875,7 @@ pub fn decode_i_frame(
                     &mut dc_predictor[component],
                     tables.intra_rl,
                     tables.scan,
+                    tables.intra_eob,
                 )?;
                 let residual = idct_residual(&coeffs);
                 store_mb_block(
@@ -1120,6 +1134,7 @@ pub fn decode_p_frame(
                         &mut dc_predictor[component],
                         tables.intra_rl,
                         tables.scan,
+                        tables.intra_eob,
                     )?;
                     let residual = idct_residual(&coeffs);
                     store_mb_block(
@@ -1199,7 +1214,7 @@ pub fn decode_p_frame(
                     let coded = mb.coded && (cbp & (1 << (5 - block))) != 0;
                     if coded {
                         let coeffs =
-                            decode_inter_block(&mut r, quant, tables.inter_rl, tables.scan)?;
+                            decode_inter_block(&mut r, quant, tables.inter_rl, tables.scan, tables.inter_eob)?;
                         let residual = idct_residual(&coeffs);
                         add_mb_block(
                             &mut frame, block, column, mb_row, width, cw, interlaced_dct,
@@ -1212,7 +1227,7 @@ pub fn decode_p_frame(
                     let coded = mb.coded && (cbp & (1 << (5 - block))) != 0;
                     let residual = if coded {
                         let coeffs =
-                            decode_inter_block(&mut r, quant, tables.inter_rl, tables.scan)?;
+                            decode_inter_block(&mut r, quant, tables.inter_rl, tables.scan, tables.inter_eob)?;
                         idct_residual(&coeffs)
                     } else {
                         [0i32; 64]
@@ -1610,6 +1625,7 @@ pub fn decode_b_frame(
                         &mut dc_predictor[component],
                         tables.intra_rl,
                         tables.scan,
+                        tables.intra_eob,
                     )?;
                     let residual = idct_residual(&coeffs);
                     store_mb_block(
@@ -1725,7 +1741,7 @@ pub fn decode_b_frame(
                     let coded = mb.coded && (cbp & (1 << (5 - block))) != 0;
                     if coded {
                         let coeffs =
-                            decode_inter_block(&mut r, quant, tables.inter_rl, tables.scan)?;
+                            decode_inter_block(&mut r, quant, tables.inter_rl, tables.scan, tables.inter_eob)?;
                         let residual = idct_residual(&coeffs);
                         add_mb_block(
                             &mut frame, block, column, mb_row, width, cw, interlaced_dct,
@@ -1738,7 +1754,7 @@ pub fn decode_b_frame(
                     let coded = mb.coded && (cbp & (1 << (5 - block))) != 0;
                     let residual = if coded {
                         let coeffs =
-                            decode_inter_block(&mut r, quant, tables.inter_rl, tables.scan)?;
+                            decode_inter_block(&mut r, quant, tables.inter_rl, tables.scan, tables.inter_eob)?;
                         idct_residual(&coeffs)
                     } else {
                         [0i32; 64]
