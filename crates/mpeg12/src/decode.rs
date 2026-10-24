@@ -1036,6 +1036,73 @@ fn predict_block(
     let fx = mx & 1;
     let fy = my & 1;
     let mut out = [0i32; 64];
+    let sx = origin_x as i32 + ix;
+    let sy = origin_y as i32 + row_step * 0 + iy; // 块左上角的参考坐标
+    // 四个抽头在这一块上覆盖的包围盒。整块都在帧内 → 一个像素都不用 clamp
+    //（clamp 只对帧边界有意义，而边界块是极少数）。
+    let last_y = 7 * row_step + fy * row_step;
+    let (ylo, yhi) = if last_y >= 0 {
+        (sy, sy + last_y)
+    } else {
+        (sy + last_y, sy)
+    };
+    let interior = sx >= 0
+        && sx + 7 + fx < width as i32
+        && ylo >= 0
+        && yhi < height as i32
+        && sy >= 0
+        && sy + 7 * row_step >= 0;
+    if interior {
+        // ── 快路：行首地址一次算好，内层直接下标 ──
+        let row0 = (sy as usize) * stride + sx as usize;
+        let row1 = ((sy + row_step) as usize) * stride + sx as usize;
+        match (fx, fy) {
+            (0, 0) => {
+                for y in 0..8 {
+                    let base = row0 + y * row_step as usize * stride;
+                    for x in 0..8 {
+                        out[y * 8 + x] = reference[base + x] as i32;
+                    }
+                }
+            }
+            (1, 0) => {
+                for y in 0..8 {
+                    let base = row0 + y * row_step as usize * stride;
+                    for x in 0..8 {
+                        let a = reference[base + x] as i32;
+                        let b = reference[base + x + 1] as i32;
+                        out[y * 8 + x] = (a + b + 1) >> 1;
+                    }
+                }
+            }
+            (0, 1) => {
+                for y in 0..8 {
+                    let a0 = row0 + y * row_step as usize * stride;
+                    let b0 = row1 + y * row_step as usize * stride;
+                    for x in 0..8 {
+                        let a = reference[a0 + x] as i32;
+                        let b = reference[b0 + x] as i32;
+                        out[y * 8 + x] = (a + b + 1) >> 1;
+                    }
+                }
+            }
+            _ => {
+                for y in 0..8 {
+                    let a0 = row0 + y * row_step as usize * stride;
+                    let b0 = row1 + y * row_step as usize * stride;
+                    for x in 0..8 {
+                        let a = reference[a0 + x] as i32;
+                        let b = reference[a0 + x + 1] as i32;
+                        let c = reference[b0 + x] as i32;
+                        let d = reference[b0 + x + 1] as i32;
+                        out[y * 8 + x] = (a + b + c + d + 2) >> 2;
+                    }
+                }
+            }
+        }
+        return out;
+    }
+    // ── 慢路：贴着帧边界的块，逐像素 clamp（和原来逐位相同）──
     for y in 0..8 {
         for x in 0..8 {
             let sx = origin_x as i32 + ix + x as i32;
