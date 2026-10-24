@@ -78,87 +78,7 @@ pub mod prof {
     }
 }
 
-/// VLC 查表：把「按长度逐层扫全表」换成**一次 LUT 命中**。
-///
-/// 剖析（`V2V_PROF=1`）显示 MPEG-1/2 解码 **85~90%** 的时间花在位读取 + VLC + 反量化上，
-/// 而原来的 `decode_vlc` / `decode_rl` 是线性扫描 —— 每个符号要试 1..=max_bits 种长度、
-/// 每种长度再扫一遍全表（RL 表 111 项、最长 16 位）。这里是那一块的大头。
-///
-/// 做法：按前 `LUT_BITS` 位建一张 2^LUT_BITS 的表，命中即得 (符号, 位数)；
-/// 比 `LUT_BITS` 长的码字（极少）回退到原来的线性路径。表在首次使用时建一次
-/// （`OnceLock`，零依赖），之后每个符号只做**一次查表 + 一次跳位**。
 const LUT_BITS: u32 = 16;
-
-/// 能建 LUT 的码字（`Code` 与 `RlEntry` 的前两个字段正好一样）。
-trait VlcCode {
-    fn vlc_code(&self) -> u16;
-    fn vlc_bits(&self) -> u8;
-}
-impl VlcCode for Code {
-    #[inline]
-    fn vlc_code(&self) -> u16 {
-        self.code
-    }
-    #[inline]
-    fn vlc_bits(&self) -> u8 {
-        self.bits
-    }
-}
-impl VlcCode for RlEntry {
-    #[inline]
-    fn vlc_code(&self) -> u16 {
-        self.code
-    }
-    #[inline]
-    fn vlc_bits(&self) -> u8 {
-        self.bits
-    }
-}
-
-/// 帧间 RL 表的查找表（**进程内只建一次**）。
-///
-/// ⚠️ 曾经是「每张图建一次」：180 帧 × 2 张表 × 65536 格 = 两千多万次写入，
-/// 白白吃掉一截。表来自 `const`，本来就可以共享。
-fn inter_lut() -> &'static VlcLut {
-    static LUT: std::sync::OnceLock<VlcLut> = std::sync::OnceLock::new();
-    LUT.get_or_init(|| build_lut(&MPEG1_RL))
-}
-
-/// 帧内 RL 表的查找表（`intra_vlc_format` 决定用 MPEG-1 还是 MPEG-2 的表）。
-fn intra_lut_for(mpeg2_table: bool) -> &'static VlcLut {
-    static M1: std::sync::OnceLock<VlcLut> = std::sync::OnceLock::new();
-    static M2: std::sync::OnceLock<VlcLut> = std::sync::OnceLock::new();
-    if mpeg2_table {
-        M2.get_or_init(|| build_lut(&MPEG2_RL))
-    } else {
-        M1.get_or_init(|| build_lut(&MPEG1_RL))
-    }
-}
-
-/// 一张码表的查找表。`slots[i]` = (符号下标, 码长)；码长 0 表示「这一格只有长码字」。
-struct VlcLut {
-    slots: Vec<(u16, u8)>,
-}
-
-fn build_lut<T: VlcCode>(table: &[T]) -> VlcLut {
-    let mut slots = vec![(u16::MAX, 0u8); 1usize << LUT_BITS];
-    for (index, entry) in table.iter().enumerate() {
-        let bits = entry.vlc_bits() as u32;
-        if bits > LUT_BITS {
-            continue; // 长码字走回退路径
-        }
-        let shift = LUT_BITS - bits;
-        let base = (entry.vlc_code() as usize) << shift;
-        for slot in slots.iter_mut().skip(base).take(1usize << shift) {
-            // **先到先得**：线性扫描是按表序返回第一个命中的，LUT 也必须一样，
-            // 否则同一格被后一个码字覆盖，行为就和回退路径不一致了。
-            if slot.1 == 0 {
-                *slot = (index as u16, entry.vlc_bits());
-            }
-        }
-    }
-    VlcLut { slots }
-}
 
 /// 解码失败的位置。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,14 +87,92 @@ pub struct DecodeError {
     pub bit: usize,
     pub detail: i64,
 }
-
 impl DecodeError {
     fn new(stage: &'static str, bit: usize, detail: i64) -> Self {
         Self { stage, bit, detail }
     }
 }
+/// RL 表的查找表：**一个 u32 装下整个符号**，查表之后不再碰 RL 表。
+///
+/// 布局（位域）：
+///
+/// | 位 | 含义 |
+/// |---|------|
+/// | 0-1 | kind：0 = 普通符号、1 = EOB、2 = escape、3 = 长码 / 不该走表 |
+/// | 2-6 | run（0..31） |
+/// | 7-12 | level 的**幅度**（1..40；符号位在码里单独 1 位） |
+/// | 13-17 | 码长（1..16） |
+///
+/// 为什么把 EOB / escape 也编进表：主循环每个符号原本要做
+/// 「EOB 检查 + escape 检查 + RL 查表 + 符号位读取」四次独立取位，
+/// 现在一次 16 位窗口 + 一次查表全部解决。level 恒为正（符号在码里），
+/// run <= 31，所以 18 位就够 —— 65536 格 x 4 字节 = 256 KB，L2 放得下。
+struct RlLut {
+    slots: Vec<u32>,
+}
 
-/// 按最长前缀在 `table` 里找码，命中后消耗对应位数。
+const RL_SYM: u32 = 0;
+const RL_EOB: u32 = 1;
+const RL_ESC: u32 = 2;
+const RL_LONG: u32 = 3;
+
+fn build_rl_lut(table: &[RlEntry], eob: (u16, u8)) -> RlLut {
+    let mut slots = vec![RL_LONG; 1usize << LUT_BITS];
+    // 按**码长**从短到长填（和线性扫描的尝试顺序一致：短码永远赢）。
+    for len in 1..=LUT_BITS {
+        for entry in table {
+            if entry.bits as u32 != len {
+                continue;
+            }
+            let shift = LUT_BITS - len;
+            let base = (entry.code as usize) << shift;
+            let slot =
+                RL_SYM | ((entry.run as u32) << 2) | ((entry.level as u32) << 7) | (len << 13);
+            for s in slots.iter_mut().skip(base).take(1usize << shift) {
+                if *s == RL_LONG {
+                    *s = slot;
+                }
+            }
+        }
+    }
+    // EOB / escape **后填并覆盖**：调用方的检查顺序就是 EOB 先、escape 次、RL 最后，
+    // 所以同一段前缀上它们必须赢过表里的普通符号。
+    for (code, bits, kind) in [
+        (eob.0, eob.1 as u32, RL_EOB),
+        (ESCAPE_CODE, ESCAPE_BITS as u32, RL_ESC),
+    ] {
+        if bits > LUT_BITS {
+            continue;
+        }
+        let shift = LUT_BITS - bits;
+        let base = (code as usize) << shift;
+        let slot = kind | (bits << 13);
+        for s in slots.iter_mut().skip(base).take(1usize << shift) {
+            *s = slot;
+        }
+    }
+    RlLut { slots }
+}
+
+/// 帧间 RL 查找表（MPEG-1 表 + 2 位 EOB）。**进程内只建一次** ——
+/// 表来自 `const`，本来就可以共享（曾经每张图建一次，白烧两千多万次写入）。
+fn inter_lut() -> &'static RlLut {
+    static LUT: std::sync::OnceLock<RlLut> = std::sync::OnceLock::new();
+    LUT.get_or_init(|| build_rl_lut(&MPEG1_RL, (EOB_CODE, EOB_BITS)))
+}
+
+/// 帧内 RL 查找表（`intra_vlc_format` 决定用 MPEG-1 还是 MPEG-2 的表 ——
+/// 两者的 EOB 也不同：MPEG-1 是 `10`，MPEG-2 的 intra_vlc 表是 `0110`）。
+fn intra_lut_for(mpeg2_table: bool) -> &'static RlLut {
+    static M1: std::sync::OnceLock<RlLut> = std::sync::OnceLock::new();
+    static M2: std::sync::OnceLock<RlLut> = std::sync::OnceLock::new();
+    if mpeg2_table {
+        M2.get_or_init(|| build_rl_lut(&MPEG2_RL, (0b0110, 4)))
+    } else {
+        M1.get_or_init(|| build_rl_lut(&MPEG1_RL, (EOB_CODE, EOB_BITS)))
+    }
+}
+
 fn decode_vlc(r: &mut BitReader, table: &[Code]) -> Option<usize> {
     let max_bits = table.iter().map(|c| c.bits).max().unwrap_or(0) as u32;
     for len in 1..=max_bits {
@@ -191,30 +189,6 @@ fn decode_vlc(r: &mut BitReader, table: &[Code]) -> Option<usize> {
     }
     None
 }
-
-/// 用 LUT 解一个 VLC 符号。`None` = 这一格没有短码字（让调用方走回退路径）。
-#[inline]
-fn lut_decode(r: &mut BitReader, lut: &VlcLut) -> Option<usize> {
-    if r.bits_left() < LUT_BITS as usize {
-        return None; // 尾部不足 12 位：走线性扫描
-    }
-    let (symbol, bits) = lut.slots[r.peek_u(LUT_BITS) as usize];
-    if bits == 0 {
-        return None; // 码字比 12 位长：走线性扫描
-    }
-    r.skip(bits as u32).ok()?;
-    Some(symbol as usize)
-}
-
-/// 在 run/level 表里按最长前缀找码（带 LUT 快路）。
-#[inline]
-fn decode_rl_lut(r: &mut BitReader, lut: &VlcLut, table: &[RlEntry]) -> Option<usize> {
-    if let Some(hit) = lut_decode(r, lut) {
-        return Some(hit);
-    }
-    decode_rl(r, table)
-}
-
 /// 在 run/level 表里按最长前缀找码。
 fn decode_rl(r: &mut BitReader, table: &[RlEntry]) -> Option<usize> {
     let max_bits = table.iter().map(|e| e.bits).max().unwrap_or(0) as u32;
@@ -392,72 +366,153 @@ fn dequantise_inter(quantised: &[i32; 64], quant: Quant) -> [i32; 64] {
     out
 }
 
-/// 余弦表（编译期算好，避免每帧重复求值）。
-const COS: [[f64; 8]; 8] = build_cos();
-
-const fn cos_approx(x: f64) -> f64 {
-    // **必须先做周期归约**：泰勒展开只在 0 附近收敛，而这里最大的参数是
-    // `15 × 7 × π / 16 ≈ 20.6` 弧度。不归约的话，误差随参数增大而爆炸 ——
-    // 低频基函数（参数小）仍然准，高频全错，看起来就像「只有高频块花掉」。
-    let pi = core::f64::consts::PI;
-    let two_pi = 2.0 * pi;
-    let mut x = x;
-    while x > pi {
-        x -= two_pi;
-    }
-    while x < -pi {
-        x += two_pi;
-    }
-    let x2 = x * x;
-    let mut term = 1.0;
-    let mut sum = 1.0;
-    let mut n = 1;
-    while n < 12 {
-        term = -term * x2 / (((2 * n - 1) * (2 * n)) as f64);
-        sum += term;
-        n += 1;
-    }
-    sum
-}
-
-const fn build_cos() -> [[f64; 8]; 8] {
-    let mut table = [[0f64; 8]; 8];
-    let mut x = 0;
-    while x < 8 {
-        let mut u = 0;
-        while u < 8 {
-            table[x][u] = cos_approx(((2 * x + 1) * u) as f64 * core::f64::consts::PI / 16.0);
-            u += 1;
-        }
-        x += 1;
-    }
-    table
-}
-
-/// 8×8 逆变换，返回**残差**（未加 128、未夹取）。
+/// 8×8 逆 DCT（残差块用）：**逐位复刻 ffmpeg `simple_idct` 的 8 位路径**。
+///
+/// ## 为什么换掉原来的浮点版
+///
+/// 原来是 f64 两天通道 + `.round()`：慢（占解码 28%），而且和 ffmpeg 的整数 IDCT
+/// 有 ±2~3 的舍入差 —— 对账里「最差 2/3」全是它。移植 ffmpeg 的整数 IDCT 之后，
+/// 两边**逐位相同**（判据：I 帧对 ffmpeg 的最差像素差从 2 掉到 0）。
+///
+/// ## 必须原样保留的三个细节（改了就不是同一个 IDCT）
+///
+/// 1. **DC-only 捷径**：一行里只有 DC 时，8 个输出都 = `(dc * 8) as i16`
+///    （`& 0xffff` 后按 int16 读回）。不走通用路径 —— 两者的舍入不同。
+/// 2. **列通道的 DC 取整**：`a0 = W4 * (dc + 32)`，那个 32 是
+///    `(1 << (COL_SHIFT-1)) / W4 = 524288/16383` 的整数商（≈ 但不是 2^19/W4）。
+/// 3. **无符号回绕运算**：ffmpeg 的累加器是 `unsigned`，负数系数先转无符号再乘。
+///    Rust 侧用 `wrapping_*` 逐个对应；行/列结果都截回 i16 再进下一步。
+///
+/// 输入是**反量化后的系数**（光栅序，`block[v*8+u]`，v = 垂直频率）；
+/// 系数按 int16 截断（ffmpeg 的反量化就写进 int16 缓冲区）。
+/// 输出是**未裁剪**的残差 —— 裁剪由调用方在「预测 + 残差」之后做，
+/// 与 ffmpeg 的 `idct_add` 语义一致。
 fn idct_residual(block: &[i32; 64]) -> [i32; 64] {
     let _g = prof::enabled().then(|| prof::Guard::new(prof::IDCT));
-    let mut tmp = [[0f64; 8]; 8];
-    for v in 0..8 {
-        for x in 0..8 {
-            let mut sum = 0f64;
-            for u in 0..8 {
-                let cu = if u == 0 { core::f64::consts::FRAC_1_SQRT_2 } else { 1.0 };
-                sum += cu * block[v * 8 + u] as f64 * COS[x][u];
-            }
-            tmp[v][x] = sum / 2.0;
-        }
+    const W1: u32 = 22725;
+    const W2: u32 = 21407;
+    const W3: u32 = 19266;
+    const W4: u32 = 16383;
+    const W5: u32 = 12873;
+    const W6: u32 = 8867;
+    const W7: u32 = 4520;
+    const ROW_SHIFT: u32 = 11;
+    const COL_SHIFT: u32 = 20;
+
+    // 输入截成 int16（与 ffmpeg 的反量化缓冲区同宽）。
+    let mut b = [0i32; 64];
+    for (dst, src) in b.iter_mut().zip(block) {
+        *dst = *src as i16 as i32;
     }
-    let mut out = [0i32; 64];
-    for x in 0..8 {
-        for y in 0..8 {
-            let mut sum = 0f64;
-            for v in 0..8 {
-                let cv = if v == 0 { core::f64::consts::FRAC_1_SQRT_2 } else { 1.0 };
-                sum += cv * tmp[v][x] * COS[y][v];
-            }
-            out[y * 8 + x] = (sum / 2.0).round() as i32;
+
+    // ---- 行通道（水平频率 u）----
+    for v in 0..8 {
+        let r = &mut b[v * 8..v * 8 + 8];
+        let u = |i: usize| r[i] as u32; // 负数系数转无符号（与 C 的 (SUINT) 相同）
+        // ① DC-only 捷径：1..7 全为 0 时，8 个输出都是 (dc*8) as i16。
+        if r[1] == 0 && r[2] == 0 && r[3] == 0 && r[4] == 0 && r[5] == 0 && r[6] == 0 && r[7] == 0
+        {
+            let flat = (r[0].wrapping_mul(8)) as i16 as i32;
+            r.fill(flat);
+            continue;
         }
+        let mut a0 = W4.wrapping_mul(u(0)).wrapping_add(1 << (ROW_SHIFT - 1));
+        let mut a1 = a0;
+        let mut a2 = a0;
+        let mut a3 = a0;
+        a0 = a0.wrapping_add(W2.wrapping_mul(u(2)));
+        a1 = a1.wrapping_add(W6.wrapping_mul(u(2)));
+        a2 = a2.wrapping_sub(W6.wrapping_mul(u(2)));
+        a3 = a3.wrapping_sub(W2.wrapping_mul(u(2)));
+
+        let mut b0 = W1.wrapping_mul(u(1));
+        b0 = b0.wrapping_add(W3.wrapping_mul(u(3)));
+        let mut b1 = W3.wrapping_mul(u(1));
+        b1 = b1.wrapping_sub(W7.wrapping_mul(u(3)));
+        let mut b2 = W5.wrapping_mul(u(1));
+        b2 = b2.wrapping_sub(W1.wrapping_mul(u(3)));
+        let mut b3 = W7.wrapping_mul(u(1));
+        b3 = b3.wrapping_sub(W5.wrapping_mul(u(3)));
+
+        // 4..7 全 0 时跳过（加 0 是空操作，纯优化）。
+        if r[4] != 0 || r[5] != 0 || r[6] != 0 || r[7] != 0 {
+            a0 = a0.wrapping_add(W4.wrapping_mul(u(4)).wrapping_add(W6.wrapping_mul(u(6))));
+            a1 = a1.wrapping_sub(W4.wrapping_mul(u(4)).wrapping_add(W2.wrapping_mul(u(6))));
+            a2 = a2.wrapping_sub(W4.wrapping_mul(u(4)).wrapping_sub(W2.wrapping_mul(u(6))));
+            a3 = a3.wrapping_add(W4.wrapping_mul(u(4)).wrapping_sub(W6.wrapping_mul(u(6))));
+
+            b0 = b0.wrapping_add(W5.wrapping_mul(u(5)).wrapping_add(W7.wrapping_mul(u(7))));
+            b1 = b1.wrapping_sub(W1.wrapping_mul(u(5)).wrapping_add(W5.wrapping_mul(u(7))));
+            b2 = b2.wrapping_add(W7.wrapping_mul(u(5)).wrapping_add(W3.wrapping_mul(u(7))));
+            b3 = b3.wrapping_add(W3.wrapping_mul(u(5)).wrapping_sub(W1.wrapping_mul(u(7))));
+        }
+
+        r[0] = ((a0.wrapping_add(b0) as i32) >> ROW_SHIFT) as i16 as i32;
+        r[7] = ((a0.wrapping_sub(b0) as i32) >> ROW_SHIFT) as i16 as i32;
+        r[1] = ((a1.wrapping_add(b1) as i32) >> ROW_SHIFT) as i16 as i32;
+        r[6] = ((a1.wrapping_sub(b1) as i32) >> ROW_SHIFT) as i16 as i32;
+        r[2] = ((a2.wrapping_add(b2) as i32) >> ROW_SHIFT) as i16 as i32;
+        r[5] = ((a2.wrapping_sub(b2) as i32) >> ROW_SHIFT) as i16 as i32;
+        r[3] = ((a3.wrapping_add(b3) as i32) >> ROW_SHIFT) as i16 as i32;
+        r[4] = ((a3.wrapping_sub(b3) as i32) >> ROW_SHIFT) as i16 as i32;
+    }
+
+    // ---- 列通道（垂直频率 v）----
+    let mut out = [0i32; 64];
+    for u in 0..8 {
+        let c = |i: usize| b[i * 8 + u] as u32;
+        // DC 项的取整常数是 (1<<(COL_SHIFT-1))/W4 的**整数商** 32，不是 2^19/W4。
+        let mut a0 = W4.wrapping_mul(c(0).wrapping_add(32));
+        let mut a1 = a0;
+        let mut a2 = a0;
+        let mut a3 = a0;
+        a0 = a0.wrapping_add(W2.wrapping_mul(c(2)));
+        a1 = a1.wrapping_add(W6.wrapping_mul(c(2)));
+        a2 = a2.wrapping_sub(W6.wrapping_mul(c(2)));
+        a3 = a3.wrapping_sub(W2.wrapping_mul(c(2)));
+
+        let mut b0 = W1.wrapping_mul(c(1));
+        b0 = b0.wrapping_add(W3.wrapping_mul(c(3)));
+        let mut b1 = W3.wrapping_mul(c(1));
+        b1 = b1.wrapping_sub(W7.wrapping_mul(c(3)));
+        let mut b2 = W5.wrapping_mul(c(1));
+        b2 = b2.wrapping_sub(W1.wrapping_mul(c(3)));
+        let mut b3 = W7.wrapping_mul(c(1));
+        b3 = b3.wrapping_sub(W5.wrapping_mul(c(3)));
+
+        if c(4) != 0 {
+            a0 = a0.wrapping_add(W4.wrapping_mul(c(4)));
+            a1 = a1.wrapping_sub(W4.wrapping_mul(c(4)));
+            a2 = a2.wrapping_sub(W4.wrapping_mul(c(4)));
+            a3 = a3.wrapping_add(W4.wrapping_mul(c(4)));
+        }
+        if c(5) != 0 {
+            b0 = b0.wrapping_add(W5.wrapping_mul(c(5)));
+            b1 = b1.wrapping_sub(W1.wrapping_mul(c(5)));
+            b2 = b2.wrapping_add(W7.wrapping_mul(c(5)));
+            b3 = b3.wrapping_add(W3.wrapping_mul(c(5)));
+        }
+        if c(6) != 0 {
+            a0 = a0.wrapping_add(W6.wrapping_mul(c(6)));
+            a1 = a1.wrapping_sub(W2.wrapping_mul(c(6)));
+            a2 = a2.wrapping_add(W2.wrapping_mul(c(6)));
+            a3 = a3.wrapping_sub(W6.wrapping_mul(c(6)));
+        }
+        if c(7) != 0 {
+            b0 = b0.wrapping_add(W7.wrapping_mul(c(7)));
+            b1 = b1.wrapping_sub(W5.wrapping_mul(c(7)));
+            b2 = b2.wrapping_add(W3.wrapping_mul(c(7)));
+            b3 = b3.wrapping_sub(W1.wrapping_mul(c(7)));
+        }
+
+        out[0 * 8 + u] = (a0.wrapping_add(b0) as i32) >> COL_SHIFT;
+        out[1 * 8 + u] = (a1.wrapping_add(b1) as i32) >> COL_SHIFT;
+        out[2 * 8 + u] = (a2.wrapping_add(b2) as i32) >> COL_SHIFT;
+        out[3 * 8 + u] = (a3.wrapping_add(b3) as i32) >> COL_SHIFT;
+        out[4 * 8 + u] = (a3.wrapping_sub(b3) as i32) >> COL_SHIFT;
+        out[5 * 8 + u] = (a2.wrapping_sub(b2) as i32) >> COL_SHIFT;
+        out[6 * 8 + u] = (a1.wrapping_sub(b1) as i32) >> COL_SHIFT;
+        out[7 * 8 + u] = (a0.wrapping_sub(b0) as i32) >> COL_SHIFT;
     }
     out
 }
@@ -548,7 +603,7 @@ fn store_pred_block(
 fn decode_intra_block(
     r: &mut BitReader,
     quant: Quant,
-    lut: &VlcLut,
+    lut: &RlLut,
     dc_table: &[Code],
     dc_predictor: &mut i32,
     rl: &[RlEntry],
@@ -575,6 +630,36 @@ fn decode_intra_block(
     while index < 64 {
         if r.bits_left() == 0 {
             break;
+        }
+        // ── 快路：一次 17 位窗口同时解决 EOB / escape / RL / 符号位 ──
+        // 窗口 = 16 位码前缀 + 紧接着的 1 位符号，所以**16 位的长码也走这条路**
+        // （早先只用 16 位窗口，长码全掉到慢路上去 —— 高码率素材里长码很常见）。
+        // escape 和「一段不足 17 位」才落回下面的原路径（原路径本来就是判据）。
+        if r.bits_left() >= LUT_BITS as usize + 1 {
+            let w = r.peek_u(LUT_BITS + 1);
+            let slot = lut.slots[(w >> 1) as usize];
+            let bits = slot >> 13;
+            match slot & 3 {
+                RL_SYM => {
+                    let run = ((slot >> 2) & 31) as usize;
+                    let level = ((slot >> 7) & 63) as i32;
+                    // 窗口是 17 位：码占高 16 位里的前 `bits` 位，符号位在
+                    // 第 `16 - bits` 位（不是最低位 —— 只有 bits == 16 时才是）。
+                    let negative = (w >> (LUT_BITS - bits)) & 1 == 1;
+                    r.advance(bits + 1);
+                    index += run;
+                    if index < 64 {
+                        coeffs[scan[index]] = if negative { -level } else { level };
+                    }
+                    index += 1;
+                    continue;
+                }
+                RL_EOB => {
+                    r.advance(bits);
+                    break;
+                }
+                _ => {}
+            }
         }
         if r.bits_left() >= eob.1 as usize && r.peek_u(eob.1 as u32) == eob.0 as u32 {
             r.skip(eob.1 as u32)
@@ -626,7 +711,7 @@ fn decode_intra_block(
         }
 
         let entry =
-            decode_rl_lut(r, lut, rl)
+            decode_rl(r, rl)
                 .ok_or_else(|| DecodeError::new("rl", r.bit_pos(), index as i64))?;
         let run = rl[entry].run as usize;
         let level = rl[entry].level as i32;
@@ -657,7 +742,7 @@ fn decode_intra_block(
 fn decode_inter_block(
     r: &mut BitReader,
     quant: Quant,
-    lut: &VlcLut,
+    lut: &RlLut,
     rl: &[RlEntry],
     scan: &[usize; 64],
     eob: (u16, u8),
@@ -691,6 +776,36 @@ fn decode_inter_block(
     while index < 64 {
         if r.bits_left() == 0 {
             break;
+        }
+        // ── 快路：一次 17 位窗口同时解决 EOB / escape / RL / 符号位 ──
+        // 窗口 = 16 位码前缀 + 紧接着的 1 位符号，所以**16 位的长码也走这条路**
+        // （早先只用 16 位窗口，长码全掉到慢路上去 —— 高码率素材里长码很常见）。
+        // escape 和「一段不足 17 位」才落回下面的原路径（原路径本来就是判据）。
+        if r.bits_left() >= LUT_BITS as usize + 1 {
+            let w = r.peek_u(LUT_BITS + 1);
+            let slot = lut.slots[(w >> 1) as usize];
+            let bits = slot >> 13;
+            match slot & 3 {
+                RL_SYM => {
+                    let run = ((slot >> 2) & 31) as usize;
+                    let level = ((slot >> 7) & 63) as i32;
+                    // 窗口是 17 位：码占高 16 位里的前 `bits` 位，符号位在
+                    // 第 `16 - bits` 位（不是最低位 —— 只有 bits == 16 时才是）。
+                    let negative = (w >> (LUT_BITS - bits)) & 1 == 1;
+                    r.advance(bits + 1);
+                    index += run;
+                    if index < 64 {
+                        coeffs[scan[index]] = if negative { -level } else { level };
+                    }
+                    index += 1;
+                    continue;
+                }
+                RL_EOB => {
+                    r.advance(bits);
+                    break;
+                }
+                _ => {}
+            }
         }
         if r.bits_left() >= eob.1 as usize && r.peek_u(eob.1 as u32) == eob.0 as u32 {
             r.skip(eob.1 as u32)
@@ -740,7 +855,7 @@ fn decode_inter_block(
             continue;
         }
 
-        let entry = decode_rl_lut(r, lut, rl)
+        let entry = decode_rl(r, rl)
             .ok_or_else(|| DecodeError::new("rl_inter", r.bit_pos(), index as i64))?;
         let run = rl[entry].run as usize;
         let level = rl[entry].level as i32;
@@ -947,8 +1062,8 @@ struct BlockTables<'a> {
     intra_rl: &'a [RlEntry],
     inter_rl: &'a [RlEntry],
     /// 上面两张 RL 表的查找表（进程内建一次，见 `inter_lut` / `intra_lut_for`）。
-    intra_lut: &'static VlcLut,
-    inter_lut: &'static VlcLut,
+    intra_lut: &'static RlLut,
+    inter_lut: &'static RlLut,
     scan: &'a [usize; 64],
     intra_eob: (u16, u8),
     inter_eob: (u16, u8),
@@ -1007,11 +1122,17 @@ fn mpeg2_extension(
 }
 
 /// 解一帧 I 图像。
-pub fn decode_i_frame(
+/// 解一个 I 帧，写进调用方给的 `out`。
+///
+/// ⚠️ **不建帧、不清空**：底色由调用方负责（单线程走 `decode_i_frame` 的包装，
+/// 多线程走 `MtDecoder` —— 那边只预填 worker 负责的那几行，别处是复用的旧数据）。
+/// 写入只允许发生在自己那些 slice 覆盖的行上。
+fn decode_i_frame_into(
     sequence: &SequenceHeader,
     picture: PictureHeader,
     data: &[u8],
-) -> Result<Frame, DecodeError> {
+    out: &mut Frame,
+) -> Result<(), DecodeError> {
     if !matches!(picture.picture_type, PictureType::I) {
         return Err(DecodeError::new("picture_type", 0, 0));
     }
@@ -1026,15 +1147,9 @@ pub fn decode_i_frame(
     let width = sequence.width as usize;
     let height = sequence.height as usize;
     let chroma_format = sequence.chroma_format;
-    let (cw, ch) = chroma_dims(chroma_format, width, height);
+    let (cw, _ch) = chroma_dims(chroma_format, width, height);
     let mb_blocks = mb_block_count(chroma_format);
-    let mut frame = Frame {
-        width: sequence.width,
-        height: sequence.height,
-        y: vec![0; width * height],
-        u: vec![128; cw * ch],
-        v: vec![128; cw * ch],
-    };
+    let mut frame = out;
 
     let mb_w = width.div_ceil(16);
     let mb_h = height.div_ceil(16);
@@ -1143,6 +1258,43 @@ pub fn decode_i_frame(
     if decoded_slices == 0 {
         return Err(DecodeError::new("no_slices", 0, 0));
     }
+    Ok(())
+}
+
+/// 解一个 I 帧（自己建帧缓冲）。多线程 / 复用缓冲的路径走 `decode_i_frame_into`。
+pub fn decode_i_frame(
+    sequence: &SequenceHeader,
+    picture: PictureHeader,
+    data: &[u8],
+) -> Result<Frame, DecodeError> {
+    let mut frame = base_frame(sequence, picture.picture_type, None);
+    decode_i_frame_into(sequence, picture, data, &mut frame)?;
+    Ok(frame)
+}
+
+/// 解一个 P 帧（自己建帧缓冲，底色 = 参考帧）。
+pub fn decode_p_frame(
+    sequence: &SequenceHeader,
+    picture: PictureHeader,
+    data: &[u8],
+    reference: &Frame,
+    other: Option<&Frame>,
+) -> Result<Frame, DecodeError> {
+    let mut frame = base_frame(sequence, picture.picture_type, Some(reference));
+    decode_p_frame_into(sequence, picture, data, reference, other, &mut frame)?;
+    Ok(frame)
+}
+
+/// 解一个 B 帧（自己建帧缓冲，底色 = 前向参考帧）。
+pub fn decode_b_frame(
+    sequence: &SequenceHeader,
+    picture: PictureHeader,
+    data: &[u8],
+    forward: &Frame,
+    backward: &Frame,
+) -> Result<Frame, DecodeError> {
+    let mut frame = base_frame(sequence, picture.picture_type, Some(forward));
+    decode_b_frame_into(sequence, picture, data, forward, backward, &mut frame)?;
     Ok(frame)
 }
 
@@ -1322,13 +1474,15 @@ fn add_mb_block(
 }
 
 /// 解一帧 P 图像：以 `reference` 为底做前向运动补偿 + 残差。
-pub fn decode_p_frame(
+/// 解一个 P 帧，写进调用方给的 `out`（底色 = 参考帧，见 `decode_i_frame_into` 的说明）。
+fn decode_p_frame_into(
     sequence: &SequenceHeader,
     picture: PictureHeader,
     data: &[u8],
     reference: &Frame,
     other: Option<&Frame>,
-) -> Result<Frame, DecodeError> {
+    out: &mut Frame,
+) -> Result<(), DecodeError> {
     if !matches!(picture.picture_type, PictureType::P) {
         return Err(DecodeError::new("picture_type", 0, 0));
     }
@@ -1352,15 +1506,7 @@ pub fn decode_p_frame(
     let chroma_format = sequence.chroma_format;
     let (cw, ch) = chroma_dims(chroma_format, width, height);
     let mb_blocks = mb_block_count(chroma_format);
-    // 以参考帧为底：**被跳过的宏块天然就是「零运动矢量、无残差」的预测**，
-    // 不需要单独处理 —— 后面解到的宏块再覆盖它。
-    let mut frame = Frame {
-        width: sequence.width,
-        height: sequence.height,
-        y: reference.y.clone(),
-        u: reference.u.clone(),
-        v: reference.v.clone(),
-    };
+    let mut frame = out;
 
     let mb_w = width.div_ceil(16);
     let mb_h = height.div_ceil(16);
@@ -1715,7 +1861,7 @@ pub fn decode_p_frame(
     if decoded_slices == 0 {
         return Err(DecodeError::new("no_slices", 0, 0));
     }
-    Ok(frame)
+    Ok(())
 }
 
 /// 写一个 B 帧块：按前向 / 后向 / 双向取预测，再叠残差。
@@ -1928,13 +2074,15 @@ struct BPrev {
 ///
 /// 参考帧由调用方按**解码序**维护：`forward` 是前一个 I/P，`backward` 是紧随其后的
 /// I/P（在码流里它比 B 帧先出现）。
-pub fn decode_b_frame(
+/// 解一个 B 帧，写进调用方给的 `out`（底色 = 前向参考帧）。
+fn decode_b_frame_into(
     sequence: &SequenceHeader,
     picture: PictureHeader,
     data: &[u8],
     forward: &Frame,
     backward: &Frame,
-) -> Result<Frame, DecodeError> {
+    out: &mut Frame,
+) -> Result<(), DecodeError> {
     if !matches!(picture.picture_type, PictureType::B) {
         return Err(DecodeError::new("picture_type", 0, 0));
     }
@@ -1961,13 +2109,7 @@ pub fn decode_b_frame(
     let chroma_format = sequence.chroma_format;
     let (cw, ch) = chroma_dims(chroma_format, width, height);
     let mb_blocks = mb_block_count(chroma_format);
-    let mut frame = Frame {
-        width: sequence.width,
-        height: sequence.height,
-        y: forward.y.clone(),
-        u: forward.u.clone(),
-        v: forward.v.clone(),
-    };
+    let mut frame = out;
 
     let mb_w = width.div_ceil(16);
     let mb_h = height.div_ceil(16);
@@ -2287,159 +2429,304 @@ pub fn decode_b_frame(
     if decoded_slices == 0 {
         return Err(DecodeError::new("no_slices", 0, 0));
     }
-    Ok(frame)
+    Ok(())
 }
 
-/// 多线程解码：**按 slice 切给多个线程**，各自解自己那几行，最后按行合并。
+/// 一帧的「底色」：I 帧 = 黑 + 中性色度；P / B 帧 = 参考帧的拷贝。
+///
+/// 只有**没有被任何 slice 覆盖的行**会留着底色；被覆盖的行由解码写入。
+/// 跳过宏块（`macroblock_address_increment > 1`）的语义是「参考帧原位」，
+/// 所以多线程路径下每个 worker 必须**先把自己那段行区间填成底色**再解
+/// （见 `MtDecoder::decode`）。
+fn base_frame(sequence: &SequenceHeader, picture_type: PictureType, forward: Option<&Frame>) -> Frame {
+    let width = sequence.width as usize;
+    let height = sequence.height as usize;
+    let (cw, ch) = chroma_dims(sequence.chroma_format, width, height);
+    let (y, u, v) = match (picture_type, forward) {
+        (PictureType::I, _) | (_, None) => (
+            vec![0u8; width * height],
+            vec![128u8; cw * ch],
+            vec![128u8; cw * ch],
+        ),
+        (_, Some(f)) => (f.y.clone(), f.u.clone(), f.v.clone()),
+    };
+    Frame {
+        width: sequence.width,
+        height: sequence.height,
+        y,
+        u,
+        v,
+    }
+}
+
+/// 一段**宏块行** `[rs, re)` 在三个平面上对应的字节区间。
+///
+/// ⚠️ 行号要先乘平面宽度才是字节偏移 —— 直接把宏块行号当下标用，会把
+/// 「第 20 个宏块行」当成「第 20 个字节」，整片错位。
+/// 色度的行数按色度格式缩放：4:2:0 减半，4:2:2 / 4:4:4 与亮度相同。
+struct RowSpan<'a> {
+    y: &'a mut [u8],
+    u: &'a mut [u8],
+    v: &'a mut [u8],
+}
+
+/// 把 `src` 的宏块行 `[r0, r1)` 拷进 `dst` 的同一段行（三个平面各一份）。
+fn copy_rows(dst: &mut Frame, src: &Frame, r0: usize, r1: usize, chroma_format: u8) {
+    let height = dst.height as usize;
+    let lw = dst.y.len() / height.max(1);
+    let ch = match chroma_format {
+        2 | 3 => height,
+        _ => height.div_ceil(2),
+    };
+    let cw = dst.u.len() / ch.max(1);
+    let shift = if chroma_format == 1 { 1 } else { 0 };
+    let (y0, y1) = (r0 * 16 * lw, r1 * 16 * lw);
+    let (c0, c1) = ((r0 << (4 - shift)) * cw, (r1 << (4 - shift)) * cw);
+    dst.y[y0..y1].copy_from_slice(&src.y[y0..y1]);
+    dst.u[c0..c1].copy_from_slice(&src.u[c0..c1]);
+    dst.v[c0..c1].copy_from_slice(&src.v[c0..c1]);
+}
+
+/// 把 `dst` 的宏块行 `[r0, r1)` 填成 I 帧的底色（亮度 0、色度 128）。
+fn fill_blank_rows(dst: &mut Frame, r0: usize, r1: usize, chroma_format: u8) {
+    let span = row_span(dst, r0, r1, chroma_format);
+    span.y.fill(0);
+    span.u.fill(128);
+    span.v.fill(128);
+}
+
+fn row_span(frame: &mut Frame, rs: usize, re: usize, chroma_format: u8) -> RowSpan<'_> {
+    let height = frame.height as usize;
+    let (ylen, ulen) = (frame.y.len(), frame.u.len());
+    let lw = ylen / height.max(1); // 亮度平面一行多少字节
+    let ch = match chroma_format {
+        2 | 3 => height,
+        _ => height.div_ceil(2),
+    };
+    let cw = ulen / ch.max(1);
+    // 4:2:0 的色度行数是亮度的一半；4:2:2 / 4:4:4 相同。
+    let shift = if chroma_format == 1 { 1 } else { 0 };
+    let (c0, c1) = ((rs << (4 - shift)) * cw, (re << (4 - shift)) * cw);
+    let (y0, y1) = ((rs * 16 * lw).min(ylen), (re * 16 * lw).min(ylen));
+    let (c0, c1) = (c0.min(ulen), c1.min(ulen));
+    RowSpan {
+        y: &mut frame.y[y0..y1],
+        u: &mut frame.u[c0..c1],
+        v: &mut frame.v[c0..c1],
+    }
+}
+
+/// 多线程解码器：**按 slice 的行区间切给多个线程**，各自解自己那几行，最后按行合并。
 ///
 /// ## 为什么能按 slice 切
 ///
-/// MPEG-1/2 的 slice 从 `slice_vertical_position` 指定的**宏块行**开始，
-/// 宏块按光栅序连续排到下一个 slice —— 所以每个 slice 覆盖一段**互不重叠的整行**，
-/// 写进输出缓冲区不会打架。而 slice 内的全部状态（DC 预测器、MV 预测器、
-/// 量化尺度）都以 slice 为单位复位，**slice 之间没有依赖**。
+/// slice 从 `slice_vertical_position` 指定的**宏块行**开始，宏块按光栅序连续排到
+/// 下一个 slice —— 每片覆盖一段**互不重叠的整行**；slice 内的状态（DC / MV
+/// 预测器、量化尺度）都以 slice 为单位复位，**片间无依赖**。
 ///
-/// ## 实现要点
+/// ## 不为线程单独写解码逻辑
 ///
-/// 不为每个线程单独写一份解码逻辑 —— 那必然漂。做法是给每个线程**重组一段只含
-/// 自己那些 slice 的码流**，直接调既有的 `decode_frame`，再把解出来的行按范围
-/// 拷回主帧。每个线程的输出帧本身就是「参考帧副本 + 自己那几行」，
-/// 所以没被任何 slice 覆盖的行天然就是参考帧内容。
+/// 每个线程拿「图像头 + 自己那几个 slice」重组的码流，直接调
+/// `decode_frame_into` 写进**自己复用的帧缓冲**，主线程再把各行拷回结果。
 ///
-/// 代价：每个线程多一份帧缓冲（1080p ≈ 3.1 MB）。6 个线程约 19 MB，换来的是
-/// 解码时间按线程数近线性下降。
-pub fn decode_frame_mt(
-    sequence: &SequenceHeader,
-    picture: PictureHeader,
-    data: &[u8],
-    forward: Option<&Frame>,
-    backward: Option<&Frame>,
+/// ## 每个 worker 要先填底色
+///
+/// 跳过宏块的语义是「参考帧原位」，所以 worker 必须把自己那段行区间先填成底色
+/// （P/B 从参考帧拷，I 帧填 0/128）再解；缓冲区其余部分是上一帧的旧数据，**不会
+/// 被合并，也不该被读**。
+///
+/// ## 代价
+///
+/// 每帧两次全帧大小的行拷贝（worker 填底色 + 主线程合并），换来解码时间按线程数
+/// 下降。worker 缓冲跨帧复用，不重新分配。
+pub struct MtDecoder {
     threads: usize,
-) -> Result<Frame, DecodeError> {
-    // 收集这一帧的所有 slice（连同起始码，方便重组码流）。
-    let units = crate::split_units(data);
-    let mut slices: Vec<(u8, Vec<u8>)> = Vec::new();
-    // ⚠️ **图像头 / 扩展要一起带上**：MPEG-2 的 picture coding extension 就在图像头
-    // 后面、第一个 slice 前面，`mpeg2_extension()` 是从 `data` 里扫它的。只把 slice
-    // 拼给线程，扩展就丢了 → MPEG-2 会按 MPEG-1 的表解，直接报错。
-    let mut head: &[u8] = &[];
-    for (code, payload) in &units {
-        if (0x01..=0xAF).contains(code) {
-            if head.is_empty() {
-                let off = (payload.as_ptr() as usize)
-                    .wrapping_sub(data.as_ptr() as usize)
-                    .saturating_sub(4) // 去掉这个 slice 自己的起始码（下面会重新拼）
-                    .min(data.len());
-                head = &data[..off];
+    /// 每个 worker 复用的帧缓冲（跨帧不释放）。
+    bufs: Vec<Frame>,
+}
+
+impl MtDecoder {
+    pub fn new(threads: usize) -> Self {
+        MtDecoder {
+            threads: threads.max(1),
+            bufs: Vec::new(),
+        }
+    }
+
+    /// 解一帧。`forward` / `backward` 的语义同 `decode_frame`。
+    pub fn decode(
+        &mut self,
+        sequence: &SequenceHeader,
+        picture: PictureHeader,
+        data: &[u8],
+        forward: Option<&Frame>,
+        backward: Option<&Frame>,
+    ) -> Result<Frame, DecodeError> {
+        // 收集这一帧的所有 slice（连同起始码，方便重组码流）。
+        let units = crate::split_units(data);
+        let mut slices: Vec<(u8, Vec<u8>)> = Vec::new();
+        // ⚠️ **图像头 / 扩展要一起带上**：MPEG-2 的 picture coding extension 就在图像头
+        // 后面、第一个 slice 前面，`mpeg2_extension()` 是从 `data` 里扫它的。只把 slice
+        // 拼给线程，扩展就丢了 → MPEG-2 会按 MPEG-1 的表解，直接报错。
+        let mut head: &[u8] = &[];
+        for (code, payload) in &units {
+            if (0x01..=0xAF).contains(code) {
+                if head.is_empty() {
+                    let off = (payload.as_ptr() as usize)
+                        .wrapping_sub(data.as_ptr() as usize)
+                        .saturating_sub(4) // 去掉这个 slice 自己的起始码（下面会重新拼）
+                        .min(data.len());
+                    head = &data[..off];
+                }
+                let mut raw = Vec::with_capacity(payload.len() + 4);
+                raw.extend_from_slice(&[0, 0, 1, *code]);
+                raw.extend_from_slice(payload);
+                slices.push((*code, raw));
             }
-            let mut raw = Vec::with_capacity(payload.len() + 4);
-            raw.extend_from_slice(&[0, 0, 1, *code]);
-            raw.extend_from_slice(payload);
-            slices.push((*code, raw));
         }
-    }
-    let mb_h = (sequence.height as usize).div_ceil(16);
-    // 单线程 / 只有一片 / 帧太小 —— 直接走原路径，别为线程开销买单。
-    if threads <= 1 || slices.len() <= 1 || mb_h < 4 {
-        return decode_frame(sequence, picture, data, forward, backward);
-    }
+        let mb_h = (sequence.height as usize).div_ceil(16);
+        // 单线程 / 只有一片 / 帧太小 —— 直接走原路径，别为线程开销买单。
+        if self.threads <= 1 || slices.len() <= 1 || mb_h < 4 {
+            return decode_frame(sequence, picture, data, forward, backward);
+        }
 
-    // 按行把 slice 分成 `threads` 组（连续的 slice 并到一组，减少线程数）。
-    let mut groups: Vec<(usize, usize, Vec<u8>)> = Vec::new(); // (起始行, 结束行, 码流)
-    let target = slices.len().div_ceil(threads).max(1);
-    let mut cur: Vec<(u8, Vec<u8>)> = Vec::new();
-    let flush = |cur: &mut Vec<(u8, Vec<u8>)>, groups: &mut Vec<(usize, usize, Vec<u8>)>| {
-        if cur.is_empty() {
-            return;
-        }
-        let first = (cur[0].0 as usize).saturating_sub(1);
-        let last = (cur[cur.len() - 1].0 as usize).saturating_sub(1) + 1;
-        let mut raw = Vec::new();
-        for (_, r) in cur.drain(..) {
-            raw.extend_from_slice(&r);
-        }
-        let mut with_head = Vec::with_capacity(head.len() + raw.len());
-        with_head.extend_from_slice(head);
-        with_head.extend_from_slice(&raw);
-        groups.push((first, last, with_head));
-    };
-    for s in slices {
-        cur.push(s);
-        if cur.len() >= target {
-            flush(&mut cur, &mut groups);
-        }
-    }
-    flush(&mut cur, &mut groups);
-
-    // ⚠️ **组的结束行 = 下一组的起始行**（最后一组到帧底）。一个 slice 覆盖到
-    // 下一个 slice 的起始行为止；写成「本组最后一个 slice 的起始行 + 1」会把
-    // 最后一个 slice 之后的行漏掉 —— I 帧那些行没人写，就留着初值。
-    for i in 0..groups.len() {
-        groups[i].1 = if i + 1 < groups.len() {
-            groups[i + 1].0
-        } else {
-            mb_h
+        // 按**行区间**切组，而不是按「每组几片」—— 常见流只有 9 片（每片 4 行），
+        // 按片数切最多用满 5 个线程；按行区间切能把 36 行均分给 8 个线程。
+        // 一个 slice 覆盖到下一个 slice 的起始行为止，所以切点必须落在**片边界**上
+        // （否则某一组会缺行）。做法：按行边界扫，到了下一个线程的行区间就切。
+        let mut groups: Vec<(usize, usize, Vec<u8>)> = Vec::new(); // (起始行, 结束行, 码流)
+        let mut cur: Vec<(u8, Vec<u8>)> = Vec::new();
+        let flush = |cur: &mut Vec<(u8, Vec<u8>)>, groups: &mut Vec<(usize, usize, Vec<u8>)>| {
+            if cur.is_empty() {
+                return;
+            }
+            let first = (cur[0].0 as usize).saturating_sub(1);
+            let last = (cur[cur.len() - 1].0 as usize).saturating_sub(1) + 1;
+            let raw_len: usize = cur.iter().map(|(_, r)| r.len()).sum();
+            let mut with_head = Vec::with_capacity(head.len() + raw_len);
+            with_head.extend_from_slice(head);
+            for (_, r) in cur.drain(..) {
+                with_head.extend_from_slice(&r);
+            }
+            groups.push((first, last, with_head));
         };
-    }
-
-    // 主帧：先铺参考帧（I 帧铺 128），再把各组解出来的行盖上。
-    let base = match forward {
-        Some(f) => f.clone(),
-        None => Frame {
-            width: sequence.width,
-            height: sequence.height,
-            y: vec![128u8; (sequence.width * sequence.height) as usize],
-            u: vec![128u8; ((sequence.width / 2) * (sequence.height / 2)) as usize],
-            v: vec![128u8; ((sequence.width / 2) * (sequence.height / 2)) as usize],
-        },
-    };
-    let mut out = base;
-    if groups.is_empty() {
-        return Ok(out);
-    }
-
-    let mut results: Vec<(usize, usize, Result<Frame, DecodeError>)> = Vec::new();
-    std::thread::scope(|scope| {
-        let mut handles = Vec::new();
-        for (row_start, row_end, raw) in groups {
-            let f = forward;
-            let b = backward;
-            let pic = picture.clone();
-            handles.push((
-                row_start,
-                row_end,
-                scope.spawn(move || decode_frame(sequence, pic, &raw, f, b)),
-            ));
+        // 第 i 组覆盖的行区间是 [i*mb_h/threads, (i+1)*mb_h/threads)；遇到某个 slice
+        // 的起始行已经越过这个上界、并且还没用完线程额度，就切一刀。
+        let threads = self.threads.min(slices.len());
+        let mut group_index = 0usize;
+        let mut next_boundary = mb_h.div_ceil(threads).max(1);
+        for s in slices {
+            let row = (s.0 as usize).saturating_sub(1);
+            if row >= next_boundary && group_index + 1 < threads {
+                flush(&mut cur, &mut groups);
+                group_index += 1;
+                next_boundary =
+                    ((group_index + 1) * mb_h).div_ceil(threads).max(next_boundary + 1);
+            }
+            cur.push(s);
         }
-        for (rs, re, h) in handles {
-            results.push((rs, re, h.join().unwrap_or_else(|_| Err(DecodeError::new("worker panic", 0, 0)))));
-        }
-    });
+        flush(&mut cur, &mut groups);
 
-    // 按行合并。⚠️ **行号要乘平面宽度才是字节偏移** —— 直接拿 `rs * 16` 当下标，
-    // 会把「第 20 个宏块行」当成「第 20 个字节」，整片错位（实测表现为零星几个
-    // 宏块变成 0）。
-    let lw = out.y.len() / (out.height as usize).max(1);
-    let ch = match sequence.chroma_format {
-        2 => out.height as usize,
-        _ => out.height as usize / 2,
-    };
-    let cw = out.u.len() / ch.max(1);
-    for (rs, re, res) in results {
-        let f = res?;
-        let y0 = (rs * 16 * lw).min(out.y.len());
-        let y1 = (re * 16 * lw).min(out.y.len());
-        out.y[y0..y1].copy_from_slice(&f.y[y0..y1]);
-        // 色度行按 4:2:0 减半；4:2:2 / 4:4:4 不减半。
-        let shift = if sequence.chroma_format == 2 { 0 } else { 1 };
-        let c0 = ((rs << (4 - shift)) * cw).min(out.u.len());
-        let c1 = ((re << (4 - shift)) * cw).min(out.u.len());
-        if c0 < c1 {
-            out.u[c0..c1].copy_from_slice(&f.u[c0..c1]);
-            out.v[c0..c1].copy_from_slice(&f.v[c0..c1]);
+        // ⚠️ **组的结束行 = 下一组的起始行**（最后一组到帧底）。一个 slice 覆盖到
+        // 下一个 slice 的起始行为止；写成「本组最后一个 slice 的起始行 + 1」会把
+        // 最后一个 slice 之后的行漏掉 —— I 帧那些行没人写，就留着初值。
+        for i in 0..groups.len() {
+            groups[i].1 = if i + 1 < groups.len() {
+                groups[i + 1].0
+            } else {
+                mb_h
+            };
         }
+
+        // worker 缓冲：按需分配 / 尺寸变了就重建（跨帧复用，不每帧申请）。
+        let want = groups.len();
+        if self.bufs.len() < want
+            || self
+                .bufs
+                .first()
+                .is_some_and(|f| f.width != sequence.width || f.height != sequence.height)
+        {
+            self.bufs.clear();
+            for _ in 0..want {
+                self.bufs.push(Frame {
+                    width: sequence.width,
+                    height: sequence.height,
+                    y: Vec::new(),
+                    u: Vec::new(),
+                    v: Vec::new(),
+                });
+            }
+        }
+        for buf in &mut self.bufs[..want] {
+            if buf.y.len() != (sequence.width as usize) * (sequence.height as usize) {
+                let (w, h) = (sequence.width as usize, sequence.height as usize);
+                let (cw, ch) = chroma_dims(sequence.chroma_format, w, h);
+                buf.y.resize(w * h, 0);
+                buf.u.resize(cw * ch, 128);
+                buf.v.resize(cw * ch, 128);
+            }
+        }
+
+        // 结果帧：只需要「没有被任何组覆盖的行」有底色（被覆盖的行由合并写满）。
+        let mut out = base_frame(sequence, picture.picture_type, forward);
+        let first_start = groups.first().map(|g| g.0).unwrap_or(0);
+        let last_end = groups.last().map(|g| g.1).unwrap_or(0);
+        let intra = matches!(picture.picture_type, PictureType::I);
+        for (r0, r1) in [(0usize, first_start), (last_end, mb_h)] {
+            if r0 >= r1 {
+                continue;
+            }
+            match (intra, forward) {
+                (true, _) | (false, None) => {
+                    fill_blank_rows(&mut out, r0, r1, sequence.chroma_format)
+                }
+                (false, Some(f)) => copy_rows(&mut out, f, r0, r1, sequence.chroma_format),
+            }
+        }
+
+        let chroma_format = sequence.chroma_format;
+        let mut results: Vec<(usize, usize, Result<(), DecodeError>)> = Vec::new();
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for ((rs, re, raw), buf) in groups.into_iter().zip(self.bufs.iter_mut()) {
+                let f = forward;
+                let b = backward;
+                let pic = picture.clone();
+                handles.push((
+                    rs,
+                    re,
+                    scope.spawn(move || {
+                        // ① 把自己那段行区间填成底色（跳过宏块需要「参考帧原位」）。
+                        match (intra, f) {
+                            (true, _) | (false, None) => {
+                                fill_blank_rows(buf, rs, re, chroma_format)
+                            }
+                            (false, Some(fwd)) => copy_rows(buf, fwd, rs, re, chroma_format),
+                        }
+                        // ② 解自己那几个 slice，写进同一块缓冲。
+                        decode_frame_into(sequence, pic, &raw, f, b, buf)
+                    }),
+                ));
+            }
+            for (rs, re, h) in handles {
+                results.push((
+                    rs,
+                    re,
+                    h.join()
+                        .unwrap_or_else(|_| Err(DecodeError::new("worker panic", 0, 0))),
+                ));
+            }
+        });
+
+        // ③ 按行合并回结果帧（每组一段，互不重叠）。任何一个 worker 失败就整体失败 ——
+        // 半帧结果比没有结果更坏。
+        for (i, (rs, re, res)) in results.into_iter().enumerate() {
+            res?;
+            let buf = &self.bufs[i];
+            copy_rows(&mut out, buf, rs, re, chroma_format);
+        }
+        Ok(out)
     }
-    Ok(out)
 }
 
 /// 按图像类型分派。P 帧给 `forward`；B 帧给 `forward` 与 `backward`。
@@ -2450,27 +2737,58 @@ pub fn decode_frame(
     forward: Option<&Frame>,
     backward: Option<&Frame>,
 ) -> Result<Frame, DecodeError> {
+    let mut frame = base_frame(sequence, picture.picture_type, forward);
+    decode_frame_into(sequence, picture, data, forward, backward, &mut frame)?;
+    Ok(frame)
+}
+
+/// 同 `decode_frame`，但写进调用方给的 `out`（**不会清空它**）。
+///
+/// ⚠️ 调用方必须先把 `out` 填成底色（`base_frame` 干的事）：被跳过的宏块
+/// 直接读缓冲区里已有的内容当预测。多线程路径只填 worker 负责的那几行。
+pub fn decode_frame_into(
+    sequence: &SequenceHeader,
+    picture: PictureHeader,
+    data: &[u8],
+    forward: Option<&Frame>,
+    backward: Option<&Frame>,
+    out: &mut Frame,
+) -> Result<(), DecodeError> {
     if let Some(ext) = mpeg2_extension(sequence, data)? {
         if ext.picture_structure != 3 {
             return Err(DecodeError::new("field_picture_in_frame_path", 0, 0));
         }
     }
     match picture.picture_type {
-        PictureType::I => decode_i_frame(sequence, picture, data),
+        PictureType::I => decode_i_frame_into(sequence, picture, data, out),
         PictureType::P => {
             let forward =
                 forward.ok_or_else(|| DecodeError::new("missing_reference", 0, 0))?;
-            decode_p_frame(sequence, picture, data, forward, None)
+            decode_p_frame_into(sequence, picture, data, forward, None, out)
         }
         PictureType::B => {
             let forward =
                 forward.ok_or_else(|| DecodeError::new("missing_reference", 0, 0))?;
             let backward =
                 backward.ok_or_else(|| DecodeError::new("missing_backward_reference", 0, 0))?;
-            decode_b_frame(sequence, picture, data, forward, backward)
+            decode_b_frame_into(sequence, picture, data, forward, backward, out)
         }
         _ => Err(DecodeError::new("unsupported_picture_type", 0, 0)),
     }
+}
+
+/// 一次性多线程解码（方便用；**每帧都新建 `MtDecoder`**，缓冲不跨帧复用）。
+///
+/// 连续解很多帧请直接用 [`MtDecoder`] —— 那边的 worker 缓冲是复用的。
+pub fn decode_frame_mt(
+    sequence: &SequenceHeader,
+    picture: PictureHeader,
+    data: &[u8],
+    forward: Option<&Frame>,
+    backward: Option<&Frame>,
+    threads: usize,
+) -> Result<Frame, DecodeError> {
+    MtDecoder::new(threads).decode(sequence, picture, data, forward, backward)
 }
 
 /// 解一个**场**（`picture_structure = 1/2`）：半高画面。
@@ -2510,84 +2828,85 @@ pub fn decode_field(
 #[cfg(test)]
 mod lut_tests {
     use super::*;
-    use crate::tables::{MPEG1_RL, MV_CODE, MB_ADDR_INCR, MB_PATTERN};
+    use crate::tables::{MPEG1_RL, MPEG2_RL};
 
-    /// LUT 与线性扫描必须在**每一个 12 位前缀**上给出一致结果。
-    #[test]
-    fn lut_agrees_with_linear_scan() {
-        fn check(name: &str, table: &[Code]) {
-            let lut = build_lut(table);
-            for prefix in 0u32..(1 << LUT_BITS) {
-                // 左对齐：让 `prefix` 的 12 个位正好是码流的前 12 位。
-                let raw = (prefix << (32 - LUT_BITS)).to_be_bytes();
-                let bits = BitReader::new(&raw);
-                let want = linear_scan(&bits, table);
-                let (symbol, len) = lut.slots[prefix as usize];
-                match (len, want) {
-                    (1..=16, Some((i, l))) if len as u32 <= LUT_BITS => assert!(
-                        symbol as usize == i && len as u32 == l,
-                        "{name}: 前缀 {prefix:012b} LUT 给 ({symbol},{len})，线性给 ({i},{l})"
-                    ),
-                    (0, w) => assert!(
-                        w.map_or(true, |(_, l)| l > LUT_BITS),
-                        "{name}: 前缀 {prefix:012b} LUT 未命中，但线性给出 {w:?}"
-                    ),
-                    _ => unreachable!(),
+    /// 参考语义：**调用方原来的检查顺序** —— EOB 先、escape 次、RL 线性扫描最后。
+    /// 快路（RlLut）必须在每一个前缀上和它给出一致的结论。
+    fn reference(prefix: u32, table: &[RlEntry], eob: (u16, u8)) -> (u32, u32, u32) {
+        // 返回 (kind, a, b)：kind 0 = 普通符号（a = 下标），1 = EOB，2 = escape，3 = 没有。
+        let top = |n: u32| prefix >> (LUT_BITS - n);
+        if top(eob.1 as u32) == eob.0 as u32 {
+            return (1, 0, eob.1 as u32);
+        }
+        if top(ESCAPE_BITS as u32) == ESCAPE_CODE as u32 {
+            return (2, 0, ESCAPE_BITS as u32);
+        }
+        for len in 1..=LUT_BITS {
+            let v = top(len);
+            for (index, entry) in table.iter().enumerate() {
+                if entry.bits as u32 == len && entry.code as u32 == v {
+                    return (0, index as u32, len);
                 }
             }
         }
-        fn check_rl(table: &[RlEntry]) {
-            let lut = build_lut(table);
-            for prefix in 0u32..(1 << LUT_BITS) {
-                let (symbol, len) = lut.slots[prefix as usize];
-                let raw = (prefix << (32 - LUT_BITS)).to_be_bytes();
-                let r = BitReader::new(&raw);
-                let mut want = None;
-                'outer: for l in 1..=16u32 {
-                    if r.bits_left() < l as usize {
-                        break;
-                    }
-                    let v = r.peek_u(l);
-                    for (i, e) in table.iter().enumerate() {
-                        if e.bits as u32 == l && e.code as u32 == v {
-                            want = Some((i, l));
-                            break 'outer;
-                        }
-                    }
-                }
-                match (len, want) {
-                    (1..=16, Some((i, l))) if len as u32 <= LUT_BITS => assert!(
-                        symbol as usize == i && len as u32 == l,
-                        "RL: 前缀 {prefix:012b} LUT 给 ({symbol},{len})，线性给 ({i},{l})"
-                    ),
-                    (0, w) => assert!(
-                        w.map_or(true, |(_, l)| l > LUT_BITS),
-                        "RL: 前缀 {prefix:012b} LUT 未命中，但线性给出 {w:?}"
-                    ),
-                    _ => unreachable!(),
-                }
-            }
-        }
-        check("MV_CODE", &MV_CODE);
-        check("MB_ADDR_INCR", &MB_ADDR_INCR);
-        check("MB_PATTERN", &MB_PATTERN);
-        check_rl(&MPEG1_RL);
+        (3, 0, 0)
     }
 
-    /// 线性扫描的参考实现（和改之前的 `decode_vlc` 一样）。
-    fn linear_scan(r: &BitReader, table: &[Code]) -> Option<(usize, u32)> {
-        let max_bits = table.iter().map(|e| e.bits).max().unwrap_or(0) as u32;
-        for len in 1..=max_bits {
-            if r.bits_left() < len as usize {
-                return None;
-            }
-            let value = r.peek_u(len);
-            for (index, entry) in table.iter().enumerate() {
-                if entry.bits as u32 == len && entry.code as u32 == value {
-                    return Some((index, len));
+    /// 两张表（MPEG-1 / MPEG-2 intra_vlc）× 全部 65536 个 16 位前缀：
+    /// 快路查出来的 (kind, run, level, bits) 必须和参考语义逐项相同。
+    #[test]
+    fn rl_lut_agrees_with_reference_order() {
+        for (name, table, eob) in [
+            ("MPEG1_RL/inter", &MPEG1_RL, (EOB_CODE, EOB_BITS)),
+            ("MPEG2_RL/intra_vlc", &MPEG2_RL, (0b0110u16, 4u8)),
+        ] {
+            let lut = build_rl_lut(table, eob);
+            for prefix in 0u32..(1 << LUT_BITS) {
+                let (kind, a, bits) = reference(prefix, table, eob);
+                let slot = lut.slots[prefix as usize];
+                let got_kind = slot & 3;
+                let got_bits = slot >> 13;
+                assert_eq!(got_kind, kind, "{name}: 前缀 {prefix:016b} 的 kind 不一致");
+                assert_eq!(got_bits, bits, "{name}: 前缀 {prefix:016b} 的码长不一致");
+                if kind == RL_SYM {
+                    let entry = &table[a as usize];
+                    assert_eq!((slot >> 2) & 31, entry.run as u32, "{name}: run 不一致");
+                    assert_eq!((slot >> 7) & 63, entry.level as u32, "{name}: level 不一致");
                 }
             }
         }
-        None
+    }
+
+    /// 纯 DC 块（只有一个 DC 系数）必须出**平地**，值约等于 dc / 8
+    /// （IDCT 的归一化：u=v=0 时 s = S[0][0] / 8）。
+    ///
+    /// 这条同时钉住 DC-only 捷径：那一行的 8 个中间值都是 `(dc*8) as i16`，
+    /// 再经列通道的 `W4*(x+32) >> 20`。若捷径失效（走了通用路径），
+    /// 舍入会不同 —— 表现为平地上出现 ±1 的纹。
+    #[test]
+    fn idct_dc_only_block_is_flat() {
+        for dc in [0i32, 1, -1, 8, -8, 64, -64, 512, -512, 4095, -4095] {
+            let mut block = [0i32; 64];
+            block[0] = dc;
+            let out = idct_residual(&block);
+            let flat = out[0];
+            assert!(
+                out.iter().all(|&v| v == flat),
+                "dc={dc} 不是平地：{:?}",
+                &out[..8]
+            );
+            // 容差 1：`>> 20` 的取整。
+            assert!(
+                (flat - dc / 8).abs() <= 1,
+                "dc={dc} 的平地值 {flat} 偏离 dc/8={}",
+                dc / 8
+            );
+        }
+    }
+
+    /// 全零块必须出全零（线性 + 捷径都不能凭空造出值）。
+    #[test]
+    fn idct_zero_is_zero() {
+        assert_eq!(idct_residual(&[0i32; 64]), [0i32; 64]);
     }
 }
