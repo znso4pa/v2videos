@@ -8,6 +8,20 @@
 //! 参考件用 `ffmpeg -frames:v 1 -f rawvideo -pix_fmt yuv420p` 生成。
 //! 判据是**逐像素**，容差 2：浮点 IDCT 与整数 IDCT 在舍入上会有 ±1 差别，
 //! 那是实现选择；任何更大的差别都是 bug。
+//!
+//! ⚠️ 覆盖不到的两块，用下面的片段补（都要各跑一遍）：
+//!
+//! ```bash
+//! # 隔行 DCT + 场运动估计（帧图）。这一条抓到过「B 帧跳过宏块照抄上一块的
+//! # field_motion，导致帧图里按场运动取像素、底场错 90」的 bug。
+//! ffmpeg -f lavfi -i testsrc=size=720x576:rate=25:duration=4 -vf setfield=tff \
+//!   -c:v mpeg2video -b:v 8M -bf 1 -flags +ildct+ilme -alternate_scan 1 -f mpeg out.mpg
+//!
+//! # 真正的场图（picture_structure = 1/2）：ffmpeg 的 mpeg2 编码器只会出帧图
+//! # （实测 100 张全是 structure=3），所以 `field_pictures_match_the_reference`
+//! # 拿 ffmpeg 生成的样本永远会报 "no field frames decoded"。这条要有硬件编码器
+//! # 的样本才能覆盖。
+//! ```
 
 use v2v_mpeg12::{
     PictureType, SequenceHeader, decode::decode_frame, decode::decode_i_frame, split_pictures,
