@@ -120,6 +120,26 @@ impl<'a> BitReader<'a> {
         debug_assert!(self.bits_left() >= n as usize);
         self.pos += n as usize;
     }
+
+    /// 底层字节切片。
+    ///
+    /// 给**本地位缓存**用：解码内层循环里每个符号都调一次 `peek_u`，等于
+    /// 每符号一次 8 字节 unaligned load + bswap + 移位；缓存版本一次装 64 位、
+    /// 能连着服务好几个符号。缓存需要直接读原始字节，所以这里把它交出去。
+    #[inline]
+    pub fn data(&self) -> &'a [u8] {
+        self.data
+    }
+
+    /// 直接把游标设到绝对位位置 —— **给本地位缓存同步用**。
+    ///
+    /// 调用方必须自己保证 `pos <= data.len() * 8`（缓存那边只会在已经
+    /// 消费过的位置上回写，所以这个前提天然成立）。
+    #[inline]
+    pub fn set_pos(&mut self, pos: usize) {
+        debug_assert!(pos <= self.data.len() * 8);
+        self.pos = pos;
+    }
 }
 
 #[cfg(test)]
