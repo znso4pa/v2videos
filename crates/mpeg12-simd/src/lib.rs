@@ -54,4 +54,8 @@ pub extern "C" fn v2v_mpeg12_simd_kernels() -> u32 {
 pub mod kernels;
 
 /// 解码入口（当前直接转调 `v2v-mpeg12`，见模块文档：安全路径是 oracle）。
-pub use v2v_mpeg12::decode::decode_frame;
+///
+/// ⚠️ **性能上与 `v2v-mpeg12` 完全相同** —— 这里只是转调，`kernels` 里的
+/// unsafe 内核还没接进解码路径。要让它真的变快，得先在 `v2v-mpeg12` 里留一个
+/// 内核挂载点（本 crate 依赖 mpeg12，反过来不行，所以挂载点必须在 mpeg12 侧）。
+pub use v2v_mpeg12::decode::{decode_frame, MtDecoder};

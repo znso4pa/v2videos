@@ -8,15 +8,26 @@
 /// 本 crate 提供的内核（位掩码）。
 pub const KERNEL_AVG: u32 = 1 << 0;
 
-/// 当前CPU 上实际可用的内核（运行时检测，不是编译期）。
+/// 当前实际**会用到**的内核（位掩码）。
+///
+/// ⚠️ 关掉 `unsafe-kernels` feature 时这里是 0 —— 因为那时 `avg_rows` 走标量，
+/// 内核根本没被调用。早先这里不看 feature、恒报可用，等于骗宿主。
 pub fn available() -> u32 {
-    let mut mask = 0;
-    if avg_available() {
-        mask |= KERNEL_AVG;
+    #[cfg(feature = "unsafe-kernels")]
+    {
+        let mut mask = 0;
+        if avg_available() {
+            mask |= KERNEL_AVG;
+        }
+        mask
     }
-    mask
+    #[cfg(not(feature = "unsafe-kernels"))]
+    {
+        0
+    }
 }
 
+#[cfg(feature = "unsafe-kernels")]
 fn avg_available() -> bool {
     // x86_64 一定有 SSE2；AVX2 只是更快，没有也能跑。
     #[cfg(target_arch = "x86_64")]
@@ -42,28 +53,33 @@ pub fn avg_rows_scalar(dst: &mut [u8], a: &[u8], b: &[u8]) {
 }
 
 /// 半像素平均。三个切片必须**等长**（不变量，调用方保证）。
+///
+/// `unsafe-kernels` feature 关掉时走标量 —— 这样「关掉 feature 就完全不碰
+/// unsafe」才是真的（之前 feature 声明了却没人读，等于永远走 SIMD）。
 pub fn avg_rows(dst: &mut [u8], a: &[u8], b: &[u8]) {
     assert_eq!(dst.len(), a.len(), "dst 与 a 不等长");
     assert_eq!(dst.len(), b.len(), "dst 与 b 不等长");
-    if !avg_available() {
-        avg_rows_scalar(dst, a, b);
-        return;
-    }
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        avg_rows_x86(dst, a, b)
-    }
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        avg_rows_neon(dst, a, b)
-    }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(feature = "unsafe-kernels")]
     {
-        avg_rows_scalar(dst, a, b);
+        if avg_available() {
+            #[cfg(target_arch = "x86_64")]
+            {
+                // 安全：切片等长已断言，内核只读写 `0..dst.len()`，不越界。
+                unsafe { avg_rows_x86(dst, a, b) };
+                return;
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                // 安全：同上，切片等长已断言，内核只读写 `0..dst.len()`。
+                unsafe { avg_rows_neon(dst, a, b) };
+                return;
+            }
+        }
     }
+    avg_rows_scalar(dst, a, b);
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(feature = "unsafe-kernels", target_arch = "x86_64"))]
 #[target_feature(enable = "sse2")]
 unsafe fn avg_rows_x86(dst: &mut [u8], a: &[u8], b: &[u8]) {
     use std::arch::x86_64::*;
@@ -88,7 +104,7 @@ unsafe fn avg_rows_x86(dst: &mut [u8], a: &[u8], b: &[u8]) {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(feature = "unsafe-kernels", target_arch = "aarch64"))]
 #[target_feature(enable = "neon")]
 unsafe fn avg_rows_neon(dst: &mut [u8], a: &[u8], b: &[u8]) {
     use std::arch::aarch64::*;
