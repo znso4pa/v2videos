@@ -84,6 +84,7 @@ fn run_bench(sample: &str, rounds: usize, threads: usize) -> std::process::ExitC
         "[bench] {} {w}x{h} {frames} 帧 / {} 遍：**{ms:.2} ms/帧**（threads={threads}）",
         sample, rounds
     );
+    v2v_mpeg12::decode::prof::report();
     std::process::ExitCode::SUCCESS
 }
 
