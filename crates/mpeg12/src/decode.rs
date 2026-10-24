@@ -621,22 +621,30 @@ fn idct_residual(block: &[i32; 64]) -> [i32; 64] {
 fn store_block(residual: &[i32; 64], offset: i32, out: &mut [u8], stride: usize, at: usize) {
     let _g = prof::enabled().then(|| prof::Guard::new(prof::STORE));
     for y in 0..8 {
+        // 一行先攒成 `[u8; 8]` 再整块写：直接逐像素下标的话，LLVM 既证明不了
+        // 边界（每像素一次检查），也没法把 8 次单字节写合成一次 8 字节写。
+        let mut row = [0u8; 8];
         for x in 0..8 {
-            out[at + y * stride + x] = (residual[y * 8 + x] + offset).clamp(0, 255) as u8;
+            row[x] = (residual[y * 8 + x] + offset).clamp(0, 255) as u8;
         }
+        let base = at + y * stride;
+        out[base..base + 8].copy_from_slice(&row);
     }
 }
 
 /// 预测块 + 残差，夹到 0..=255。帧间块用。
 ///
-/// 预测是 u8、残差是 i32：预测本来就在 0..=255，用 i32 存只是白烧 4 倍流量，
-/// 而且挡住 u8 的向量化平均（`(a+b+1)>>1` 正是 SIMD 的 `pavgb`）。
+/// 预测是 u8、残差是 i32：预测本来就在 0..=255，用 i32 存只是白烧 4 倍流量。
 fn store_pred(pred: &[u8; 64], residual: &[i32; 64], out: &mut [u8], stride: usize, at: usize) {
     let _g = prof::enabled().then(|| prof::Guard::new(prof::STORE));
     for y in 0..8 {
+        // 同 `store_block`：一行攒成 8 字节再整块写。
+        let mut row = [0u8; 8];
         for x in 0..8 {
-            out[at + y * stride + x] = (pred[y * 8 + x] as i32 + residual[y * 8 + x]).clamp(0, 255) as u8;
+            row[x] = (pred[y * 8 + x] as i32 + residual[y * 8 + x]).clamp(0, 255) as u8;
         }
+        let base = at + y * stride;
+        out[base..base + 8].copy_from_slice(&row);
     }
 }
 
