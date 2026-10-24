@@ -89,6 +89,107 @@ pub mod prof {
 
 const LUT_BITS: u32 = 16;
 
+/// 本地位缓存：一个 64 位窗口，左对齐，够连着服务好几个符号。
+///
+/// ## 为什么需要它
+///
+/// `BitReader::peek_u` 每个符号都要重新做一次「8 字节 unaligned load +
+/// `from_be_bytes` + 移位」。系数解码的内层循环一个块最多 64 个符号，
+/// 那个装载占了相当一部分时间。参考实现的做法是 `OPEN_READER`/`UPDATE_CACHE`
+/// —— 在**寄存器**里维持一个位缓存，每消费 30~50 位才重新装一次。
+///
+/// ## 语义必须与 `peek_u` 逐位相同
+///
+/// - `peek(n)` 返回的位与 `BitReader::peek_u(n)` **完全一致**（含尾部补 0）；
+/// - `bits_left()` 报的是**流里真实剩下的位数**，与缓存装了多少无关 ——
+///   调用方靠它决定什么时候落回慢路。
+///
+/// 只在系数解码的内层循环里用；慢路（escape / 尾部）会把游标交还给
+/// `BitReader` 再重新装缓存，所以 `BitReader` 始终是唯一的事实来源。
+struct BitCache<'a> {
+    data: &'a [u8],
+    /// 下一个要读的位的绝对位置。
+    pos: usize,
+    /// 从 `pos` 起的位，**左对齐**（最高位就是 `pos` 处的位）；无效低位恒为 0。
+    cache: u64,
+    /// `cache` 里可信的位数（0..=64）。
+    valid: u32,
+}
+
+impl<'a> BitCache<'a> {
+    fn new(data: &'a [u8], pos: usize) -> Self {
+        let mut c = Self {
+            data,
+            pos,
+            cache: 0,
+            valid: 0,
+        };
+        c.refill();
+        c
+    }
+
+    /// 读 `at` 位位置开始的 64 位（越界补 0，与 `peek_u` 的慢路一致）。
+    #[inline]
+    fn read64(&self, at: usize) -> u64 {
+        let byte = at >> 3;
+        match self.data.get(byte..byte + 8) {
+            Some(s) => u64::from_be_bytes(s.try_into().unwrap()),
+            None => {
+                let mut w = 0u64;
+                for i in 0..8usize {
+                    w = (w << 8) | *self.data.get(byte + i).unwrap_or(&0) as u64;
+                }
+                w
+            }
+        }
+    }
+
+    /// 把缓存补满（至少 57 位，够任何一次 `peek(17)`）。
+    #[inline]
+    fn refill(&mut self) {
+        if self.valid >= 32 {
+            return;
+        }
+        let keep = self.valid as usize;
+        let at = self.pos + keep;
+        let off = (at & 7) as u32;
+        // `w << off` 把 `at` 处的位顶到最高位，于是它正好接在已有的 keep 位后面。
+        let w = self.read64(at) << off;
+        self.cache |= w >> keep;
+        self.valid = 64.min(keep as u32 + 64 - off);
+    }
+
+    /// 偷看 `n` 位（`n <= 32`）。语义与 `BitReader::peek_u` 相同。
+    #[inline]
+    fn peek(&mut self, n: u32) -> u32 {
+        debug_assert!(n <= 32);
+        if self.valid < n {
+            self.refill();
+        }
+        (self.cache >> (64 - n)) as u32
+    }
+
+    /// 前进 `n` 位（调用方保证刚 `peek` 过、位数够）。
+    #[inline]
+    fn advance(&mut self, n: u32) {
+        debug_assert!(self.valid >= n);
+        self.cache <<= n;
+        self.valid -= n;
+        self.pos += n as usize;
+    }
+
+    /// 流里真实剩下的位数（与缓存装了多少无关）。
+    #[inline]
+    fn bits_left(&self) -> usize {
+        (self.data.len() * 8).saturating_sub(self.pos)
+    }
+
+    #[inline]
+    fn pos(&self) -> usize {
+        self.pos
+    }
+}
+
 /// 解码失败的位置。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodeError {
@@ -748,16 +849,20 @@ fn decode_intra_block(
     coeffs[0] = *dc_predictor;
 
     let mut index = 1usize;
+    // 内层循环改用本地位缓存（一次装 64 位，够连着服务好几个符号）。
+    // 慢路（escape / 尾部）会把游标交还给 `r`，所以 `r` 始终是事实来源。
+    let mut c = BitCache::new(r.data(), r.bit_pos());
     while index < 64 {
-        if r.bits_left() == 0 {
+        let left = c.bits_left();
+        if left == 0 {
             break;
         }
         // ── 快路：一次 17 位窗口同时解决 EOB / escape / RL / 符号位 ──
         // 窗口 = 16 位码前缀 + 紧接着的 1 位符号，所以**16 位的长码也走这条路**
         // （早先只用 16 位窗口，长码全掉到慢路上去 —— 高码率素材里长码很常见）。
         // escape 和「一段不足 17 位」才落回下面的原路径（原路径本来就是判据）。
-        if r.bits_left() >= LUT_BITS as usize + 1 {
-            let w = r.peek_u(LUT_BITS + 1);
+        if left >= LUT_BITS as usize + 1 {
+            let w = c.peek(LUT_BITS + 1);
             let slot = lut.slots[(w >> 1) as usize];
             let bits = slot >> 13;
             match slot & 3 {
@@ -767,7 +872,7 @@ fn decode_intra_block(
                     // 窗口是 17 位：码占高 16 位里的前 `bits` 位，符号位在
                     // 第 `16 - bits` 位（不是最低位 —— 只有 bits == 16 时才是）。
                     let negative = (w >> (LUT_BITS - bits)) & 1 == 1;
-                    r.advance(bits + 1);
+                    c.advance(bits + 1);
                     index += run;
                     if index < 64 {
                         coeffs[scan[index]] = if negative { -level } else { level };
@@ -776,15 +881,18 @@ fn decode_intra_block(
                     continue;
                 }
                 RL_EOB => {
-                    r.advance(bits);
+                    c.advance(bits);
                     break;
                 }
                 _ => {}
             }
         }
+        // ── 慢路：把游标交还给 `r`（escape / 尾部要用 `r.u` / `r.skip`）──
+        r.set_pos(c.pos());
         if r.bits_left() >= eob.1 as usize && r.peek_u(eob.1 as u32) == eob.0 as u32 {
             r.skip(eob.1 as u32)
                 .map_err(|_| DecodeError::new("eob", r.bit_pos(), 0))?;
+            c = BitCache::new(r.data(), r.bit_pos());
             break;
         }
         if r.bits_left() >= ESCAPE_BITS as usize
@@ -828,6 +936,7 @@ fn decode_intra_block(
                 coeffs[scan[index]] = level;
             }
             index += 1;
+            c = BitCache::new(r.data(), r.bit_pos());
             continue;
         }
 
@@ -845,7 +954,9 @@ fn decode_intra_block(
             coeffs[scan[index]] = if negative { -level } else { level };
         }
         index += 1;
+        c = BitCache::new(r.data(), r.bit_pos());
     }
+    r.set_pos(c.pos());
 
     // 块被 64 个系数填满时，EOB 仍然在码流里 —— 不消费它，后面全部错位。
     if index >= 64
@@ -894,16 +1005,20 @@ fn decode_inter_block(
         }
     }
 
+    // 内层循环改用本地位缓存（一次装 64 位，够连着服务好几个符号）。
+    // 慢路（escape / 尾部）会把游标交还给 `r`，所以 `r` 始终是事实来源。
+    let mut c = BitCache::new(r.data(), r.bit_pos());
     while index < 64 {
-        if r.bits_left() == 0 {
+        let left = c.bits_left();
+        if left == 0 {
             break;
         }
         // ── 快路：一次 17 位窗口同时解决 EOB / escape / RL / 符号位 ──
         // 窗口 = 16 位码前缀 + 紧接着的 1 位符号，所以**16 位的长码也走这条路**
         // （早先只用 16 位窗口，长码全掉到慢路上去 —— 高码率素材里长码很常见）。
         // escape 和「一段不足 17 位」才落回下面的原路径（原路径本来就是判据）。
-        if r.bits_left() >= LUT_BITS as usize + 1 {
-            let w = r.peek_u(LUT_BITS + 1);
+        if left >= LUT_BITS as usize + 1 {
+            let w = c.peek(LUT_BITS + 1);
             let slot = lut.slots[(w >> 1) as usize];
             let bits = slot >> 13;
             match slot & 3 {
@@ -913,7 +1028,7 @@ fn decode_inter_block(
                     // 窗口是 17 位：码占高 16 位里的前 `bits` 位，符号位在
                     // 第 `16 - bits` 位（不是最低位 —— 只有 bits == 16 时才是）。
                     let negative = (w >> (LUT_BITS - bits)) & 1 == 1;
-                    r.advance(bits + 1);
+                    c.advance(bits + 1);
                     index += run;
                     if index < 64 {
                         coeffs[scan[index]] = if negative { -level } else { level };
@@ -922,15 +1037,18 @@ fn decode_inter_block(
                     continue;
                 }
                 RL_EOB => {
-                    r.advance(bits);
+                    c.advance(bits);
                     break;
                 }
                 _ => {}
             }
         }
+        // ── 慢路：把游标交还给 `r`（escape / 尾部要用 `r.u` / `r.skip`）──
+        r.set_pos(c.pos());
         if r.bits_left() >= eob.1 as usize && r.peek_u(eob.1 as u32) == eob.0 as u32 {
             r.skip(eob.1 as u32)
                 .map_err(|_| DecodeError::new("eob_inter", r.bit_pos(), 0))?;
+            c = BitCache::new(r.data(), r.bit_pos());
             break;
         }
         if r.bits_left() >= ESCAPE_BITS as usize
@@ -973,6 +1091,7 @@ fn decode_inter_block(
                 coeffs[scan[index]] = level;
             }
             index += 1;
+            c = BitCache::new(r.data(), r.bit_pos());
             continue;
         }
 
@@ -989,7 +1108,9 @@ fn decode_inter_block(
             coeffs[scan[index]] = if negative { -level } else { level };
         }
         index += 1;
+        c = BitCache::new(r.data(), r.bit_pos());
     }
+    r.set_pos(c.pos());
 
     if index >= 64
         && r.bits_left() >= eob.1 as usize
@@ -3129,6 +3250,48 @@ mod lut_tests {
                     Some(((slot >> 5) as usize, slot & 31))
                 };
                 assert_eq!(got, want, "{name}: 前缀 {prefix:016b} 结论不一致");
+            }
+        }
+    }
+
+    /// 位缓存必须与 `BitReader` **逐位**一致。
+    ///
+    /// 判据：随机数据 × 随机起点 × 随机 peek/advance 序列 —— 每一步的
+    /// `peek(n)` 与 `peek_u(n)` 相同、`bits_left()` 相同、最终位置相同。
+    /// 位缓存错一位不是「画质差一点」，而是整帧错位，症状离根因极远。
+    #[test]
+    fn bit_cache_matches_bit_reader() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for case in 0..300 {
+            let len = 8 + (rnd() % 72) as usize;
+            let data: Vec<u8> = (0..len).map(|_| (rnd() & 0xFF) as u8).collect();
+            // 起点随机（覆盖非字节对齐）
+            let start = (rnd() % (len as u64 * 8 - 32)) as usize;
+            let mut r = BitReader::new(&data);
+            r.skip(start as u32).unwrap();
+            let mut c = BitCache::new(&data, start);
+            assert_eq!(c.bits_left(), r.bits_left(), "case {case} 起点 {start}");
+            for step in 0..80 {
+                let n = 1 + (rnd() % 17) as u32;
+                if r.bits_left() < n as usize {
+                    break;
+                }
+                assert_eq!(
+                    c.peek(n),
+                    r.peek_u(n),
+                    "case {case} step {step} n {n} @ {}",
+                    r.bit_pos()
+                );
+                c.advance(n);
+                r.advance(n);
+                assert_eq!(c.pos(), r.bit_pos(), "case {case} step {step} 位置");
+                assert_eq!(c.bits_left(), r.bits_left(), "case {case} step {step} 余量");
             }
         }
     }
