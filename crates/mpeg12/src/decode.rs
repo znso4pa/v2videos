@@ -2235,10 +2235,12 @@ fn write_b_field_prediction(
 }
 
 /// B 帧「上一个已编码宏块」的完整状态（跳过宏块沿用）。
+///
+/// 只存**矢量**，不存运动类型：跳过宏块的运动类型由图像结构决定，
+/// 见 `decode_b_frame_into` 里跳过宏块那段注释。
 #[derive(Clone, Copy)]
 struct BPrev {
     kind: crate::tables::BMbType,
-    field_motion: bool,
     fs_f: [u8; 2],
     mv_f: [[i32; 2]; 2],
     fs_b: [u8; 2],
@@ -2357,18 +2359,25 @@ fn decode_b_frame_into(
                 dc_predictor = [0i32; 3];
                 let col = skipped as usize % mb_w;
                 let row_s = skipped as usize / mb_w;
-                if p.field_motion {
-                    write_b_field_prediction(
-                        &mut frame, forward, backward, col, row_s, width, height, cw, ch,
-                        p.kind.forward, p.kind.backward, p.fs_f, p.mv_f, p.fs_b, p.mv_b,
-                        chroma_format,
-                    );
-                } else {
+                // ⚠️ 跳过宏块复用上一块的**矢量与方向**，但**运动类型不照抄**：
+                // 参考实现按图像结构定死 —— 帧图一律 16×16 帧运动（只用第 0 场的
+                // 那对矢量），场图才是场运动。
+                //
+                // 照抄 `field_motion` 会让帧图里的跳过宏块按场运动取像素
+                // （行步长 2、垂直矢量按场单位翻倍），实测隔行 B 帧每个画面
+                // 都有一个宏块的**底场**错 90 —— 顶场对、底场错，就是这个。
+                if frame_picture {
                     write_predicted_mb(
                         &mut frame, forward, backward, col, row_s, p.kind.forward,
                         p.kind.backward, (p.mv_f[0][0], p.mv_f[0][1]),
                         (p.mv_b[0][0], p.mv_b[0][1]), width, height, cw, ch, false,
                         chroma_format, mb_blocks,
+                    );
+                } else {
+                    write_b_field_prediction(
+                        &mut frame, forward, backward, col, row_s, width, height, cw, ch,
+                        p.kind.forward, p.kind.backward, p.fs_f, p.mv_f, p.fs_b, p.mv_b,
+                        chroma_format,
                     );
                 }
             }
@@ -2447,7 +2456,6 @@ fn decode_b_frame_into(
                 }
                 prev = Some(BPrev {
                     kind: mb,
-                    field_motion: false,
                     fs_f: [0, 0],
                     mv_f: [[0, 0], [0, 0]],
                     fs_b: [0, 0],
@@ -2593,7 +2601,6 @@ fn decode_b_frame_into(
             }
             prev = Some(BPrev {
                 kind: mb,
-                field_motion,
                 fs_f,
                 mv_f,
                 fs_b,
