@@ -32,13 +32,16 @@ pub mod prof {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Instant;
 
-    pub const BITS: usize = 0; // 位读取 + VLC + 反量化
+    pub const BITS: usize = 0; // 位读取 + VLC（**含**嵌套的 DEQUANT —— 见下）
     pub const IDCT: usize = 1;
     pub const MC: usize = 2;
-    pub const DEQUANT: usize = 3;
-    pub const BUCKETS: usize = 4;
+    pub const DEQUANT: usize = 3; // 反量化（被 BITS 嵌套计时，报告时单列）
+    pub const PARSE: usize = 4; // slice/宏块头、运动矢量、cbp 等循环开销（含嵌套的 BITS/MC/STORE）
+    pub const STORE: usize = 5; // 残差/预测夹到 0..255 写回平面（被 PARSE 嵌套）
+    pub const BUCKETS: usize = 6;
 
-    static NS: [AtomicU64; BUCKETS] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+    static NS: [AtomicU64; BUCKETS] =
+        [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
     static ON: AtomicU64 = AtomicU64::new(0);
 
     pub fn enabled() -> bool {
@@ -72,8 +75,14 @@ pub mod prof {
         let idct = NS[IDCT].load(Ordering::Relaxed) as f64 / 1e9;
         let mc = NS[MC].load(Ordering::Relaxed) as f64 / 1e9;
         let deq = NS[DEQUANT].load(Ordering::Relaxed) as f64 / 1e9;
+        let parse = NS[PARSE].load(Ordering::Relaxed) as f64 / 1e9;
+        let store = NS[STORE].load(Ordering::Relaxed) as f64 / 1e9;
+        // ⚠️ 嵌套关系：BITS 包住 DEQUANT；PARSE 包住 BITS/IDCT/MC/STORE；STORE 包住自身。
+        // 所以「纯解析开销」= PARSE - BITS - IDCT - MC - STORE；「纯 VLC」= BITS - DEQUANT。
+        let vlc = bits - deq;
+        let parse_only = parse - bits - idct - mc - store;
         eprintln!(
-            "[prof] 位读取+VLC {bits:.3}s | 反量化 {deq:.3}s | 逆变换 {idct:.3}s | 运动补偿 {mc:.3}s"
+            "[prof] VLC {vlc:.3}s | 反量化 {deq:.3}s | 逆变换 {idct:.3}s | 运动补偿 {mc:.3}s | 写回 {store:.3}s | 解析开销 {parse_only:.3}s"
         );
     }
 }
@@ -173,14 +182,87 @@ fn intra_lut_for(mpeg2_table: bool) -> &'static RlLut {
     }
 }
 
-fn decode_vlc(r: &mut BitReader, table: &[Code]) -> Option<usize> {
-    let max_bits = table.iter().map(|c| c.bits).max().unwrap_or(0) as u32;
+/// 通用前缀码查找表：一个 16 位窗口 → `(码长, 下标)`，一次查表解决。
+///
+/// 位域（`u32`）：
+///
+/// | 位 | 含义 |
+/// |---|------|
+/// | 0-4 | 码长（1..=16；0 = 该前缀不对应任何码） |
+/// | 5-15 | 表下标 |
+///
+/// 为什么需要它：结构码（`macroblock_address_increment`、`motion_code`、
+/// `coded_block_pattern`、`dct_dc_size`、`macroblock_type`）原本走的是
+/// 「按码长从短到长 × 遍历整张表」的线性扫描 —— 解一个 MBA 增量最坏要做
+/// 11 × 36 ≈ 400 次比较，而它**每个宏块至少调用一次**。剖析里这类结构码
+/// 合计占了 34% 的解码时间，是当时最大的一块。
+struct VlcLut {
+    slots: Vec<u32>,
+    /// 原始表，**只给尾部（不足 16 位）退化用**。
+    codes: Vec<Code>,
+}
+
+/// 空槽：该前缀不对应任何码。
+const VLC_INVALID: u32 = 0;
+
+impl VlcLut {
+    fn from_codes(codes: &[Code]) -> Self {
+        Self::build(codes.len(), |i| (codes[i].code, codes[i].bits))
+    }
+
+    fn from_pairs(n: usize, at: impl Fn(usize) -> (u16, u8)) -> Self {
+        Self::build(n, at)
+    }
+
+    fn build(n: usize, at: impl Fn(usize) -> (u16, u8)) -> Self {
+        let mut slots = vec![VLC_INVALID; 1usize << LUT_BITS];
+        let mut codes = Vec::with_capacity(n);
+        for i in 0..n {
+            let (code, bits) = at(i);
+            codes.push(Code { code, bits });
+        }
+        // 按**码长从短到长**填，且「先填者赢」—— 与线性扫描的尝试顺序完全一致。
+        for len in 1..=LUT_BITS as u8 {
+            for (index, code) in codes.iter().enumerate() {
+                if code.bits != len {
+                    continue;
+                }
+                let shift = LUT_BITS - len as u32;
+                let base = (code.code as usize) << shift;
+                let slot = len as u32 | ((index as u32) << 5);
+                for s in slots.iter_mut().skip(base).take(1usize << shift) {
+                    if *s == VLC_INVALID {
+                        *s = slot;
+                    }
+                }
+            }
+        }
+        Self { slots, codes }
+    }
+}
+
+/// 一次查表解一个前缀码。
+#[inline]
+fn decode_lut(r: &mut BitReader, lut: &VlcLut) -> Option<usize> {
+    if r.bits_left() >= LUT_BITS as usize {
+        let w = r.peek_u(LUT_BITS) as usize;
+        let slot = lut.slots[w];
+        let bits = slot & 31;
+        if bits == 0 {
+            return None;
+        }
+        r.advance(bits);
+        return Some((slot >> 5) as usize);
+    }
+    // 尾部不足一个 16 位窗口：退化回线性扫描。语义与旧实现逐位一致，
+    // 且只在每个 slice 的最后两个字节才会走到。
+    let max_bits = lut.codes.iter().map(|c| c.bits).max().unwrap_or(0) as u32;
     for len in 1..=max_bits {
         if r.bits_left() < len as usize {
             return None;
         }
         let value = r.peek_u(len);
-        for (index, code) in table.iter().enumerate() {
+        for (index, code) in lut.codes.iter().enumerate() {
             if code.bits as u32 == len && code.code as u32 == value {
                 r.skip(len).ok()?;
                 return Some(index);
@@ -188,6 +270,50 @@ fn decode_vlc(r: &mut BitReader, table: &[Code]) -> Option<usize> {
         }
     }
     None
+}
+
+/// 结构码表各自**一张**查找表，进程内只建一次。
+///
+/// ⚠️ 必须「一张表一个 `OnceLock`」。曾经在 `decode_vlc` 内部用单个
+/// `OnceLock` 缓存，结果第一张表（MBA 增量）的 LUT 被复用给了后面所有表 ——
+/// 解出来的符号全错，而且症状离根因极远（表现为某个 slice 突然解不动）。
+fn mb_addr_lut() -> &'static VlcLut {
+    static L: std::sync::OnceLock<VlcLut> = std::sync::OnceLock::new();
+    L.get_or_init(|| VlcLut::from_codes(&MB_ADDR_INCR))
+}
+
+fn mv_code_lut() -> &'static VlcLut {
+    static L: std::sync::OnceLock<VlcLut> = std::sync::OnceLock::new();
+    L.get_or_init(|| VlcLut::from_codes(&MV_CODE))
+}
+
+fn mb_pattern_lut() -> &'static VlcLut {
+    static L: std::sync::OnceLock<VlcLut> = std::sync::OnceLock::new();
+    L.get_or_init(|| VlcLut::from_codes(&MB_PATTERN))
+}
+
+fn dc_lum_lut() -> &'static VlcLut {
+    static L: std::sync::OnceLock<VlcLut> = std::sync::OnceLock::new();
+    L.get_or_init(|| VlcLut::from_codes(&DC_LUM))
+}
+
+fn dc_chroma_lut() -> &'static VlcLut {
+    static L: std::sync::OnceLock<VlcLut> = std::sync::OnceLock::new();
+    L.get_or_init(|| VlcLut::from_codes(&DC_CHROMA))
+}
+
+fn p_mb_type_lut() -> &'static VlcLut {
+    static L: std::sync::OnceLock<VlcLut> = std::sync::OnceLock::new();
+    L.get_or_init(|| {
+        VlcLut::from_pairs(P_MB_TYPE.len(), |i| (P_MB_TYPE[i].code, P_MB_TYPE[i].bits))
+    })
+}
+
+fn b_mb_type_lut() -> &'static VlcLut {
+    static L: std::sync::OnceLock<VlcLut> = std::sync::OnceLock::new();
+    L.get_or_init(|| {
+        VlcLut::from_pairs(B_MB_TYPE.len(), |i| (B_MB_TYPE[i].code, B_MB_TYPE[i].bits))
+    })
 }
 /// 在 run/level 表里按最长前缀找码。
 fn decode_rl(r: &mut BitReader, table: &[RlEntry]) -> Option<usize> {
@@ -207,40 +333,14 @@ fn decode_rl(r: &mut BitReader, table: &[RlEntry]) -> Option<usize> {
     None
 }
 
-/// P 帧 `macroblock_type`：码表是 `PMbType`，单独走一遍最长前缀。
+/// P 帧 `macroblock_type`。
 fn decode_p_mb_type(r: &mut BitReader) -> Option<usize> {
-    let max_bits = P_MB_TYPE.iter().map(|c| c.bits).max().unwrap_or(0) as u32;
-    for len in 1..=max_bits {
-        if r.bits_left() < len as usize {
-            return None;
-        }
-        let value = r.peek_u(len);
-        for (index, entry) in P_MB_TYPE.iter().enumerate() {
-            if entry.bits as u32 == len && entry.code as u32 == value {
-                r.skip(len).ok()?;
-                return Some(index);
-            }
-        }
-    }
-    None
+    decode_lut(r, p_mb_type_lut())
 }
 
 /// B 帧 `macroblock_type`。
 fn decode_b_mb_type(r: &mut BitReader) -> Option<usize> {
-    let max_bits = B_MB_TYPE.iter().map(|c| c.bits).max().unwrap_or(0) as u32;
-    for len in 1..=max_bits {
-        if r.bits_left() < len as usize {
-            return None;
-        }
-        let value = r.peek_u(len);
-        for (index, entry) in B_MB_TYPE.iter().enumerate() {
-            if entry.bits as u32 == len && entry.code as u32 == value {
-                r.skip(len).ok()?;
-                return Some(index);
-            }
-        }
-    }
-    None
+    decode_lut(r, b_mb_type_lut())
 }
 
 /// zigzag 扫描顺序 → 光栅下标。
@@ -519,6 +619,7 @@ fn idct_residual(block: &[i32; 64]) -> [i32; 64] {
 
 /// 把残差（+ 一个偏移）写到平面，夹到 0..=255。帧内块偏移 128。
 fn store_block(residual: &[i32; 64], offset: i32, out: &mut [u8], stride: usize, at: usize) {
+    let _g = prof::enabled().then(|| prof::Guard::new(prof::STORE));
     for y in 0..8 {
         for x in 0..8 {
             out[at + y * stride + x] = (residual[y * 8 + x] + offset).clamp(0, 255) as u8;
@@ -528,6 +629,7 @@ fn store_block(residual: &[i32; 64], offset: i32, out: &mut [u8], stride: usize,
 
 /// 预测块 + 残差，夹到 0..=255。帧间块用。
 fn store_pred(pred: &[i32; 64], residual: &[i32; 64], out: &mut [u8], stride: usize, at: usize) {
+    let _g = prof::enabled().then(|| prof::Guard::new(prof::STORE));
     for y in 0..8 {
         for x in 0..8 {
             out[at + y * stride + x] = (pred[y * 8 + x] + residual[y * 8 + x]).clamp(0, 255) as u8;
@@ -604,7 +706,7 @@ fn decode_intra_block(
     r: &mut BitReader,
     quant: Quant,
     lut: &RlLut,
-    dc_table: &[Code],
+    dc_lut: &VlcLut,
     dc_predictor: &mut i32,
     rl: &[RlEntry],
     scan: &[usize; 64],
@@ -613,7 +715,7 @@ fn decode_intra_block(
     let _g = prof::enabled().then(|| prof::Guard::new(prof::BITS));
     let mut coeffs = [0i32; 64];
 
-    let size = decode_vlc(r, dc_table)
+    let size = decode_lut(r, dc_lut)
         .ok_or_else(|| DecodeError::new("dc_size", r.bit_pos(), 0))?;
     if size > 0 {
         let raw = r
@@ -903,7 +1005,7 @@ fn sign_extend(val: i32, bits: u32) -> i32 {
 fn decode_mb_increment(r: &mut BitReader) -> Option<isize> {
     let mut total = 0isize;
     loop {
-        match decode_vlc(r, &MB_ADDR_INCR)? {
+        match decode_lut(r, mb_addr_lut())? {
             33 => total += 33,
             34 => {}
             35 => return None,
@@ -913,7 +1015,7 @@ fn decode_mb_increment(r: &mut BitReader) -> Option<isize> {
 }
 
 fn decode_motion(r: &mut BitReader, fcode: u32, pred: i32) -> Option<i32> {
-    let code = decode_vlc(r, &MV_CODE)? as i32;
+    let code = decode_lut(r, mv_code_lut())? as i32;
     if code == 0 {
         return Some(pred);
     }
@@ -1256,6 +1358,7 @@ fn decode_i_frame_into(
         let mut mb_index = (row * mb_w) as isize - 1;
         let total_mb = mb_w * mb_h;
         loop {
+            let _g = prof::enabled().then(|| prof::Guard::new(prof::PARSE));
             let Some(increment) = decode_mb_increment(&mut r) else {
                 break;
             };
@@ -1301,13 +1404,13 @@ fn decode_i_frame_into(
 
             let quant = Quant::new(scale, sequence.mpeg2_stream(), non_linear, precision);
             for block in 0..mb_blocks {
-                let dc_table = if block < 4 { &DC_LUM } else { &DC_CHROMA };
+                let dc_lut = if block < 4 { dc_lum_lut() } else { dc_chroma_lut() };
                 let component = if block < 4 { 0 } else { (block - 4) % 2 + 1 };
                 let coeffs = decode_intra_block(
                     &mut r,
                     quant,
                     &tables.intra_lut,
-                    dc_table,
+                    dc_lut,
                     &mut dc_predictor[component],
                     tables.intra_rl,
                     tables.scan,
@@ -1617,6 +1720,7 @@ fn decode_p_frame_into(
         let mut last_mv_f = [[0i32; 2]; 2];
         let mut mb_index = (row * mb_w) as isize - 1;
         loop {
+            let _g = prof::enabled().then(|| prof::Guard::new(prof::PARSE));
             let Some(increment) = decode_mb_increment(&mut r) else {
                 break;
             };
@@ -1705,13 +1809,13 @@ fn decode_p_frame_into(
             if mb.intra {
                 last_mv_f = [[0, 0], [0, 0]];
                 for block in 0..mb_blocks {
-                    let dc_table = if block < 4 { &DC_LUM } else { &DC_CHROMA };
+                    let dc_lut = if block < 4 { dc_lum_lut() } else { dc_chroma_lut() };
                     let component = if block < 4 { 0 } else { (block - 4) % 2 + 1 };
                     let coeffs = decode_intra_block(
                         &mut r,
                         quant,
                         &tables.intra_lut,
-                        dc_table,
+                        dc_lut,
                         &mut dc_predictor[component],
                         tables.intra_rl,
                         tables.scan,
@@ -1829,7 +1933,7 @@ fn decode_p_frame_into(
             dc_predictor = [0i32; 3];
 
             let cbp = if mb.coded {
-                let base = decode_vlc(&mut r, &MB_PATTERN)
+                let base = decode_lut(&mut r, mb_pattern_lut())
                     .ok_or_else(|| DecodeError::new("cbp", r.bit_pos(), column as i64))?
                     as u32;
                 if mb_blocks > 6 {
@@ -2223,6 +2327,7 @@ fn decode_b_frame_into(
         let mut prev: Option<BPrev> = None;
         let mut mb_index = (row * mb_w) as isize - 1;
         loop {
+            let _g = prof::enabled().then(|| prof::Guard::new(prof::PARSE));
             let Some(increment) = decode_mb_increment(&mut r) else {
                 break;
             };
@@ -2318,13 +2423,13 @@ fn decode_b_frame_into(
                 last_mv_f = [[0, 0], [0, 0]];
                 last_mv_b = [[0, 0], [0, 0]];
                 for block in 0..mb_blocks {
-                    let dc_table = if block < 4 { &DC_LUM } else { &DC_CHROMA };
+                    let dc_lut = if block < 4 { dc_lum_lut() } else { dc_chroma_lut() };
                     let component = if block < 4 { 0 } else { (block - 4) % 2 + 1 };
                     let coeffs = decode_intra_block(
                         &mut r,
                         quant,
                         &tables.intra_lut,
-                        dc_table,
+                        dc_lut,
                         &mut dc_predictor[component],
                         tables.intra_rl,
                         tables.scan,
@@ -2428,7 +2533,7 @@ fn decode_b_frame_into(
             dc_predictor = [0i32; 3];
 
             let cbp = if mb.coded {
-                let base = decode_vlc(&mut r, &MB_PATTERN)
+                let base = decode_lut(&mut r, mb_pattern_lut())
                     .ok_or_else(|| DecodeError::new("cbp", r.bit_pos(), column as i64))?
                     as u32;
                 if mb_blocks > 6 {
@@ -2940,6 +3045,71 @@ mod lut_tests {
                     assert_eq!((slot >> 2) & 31, entry.run as u32, "{name}: run 不一致");
                     assert_eq!((slot >> 7) & 63, entry.level as u32, "{name}: level 不一致");
                 }
+            }
+        }
+    }
+
+    /// 结构码表的通用查找表：**每张表 × 全部 65536 个 16 位前缀**，
+    /// 查表结论必须与线性扫描（改造前的实现）逐项一致 —— 包括「解不出码」。
+    ///
+    /// 这是快路的判据：结构码错了不是「画质差一点」，而是位游标整体错位，
+    /// 症状离根因极远（曾经就因为这个，某个 slice 突然整片解不动）。
+    #[test]
+    fn vlc_lut_agrees_with_linear_scan() {
+        /// 改造前的实现，原样保留为参考。
+        fn scan(prefix: u32, codes: &[Code]) -> Option<(usize, u32)> {
+            let max_bits = codes.iter().map(|c| c.bits).max().unwrap_or(0) as u32;
+            for len in 1..=max_bits {
+                let v = prefix >> (LUT_BITS - len);
+                for (index, code) in codes.iter().enumerate() {
+                    if code.bits as u32 == len && code.code as u32 == v {
+                        return Some((index, len));
+                    }
+                }
+            }
+            None
+        }
+
+        fn as_codes(n: usize, at: impl Fn(usize) -> (u16, u8)) -> Vec<Code> {
+            (0..n).map(|i| {
+                let (code, bits) = at(i);
+                Code { code, bits }
+            }).collect()
+        }
+
+        let tables: [(&str, &[Code]); 5] = [
+            ("MB_ADDR_INCR", &MB_ADDR_INCR),
+            ("MV_CODE", &MV_CODE),
+            ("MB_PATTERN", &MB_PATTERN),
+            ("DC_LUM", &DC_LUM),
+            ("DC_CHROMA", &DC_CHROMA),
+        ];
+        let mb_types: [(&str, Vec<Code>); 2] = [
+            (
+                "P_MB_TYPE",
+                as_codes(P_MB_TYPE.len(), |i| (P_MB_TYPE[i].code, P_MB_TYPE[i].bits)),
+            ),
+            (
+                "B_MB_TYPE",
+                as_codes(B_MB_TYPE.len(), |i| (B_MB_TYPE[i].code, B_MB_TYPE[i].bits)),
+            ),
+        ];
+
+        for (name, codes) in tables
+            .iter()
+            .map(|(n, c)| (*n, *c))
+            .chain(mb_types.iter().map(|(n, c)| (*n, c.as_slice())))
+        {
+            let lut = VlcLut::from_codes(codes);
+            for prefix in 0u32..(1 << LUT_BITS) {
+                let want = scan(prefix, codes);
+                let slot = lut.slots[prefix as usize];
+                let got = if slot == VLC_INVALID {
+                    None
+                } else {
+                    Some(((slot >> 5) as usize, slot & 31))
+                };
+                assert_eq!(got, want, "{name}: 前缀 {prefix:016b} 结论不一致");
             }
         }
     }
