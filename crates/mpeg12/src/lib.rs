@@ -275,15 +275,40 @@ pub enum Unit<'a> {
     SequenceEnd,
 }
 
+/// 一个 64 位字里**有没有** 0 字节（SWAR，不需要 unsafe）。
+///
+/// 原理：`w - 0x0101..` 会把每个字节的 0 变成 0xFF 并借位，`& !w` 把原本非零的
+/// 位清掉，最后 `& 0x8080..` 只看每个字节的最高位。
+#[inline]
+const fn has_zero_byte(w: u64) -> bool {
+    w.wrapping_sub(0x0101_0101_0101_0101) & !w & 0x8080_8080_8080_8080 != 0
+}
+
 /// 按 start code 切分 elementary stream。
 ///
 /// 返回 `(code, payload)`，`payload` 是该 start code 之后、下一个 start code
 /// 之前的字节。**不解析 slice 内部**——那是宏块层的事。
+///
+/// 扫描用 8 字节一跳：`00 00 01` 必然以 `00` 开头，所以**一个不含 0 字节的
+/// 8 字节字里不可能有任何 start code 的开头**（包括跨字边界的那些 —— 跨边界也
+/// 得先有两个 0）。命中含 0 的字之后再逐字节确认。
 pub fn split_units(es: &[u8]) -> Vec<(u8, &[u8])> {
+    let len = es.len();
     let mut out = Vec::new();
     let mut starts = Vec::new();
     let mut i = 0;
-    while i + 3 < es.len() {
+    while i + 3 < len {
+        // 跳过不含 0 字节的整字
+        while i + 8 <= len {
+            let w = u64::from_be_bytes(es[i..i + 8].try_into().unwrap());
+            if has_zero_byte(w) {
+                break;
+            }
+            i += 8;
+        }
+        if i + 3 >= len {
+            break;
+        }
         if es[i] == 0 && es[i + 1] == 0 && es[i + 2] == 1 {
             starts.push(i);
             i += 3;
@@ -291,10 +316,10 @@ pub fn split_units(es: &[u8]) -> Vec<(u8, &[u8])> {
             i += 1;
         }
     }
-    for (n, &start) in starts.iter().enumerate() {
+    for (k, &start) in starts.iter().enumerate() {
         let code = es[start + 3];
         let body_start = start + 4;
-        let body_end = starts.get(n + 1).copied().unwrap_or(es.len());
+        let body_end = starts.get(k + 1).copied().unwrap_or(len);
         out.push((code, &es[body_start..body_end]));
     }
     out
@@ -345,6 +370,110 @@ mod tests {
         let mut r = BitReader::new(&[0xFF]);
         assert_eq!(r.u(8).ok(), Some(0xFF));
         assert!(r.u(1).is_err());
+    }
+
+    /// 逐字节扫描的参考实现 —— `split_units` 的 8 字节 SWAR 快路必须与它
+    /// **切出完全相同的单元序列**（位置、码、长度）。
+    ///
+    /// 为什么要穷举：SWAR 快路一次跳 8 字节，最容易错的就是「跨字边界的
+    /// `00 00 01`」和「末尾不足 8 字节」这两处，而那两处错了不会崩，
+    /// 只会让某一帧少解一段 —— 症状离根因极远。
+    #[test]
+    fn split_units_matches_bytewise_scan() {
+        /// 逐字节找 start code（改造前的实现）。
+        fn starts_of(es: &[u8]) -> Vec<usize> {
+            let mut starts = Vec::new();
+            let mut i = 0;
+            while i + 3 < es.len() {
+                if es[i] == 0 && es[i + 1] == 0 && es[i + 2] == 1 {
+                    starts.push(i);
+                    i += 3;
+                } else {
+                    i += 1;
+                }
+            }
+            starts
+        }
+
+        /// 按参考实现切出 `(码, 载荷绝对起点, 载荷长度)`。
+        fn expect(es: &[u8], starts: &[usize]) -> Vec<(u8, usize, usize)> {
+            let base = es.as_ptr() as usize;
+            starts
+                .iter()
+                .enumerate()
+                .map(|(k, &s)| {
+                    let end = starts.get(k + 1).copied().unwrap_or(es.len());
+                    (es[s + 3], base + s + 4, end - (s + 4))
+                })
+                .collect()
+        }
+
+        fn got(es: &[u8]) -> Vec<(u8, usize, usize)> {
+            split_units(es)
+                .into_iter()
+                .map(|(code, body)| (code, body.as_ptr() as usize, body.len()))
+                .collect()
+        }
+
+        // 两个 start code 之间至少隔 4 字节（每个 start code 后面跟着自己的码字节）。
+        // 更近的话**两边都切不出合法切片**（原实现会 panic），真实码流不会出现 ——
+        // 这类退化输入直接跳过，不在它上面比。
+        let usable = |starts: &[usize]| starts.windows(2).all(|w| w[1] - w[0] >= 4);
+
+        // 随机数据 × 三种 0 密度（真码流里 0 很少，但错就错在密集处）
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut checked = 0usize;
+        for case in 0..400 {
+            let len = (rnd() % 220) as usize;
+            let dense = case % 3;
+            let data: Vec<u8> = (0..len)
+                .map(|_| {
+                    let r = rnd();
+                    match dense {
+                        0 => (r & 0xFF) as u8,
+                        1 => (r % 3) as u8,
+                        _ => {
+                            if r % 4 == 0 {
+                                0
+                            } else {
+                                (r >> 8) as u8
+                            }
+                        }
+                    }
+                })
+                .collect();
+            let starts = starts_of(&data);
+            if !usable(&starts) {
+                continue;
+            }
+            checked += 1;
+            assert_eq!(
+                got(&data),
+                expect(&data, &starts),
+                "case {case} len {len} dense {dense}"
+            );
+        }
+        assert!(checked > 100, "有效用例太少（{checked}），测试没覆盖到东西");
+
+        // 手工边界：跨 8 字节边界、末尾恰好、末尾不足
+        for data in [
+            &b"\x00\x00\x01\xb3abc"[..],
+            &b"abcdef\x00\x00\x01\x00"[..],
+            &b"abcdefgh\x00\x00\x01\xb5"[..],
+            &b"abcd\x00\x00\x01\xb8xy\x00\x00\x01\x00z"[..],
+            &b"\x00\x00\x01"[..],
+            &b"abcdefghijklmnop"[..],
+        ] {
+            let starts = starts_of(data);
+            assert!(usable(&starts), "边界用例本身退化：{data:?}");
+            assert_eq!(got(data), expect(data, &starts), "边界 {data:?}");
+        }
     }
 
     #[test]
