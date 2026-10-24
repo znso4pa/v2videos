@@ -628,12 +628,23 @@ fn store_block(residual: &[i32; 64], offset: i32, out: &mut [u8], stride: usize,
 }
 
 /// 预测块 + 残差，夹到 0..=255。帧间块用。
-fn store_pred(pred: &[i32; 64], residual: &[i32; 64], out: &mut [u8], stride: usize, at: usize) {
+///
+/// 预测是 u8、残差是 i32：预测本来就在 0..=255，用 i32 存只是白烧 4 倍流量，
+/// 而且挡住 u8 的向量化平均（`(a+b+1)>>1` 正是 SIMD 的 `pavgb`）。
+fn store_pred(pred: &[u8; 64], residual: &[i32; 64], out: &mut [u8], stride: usize, at: usize) {
     let _g = prof::enabled().then(|| prof::Guard::new(prof::STORE));
     for y in 0..8 {
         for x in 0..8 {
-            out[at + y * stride + x] = (pred[y * 8 + x] + residual[y * 8 + x]).clamp(0, 255) as u8;
+            out[at + y * stride + x] = (pred[y * 8 + x] as i32 + residual[y * 8 + x]).clamp(0, 255) as u8;
         }
+    }
+}
+
+/// 只写预测（没有残差）：预测已经是 0..=255，不用再夹。
+fn store_pixels(pred: &[u8; 64], out: &mut [u8], stride: usize, at: usize) {
+    let _g = prof::enabled().then(|| prof::Guard::new(prof::STORE));
+    for y in 0..8 {
+        out[at + y * stride..at + y * stride + 8].copy_from_slice(&pred[y * 8..y * 8 + 8]);
     }
 }
 
@@ -1121,7 +1132,7 @@ fn predict_block(
     row_step: i32,
     mv_y_scale: i32,
     chroma_format: u8,
-) -> [i32; 64] {
+) -> [u8; 64] {
     let _g = prof::enabled().then(|| prof::Guard::new(prof::MC));
     let (mx, my) = if chroma {
         let (hs, vs) = match chroma_format {
@@ -1137,7 +1148,9 @@ fn predict_block(
     let iy = (my >> 1) * mv_y_scale;
     let fx = mx & 1;
     let fy = my & 1;
-    let mut out = [0i32; 64];
+    // 预测值本身就是 0..=255 的像素（u8 的平均还在 0..=255 内），所以存 u8 ——
+    // 存 i32 要多 4 倍内存流量，而且挡住 u8 的向量化平均。
+    let mut out = [0u8; 64];
     let sx = origin_x as i32 + ix;
     let sy = origin_y as i32 + row_step * 0 + iy; // 块左上角的参考坐标
     // 四个抽头在这一块上覆盖的包围盒。整块都在帧内 → 一个像素都不用 clamp
@@ -1163,7 +1176,7 @@ fn predict_block(
                 for y in 0..8 {
                     let base = row0 + y * row_step as usize * stride;
                     for x in 0..8 {
-                        out[y * 8 + x] = reference[base + x] as i32;
+                        out[y * 8 + x] = reference[base + x];
                     }
                 }
             }
@@ -1171,9 +1184,9 @@ fn predict_block(
                 for y in 0..8 {
                     let base = row0 + y * row_step as usize * stride;
                     for x in 0..8 {
-                        let a = reference[base + x] as i32;
-                        let b = reference[base + x + 1] as i32;
-                        out[y * 8 + x] = (a + b + 1) >> 1;
+                        let a = reference[base + x] as u16;
+                        let b = reference[base + x + 1] as u16;
+                        out[y * 8 + x] = ((a + b + 1) >> 1) as u8;
                     }
                 }
             }
@@ -1182,9 +1195,9 @@ fn predict_block(
                     let a0 = row0 + y * row_step as usize * stride;
                     let b0 = row1 + y * row_step as usize * stride;
                     for x in 0..8 {
-                        let a = reference[a0 + x] as i32;
-                        let b = reference[b0 + x] as i32;
-                        out[y * 8 + x] = (a + b + 1) >> 1;
+                        let a = reference[a0 + x] as u16;
+                        let b = reference[b0 + x] as u16;
+                        out[y * 8 + x] = ((a + b + 1) >> 1) as u8;
                     }
                 }
             }
@@ -1193,11 +1206,11 @@ fn predict_block(
                     let a0 = row0 + y * row_step as usize * stride;
                     let b0 = row1 + y * row_step as usize * stride;
                     for x in 0..8 {
-                        let a = reference[a0 + x] as i32;
-                        let b = reference[a0 + x + 1] as i32;
-                        let c = reference[b0 + x] as i32;
-                        let d = reference[b0 + x + 1] as i32;
-                        out[y * 8 + x] = (a + b + c + d + 2) >> 2;
+                        let a = reference[a0 + x] as u16;
+                        let b = reference[a0 + x + 1] as u16;
+                        let c = reference[b0 + x] as u16;
+                        let d = reference[b0 + x + 1] as u16;
+                        out[y * 8 + x] = ((a + b + c + d + 2) >> 2) as u8;
                     }
                 }
             }
@@ -1209,17 +1222,17 @@ fn predict_block(
         for x in 0..8 {
             let sx = origin_x as i32 + ix + x as i32;
             let sy = origin_y as i32 + row_step * y as i32 + iy;
-            let at = |dx: i32, dy: i32| -> i32 {
+            let at = |dx: i32, dy: i32| -> u16 {
                 let px = (sx + dx).clamp(0, width as i32 - 1) as usize;
                 let py = (sy + dy).clamp(0, height as i32 - 1) as usize;
-                reference[py * stride + px] as i32
+                reference[py * stride + px] as u16
             };
             let a = at(0, 0);
             out[y * 8 + x] = match (fx, fy) {
-                (0, 0) => a,
-                (1, 0) => (a + at(1, 0) + 1) >> 1,
-                (0, 1) => (a + at(0, row_step) + 1) >> 1,
-                _ => (a + at(1, 0) + at(0, row_step) + at(1, row_step) + 2) >> 2,
+                (0, 0) => a as u8,
+                (1, 0) => ((a + at(1, 0) + 1) >> 1) as u8,
+                (0, 1) => ((a + at(0, row_step) + 1) >> 1) as u8,
+                _ => ((a + at(1, 0) + at(0, row_step) + at(1, row_step) + 2) >> 2) as u8,
             };
         }
     }
@@ -1493,7 +1506,7 @@ fn write_field_prediction(
                 &reference.y, width, width, height, origin_x, src_y, mv[j][0], mv[j][1],
                 false, 2, 2, chroma_format,
             );
-            store_block(&pred, 0, &mut frame.y, 2 * width, dst_y * width + origin_x);
+            store_pixels(&pred, &mut frame.y, 2 * width, dst_y * width + origin_x);
         }
     }
     // 色度：4:2:0 每个场 8×4；4:2:2 / 4:4:4 每个场 8×8。
@@ -1515,8 +1528,8 @@ fn write_field_prediction(
         for y in 0..chroma_rows {
             for x in 0..8 {
                 let idx = dst_y * cw + origin_x + y * (2 * cw) + x;
-                frame.u[idx] = pred_u[y * 8 + x].clamp(0, 255) as u8;
-                frame.v[idx] = pred_v[y * 8 + x].clamp(0, 255) as u8;
+                frame.u[idx] = pred_u[y * 8 + x];
+                frame.v[idx] = pred_v[y * 8 + x];
             }
         }
     }
@@ -1558,7 +1571,7 @@ fn write_field_picture_mb(
             4 | 6 | 8 | 10 => &mut frame.u,
             _ => &mut frame.v,
         };
-        store_block(&pred, 0, out, stride, origin_y * plane_width + origin_x);
+        store_pixels(&pred, out, stride, origin_y * plane_width + origin_x);
     }
 }
 
@@ -1600,16 +1613,16 @@ fn write_dmv_prediction(
             op, plane_width, rw, rh, origin_x, origin_y, mv2[0], mv2[1], chroma, 1, 1,
             chroma_format,
         );
-        let mut pred = [0i32; 64];
+        let mut pred = [0u8; 64];
         for i in 0..64 {
-            pred[i] = (p0[i] + p2[i] + 1) >> 1;
+            pred[i] = ((p0[i] as u16 + p2[i] as u16 + 1) >> 1) as u8;
         }
         let out = match block {
             0..=3 => &mut frame.y,
             4 | 6 | 8 | 10 => &mut frame.u,
             _ => &mut frame.v,
         };
-        store_block(&pred, 0, out, stride, origin_y * plane_width + origin_x);
+        store_pixels(&pred, out, stride, origin_y * plane_width + origin_x);
     }
 }
 
@@ -2084,16 +2097,7 @@ fn write_b_block(
     } else {
         None
     };
-    let mut pred = [0i32; 64];
-    for i in 0..64 {
-        pred[i] = match (&pf, &pb) {
-            // 双向预测取两路平均（四舍五入）。
-            (Some(a), Some(b)) => (a[i] + b[i] + 1) >> 1,
-            (Some(a), None) => a[i],
-            (None, Some(b)) => b[i],
-            (None, None) => 0,
-        };
-    }
+    let pred = combine_pred(&pf, &pb);
     let out_plane = match block {
         0..=3 => &mut frame.y,
         4 | 6 | 8 | 10 => &mut frame.u,
@@ -2132,11 +2136,11 @@ fn write_predicted_mb(
 }
 
 /// 合并前向 / 后向两路预测（双向取平均）。
-fn combine_pred(pf: &Option<[i32; 64]>, pb: &Option<[i32; 64]>) -> [i32; 64] {
-    let mut out = [0i32; 64];
+fn combine_pred(pf: &Option<[u8; 64]>, pb: &Option<[u8; 64]>) -> [u8; 64] {
+    let mut out = [0u8; 64];
     for i in 0..64 {
         out[i] = match (pf, pb) {
-            (Some(a), Some(b)) => (a[i] + b[i] + 1) >> 1,
+            (Some(a), Some(b)) => ((a[i] as u16 + b[i] as u16 + 1) >> 1) as u8,
             (Some(a), None) => a[i],
             (None, Some(b)) => b[i],
             (None, None) => 0,
@@ -2189,7 +2193,7 @@ fn write_b_field_prediction(
                 None
             };
             let pred = combine_pred(&pf, &pb);
-            store_block(&pred, 0, &mut frame.y, 2 * width, dst_y * width + origin_x);
+            store_pixels(&pred, &mut frame.y, 2 * width, dst_y * width + origin_x);
         }
         // 色度：4:2:0 每个场 8×4；4:2:2 / 4:4:4 每个场 8×8。
         let chroma_rows = if chroma_format == 1 { 4 } else { 8 };
@@ -2197,7 +2201,7 @@ fn write_b_field_prediction(
         let chroma_mb_w = if chroma_format == 3 { 16 } else { 8 };
         let origin_x = column * chroma_mb_w;
         let dst_y = mb_row * chroma_mb_h + j;
-        let pred = |plane_f: &[u8], plane_b: &[u8]| -> [i32; 64] {
+        let pred = |plane_f: &[u8], plane_b: &[u8]| -> [u8; 64] {
             let pf = if fwd {
                 let src_y = mb_row * chroma_mb_h + fs_f[j] as usize;
                 Some(predict_block(
