@@ -110,6 +110,16 @@ impl<'a> BitReader<'a> {
         self.pos += n as usize;
         Ok(())
     }
+
+    /// 无条件前进 `n` 位（**调用方必须自己保证位数够**）。
+    ///
+    /// VLC 快路用：查表已经知道码长，且调用方刚查过 `bits_left`，
+    /// 再走一遍 `skip` 的边界检查是纯浪费。debug 构建里仍有断言兜底。
+    #[inline]
+    pub fn advance(&mut self, n: u32) {
+        debug_assert!(self.bits_left() >= n as usize);
+        self.pos += n as usize;
+    }
 }
 
 #[cfg(test)]

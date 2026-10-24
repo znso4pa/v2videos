@@ -52,6 +52,11 @@ fn run_bench(sample: &str, rounds: usize, threads: usize) -> std::process::ExitC
     for _ in 0..rounds {
         let mut last_ip: Option<v2v_mpeg12::decode::Frame> = None;
         let mut prev_ip: Option<v2v_mpeg12::decode::Frame> = None;
+        let mut mt = if threads > 1 {
+            Some(v2v_mpeg12::decode::MtDecoder::new(threads))
+        } else {
+            None
+        };
         for (header, data) in &pictures {
             let kind = header.picture_type;
             let forward = if matches!(kind, PictureType::B) {
@@ -59,19 +64,13 @@ fn run_bench(sample: &str, rounds: usize, threads: usize) -> std::process::ExitC
             } else {
                 last_ip.as_ref()
             };
-            let f = if threads > 1 {
-                v2v_mpeg12::decode::decode_frame_mt(
-                    &sequence,
-                    header.clone(),
-                    data,
-                    forward,
-                    last_ip.as_ref(),
-                    threads,
-                )
-            } else {
-                decode_frame(&sequence, header.clone(), data, forward, last_ip.as_ref())
-            }
-            .expect("解码");
+            let f = match &mut mt {
+                Some(m) => m
+                    .decode(&sequence, header.clone(), data, forward, last_ip.as_ref())
+                    .expect("解码"),
+                None => decode_frame(&sequence, header.clone(), data, forward, last_ip.as_ref())
+                    .expect("解码"),
+            };
             if matches!(kind, PictureType::I | PictureType::P) {
                 prev_ip = last_ip.take();
                 last_ip = Some(f);
@@ -166,6 +165,11 @@ fn main() {
     let mut gop = 0u32;
     let mut last_ip: Option<v2v_mpeg12::decode::Frame> = None;
     let mut prev_ip: Option<v2v_mpeg12::decode::Frame> = None;
+    let mut mt = if threads > 1 {
+        Some(v2v_mpeg12::decode::MtDecoder::new(threads))
+    } else {
+        None
+    };
     for (header, data) in split_pictures(&es) {
         let kind = header.picture_type;
         let tr = header.temporal_reference;
@@ -180,14 +184,13 @@ fn main() {
         } else {
             last_ip.as_ref()
         };
-        let frame = if threads > 1 {
-            v2v_mpeg12::decode::decode_frame_mt(
-                &sequence, header, data, forward, last_ip.as_ref(), threads,
-            )
-        } else {
-            decode_frame(&sequence, header, data, forward, last_ip.as_ref())
-        }
-        .unwrap_or_else(|e| panic!("解码失败：{e:?}"));
+        let frame = match &mut mt {
+            Some(m) => m
+                .decode(&sequence, header, data, forward, last_ip.as_ref())
+                .unwrap_or_else(|e| panic!("解码失败：{e:?}")),
+            None => decode_frame(&sequence, header, data, forward, last_ip.as_ref())
+                .unwrap_or_else(|e| panic!("解码失败：{e:?}")),
+        };
         if matches!(kind, PictureType::I | PictureType::P) {
             prev_ip = last_ip.take();
             last_ip = Some(frame.clone());
