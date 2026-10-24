@@ -23,11 +23,14 @@ fn main() -> std::process::ExitCode {
     };
     let mut rounds = 20usize;
     let mut threads = 1usize;
+    let mut dump: Option<String> = None;
     for arg in args {
         if let Some(v) = arg.strip_prefix("--rounds=") {
             rounds = v.parse().expect("--rounds=N");
         } else if let Some(v) = arg.strip_prefix("--threads=") {
             threads = v.parse().expect("--threads=N");
+        } else if let Some(v) = arg.strip_prefix("--dump=") {
+            dump = Some(v.to_string());
         }
     }
 
@@ -62,7 +65,8 @@ fn main() -> std::process::ExitCode {
 
     let t0 = std::time::Instant::now();
     let mut frames = 0usize;
-    for _ in 0..rounds {
+    let mut dumped: Vec<u8> = Vec::new();
+    for round in 0..rounds {
         let mut last_ip: Option<v2v_mpeg12::decode::Frame> = None;
         let mut prev_ip: Option<v2v_mpeg12::decode::Frame> = None;
         let mut mt = if threads > 1 {
@@ -90,12 +94,22 @@ fn main() -> std::process::ExitCode {
                 )
                 .expect("解码"),
             };
+            // 只在最后一轮落盘。这里是**解码序**（`compare` 是显示序），
+            // 两条路径互相比对时只要口径一致就够了。
+            if dump.is_some() && round + 1 == rounds {
+                dumped.extend_from_slice(&f.y);
+                dumped.extend_from_slice(&f.u);
+                dumped.extend_from_slice(&f.v);
+            }
             if matches!(kind, PictureType::I | PictureType::P) {
                 prev_ip = last_ip.take();
                 last_ip = Some(f);
             }
             frames += 1;
         }
+    }
+    if let Some(path) = &dump {
+        std::fs::write(path, &dumped).expect("写 dump");
     }
     let ms = t0.elapsed().as_secs_f64() * 1000.0 / frames as f64;
     let (w, h) = (sequence.width, sequence.height);
