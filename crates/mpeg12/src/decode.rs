@@ -519,8 +519,11 @@ impl Quant {
 }
 
 /// 帧内反量化：DC 乘 `dc_scale`，交流 `(|level|·q·W) >> intra_shift`。
+///
+/// ⚠️ **只作测试参考**：生产路径已经把反量化融进 `decode_intra_block`
+/// （同帧间的做法）。这条留着给 `fused_dequant_matches_array_dequant` 当 oracle。
+#[cfg(test)]
 fn dequantise_intra(quantised: &[i32; 64], quant: Quant) -> [i32; 64] {
-    let _g = prof::enabled().then(|| prof::Guard::new(prof::DEQUANT));
     let mut out = [0i32; 64];
     out[0] = quantised[0] * quant.dc_scale;
     // MPEG-2 的 mismatch control：把块内系数和的奇偶钉住。
@@ -530,17 +533,44 @@ fn dequantise_intra(quantised: &[i32; 64], quant: Quant) -> [i32; 64] {
         if level == 0 {
             continue;
         }
-        let mut magnitude = (level.abs() * quant.q * INTRA_MATRIX[i] as i32) >> quant.intra_shift;
-        if quant.oddify {
-            magnitude = (magnitude - 1) | 1;
-        }
-        out[i] = if level < 0 { -magnitude } else { magnitude };
+        out[i] = dequant_intra_one(level, i, quant);
         mismatch ^= out[i];
     }
     if quant.mpeg2 {
         out[63] ^= mismatch & 1;
     }
     out
+}
+
+/// 反量化**一个**帧内交流系数（公式与 `dequantise_intra` 逐位相同）。
+#[inline]
+fn dequant_intra_one(level: i32, raster: usize, quant: Quant) -> i32 {
+    let mut magnitude = (level.abs() * quant.q * INTRA_MATRIX[raster] as i32) >> quant.intra_shift;
+    if quant.oddify {
+        magnitude = (magnitude - 1) | 1;
+    }
+    if level < 0 {
+        -magnitude
+    } else {
+        magnitude
+    }
+}
+
+/// 帧内版的「解到一个系数就就地反量化」。
+#[inline]
+fn put_intra_coeff(
+    coeffs: &mut [i32; 64],
+    mismatch: &mut i32,
+    idx: usize,
+    level: i32,
+    scan: &[usize; 64],
+    quant: Quant,
+) {
+    if idx < 64 {
+        let v = dequant_intra_one(level, scan[idx], quant);
+        coeffs[scan[idx]] = v;
+        *mismatch ^= v;
+    }
 }
 
 /// 帧间反量化：`((2|level|+1)·q·W) >> inter_shift`，DC 无特例。
@@ -604,7 +634,7 @@ fn put_inter_coeff(
 
 /// 融合路径的收尾：MPEG-2 mismatch control 的最后一步。
 #[inline]
-fn finish_inter(mut coeffs: [i32; 64], mismatch: i32, quant: Quant) -> [i32; 64] {
+fn finish_mismatch(mut coeffs: [i32; 64], mismatch: i32, quant: Quant) -> [i32; 64] {
     if quant.mpeg2 {
         coeffs[63] ^= mismatch & 1;
     }
@@ -890,7 +920,9 @@ fn decode_intra_block(
         // 帧内 DC 是**差分**编码：要累加到预测值上，否则整块偏掉。
         *dc_predictor += diff;
     }
-    coeffs[0] = *dc_predictor;
+    coeffs[0] = *dc_predictor * quant.dc_scale;
+    // 反量化融进解码（同帧间）：DC 先单独做，AC 解到就乘。
+    let mut mismatch = coeffs[0] ^ 1;
 
     let mut index = 1usize;
     // 内层循环改用本地位缓存（一次装 64 位，够连着服务好几个符号）。
@@ -919,7 +951,7 @@ fn decode_intra_block(
                     c.advance(bits + 1);
                     index += run;
                     if index < 64 {
-                        coeffs[scan[index]] = if negative { -level } else { level };
+                        put_intra_coeff(&mut coeffs, &mut mismatch, index, if negative { -level } else { level }, scan, quant);
                     }
                     index += 1;
                     continue;
@@ -977,7 +1009,7 @@ fn decode_intra_block(
             };
             index += run;
             if index < 64 {
-                coeffs[scan[index]] = level;
+                put_intra_coeff(&mut coeffs, &mut mismatch, index, level, scan, quant);
             }
             index += 1;
             c = BitCache::new(r.data(), r.bit_pos());
@@ -995,7 +1027,7 @@ fn decode_intra_block(
             == 1;
         index += run;
         if index < 64 {
-            coeffs[scan[index]] = if negative { -level } else { level };
+            put_intra_coeff(&mut coeffs, &mut mismatch, index, if negative { -level } else { level }, scan, quant);
         }
         index += 1;
         c = BitCache::new(r.data(), r.bit_pos());
@@ -1011,7 +1043,7 @@ fn decode_intra_block(
             .map_err(|_| DecodeError::new("eob_full", r.bit_pos(), 0))?;
     }
 
-    Ok(dequantise_intra(&coeffs, quant))
+    Ok(finish_mismatch(coeffs, mismatch, quant))
 }
 
 /// 解一个帧间块（P/B 帧残差）。没有 DC 预测，系数从扫描第 0 位开始。
@@ -1056,7 +1088,7 @@ fn decode_inter_block(
         if eob_hit {
             r.skip(2)
                 .map_err(|_| DecodeError::new("eob_fast", r.bit_pos(), 0))?;
-            return Ok(finish_inter(coeffs, mismatch, quant));
+            return Ok(finish_mismatch(coeffs, mismatch, quant));
         }
     }
 
@@ -1175,7 +1207,7 @@ fn decode_inter_block(
             .map_err(|_| DecodeError::new("eob_full_inter", r.bit_pos(), 0))?;
     }
 
-    Ok(finish_inter(coeffs, mismatch, quant))
+    Ok(finish_mismatch(coeffs, mismatch, quant))
 }
 
 /// 把 `val` 当 `bits` 位补码解释（MPEG 运动矢量的模运算）。
@@ -3351,7 +3383,7 @@ mod lut_tests {
         }
     }
 
-    /// 融合路径（`put_inter_coeff` + `finish_inter`）必须与参考实现
+    /// 融合路径（`put_inter_coeff` + `finish_mismatch`）必须与参考实现
     /// `dequantise_inter` **逐位相同**。
     ///
     /// 融合改变了三件容易错的事：矩阵下标要用 `scan[idx]`（光栅序）而不是
@@ -3397,10 +3429,27 @@ mod lut_tests {
                         put_inter_coeff(&mut got, &mut mismatch, i, level, &scan, quant);
                     }
                 }
-                let got = finish_inter(got, mismatch, quant);
+                let got = finish_mismatch(got, mismatch, quant);
                 assert_eq!(
                     got, want,
-                    "mpeg2={mpeg2} non_linear={non_linear} scale={scale}"
+                    "inter mpeg2={mpeg2} non_linear={non_linear} scale={scale}"
+                );
+
+                // 帧内：DC 单独先做（乘 dc_scale），AC 从 index 1 起
+                let want_i = dequantise_intra(&quantised, quant);
+                let mut got_i = [0i32; 64];
+                got_i[0] = quantised[0] * quant.dc_scale;
+                let mut mismatch_i = got_i[0] ^ 1;
+                for i in 1..64 {
+                    let level = quantised[scan[i]];
+                    if level != 0 {
+                        put_intra_coeff(&mut got_i, &mut mismatch_i, i, level, &scan, quant);
+                    }
+                }
+                let got_i = finish_mismatch(got_i, mismatch_i, quant);
+                assert_eq!(
+                    got_i, want_i,
+                    "intra mpeg2={mpeg2} non_linear={non_linear} scale={scale}"
                 );
             }
         }
