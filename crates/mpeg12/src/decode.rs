@@ -3569,6 +3569,16 @@ mod mc_bench {
         });
         println!("  纯拷贝基准线          : {copy_ns:6.1} ns/块");
 
+        // 每块都要调的几何计算 —— 它和 predict_block 是同一个调用频次。
+        let geo_ns = ns_per_call(|i| {
+            let col = (i * 7) % 40;
+            let row = (i * 13) % 30;
+            let (chroma, ox, oy, stride, rs) =
+                block_geometry(i % 6, col, row, W, 360, false, 1);
+            (chroma as u64) + ox as u64 + oy as u64 + stride as u64 + rs as u64
+        });
+        println!("  block_geometry        : {geo_ns:6.1} ns/块");
+
         for (fx, fy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
             let ns = ns_per_call(|i| {
                 let ox = 16 + (i * 7) % (W - 64);
