@@ -53,6 +53,9 @@ pub extern "C" fn v2v_mpeg12_simd_kernels() -> u32 {
 
 pub mod kernels;
 
+/// 把本 crate 的内核装进解码器（进程内调一次即可）。
+pub use kernels::install;
+
 /// 解码入口（当前直接转调 `v2v-mpeg12`，见模块文档：安全路径是 oracle）。
 ///
 /// ⚠️ **性能上与 `v2v-mpeg12` 完全相同** —— 这里只是转调，`kernels` 里的
