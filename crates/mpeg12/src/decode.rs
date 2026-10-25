@@ -672,7 +672,6 @@ fn idct_residual(block: &[i32; 64]) -> [i32; 64] {
     const W6: u32 = 8867;
     const W7: u32 = 4520;
     const ROW_SHIFT: u32 = 11;
-    const COL_SHIFT: u32 = 20;
 
     // 输入截成 int16（与 ffmpeg 的反量化缓冲区同宽）。
     let mut b = [0i32; 64];
@@ -734,9 +733,45 @@ fn idct_residual(block: &[i32; 64]) -> [i32; 64] {
 
     // ---- 列通道（垂直频率 v）----
     let mut out = [0i32; 64];
+    // 列通道可以整个换掉（unsafe/FFI 加速）。默认标量；`v2v-mpeg12-simd`
+    // 可以装一个 NEON/SSE2 版本进来 —— **约定：必须与标量版逐位相同**。
+    // 每块一次原子读，相对 64 个系数的变换可以忽略。
+    let cols = IDCT_COLS.get().copied().unwrap_or(idct_cols_scalar);
+    cols(&b, &mut out);
+    out
+}
+
+/// 列通道内核的签名：`b` 是行变换后的中间块（i16 值存在 i32 里），
+/// 结果写到 `out`（光栅序，未裁剪）。
+pub type IdctCols = fn(&[i32; 64], &mut [i32; 64]);
+
+/// 可替换的列通道内核。默认没装 = 走标量。
+static IDCT_COLS: std::sync::OnceLock<IdctCols> = std::sync::OnceLock::new();
+
+/// 装一个列通道内核（只生效一次；重复调用忽略）。
+///
+/// ⚠️ 装进来的实现**必须与 `idct_cols_scalar` 逐位相同** —— 这是解码器
+/// 对账「逐字节一致」的地基。`v2v-mpeg12-simd` 里有等价的穷举测试。
+pub fn set_idct_cols(f: IdctCols) {
+    let _ = IDCT_COLS.set(f);
+}
+
+/// 列通道的标量实现（参考实现 / oracle）。
+///
+/// 注意 `c(0) + 32` 里的 32：它是 `(1 << (COL_SHIFT-1)) / W4 = 524288/16383`
+/// 的**整数商**，不是 `2^19 / W4`。换成后者就不是同一个 IDCT 了。
+pub fn idct_cols_scalar(b: &[i32; 64], out: &mut [i32; 64]) {
+    const W1: u32 = 22725;
+    const W2: u32 = 21407;
+    const W3: u32 = 19266;
+    const W4: u32 = 16383;
+    const W5: u32 = 12873;
+    const W6: u32 = 8867;
+    const W7: u32 = 4520;
+    const COL_SHIFT: u32 = 20;
+
     for u in 0..8 {
         let c = |i: usize| b[i * 8 + u] as u32;
-        // DC 项的取整常数是 (1<<(COL_SHIFT-1))/W4 的**整数商** 32，不是 2^19/W4。
         let mut a0 = W4.wrapping_mul(c(0).wrapping_add(32));
         let mut a1 = a0;
         let mut a2 = a0;
@@ -789,7 +824,6 @@ fn idct_residual(block: &[i32; 64]) -> [i32; 64] {
         out[6 * 8 + u] = (a1.wrapping_sub(b1) as i32) >> COL_SHIFT;
         out[7 * 8 + u] = (a0.wrapping_sub(b0) as i32) >> COL_SHIFT;
     }
-    out
 }
 
 /// 把残差（+ 一个偏移）写到平面，夹到 0..=255。帧内块偏移 128。

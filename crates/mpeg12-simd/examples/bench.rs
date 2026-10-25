@@ -34,8 +34,10 @@ fn main() -> std::process::ExitCode {
         }
     }
 
-    let bytes = std::fs::read(&sample).expect("read the program stream");
-    let mut demux = PsDemuxer::new(bytes);
+    // 把本 crate 的内核装进解码器（关掉 `unsafe-kernels` 时是空操作）。
+    v2v_mpeg12_simd::install();
+
+    let bytes = std::fs::read(&sample).expect("read the program stream");    let mut demux = PsDemuxer::new(bytes);
     let mut es = Vec::new();
     while let Some(packet) = demux.next_packet() {
         if packet.is_video() {
