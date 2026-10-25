@@ -3522,3 +3522,66 @@ mod lut_tests {
         assert_eq!(idct_residual(&[0i32; 64]), [0i32; 64]);
     }
 }
+
+/// 微基准：**直接量单个内核的每次调用成本**，绕开整解码器里的归因歧义。
+///
+/// 为什么需要它：采样剖析把「内联进来的调用方代码」算到被调用者头上，
+/// 消融又会改变下游代码形状 —— 两者给出的结论会互相矛盾（实测过）。
+/// 在受控的微基准里一次只动一个变量，才分得清「算术」和「固定开销」。
+///
+/// ```text
+/// cargo test -p v2v-mpeg12 --release --lib mc_bench -- --ignored --nocapture
+/// ```
+#[cfg(test)]
+mod mc_bench {
+    use super::*;
+
+    const W: usize = 720;
+    const H: usize = 576;
+    const ITERS: usize = 200_000;
+
+    fn ns_per_call(mut f: impl FnMut(usize) -> u64) -> f64 {
+        let t0 = std::time::Instant::now();
+        let mut acc = 0u64;
+        for i in 0..ITERS {
+            acc = acc.wrapping_add(f(i));
+        }
+        let ns = t0.elapsed().as_nanos() as f64 / ITERS as f64;
+        std::hint::black_box(acc);
+        ns
+    }
+
+    #[test]
+    #[ignore]
+    fn mc_bench() {
+        let plane = vec![128u8; W * H];
+
+        // 基准线：纯 8×8 拷贝（没有任何插值），代表「循环 + 写出」的固定成本。
+        let copy_ns = ns_per_call(|i| {
+            let ox = 16 + (i * 7) % (W - 64);
+            let oy = 16 + (i * 13) % (H - 64);
+            let base = oy * W + ox;
+            let mut out = [0u8; 64];
+            for y in 0..8 {
+                out[y * 8..y * 8 + 8].copy_from_slice(&plane[base + y * W..base + y * W + 8]);
+            }
+            out.iter().map(|&b| b as u64).sum::<u64>()
+        });
+        println!("  纯拷贝基准线          : {copy_ns:6.1} ns/块");
+
+        for (fx, fy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            let ns = ns_per_call(|i| {
+                let ox = 16 + (i * 7) % (W - 64);
+                let oy = 16 + (i * 13) % (H - 64);
+                let out = predict_block(
+                    &plane, W, W, H, ox, oy, fx as i32, fy as i32, false, 1, 1, 1,
+                );
+                out.iter().map(|&b| b as u64).sum::<u64>()
+            });
+            println!(
+                "  predict_block fx={fx} fy={fy} : {ns:6.1} ns/块  （比拷贝 {:+5.1} ns）",
+                ns - copy_ns
+            );
+        }
+    }
+}
