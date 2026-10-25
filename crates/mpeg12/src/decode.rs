@@ -544,8 +544,12 @@ fn dequantise_intra(quantised: &[i32; 64], quant: Quant) -> [i32; 64] {
 }
 
 /// 帧间反量化：`((2|level|+1)·q·W) >> inter_shift`，DC 无特例。
+///
+/// ⚠️ **只作测试参考**：生产路径已经把反量化融进 `decode_inter_block`
+/// （解到系数就地乘，省掉整趟 64 元素 pass）。这条留着给
+/// `fused_dequant_matches_array_dequant` 当 oracle。
+#[cfg(test)]
 fn dequantise_inter(quantised: &[i32; 64], quant: Quant) -> [i32; 64] {
-    let _g = prof::enabled().then(|| prof::Guard::new(prof::DEQUANT));
     let mut out = [0i32; 64];
     let mut mismatch = 1;
     for i in 0..64 {
@@ -553,18 +557,58 @@ fn dequantise_inter(quantised: &[i32; 64], quant: Quant) -> [i32; 64] {
         if level == 0 {
             continue;
         }
-        let mut magnitude =
-            ((level.abs() * 2 + 1) * quant.q * NON_INTRA_MATRIX[i] as i32) >> quant.inter_shift;
-        if quant.oddify {
-            magnitude = (magnitude - 1) | 1;
-        }
-        out[i] = if level < 0 { -magnitude } else { magnitude };
+        out[i] = dequant_inter_one(level, i, quant);
         mismatch ^= out[i];
     }
     if quant.mpeg2 {
         out[63] ^= mismatch & 1;
     }
     out
+}
+
+/// 反量化**一个**帧间系数（公式与 `dequantise_inter` 逐位相同，只是拆出来）。
+#[inline]
+fn dequant_inter_one(level: i32, raster: usize, quant: Quant) -> i32 {
+    let mut magnitude =
+        ((level.abs() * 2 + 1) * quant.q * NON_INTRA_MATRIX[raster] as i32) >> quant.inter_shift;
+    if quant.oddify {
+        magnitude = (magnitude - 1) | 1;
+    }
+    if level < 0 {
+        -magnitude
+    } else {
+        magnitude
+    }
+}
+
+/// 融合路径里「解到一个系数就就地反量化」。
+///
+/// `idx` 是 **zigzag 序**，矩阵下标要用 `scan[idx]` 换回光栅序。
+/// `idx >= 64` 的系数会被丢掉，**且不计入 `mismatch`** —— 与参考实现一致
+/// （那里这些位置保持 0，`mismatch ^= 0` 是空操作）。
+#[inline]
+fn put_inter_coeff(
+    coeffs: &mut [i32; 64],
+    mismatch: &mut i32,
+    idx: usize,
+    level: i32,
+    scan: &[usize; 64],
+    quant: Quant,
+) {
+    if idx < 64 {
+        let v = dequant_inter_one(level, scan[idx], quant);
+        coeffs[scan[idx]] = v;
+        *mismatch ^= v;
+    }
+}
+
+/// 融合路径的收尾：MPEG-2 mismatch control 的最后一步。
+#[inline]
+fn finish_inter(mut coeffs: [i32; 64], mismatch: i32, quant: Quant) -> [i32; 64] {
+    if quant.mpeg2 {
+        coeffs[63] ^= mismatch & 1;
+    }
+    coeffs
 }
 
 /// 8×8 逆 DCT（残差块用）：**逐位复刻 ffmpeg `simple_idct` 的 8 位路径**。
@@ -983,13 +1027,24 @@ fn decode_inter_block(
     let _g = prof::enabled().then(|| prof::Guard::new(prof::BITS));
     let mut coeffs = [0i32; 64];
     let mut index = 0usize;
+    // 反量化**融进解码**：解到一个系数就地乘，省掉原来那趟 64 元素 pass。
+    // `mismatch` 是 MPEG-2 mismatch control 的累加器，等价于参考实现的
+    // `mismatch ^= out[i]`（每个非零系数只写一次，且 `index` 单调递增）。
+    let mut mismatch = 1i32;
 
     // 首系数快速路径（照参考实现）：首码以 '1' 开头时就是 (run 0, level 1)，
     // 第 2 位当符号，**只吃 2 位**。走通用 RL 会多吃 1 位，从第二个色度块起就错位。
     if r.bits_left() >= 2 && r.peek_u(1) == 1 {
         let negative = (r.peek_u(2) & 1) == 1;
         r.skip(2).ok();
-        coeffs[scan[0]] = if negative { -1 } else { 1 };
+        put_inter_coeff(
+            &mut coeffs,
+            &mut mismatch,
+            0,
+            if negative { -1 } else { 1 },
+            scan,
+            quant,
+        );
         index = 1;
         // 场图的参考实现用 `GET_CACHE <= 0xBFFFFFFF`（下两位不是 `11`）判 EOB；
         // 帧图用显式的 `10`。两者不能混用，否则整段位流会偏。
@@ -1001,7 +1056,7 @@ fn decode_inter_block(
         if eob_hit {
             r.skip(2)
                 .map_err(|_| DecodeError::new("eob_fast", r.bit_pos(), 0))?;
-            return Ok(dequantise_inter(&coeffs, quant));
+            return Ok(finish_inter(coeffs, mismatch, quant));
         }
     }
 
@@ -1031,7 +1086,7 @@ fn decode_inter_block(
                     c.advance(bits + 1);
                     index += run;
                     if index < 64 {
-                        coeffs[scan[index]] = if negative { -level } else { level };
+                        put_inter_coeff(&mut coeffs, &mut mismatch, index, if negative { -level } else { level }, scan, quant);
                     }
                     index += 1;
                     continue;
@@ -1088,7 +1143,7 @@ fn decode_inter_block(
             };
             index += run;
             if index < 64 {
-                coeffs[scan[index]] = level;
+                put_inter_coeff(&mut coeffs, &mut mismatch, index, level, scan, quant);
             }
             index += 1;
             c = BitCache::new(r.data(), r.bit_pos());
@@ -1105,7 +1160,7 @@ fn decode_inter_block(
             == 1;
         index += run;
         if index < 64 {
-            coeffs[scan[index]] = if negative { -level } else { level };
+            put_inter_coeff(&mut coeffs, &mut mismatch, index, if negative { -level } else { level }, scan, quant);
         }
         index += 1;
         c = BitCache::new(r.data(), r.bit_pos());
@@ -1120,7 +1175,7 @@ fn decode_inter_block(
             .map_err(|_| DecodeError::new("eob_full_inter", r.bit_pos(), 0))?;
     }
 
-    Ok(dequantise_inter(&coeffs, quant))
+    Ok(finish_inter(coeffs, mismatch, quant))
 }
 
 /// 把 `val` 当 `bits` 位补码解释（MPEG 运动矢量的模运算）。
@@ -3292,6 +3347,61 @@ mod lut_tests {
                 r.advance(n);
                 assert_eq!(c.pos(), r.bit_pos(), "case {case} step {step} 位置");
                 assert_eq!(c.bits_left(), r.bits_left(), "case {case} step {step} 余量");
+            }
+        }
+    }
+
+    /// 融合路径（`put_inter_coeff` + `finish_inter`）必须与参考实现
+    /// `dequantise_inter` **逐位相同**。
+    ///
+    /// 融合改变了三件容易错的事：矩阵下标要用 `scan[idx]`（光栅序）而不是
+    /// `idx`（zigzag 序）；`mismatch` 要增量累积；`idx >= 64` 的系数既不能写
+    /// 也不能计入 `mismatch`。这条测试把三种量化器组合都过一遍。
+    #[test]
+    fn fused_dequant_matches_array_dequant() {
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let cases = [
+            (false, false, 1i32),
+            (false, false, 8),
+            (false, false, 31),
+            (true, false, 1),
+            (true, false, 8),
+            (true, false, 31),
+            (true, true, 1),
+            (true, true, 16),
+            (true, true, 31),
+        ];
+        let scan: [usize; 64] = ZIGZAG;
+        for (mpeg2, non_linear, scale) in cases {
+            let quant = Quant::new(scale, mpeg2, non_linear, 0);
+            for _ in 0..20 {
+                let mut quantised = [0i32; 64];
+                for i in 0..64 {
+                    if rnd() % 3 == 0 {
+                        let mag = 1 + (rnd() % 40) as i32;
+                        quantised[scan[i]] = if rnd() & 1 == 0 { mag } else { -mag };
+                    }
+                }
+                let want = dequantise_inter(&quantised, quant);
+                let mut got = [0i32; 64];
+                let mut mismatch = 1i32;
+                for i in 0..64 {
+                    let level = quantised[scan[i]];
+                    if level != 0 {
+                        put_inter_coeff(&mut got, &mut mismatch, i, level, &scan, quant);
+                    }
+                }
+                let got = finish_inter(got, mismatch, quant);
+                assert_eq!(
+                    got, want,
+                    "mpeg2={mpeg2} non_linear={non_linear} scale={scale}"
+                );
             }
         }
     }
