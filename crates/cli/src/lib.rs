@@ -23,11 +23,12 @@
 //! 音频那边不用写编码器：**PCM（`sowt`）** 塞进 `isom` 品牌的文件里 ffmpeg 读得好好的
 //! （见 `crates/mp4` 的模块文档）。代价是文件变大（44.1 kHz 立体声约 176 KB/s）。
 //!
-//! ## `.mp4` 的校验为什么是「未校验」
+//! ## `.mp4` 的校验为什么是「未实现」
 //!
-//! `verify` 的做法是「把编出来的码流解回来和源帧比 PSNR」。`.wmv` 那条路能做到，
-//! 因为我们**自己就有 MP43 解码器**；`.mp4` 这条路做不到 —— 我们只有 `mp4v`
-//! **编码器**，没有解码器。所以 `psnr_db` 是 `None`，报告里显示「未校验」。
+//! `verify` 的做法是「把编出来的码流解回来和源帧比 PSNR」。`.wmv` 那条路接了，
+//! 因为我们自己就有 MP43 解码器；`.mp4` 这条路**没接** —— 注意不是「没有解码器」：
+//! `v2v-mp4v` 的 `decode` 早就在了（`open_video_decoder` 就认 `mp4v`），只是 CLI 还
+//! 没把产物解回来比 PSNR。所以 `psnr_db` 是 `None`，报告里显示「未实现」。
 //!
 //! 这不是「没测」：编码器的正确性由 `crates/mp4v/tests/ffmpeg_roundtrip.rs` 钉着
 //! （ffmpeg 解得开、PSNR 与 ffmpeg 自己的 mpeg4 编码器同档、`esds` 里的 VOL 完整）。
@@ -210,7 +211,7 @@ pub struct ConvertOptions {
     pub keyframe_interval: usize,
     /// 转完把输出**解码回来**与源帧比 PSNR（慢一倍，但能证明「转出来的东西真能放」）。
     ///
-    /// 只对 `.wmv` 有效；`.mp4` 没有解码器可比，见模块文档。
+    /// 只对 `.wmv` 有效；`.mp4` 这条路还没接校验（解码器是有的），见模块文档。
     pub verify: bool,
     /// 最多转多少帧（`None` = 全部）。做局部转换/预览用 —— 也让真样本的
     /// 端到端验证能在几秒内跑完。
@@ -311,7 +312,7 @@ pub struct ConvertReport {
     pub bytes_out: u64,
     /// `verify` 打开时的平均 PSNR（dB，YUV 三平面合计）。
     ///
-    /// `.mp4` 恒为 `None` —— 我们只有 `mp4v` 编码器、没有解码器，没法自己校验，见模块文档。
+    /// `.mp4` 恒为 `None` —— 那条路的 CLI 校验还没接（解码器是有的），见模块文档。
     pub psnr_db: Option<f64>,
     /// `.mp4` 视频轨的**实际**平均码率（kbps）。开了 `--video-bitrate` 才有。
     ///
@@ -994,7 +995,7 @@ fn encode_items(
 ///
 /// 1. **视频必须重编码**成 MPEG-4 Part 2（MP43 进不了 MP4，见模块文档），而且目前是**全 I 帧**；
 /// 2. **音频解成 PCM**（WMA 也进不了 MP4）；
-/// 3. **没有校验** —— 我们只有 `mp4v` 编码器、没有解码器。
+/// 3. **没有校验** —— `.mp4` 这条路的 CLI 校验还没接（`mp4v` 解码器是有的）。
 ///
 /// ## 帧率与时间基
 ///
@@ -1003,7 +1004,11 @@ fn encode_items(
 ///
 /// 视频轨的时间基取 **1000（毫秒）**，`stts` 里写**真实的帧间隔**。这样 29.97 / 23.976
 /// 这类非整数帧率也不用去找最小公倍数，播放节奏就是源文件的节奏。
-/// VOL 里声明的整数帧率只影响 VOP 头的 `time_mod` 记账，不影响播放。
+///
+/// ⚠️ **但 VOL 里的整数帧率不是「只影响记账」** —— 早期这里是这么以为的，代价是一个
+/// 真 bug：VOP 头的 `time_mod` 按**帧号**记（`frame_index % fps_num`），等于声明恒定
+/// 帧率；`stts` 却写真实间隔。源是变帧率时两者对不上，ffmpeg 读回来会按 VOL 重排帧
+/// （实测 300 帧 → 435 帧）。现在：不给 `--fps` 就**报错**，给了就按它重定时。
 fn convert_to_mp4(
     input: &Path,
     output: &Path,
@@ -1362,6 +1367,15 @@ fn convert_to_mp4(
     // 上一帧的视频时间戳（毫秒）—— `stts` 写的是**真实间隔**。
     let mut prev_vts: Option<i64> = None;
     let mut last_dur = (VTS as f64 / fps as f64).round().max(1.0) as u32;
+    // 帧间隔的分布 —— 用来判「源是不是变帧率」。
+    //
+    // ⚠️ **为什么必须判**：`.mp4` 这条路的 VOP 头里 `time_mod` 是按**帧号**记的
+    // （`frame_index % fps_num`），等于声明「恒定帧率」；而 `stts` 写的是**真实间隔**。
+    // 源是变帧率时这两件事对不上 —— 实测 ffmpeg 读回来会把 300 帧展开成 435 帧
+    // （见 TODO 的「MP43/WMV1 封装时间戳」）。所以：**没显式给 `--fps` 就不许静默
+    // 产出这种自相矛盾的文件**；给了 `--fps` 就按它重定时，让两边一致。
+    let explicit_fps = opts.fps.is_some();
+    let (mut dur_min, mut dur_max) = (u32::MAX, 0u32);
     let mut stop = false;
     let mut sample_idx = 0usize;
     // 攒够一个 GOP 就派给 worker。
@@ -1540,9 +1554,16 @@ fn convert_to_mp4(
             let d = s.timestamp_ms - p;
             if d > 0 {
                 last_dur = d.min(u32::MAX as i64) as u32;
+                dur_min = dur_min.min(last_dur);
+                dur_max = dur_max.max(last_dur);
             }
         }
         prev_vts = Some(s.timestamp_ms);
+        // 显式给了 `--fps`：按它**重定时**（`stts` 与 VOL 的 `time_mod` 才对得上）。
+        // 不给就保留源的真实间隔 —— 这是本仓「不改写源时间轴」的立场。
+        if explicit_fps {
+            last_dur = (VTS as f64 / f64::from(fps)).round().max(1.0) as u32;
+        }
 
         if par_decode {
             // ---- 并行解码：把**样本**攒成 GOP 派给解码池，本线程不解 ----
@@ -1686,6 +1707,24 @@ fn convert_to_mp4(
             } => mux.write_video(&data, key_frame, duration)?,
             PendingKind::Audio { data, duration } => mux.write_audio(&data, duration)?,
         }
+    }
+
+    // ---- 变帧率：宁可报错，也不要交出一个「时间轴自相矛盾」的 MP4 ----
+    //
+    // 判据是**帧间隔的极差**：`stts` 会照抄真实间隔，而 VOP 头的 `time_mod` 按帧号
+    // 记（= 恒定帧率）。两者只在「源本来就恒定」时一致。
+    //
+    // 容差 2 ms：29.97 / 23.976 这类非整数帧率按毫秒取整后本来就会在 33/34、41/42
+    // 之间跳 —— 那是**取整噪声，不是变帧率**，不能拿它报错。
+    const VFR_TOL_MS: u32 = 2;
+    if !explicit_fps && dur_max.saturating_sub(dur_min) > VFR_TOL_MS {
+        return Err(Error::Unsupported(format!(
+            "源是变帧率（帧间隔 {}~{} ms），而 MPEG-4 Part 2 的 VOP 头只能声明恒定帧率 —— \
+             硬写会得到一个「stts 与 VOL 对不上」的文件（ffmpeg 读回来会重排帧）。\
+             两个选择：① `--fps N` 显式给一个帧率，按它重定时（会改写时间轴）；\
+             ② 输出 `.wmv`（ASF 索引保留原时间轴）。",
+            dur_min, dur_max
+        )));
     }
 
     let mp4 = mux.finish();

@@ -101,6 +101,13 @@ fn moving_sequence(w: u32, h: u32, n: usize) -> Vec<Frame> {
 
 /// 用我们的编码器 + 封装器造一个输入 `.wmv`。
 fn make_wmv(path: &Path, frames: &[Frame], fourcc: u32, qscale: u8) {
+    // 恒定 ~30.3 fps —— 大多数用例要的就是「正常源」。
+    let ts: Vec<u32> = (0..frames.len()).map(|i| (i as u32) * 33).collect();
+    make_wmv_ts(path, frames, fourcc, qscale, &ts);
+}
+
+/// 同 [`make_wmv`]，但时间戳由调用方给 —— 造**变帧率**源用（`.mp4` 那条路的判据要它）。
+fn make_wmv_ts(path: &Path, frames: &[Frame], fourcc: u32, qscale: u8, ts: &[u32]) {
     let (w, h) = (frames[0].width, frames[0].height);
     let mut enc = Encoder::new(EncoderConfig {
         qscale,
@@ -113,9 +120,72 @@ fn make_wmv(path: &Path, frames: &[Frame], fourcc: u32, qscale: u8) {
     });
     for (i, f) in frames.iter().enumerate() {
         let s = enc.encode_frame(f).expect("编码");
-        mux.write_video(&s, i == 0, (i as u32) * 33).expect("封装");
+        mux.write_video(&s, i == 0, ts[i]).expect("封装");
     }
     std::fs::write(path, mux.finish()).expect("写输入文件");
+}
+
+/// **变帧率的源 + `.mp4` 输出：必须报错，不许静默产出「时间轴自相矛盾」的文件。**
+///
+/// 背景（真 bug）：VOP 头的 `time_mod` 按**帧号**记（= 声明恒定帧率），而 `stts` 写真实
+/// 间隔。源是变帧率时两者对不上 —— ffmpeg 读回来会按 VOL 重排帧（实测 300 → 435 帧）。
+///
+/// 判据用**合成源**就能立住（不需要真样本、不需要 ffmpeg），所以它在 CI 里真跑。
+#[test]
+fn vfr_source_to_mp4_needs_an_explicit_fps() {
+    let dir = temp_dir("vfr");
+    let frames = moving_sequence(160, 120, 12);
+    // 帧间隔 33 / 66 ms 交替（**累加**，不是 `i*33`——那会造出重复时间戳）。
+    // 极差 33 ms，远超「非整数帧率按毫秒取整」那 1~2 ms 的噪声。
+    let mut ts: Vec<u32> = Vec::with_capacity(frames.len());
+    let mut acc = 0u32;
+    for i in 0..frames.len() {
+        if i > 0 {
+            acc += if i % 2 == 1 { 33 } else { 66 };
+        }
+        ts.push(acc);
+    }
+    let input = dir.join("vfr.wmv");
+    make_wmv_ts(&input, &frames, MP43, 6, &ts);
+
+    let mp4_opts = ConvertOptions {
+        format: OutputFormat::Mp4,
+        keyframe_interval: 4,
+        verify: false,
+        copy_audio: false,
+        ..Default::default()
+    };
+
+    // ① 不给 `--fps`：报错，且**不留输出文件**。
+    let out = dir.join("no_fps.mp4");
+    let err = convert_file(&input, &out, &mp4_opts).expect_err("变帧率源应当被拒绝");
+    let msg = err.to_string();
+    eprintln!("报错：{msg}");
+    assert!(msg.contains("变帧率"), "报错要说清是变帧率：{msg}");
+    assert!(!out.exists(), "报错时不该留下输出文件");
+
+    // ② 显式给 `--fps`：按它重定时（`stts` 与 VOL 就一致了），这时放行。
+    let with_fps = ConvertOptions {
+        fps: Some(25),
+        ..mp4_opts.clone()
+    };
+    let out2 = dir.join("fps25.mp4");
+    let rep = convert_file(&input, &out2, &with_fps).expect("显式 --fps 应当放行");
+    assert_eq!(rep.frames, 12);
+    assert!(
+        out2.is_file() && std::fs::metadata(&out2).expect("stat").len() > 0,
+        "给了 --fps 就该产出文件"
+    );
+
+    // ③ `.wmv` 那条路不受影响：ASF 索引本来就存真实时间戳，变帧率源照转。
+    let wmv_opts = ConvertOptions {
+        verify: false,
+        ..Default::default()
+    };
+    let out3 = dir.join("vfr_out.wmv");
+    convert_file(&input, &out3, &wmv_opts).expect("变帧率源转 .wmv 应当照常成功");
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
