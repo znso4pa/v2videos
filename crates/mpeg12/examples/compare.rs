@@ -89,9 +89,11 @@ fn run_bench(sample: &str, rounds: usize, threads: usize) -> std::process::ExitC
 }
 
 fn main() {
-    v2v_mpeg12::decode::prof::init_from_env();
+    // `--prof` 是**开关**（不带值），先摘掉再解析位置参数 —— 否则它会顶掉 sample 的位置。
+    let raw: Vec<String> = std::env::args().collect();
+    v2v_mpeg12::decode::prof::enable(raw.iter().any(|a| a == "--prof"));
+    let argv: Vec<String> = raw.iter().filter(|a| *a != "--prof").cloned().collect();
     // `--bench=N` 要在读参考件**之前**判掉：基准模式不读那 135 MB。
-    let argv: Vec<String> = std::env::args().collect();
     if let Some(n) = argv.iter().find_map(|a| a.strip_prefix("--bench=")) {
         let rounds: usize = n.parse().unwrap_or(1);
         let threads: usize = argv
@@ -103,13 +105,13 @@ fn main() {
         run_bench(&sample, rounds, threads);
         return;
     }
-    let mut it = std::env::args().skip(1);
+    let mut it = argv.iter().skip(1).cloned();
     let Some(sample) = it.next().map(PathBuf::from) else {
-        eprintln!("用法: compare <sample.mpg> <ref.yuv>");
+        eprintln!("用法: compare <sample.mpg> <ref.yuv> [--dump <out.yuv>] [--threads=N] [--prof]");
         std::process::exit(2);
     };
     let Some(reference) = it.next().map(PathBuf::from) else {
-        eprintln!("用法: compare <sample.mpg> <ref.yuv> [--dump <out.yuv>]");
+        eprintln!("用法: compare <sample.mpg> <ref.yuv> [--dump <out.yuv>] [--threads=N] [--prof]");
         std::process::exit(2);
     };
     // `--dump`：把**我们解出来的**帧按显示序写成 YUV，方便拿去做宏块级的排查。

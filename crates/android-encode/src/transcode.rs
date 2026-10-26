@@ -45,18 +45,66 @@ pub struct Stats {
     pub output_bytes: u64,
 }
 
-/// 用平台硬件编码器把一个 WMV 转成 MP4。
+/// 硬件转码的可调旋钮。**默认值就是实测最优的那一档**，只有量曲线时才改。
+///
+/// 这三个原本是环境变量 —— 那是排查期的做法，不该留在 `src/` 里
+/// （见 AGENTS.md「本地调试残留」）。改成参数后，量曲线走 example 的命令行，
+/// 生产路径拿到的是确定的默认值。
+#[derive(Debug, Clone, Copy)]
+pub struct HwOptions {
+    /// 每块的目标时长（秒）。实测 2 s 会话太多、10 s 并行度不够，**3 s 最好**。
+    pub chunk_secs: usize,
+    /// worker 数。默认按核数，封顶 16。
+    ///
+    /// ⚠️ 实测 6 个就能把硬件编码器喂满（1080p 47 → 32 → 26 s），再多只是抢同一个
+    /// 编码器；但**默认值不擅自改成 6** —— 那会改掉已经在产线上量过的行为。
+    pub workers: usize,
+    /// 把 `[probe]` 诊断打到 stderr（只在量性能时开）。
+    pub profile: bool,
+}
+
+impl Default for HwOptions {
+    fn default() -> Self {
+        HwOptions {
+            chunk_secs: 3,
+            workers: std::thread::available_parallelism()
+                .map(|n| n.get().max(1))
+                .unwrap_or(4)
+                .clamp(1, 16),
+            profile: false,
+        }
+    }
+}
+
+/// 用平台硬件编码器把一个 WMV 转成 MP4（默认参数）。
 pub fn wmv_to_mp4_hw(
     input: &Path,
     output: &Path,
     video_bitrate: u32,
     audio_bitrate: u32,
 ) -> Result<Stats> {
+    wmv_to_mp4_hw_with(
+        input,
+        output,
+        video_bitrate,
+        audio_bitrate,
+        HwOptions::default(),
+    )
+}
+
+/// 同 [`wmv_to_mp4_hw`]，但旋钮可调（量并行度 / 块长曲线时用）。
+pub fn wmv_to_mp4_hw_with(
+    input: &Path,
+    output: &Path,
+    video_bitrate: u32,
+    audio_bitrate: u32,
+    opts: HwOptions,
+) -> Result<Stats> {
     // 非 macOS / Android：没有硬件编码后端 —— 早退（整段实现在下面的 cfg 块里，
     // 这样 Linux CI 上既不会报「不可达语句」，也不会有未用变量）。
     #[cfg(not(any(target_os = "macos", target_os = "android")))]
     {
-        let _ = (input, output, video_bitrate, audio_bitrate);
+        let _ = (input, output, video_bitrate, audio_bitrate, opts);
         return Err(Error::Unsupported(
             "硬件编码后端只有 macOS（VideoToolbox）与 Android（MediaCodec）".into(),
         ));
@@ -64,7 +112,7 @@ pub fn wmv_to_mp4_hw(
 
     #[cfg(any(target_os = "macos", target_os = "android"))]
     {
-        let profile = std::env::var("V2V_HW_PROFILE").is_ok();
+        let profile = opts.profile;
         let t_start = std::time::Instant::now();
         let mut stats = Stats {
             frames: 0,
@@ -223,7 +271,7 @@ pub fn wmv_to_mp4_hw(
                         out.extend(enc.encode_frames(&pending).map_err(|e| e.to_string())?);
                         t_enc_ns += t.elapsed().as_nanos() as u64;
                     }
-                    if std::env::var("V2V_HW_PROFILE").is_ok() {
+                    if profile {
                         eprintln!(
                             "[probe] 音频线程：WMA 解码 {:.2} s / AAC 编码 {:.2} s（{} 段）",
                             t_dec_ns as f64 / 1e9,
@@ -294,12 +342,9 @@ pub fn wmv_to_mp4_hw(
             //
             // 块边界仍落在源 I 帧上（只在 GOP 之间切），所以「从块首起解 == 整链解到
             // 那里」这条前提不变。
-            // 块长（秒）。`V2V_HW_CHUNK_SECS` 只用来量「块长 ↔ 并行度/IDR 数」的
-            // 曲线：实测 2 s 会话太多、10 s 并行度不够，3 s 最好；正常别设。
-            let chunk_secs: usize = std::env::var("V2V_HW_CHUNK_SECS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(3);
+            // 块长（秒）。实测 2 s 会话太多、10 s 并行度不够，**3 s 最好** ——
+            // 所以默认值是量出来的，不是拍的；要量曲线走 `HwOptions::chunk_secs`。
+            let chunk_secs: usize = opts.chunk_secs.max(1);
             let target_frames = (fps as usize * chunk_secs).max(1);
             let mut chunks: Vec<Vec<(Vec<u8>, i64, u64)>> = Vec::new();
             let mut cur: Vec<(Vec<u8>, i64, u64)> = Vec::new();
@@ -359,17 +404,9 @@ pub fn wmv_to_mp4_hw(
                 std::sync::Condvar::new(),
             ));
 
-            // 并行度：默认按核数，封顶 6（再多只是抢同一个硬件编码器）。
-            // `V2V_HW_WORKERS` 只用来量并行度曲线 —— 正常别设。
-            let n_workers = std::env::var("V2V_HW_WORKERS")
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or_else(|| {
-                    std::thread::available_parallelism()
-                        .map(|n| n.get().max(1))
-                        .unwrap_or(4)
-                })
-                .clamp(1, 16);
+            // 并行度：默认按核数，封顶 16（实测 6 个就能把硬件编码器喂满；再多只是
+            // 抢同一个编码器）。要量曲线走 `HwOptions::workers`。
+            let n_workers = opts.workers.clamp(1, 16);
             let mut handles = Vec::new();
             for _ in 0..n_workers {
                 let state = Arc::clone(&state);

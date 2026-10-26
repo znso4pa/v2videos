@@ -24,10 +24,13 @@ pub struct Frame {
     pub v: Vec<u8>,
 }
 
-/// 极简热点剖析（**只在设了 `V2V_PROF` 时开**，否则零开销）。
+/// 极简热点剖析（**只在显式 `enable(true)` 之后开**，否则零开销）。
 ///
 /// 目的是回答「下一个 unsafe 内核该上哪儿」—— 不凭感觉。四个桶：
 /// 码流/反量化、逆变换、运动补偿预测、其它（总时间减前三）。
+///
+/// 开关由调用方（`examples/compare.rs` 的 `--prof`）给，**不读环境变量** ——
+/// 「参数全从命令行来」是 AGENTS.md 的规矩，环境变量是排查期残留的形状。
 pub mod prof {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Instant;
@@ -48,10 +51,12 @@ pub mod prof {
         ON.load(Ordering::Relaxed) != 0
     }
 
-    /// 在 main 里调一次（读环境变量）。
-    pub fn init_from_env() {
-        let on = std::env::var("V2V_PROF").is_ok() as u64;
-        ON.store(on, Ordering::Relaxed);
+    /// 开/关剖析，并清空已有的计数（基准跑多遍时不想混进上一遍的数）。
+    pub fn enable(on: bool) {
+        for n in &NS {
+            n.store(0, Ordering::Relaxed);
+        }
+        ON.store(on as u64, Ordering::Relaxed);
     }
 
     /// RAII 计时器：drop 时把耗时加进桶。
