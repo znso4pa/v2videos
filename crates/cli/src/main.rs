@@ -214,8 +214,9 @@ fn run(args: &[String]) -> Result<bool, String> {
     let verify = match opts.format {
         OutputFormat::Asf if opts.verify => "开",
         OutputFormat::Asf => "关",
-        // `.mp4` 没有解码器可比，见 lib.rs 的模块文档。
-        OutputFormat::Mp4 => "不支持（.mp4 无解码器）",
+        // `.mp4` 这条路**还没接**校验（不是「没有解码器」—— `v2v-mp4v` 有解码器，
+        // 只是 CLI 没把产物解回来比 PSNR）。见 lib.rs 的模块文档。
+        OutputFormat::Mp4 => "未实现（.mp4 这条路没接 PSNR 校验）",
     };
     let vbr = match opts.video_bitrate {
         Some(b) => format!("，视频目标 {} kbps", b / 1000),
