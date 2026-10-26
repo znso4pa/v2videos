@@ -8,24 +8,36 @@
 
 ## 现状
 
-**链路已经打通到 `.wmv → .mp4`**：10 个 crate、约 5.5 万行 Rust，**零第三方依赖**
-（`Cargo.lock` 里只有本仓的包）。
+**链路已经打通到 `.wmv → .mp4`**：**15 个 crate、约 6.9 万行 Rust**，**零第三方运行时依赖**
+（`Cargo.lock` 里只有本仓的包，外加 `cc` 那条**构建**链 —— 只服务 `android-encode` 的 C shim）。
 
 ```text
 container  解封装共用的数据模型（Stream / Sample / AudioFormat / VideoFormat）—— 零依赖
 asf        ASF（.wmv / .wma）解封装 **+ 封装**（多载荷打包 + Simple Index）
 avi        AVI（RIFF）解封装
-msmpeg4    MP43 / WMV1 / WMV2 解码（I / P）**+ MP43 编码**（I / P，含运动估计）；兼**共享数值内核**（见下）
+mpegps     MPEG-1/2 program stream（`.mpg` / `.dat` / `.vob`）解封装
+msmpeg4    MP42 / MP43 / WMV1 / WMV2 解码（I / P，WMV2 含 IntraX8）**+ MP43 编码**（I / P，含运动估计）；
+           兼**共享数值内核**（位读写器 / DCT / FFT / VLC 表）
 wma        WMA v1 / v2 解码（**只有解码器**）
 vc1        VC-1（WMV3）解码（I / P，含 ABT / ¼ 像素 MC / 环路滤波；**只有解码器**）
-mp4v       MPEG-4 Part 2 编码（I / P + 码率控制）
+mpeg12     MPEG-1/2 解码（I / P / B、隔行、4:2:2 / 4:4:4）—— **纯安全、零 unsafe，当参考实现**
+mpeg12-simd  同一内核的 unsafe / FFI 变体，可单独编 .so / .a（unsafe 只允许出现在这里）
+mp4v       MPEG-4 Part 2 编码（I / P + 码率控制）**+ 解码**（I / P）
 aac        AAC-LC 编码（MDCT / 短窗 / TNS / Huffman / 码率控制）
 mp4        MP4 / ISOBMFF 封装（mp4v + mp4a(AAC) 或 sowt PCM）
+player     顺时播放层：逐帧 / 逐样本、两轨独立、`seek(ms)`
+android-encode  **全仓唯一的 FFI crate**：硬件 H.264（VideoToolbox / MediaCodec）+ C ABI
 cli        `v2v convert`：ASF / AVI → `.wmv`（MP43 + 音频直通）或 `.mp4`（mp4v + AAC）
 ```
 
-⚠️ **`v2v-vc1` 还没接进 `v2v-cli`** —— 它能解 WMV3 出像素，但 `v2v convert` 仍不认这个
-fourcc。接线时要处理「解码顺序 ≠ 显示顺序」（VC-1 的 I/P 按解码序进、按 PTS 出）。
+**输入编码认这些**（`crates/cli/src/lib.rs::open_video_decoder` 是唯一真源）：
+`MP42` / `MP43` / `WMV1` / `WMV2` / **`WMV3`（VC-1）** / `mp4v`（`FMP4`·`DIVX`·`XVID`）。
+其余明确报 `Unsupported`（MP41 没有可对账的样本，拒绝而不是猜）。
+
+⚠️ **VC-1 已经接进 CLI**（`open_video_decoder` 的 `WMV3` 分支 + `VideoDecoder::Vc1`），
+GOP 并行解码也开了 —— 「解码顺序 ≠ 显示顺序」由「按 PTS 出帧」处理，
+前提「从任意 I 帧起解 == 整链解到那里」由 `crates/vc1/tests/gop_start.rs` 钉着。
+CLI 级还有一条 `crates/cli/tests/convert.rs::converts_wmv3_input`。
 
 下面的**约定**与**架构不变量**是硬约束（从隔壁 UsefulUnpack 的实战里换来的，不是摆设）——
 动手前先读完；**进度、判据、下一步**在 `TODO.md`（本地、不入库、唯一真源），面向人的状态表在 README。
