@@ -119,9 +119,11 @@ fn main() -> std::process::ExitCode {
         "[bench] {sample} {w}x{h} {frames} 帧 / {rounds} 遍：**{ms:.2} ms/帧**（threads={threads}）"
     );
     eprintln!(
-        "[kernels] available=0b{:b}（KERNEL_AVG={}）",
+        "[kernels] available=0b{:b} installed=0b{:b}（KERNEL_AVG={} KERNEL_IDCT_COLS={}）",
         v2v_mpeg12_simd::kernels::available(),
-        v2v_mpeg12_simd::kernels::KERNEL_AVG
+        v2v_mpeg12_simd::kernels::installed(),
+        v2v_mpeg12_simd::kernels::KERNEL_AVG,
+        v2v_mpeg12_simd::kernels::KERNEL_IDCT_COLS
     );
     std::process::ExitCode::SUCCESS
 }

@@ -10,10 +10,12 @@ pub const KERNEL_AVG: u32 = 1 << 0;
 /// IDCT 列通道（`idct_cols`）。
 pub const KERNEL_IDCT_COLS: u32 = 1 << 1;
 
-/// 当前实际**会用到**的内核（位掩码）。
+/// 本机**可用**的内核（位掩码）—— 编译进来了 **且** 这个架构支持。
 ///
-/// ⚠️ 关掉 `unsafe-kernels` feature 时这里是 0 —— 因为那时 `avg_rows` 走标量，
-/// 内核根本没被调用。早先这里不看 feature、恒报可用，等于骗宿主。
+/// ⚠️ **不等于「已装进解码器」**：`install()` 只装 IDCT 列通道。`KERNEL_AVG`
+/// 在这里会亮，但它**没被装** —— 实测运动补偿的平均已经由 LLVM 自动向量化成
+/// `urhadd`，手写没有收益（消融过：把整个平均删掉，端到端也是 0）。
+/// 要问「实际在跑什么」，用 [`installed()`]。
 pub fn available() -> u32 {
     #[cfg(feature = "unsafe-kernels")]
     {
@@ -32,11 +34,28 @@ pub fn available() -> u32 {
     }
 }
 
+/// 本机**实际已装进解码器**的内核（位掩码）。
+///
+/// 与 [`available()`] 的差集就是「写了但没装」的内核 —— 那正是**该被质疑**的部分：
+/// 一个装了不赚、或者根本没装的内核，报成「可用」只会让人以为它在生效。
+pub fn installed() -> u32 {
+    #[cfg(all(feature = "unsafe-kernels", target_arch = "aarch64"))]
+    {
+        // 与 `install()` 严格一一对应 —— 改这里必须同步改那里。
+        KERNEL_IDCT_COLS
+    }
+    #[cfg(not(all(feature = "unsafe-kernels", target_arch = "aarch64")))]
+    {
+        0
+    }
+}
+
 /// 把本 crate 的内核装进解码器（进程内调一次即可）。
 ///
-/// 目前只装 IDCT 列通道 —— `avg_rows` 没有装，因为实测运动补偿的平均
+/// **只装 IDCT 列通道** —— `avg_rows` 没有装，因为实测运动补偿的平均
 /// **已经由 LLVM 自动向量化成 `urhadd`**，手写反而没有收益（消融过：
-/// 把整个平均删掉端到端也是 0）。
+/// 把整个平均删掉端到端也是 0）。这个「写了但没装」的差集由
+/// [`installed()`] 如实报出来，别让宿主以为它在生效。
 pub fn install() {
     #[cfg(all(feature = "unsafe-kernels", target_arch = "aarch64"))]
     v2v_mpeg12::decode::set_idct_cols(idct_cols);

@@ -39,9 +39,11 @@ pub extern "C" fn v2v_mpeg12_simd_version() -> *const c_char {
     VERSION.as_ptr() as *const c_char
 }
 
-/// 本 crate 编进了哪些内核（bit 位掩码，给宿主查询用）。
+/// 本 crate 编进了哪些内核（bit 位掩码，给宿主查询用）。**不等于已装** ——
+/// 见 [`kernels::available`] 与 [`kernels::installed`] 的区别。
 ///
-/// - bit 0：半像素平均（`kernels::avg_rows`）
+/// - bit 0：半像素平均（`kernels::avg_rows`）—— 写了但**没装**（实测无收益）
+/// - bit 1：IDCT 列通道（`kernels::idct_cols`）—— 已装（aarch64）
 #[no_mangle]
 pub extern "C" fn v2v_mpeg12_simd_kernels() -> u32 {
     kernels::available()
@@ -56,9 +58,10 @@ pub mod kernels;
 /// 把本 crate 的内核装进解码器（进程内调一次即可）。
 pub use kernels::install;
 
-/// 解码入口（当前直接转调 `v2v-mpeg12`，见模块文档：安全路径是 oracle）。
+/// 解码入口（转调 `v2v-mpeg12`，安全路径仍是 oracle）。
 ///
-/// ⚠️ **性能上与 `v2v-mpeg12` 完全相同** —— 这里只是转调，`kernels` 里的
-/// unsafe 内核还没接进解码路径。要让它真的变快，得先在 `v2v-mpeg12` 里留一个
-/// 内核挂载点（本 crate 依赖 mpeg12，反过来不行，所以挂载点必须在 mpeg12 侧）。
+/// ⚠️ **别把它当成「加速版」**：这里只是转调，加速来自 [`install`] 装进去的内核
+/// （目前只有 IDCT 列通道，实测收益在噪声内 —— 见 TODO 的 2026-10-27 一节）。
+/// 要加新内核，得先在 `v2v-mpeg12` 里留一个挂载点（本 crate 依赖 mpeg12，
+/// 反过来不行，所以挂载点必须在 mpeg12 侧）。
 pub use v2v_mpeg12::decode::{decode_frame, MtDecoder};
