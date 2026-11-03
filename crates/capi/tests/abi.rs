@@ -636,3 +636,193 @@ fn encodes_audio_through_the_abi() {
 
     unsafe { v2v_aenc_close(enc) };
 }
+
+/// 封装层：编码 → 封成 ASF → 再用容器层读回来。
+///
+/// 这是**整条链的往返**（编码器 + 封装器 + 解封装器三者的假设会一起错），
+/// 所以它只证明「ABI 把参数传对了」，不证明格式合规 —— 后者在各自 crate 的
+/// 对账测试里（对 ffprobe / ffmpeg）。
+#[test]
+fn muxes_asf_and_reads_it_back() {
+    use v2v_capi::demux::*;
+    use v2v_capi::mux::*;
+    use v2v_capi::venc::*;
+
+    let (w, h) = (64u32, 48u32);
+    let out = std::env::temp_dir().join("v2v_abi_mux_asf.wmv");
+    let _ = std::fs::remove_file(&out);
+
+    // ---- 编码几帧 ----
+    let cfg = V2vVencCfg {
+        size: size_of::<V2vVencCfg>() as u32,
+        width: w,
+        height: h,
+        qscale: 0,
+        bitrate: 0,
+        fps_num: 0,
+        ac_pred: 1,
+        mpeg_quant: 0,
+    };
+    let enc = unsafe { v2v_venc_open(CODEC_MP43, &cfg) };
+    assert!(!enc.is_null());
+
+    let mut img = Gradient::new(w, h);
+    let mut packets: Vec<(Vec<u8>, i32)> = Vec::new();
+    for i in 0..4 {
+        img.shift(i as u8);
+        let p = img.as_planes();
+        let mut pkt: V2vPacket = unsafe { std::mem::zeroed() };
+        pkt.size = size_of::<V2vPacket>() as u32;
+        assert_eq!(unsafe { v2v_venc_encode(enc, &p, i32::from(i == 0), &mut pkt) }, OK);
+        // 立刻拷走：pkt.data 活到下一次 encode。
+        let bytes = unsafe { std::slice::from_raw_parts(pkt.data, pkt.len as usize) }.to_vec();
+        packets.push((bytes, pkt.key_frame));
+    }
+    unsafe { v2v_venc_close(enc) };
+
+    // ---- 封成 ASF ----
+    let vcfg = V2vMuxVideo {
+        size: size_of::<V2vMuxVideo>() as u32,
+        width: w,
+        height: h,
+        fourcc: u32::from_le_bytes(*b"MP43"),
+        timescale: 0,
+        codec: 0,
+        avg_bitrate: 0,
+        decoder_specific_info: std::ptr::null(),
+        dsi_len: 0,
+    };
+    let path = CString::new(out.to_str().unwrap()).unwrap();
+    let mux = unsafe { v2v_mux_open(MUX_ASF, path.as_ptr(), &vcfg, std::ptr::null()) };
+    assert!(!mux.is_null(), "打开封装器失败：{}", unsafe {
+        std::ffi::CStr::from_ptr(v2v_last_error()).to_string_lossy()
+    });
+    for (i, (bytes, key)) in packets.iter().enumerate() {
+        assert_eq!(
+            unsafe { v2v_mux_write_video(mux, bytes.as_ptr(), bytes.len() as u32, *key, i as i64 * 40, 40) },
+            OK,
+            "写第 {i} 帧失败：{}",
+            unsafe { std::ffi::CStr::from_ptr(v2v_last_error()).to_string_lossy() }
+        );
+    }
+    assert_eq!(unsafe { v2v_mux_finish(mux) }, OK);
+    // finish 之后不能再写。
+    assert_eq!(
+        unsafe { v2v_mux_write_video(mux, packets[0].0.as_ptr(), packets[0].0.len() as u32, 1, 0, 40) },
+        ERR_ARG
+    );
+    unsafe { v2v_mux_close(mux) };
+
+    // ---- 读回来 ----
+    let meta = std::fs::metadata(&out).expect("产物没落盘");
+    assert!(meta.len() > 0, "产物是空文件");
+
+    let d = unsafe { v2v_demux_open(path.as_ptr()) };
+    assert!(!d.is_null(), "读不回自己封的文件");
+    let v = find_stream(d, STREAM_VIDEO);
+    assert_eq!(v.width, w);
+    assert_eq!(v.height, h);
+    assert_eq!(v.fourcc, u32::from_le_bytes(*b"MP43"));
+
+    let mut n = 0u32;
+    let mut keys = 0u32;
+    loop {
+        let mut s: V2vSample = unsafe { std::mem::zeroed() };
+        s.size = size_of::<V2vSample>() as u32;
+        match unsafe { v2v_demux_next(d, &mut s) } {
+            OK => {
+                if s.key_frame != 0 {
+                    keys += 1;
+                }
+                n += 1;
+            }
+            EOS => break,
+            other => panic!("读回来时 next 返回 {other}"),
+        }
+    }
+    assert_eq!(n, packets.len() as u32, "样本数对不上");
+    assert_eq!(keys, 1, "只有第一帧是关键帧");
+    unsafe { v2v_demux_close(d) };
+
+    let _ = std::fs::remove_file(&out);
+}
+
+/// MP4 封装：只验产物是个像样的 MP4（没有 MP4 解封装器，读不回来）。
+#[test]
+fn muxes_mp4_with_a_valid_header() {
+    use v2v_capi::mux::*;
+    use v2v_capi::venc::*;
+
+    let (w, h) = (64u32, 48u32);
+    let out = std::env::temp_dir().join("v2v_abi_mux.mp4");
+    let _ = std::fs::remove_file(&out);
+
+    let cfg = V2vVencCfg {
+        size: size_of::<V2vVencCfg>() as u32,
+        width: w,
+        height: h,
+        qscale: 0,
+        bitrate: 0,
+        fps_num: 25,
+        ac_pred: 1,
+        mpeg_quant: 0,
+    };
+    let enc = unsafe { v2v_venc_open(CODEC_MP4V, &cfg) };
+    assert!(!enc.is_null());
+
+    // 先取 VOL（封装器建的时候就定死了，之后改不了）。
+    let mut dsi = vec![0u8; 512];
+    let dsi_len = unsafe { v2v_venc_header(enc, dsi.as_mut_ptr(), dsi.len() as u32) };
+    assert!(dsi_len > 0);
+
+    let mut img = Gradient::new(w, h);
+    let mut packets: Vec<(Vec<u8>, i32)> = Vec::new();
+    for i in 0..3 {
+        img.shift(i as u8);
+        let p = img.as_planes();
+        let mut pkt: V2vPacket = unsafe { std::mem::zeroed() };
+        pkt.size = size_of::<V2vPacket>() as u32;
+        assert_eq!(unsafe { v2v_venc_encode(enc, &p, i32::from(i == 0), &mut pkt) }, OK);
+        packets.push((
+            unsafe { std::slice::from_raw_parts(pkt.data, pkt.len as usize) }.to_vec(),
+            pkt.key_frame,
+        ));
+    }
+    unsafe { v2v_venc_close(enc) };
+
+    let vcfg = V2vMuxVideo {
+        size: size_of::<V2vMuxVideo>() as u32,
+        width: w,
+        height: h,
+        fourcc: 0,
+        timescale: 1000,
+        codec: MUX_VCODEC_MP4V,
+        avg_bitrate: 0,
+        decoder_specific_info: dsi.as_ptr(),
+        dsi_len: dsi_len as u32,
+    };
+    let path = CString::new(out.to_str().unwrap()).unwrap();
+    let mux = unsafe { v2v_mux_open(MUX_MP4, path.as_ptr(), &vcfg, std::ptr::null()) };
+    assert!(!mux.is_null(), "打开 MP4 封装器失败：{}", unsafe {
+        std::ffi::CStr::from_ptr(v2v_last_error()).to_string_lossy()
+    });
+    for (i, (bytes, key)) in packets.iter().enumerate() {
+        assert_eq!(
+            unsafe { v2v_mux_write_video(mux, bytes.as_ptr(), bytes.len() as u32, *key, i as i64 * 40, 40) },
+            OK
+        );
+    }
+    assert_eq!(unsafe { v2v_mux_finish(mux) }, OK);
+    unsafe { v2v_mux_close(mux) };
+
+    let bytes = std::fs::read(&out).expect("产物没落盘");
+    assert!(bytes.len() > 32);
+    // 第一个 box 必须是 `ftyp`。
+    let size = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    assert!(size >= 8 && size as usize <= bytes.len());
+    assert_eq!(&bytes[4..8], b"ftyp", "第一个 box 不是 ftyp");
+    // 后面必须能找到 `mdat`（真有码流写进去了）。
+    assert!(bytes.windows(4).any(|w| w == b"mdat"), "没找到 mdat");
+
+    let _ = std::fs::remove_file(&out);
+}

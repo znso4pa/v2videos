@@ -35,6 +35,7 @@ pub mod adec;
 pub mod aenc;
 pub mod common;
 pub mod demux;
+pub mod mux;
 pub mod player;
 pub mod vdec;
 pub mod venc;

@@ -428,6 +428,81 @@ int32_t v2v_aenc_encode(v2v_aenc *h, const float *const *planes, uint32_t sample
 /* 把 AudioSpecificConfig 拷进 buf，返回字节数；cap 不够返回 V2V_ERR_ARG。 */
 int32_t v2v_aenc_asc(const v2v_aenc *h, uint8_t *buf, uint32_t cap);
 
+
+/* ==================================================================
+ * 封装（L4）：ASF / MP4
+ *
+ * 两个封装器的入参形状**真的不一样**，这里不假装一样：
+ *   ASF 要 width/height/fourcc + 整条 WAVEFORMATEX，写入按**毫秒**
+ *   MP4 要 width/height/timescale/codec/VOL + timescale/object_type/ASC/priming，写入按 **tick**
+ * 所以结构体里两组字段都在，各自只看自己那组。
+ *
+ * write 同时给 pts_ms 与 duration_ticks 不是冗余：ASF 用前者、MP4 用后者。
+ * 音频尤其不能换算 —— AAC 一帧 1024 个采样点，换成毫秒取整再换回来每帧丢 10 个 tick。
+ *
+ * finish 会消耗掉封装器：之后再 write 返回 V2V_ERR_ARG，close 照常。
+ * 没 finish 就 close = 什么都不写出来。
+ * ================================================================== */
+
+#define V2V_MUX_ASF 1
+#define V2V_MUX_MP4 2
+
+/* MP4 视频轨的编解码类型（目前只有这一种）。 */
+#define V2V_MUX_VCODEC_MP4V 0
+
+typedef struct v2v_mux v2v_mux;
+
+typedef struct v2v_mux_video {
+    uint32_t size;
+    uint32_t width;
+    uint32_t height;
+    /* ASF */
+    uint32_t fourcc; /* MP43 编码时传 'MP43' 的字节小端 */
+    /* MP4 */
+    uint32_t timescale;   /* 每秒多少 tick；0 = 1000（tick 就是毫秒） */
+    uint32_t codec;       /* V2V_MUX_VCODEC_MP4V */
+    uint32_t avg_bitrate; /* 写进 esds / btrt */
+    const uint8_t *decoder_specific_info; /* VOL，v2v_venc_header 拿到的 */
+    uint32_t dsi_len;
+} v2v_mux_video;
+
+typedef struct v2v_mux_audio {
+    uint32_t size;
+    /* ASF（整条 WAVEFORMATEX） */
+    uint32_t format_tag;
+    uint32_t channels;
+    uint32_t sample_rate;
+    uint32_t avg_bytes_per_sec;
+    uint32_t block_align;
+    uint32_t bits_per_sample;
+    const uint8_t *extra;
+    uint32_t extra_len;
+    /* MP4 */
+    uint32_t timescale; /* 0 = 采样率（AAC / PCM 都该这么给） */
+    uint32_t object_type; /* AAC = 0x40 */
+    uint32_t avg_bitrate;
+    const uint8_t *asc; /* AudioSpecificConfig */
+    uint32_t asc_len;
+    uint32_t priming; /* AAC = 1024，PCM = 0 */
+} v2v_mux_audio;
+
+/* 打开。audio 传 NULL 表示只要视频轨。失败返回 NULL。 */
+v2v_mux *v2v_mux_open(uint32_t container, const char *path,
+                      const v2v_mux_video *video, const v2v_mux_audio *audio);
+
+void v2v_mux_close(v2v_mux *h);
+
+/* 写一帧视频。pts_ms 给 ASF，duration_ticks 给 MP4。 */
+int32_t v2v_mux_write_video(v2v_mux *h, const uint8_t *data, uint32_t len,
+                            int32_t key_frame, int64_t pts_ms, uint32_t duration_ticks);
+
+/* 写一帧音频。同上。 */
+int32_t v2v_mux_write_audio(v2v_mux *h, const uint8_t *data, uint32_t len,
+                            int64_t pts_ms, uint32_t duration_ticks);
+
+/* 收尾并落盘。之后句柄不可再写。 */
+int32_t v2v_mux_finish(v2v_mux *h);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
