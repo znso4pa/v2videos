@@ -140,6 +140,35 @@ pub struct Info {
     pub audio_sample_rate: u32,
     /// 音频声道数；无音频轨时是 0。
     pub audio_channels: u16,
+    /// 静态能力标志，见 [`INFO_HAS_B_FRAMES`] 等常量。
+    ///
+    /// 存在的理由：**宿主该在 `open` 时就拒掉播不了的流**，而不是播到第 N 帧
+    /// 才拿到一个解码错误。
+    pub flags: u32,
+}
+
+/// 码流里声明了 B 帧（`max_b_frames != 0`）。
+///
+/// 本解码器只做 I / P —— 置位即「这条流播不了」，**不是**「会慢一点」。
+pub const INFO_HAS_B_FRAMES: u32 = 1 << 0;
+
+/// 隔行码流。**本实现恒不置位**：Main profile 的序列头不携带隔行信息
+/// （`FCM` 在每帧的帧头里），`open` 时判断不出来。隔行码流本实现也不支持。
+pub const INFO_INTERLACED: u32 = 1 << 1;
+
+/// Advanced profile。**本实现恒不置位**：Advanced 的序列头在码流里而不是
+/// extradata 里，`SeqHeader::parse` 在 `open` 阶段就已经报 `Unsupported` 了。
+pub const INFO_ADVANCED_PROFILE: u32 = 1 << 2;
+
+/// 从序列头能看出来的能力标志。
+///
+/// 只有**真能看出来**的才置位 —— 看不出来的宁可留 0，也不要给宿主一个假的绿勾。
+fn info_flags(max_b_frames: u8) -> u32 {
+    let mut f = 0;
+    if max_b_frames > 0 {
+        f |= INFO_HAS_B_FRAMES;
+    }
+    f
 }
 
 /// 解出来的一帧视频（YUV420P，三平面分开）。
@@ -235,7 +264,7 @@ impl Player {
     /// 都是 BufReader，不整文件进内存。
     pub fn open(path: &Path) -> Result<Player> {
         let video_demux = open_demux(path)?;
-        let info = demux_info(&video_demux)?;
+        let mut info = demux_info(&video_demux)?;
 
         // ---- 视频解码器（目前只有 WMV3）----
         let vstream = video_demux
@@ -251,6 +280,7 @@ impl Player {
             )));
         }
         let seq = v2v_vc1::SeqHeader::parse(&vfmt.extra)?;
+        info.flags = info_flags(seq.max_b_frames);
         let decoder = v2v_vc1::Decoder::new(seq, info.width, info.height)?;
         let video = VideoTrack {
             stream_num: vstream.number,
@@ -558,6 +588,23 @@ fn demux_info(demux: &AsfDemuxer<BufReader<File>>) -> Result<Info> {
         video_fourcc: vfmt.fourcc,
         audio_sample_rate: audio.map_or(0, |a| a.sample_rate),
         audio_channels: audio.map_or(0, |a| a.channels),
+        // 视频侧的能力标志要等序列头解析完才知道，`open` 里再补。
+        flags: 0,
     })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn b_frames_are_reported_as_unsupported() {
+        assert_eq!(info_flags(0), 0);
+        assert_eq!(info_flags(2), INFO_HAS_B_FRAMES);
+        // 三个位互不重叠，宿主按位判就行。
+        assert_eq!(
+            INFO_HAS_B_FRAMES & INFO_INTERLACED & INFO_ADVANCED_PROFILE,
+            0
+        );
+    }
+}
