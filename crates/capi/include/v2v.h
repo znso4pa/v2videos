@@ -177,6 +177,102 @@ int64_t v2v_player_seek_ms(v2v_player *h, uint64_t ms);
 /* 已交出的最后一帧视频的时间戳（ms）。没取过帧时是 0。 */
 int64_t v2v_player_position_ms(const v2v_player *h);
 
+/* ==================================================================
+ * 容器（L0 嗅探 / L1 解封装）
+ *
+ * ASF 与 AVI 共用**同一套符号**：它们的动词本来就一样（开、列流、取下一个样本），
+ * 吐出来的也是同一个样本结构。加新容器 = 加一个后端，这套符号不动。
+ *
+ * 样本的 data 是**借用**的：活到下一次 v2v_demux_next / close。
+ * 典型用法是「拿到就解」，所以这里刻意不做「交所有权 + free」。
+ * ================================================================== */
+
+#define V2V_CONTAINER_UNKNOWN 0
+#define V2V_CONTAINER_ASF 1
+#define V2V_CONTAINER_AVI 2
+/* MPEG-1/2 program stream。认得出，但**不在这套符号里**（形状不同，见 v2v_mpeg_*）。 */
+#define V2V_CONTAINER_MPEG_PS 3
+
+#define V2V_STREAM_AUDIO 0
+#define V2V_STREAM_VIDEO 1
+#define V2V_STREAM_COMMAND 2
+#define V2V_STREAM_JFIF 3
+#define V2V_STREAM_UNKNOWN 4
+
+typedef struct v2v_demux v2v_demux;
+
+/* 一条流的静态信息。视频字段与音频字段在同一块里，用不到的为 0。
+ *
+ * extra 是编解码器私有数据（VC-1 的序列头 / WMA 的 params 都在这里），
+ * 借用，活到下一次 v2v_demux_stream / close。 */
+typedef struct v2v_stream_info {
+    uint32_t size;
+    uint32_t number; /* 容器内的流号，只在同一容器内可比 */
+    uint32_t kind;   /* V2V_STREAM_* */
+    uint64_t time_offset_ms;
+
+    /* 视频 */
+    uint32_t width;
+    uint32_t height;
+    uint32_t encoded_width;
+    uint32_t encoded_height;
+    uint32_t fourcc;
+    uint32_t bits_per_pixel;
+
+    /* 音频 */
+    uint32_t format_tag; /* 0x0161 = WMA v2, 0x0160 = WMA v1, 0x0001 = PCM */
+    uint32_t sample_rate;
+    uint32_t avg_bytes_per_sec;
+    uint32_t channels;
+    uint32_t block_align;
+    uint32_t bits_per_sample;
+
+    const uint8_t *extra;
+    uint32_t extra_len;
+} v2v_stream_info;
+
+/* 一个已重组的样本（视频一帧 / 音频一帧）。 */
+typedef struct v2v_sample {
+    uint32_t size;
+    uint32_t stream; /* 与 v2v_stream_info.number 对应 */
+    int32_t key_frame;
+    int64_t timestamp_ms; /* ASF 已扣 preroll；AVI 从 0 起 */
+    const uint8_t *data;  /* 借用，活到下一次 next / close */
+    uint32_t data_len;
+} v2v_sample;
+
+/* 索引（只有 ASF 有）。槽 i = 「seek 到第 i 槽该从哪个包起读」。
+ * 用法：slot = ms / interval_ms; 然后 v2v_demux_seek_packet(packets[slot])。 */
+typedef struct v2v_index {
+    uint32_t size;
+    uint32_t interval_ms;
+    uint32_t count;
+    const uint32_t *packets; /* 借用 */
+} v2v_index;
+
+/* 嗅探容器种类。认不出来返回 V2V_CONTAINER_UNKNOWN（不是错误）。 */
+int32_t v2v_probe(const uint8_t *head, uint32_t len);
+
+/* 打开（自动嗅探）。失败返回 NULL。 */
+v2v_demux *v2v_demux_open(const char *path);
+
+void v2v_demux_close(v2v_demux *h);
+
+/* 有几条流。 */
+uint32_t v2v_demux_stream_count(const v2v_demux *h);
+
+/* 取第 i 条流的信息。越界返回 V2V_ERR_ARG。 */
+int32_t v2v_demux_stream(v2v_demux *h, uint32_t i, v2v_stream_info *out);
+
+/* 取下一个样本（所有轨混在一起，按容器里的顺序）。V2V_EOS = 到头。 */
+int32_t v2v_demux_next(v2v_demux *h, v2v_sample *out);
+
+/* 把读游标挪到第 packet 个包。AVI 没有包级索引 → V2V_ERR_UNSUPPORTED。 */
+int32_t v2v_demux_seek_packet(v2v_demux *h, uint64_t packet);
+
+/* 取索引。V2V_EOS = 这个文件没有索引。 */
+int32_t v2v_demux_index(v2v_demux *h, v2v_index *out);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

@@ -65,8 +65,12 @@ pub trait IntoAbi {
 
 /// 记下错误并返回对应的返回码。
 pub fn rc<E: IntoAbi + ?Sized>(e: &E) -> c_int {
-    let kind = e.kind();
-    set_err(kind, &e.message());
+    rc_kind(e.kind(), &e.message())
+}
+
+/// 同 [`rc`]，但种类与消息已经拆开了（两个 crate 的错误类型不同时用它收口）。
+pub fn rc_kind(kind: c_int, msg: &str) -> c_int {
+    set_err(kind, msg);
     match kind {
         KIND_UNSUPPORTED => ERR_UNSUPPORTED,
         _ => ERR_FAILED,

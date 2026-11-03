@@ -132,3 +132,61 @@ fn plays_a_real_sample_end_to_end() {
 
     unsafe { v2v_player_close(h) };
 }
+
+/// 容器层：嗅探 → 列流 → 逐样本拉到 EOS。缺样本就 SKIP（路径要给绝对的）。
+#[test]
+fn demuxes_a_real_sample() {
+    use v2v_capi::demux::*;
+
+    let Some(path) = std::env::var("V2V_ASF_SAMPLE")
+        .ok()
+        .and_then(|s| s.split(':').find(|p| std::path::Path::new(p).is_file()).map(String::from))
+    else {
+        eprintln!("SKIP demuxes_a_real_sample：没设 V2V_ASF_SAMPLE");
+        return;
+    };
+
+    // 嗅探：读文件头 64 字节，必须认成 ASF。
+    let head = std::fs::read(&path).unwrap();
+    let k = unsafe { v2v_probe(head.as_ptr(), head.len().min(64) as u32) };
+    assert_eq!(k, CONTAINER_ASF);
+
+    let c = CString::new(path).unwrap();
+    let h = unsafe { v2v_demux_open(c.as_ptr()) };
+    assert!(!h.is_null(), "打不开：{}", unsafe {
+        std::ffi::CStr::from_ptr(v2v_last_error()).to_string_lossy()
+    });
+
+    let n = unsafe { v2v_demux_stream_count(h) };
+    assert!(n >= 1, "至少得有一条流");
+
+    // 第一条应该是视频，且 extra 里带着 VC-1 的序列头。
+    let mut si: V2vStreamInfo = unsafe { std::mem::zeroed() };
+    si.size = size_of::<V2vStreamInfo>() as u32;
+    assert_eq!(unsafe { v2v_demux_stream(h, 0, &mut si) }, OK);
+    assert_eq!(si.kind, STREAM_VIDEO);
+    assert!(si.width > 0 && si.height > 0);
+    assert_ne!(si.fourcc, 0);
+    assert!(si.extra_len > 0 && !si.extra.is_null(), "视频流该带序列头");
+
+    // 逐样本拉：时间戳必须单调不减，data 必须非空。
+    let mut count = 0u32;
+    let mut last = i64::MIN;
+    loop {
+        let mut s: V2vSample = unsafe { std::mem::zeroed() };
+        s.size = size_of::<V2vSample>() as u32;
+        match unsafe { v2v_demux_next(h, &mut s) } {
+            OK => {
+                assert!(!s.data.is_null() && s.data_len > 0);
+                assert!(s.timestamp_ms >= last, "时间戳回退");
+                last = s.timestamp_ms;
+                count += 1;
+            }
+            EOS => break,
+            other => panic!("next 返回 {other}"),
+        }
+    }
+    assert!(count > 0, "一个样本都没读出来");
+
+    unsafe { v2v_demux_close(h) };
+}

@@ -32,6 +32,7 @@
 //! 在 ABI 里做一层只会多一次全帧拷贝，还多一份要维护的语义。
 
 pub mod common;
+pub mod demux;
 pub mod player;
 
 pub use common::{
