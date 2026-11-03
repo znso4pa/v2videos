@@ -108,8 +108,11 @@ FFI 有两个方向，**每个方向都只有一个 crate**，别在别处加：
 `v2v_planes_copy_to`：拷进你自己的缓冲，可以带 padding，不用自己按 stride 逐行搬 ——
 「色度是 `ceil(width/2)` 宽、`ceil(height/2)` 高」这种细节写错**只会花屏，不会报错**。
 
-两个产物：`crates/capi/build-products.sh` 出 `min`（默认 feature，38 个符号）与
-`full`（加 `hw` / `mpeg12`，50 个符号）。同主版本就同 ABI —— full 只是多一族符号。
+两个产物：`crates/capi/build-products.sh` 出 `min`（默认 feature）与 `full`（加
+`hw` / `mpeg12`）。同主版本就同 ABI —— full 只是多出 MPEG-1/2 与硬件转码那两族符号。
+
+（**别把符号个数写进文档**：加一个函数它就变，而它是「数出来的」不是契约。
+要知道当下几个，`nm -gU dist/libv2v_capi_min.so | grep -c ' _v2v_'`。）
 
 验收不靠「自己的 Rust 测试调自己」：`crates/capi/tests/smoke.c` 是个纯 C 程序，
 `dlopen` 打开产物、按头文件的声明取函数指针类型，走
@@ -214,7 +217,7 @@ cc -std=c11 -Wall -Wextra -Werror -I crates/capi/include \
 | **音频编码** | AAC-LC（`v2v-aac`）：MDCT + 量化 + Huffman 码本 + **短窗**（瞬态）+ 窗口分组 + **TNS**（长窗）+ **M/S 立体声**（逐帧决策）；预算**按声道需要分**、**逐带率-失真分配**（每带按 `失真 + λ·位数` 选，λ 从上一帧的答案出发搜）够目标码率；双声道可选**声道并行**（输出逐字节不变） | ffmpeg 解得开；码率命中目标；真素材上与 ffmpeg 的 AAC 同目标码率比：**128k +2.1 dB、192k +3.1 dB、256k +3.1 dB**（另一段素材 +7 ～ +8 dB；口径见 §4，`tools/snr.py` 搜对齐后再算）；瞬态素材上**短窗 vs 长窗 12.02 vs 10.49 dB、体积小 29%** |
 | **封装**   | ASF 写（`.wmv`，单视频流）：**多载荷打包** + **Simple Index**（每 1 秒一个 seek 槽） | `ffprobe` 认；自己解封装字节一致；ffmpeg 解出来的像素与我们的解码器**逐位一致**；真样本载荷占文件 **89%**（改前 24%）、体积小 3.8 倍；`ffmpeg -ss` 能读出我们写的索引 |
 | **封装**   | MP4 / ISOBMFF 写（`v2v-mp4`，视频 `mp4v`；音频 `mp4a`+`esds`（AAC）或 `sowt` PCM）                                     | 真样本 mp4v 轨的 `stsz`/`stts`/`stss`/`stco` 与 ffmpeg **逐项相同**、逐帧 MD5 一致；PCM 轨原样往返；AAC 轨 ffmpeg 解得开 |
-| **C ABI** | `v2v-capi`（出站 FFI）：容器 / 解码 / 编码 / 封装 / 播放 / MPEG-1/2 / 硬件转码，一层一组 `v2v_*` 符号 + 手写 `v2v.h`；`min` / `full` 两个产物 | 纯 C 程序 `dlopen` 打开自己产的 `.so`，按头文件的声明走完 `probe → open → info → 读帧（stride == width、pts 不倒退）→ seek → demux`；头文件在 `-Werror` 下编得过；`min`（38 个符号）与 `full`（50 个）都过 |
+| **C ABI** | `v2v-capi`（出站 FFI）：容器 / 解码 / 编码 / 封装 / 播放 / MPEG-1/2 / 硬件转码，一层一组 `v2v_*` 符号 + 手写 `v2v.h`；`min` / `full` 两个产物 | 纯 C 程序 `dlopen` 打开自己产的 `.so`，按头文件的声明走完 `probe → open → info → 读帧（stride == width、pts 不倒退）→ seek → demux`；头文件在 `-Werror` 下编得过；`min` 与 `full` 两个产物都过 |
 
 **两条输出路**（`v2v convert`，默认 `.wmv`）：
 
