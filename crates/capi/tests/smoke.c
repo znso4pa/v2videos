@@ -88,8 +88,17 @@ DECL(v2v_venc_open);
 DECL(v2v_venc_encode);
 DECL(v2v_venc_header);
 DECL(v2v_venc_close);
+DECL(v2v_adec_open);
+DECL(v2v_adec_feed);
+DECL(v2v_adec_next);
+DECL(v2v_adec_close);
+DECL(v2v_aenc_open);
+DECL(v2v_aenc_encode);
+DECL(v2v_aenc_asc);
+DECL(v2v_aenc_close);
 DECL(v2v_mux_open);
 DECL(v2v_mux_write_video);
+DECL(v2v_mux_write_audio);
 DECL(v2v_mux_finish);
 DECL(v2v_mux_close);
 
@@ -256,14 +265,98 @@ static int codec_of(uint32_t f) {
     return -1;
 }
 
-/* demux → 解码 → 编码 → 封装，产物写进 `out_path`。
+/* WMA 解码：喂容器里的音频载荷、逐个取帧。
+ *
+ * 这一段验的是 `v2v_adec_cfg` 与 `v2v_adec_frame` 的字段顺序 —— 尤其是
+ * `planes`（`const float *const *`）那种「指针层数写错就崩」的字段。
+ * 不解成 WAV、不算 SNR：形状测试只问「取到了没有、声道与采样率对不对」。 */
+static void check_audio_decode(const char *sample_path) {
+    v2v_demux *d = p_v2v_demux_open(sample_path);
+    CHECK(d != NULL, "audio: demux 打开失败: %s", p_v2v_last_error());
+
+    uint32_t n = p_v2v_demux_stream_count(d);
+    v2v_stream_info as;
+    int found = 0;
+    memset(&as, 0, sizeof as);
+    for (uint32_t i = 0; i < n; i++) {
+        v2v_stream_info si;
+        memset(&si, 0xAA, sizeof si);
+        V2V_INIT(si);
+        CHECK(p_v2v_demux_stream(d, i, &si) == V2V_OK, "audio: 取第 %u 条流失败", i);
+        if (si.kind == V2V_STREAM_AUDIO) {
+            as = si;
+            found = 1;
+            break;
+        }
+    }
+    if (!found) {
+        printf("（样本里没有音频流，跳过 WMA 解码那段）\n");
+        p_v2v_demux_close(d);
+        return;
+    }
+
+    v2v_adec_cfg ac;
+    memset(&ac, 0, sizeof ac);
+    V2V_INIT(ac);
+    ac.format_tag = as.format_tag;
+    ac.channels = as.channels;
+    ac.sample_rate = as.sample_rate;
+    ac.avg_bytes_per_sec = as.avg_bytes_per_sec;
+    ac.block_align = as.block_align;
+    ac.extra = as.extra;
+    ac.extra_len = as.extra_len;
+    ac.drop_priming = 1; /* 与 ffmpeg 一致：丢掉编码器开头的静音 */
+    v2v_adec *dec = p_v2v_adec_open(&ac);
+    CHECK(dec != NULL, "audio: 建解码器失败: %s", p_v2v_last_error());
+
+    int frames = 0;
+    long long samples = 0;
+    int fed = 0;
+    while (fed < 200) {
+        v2v_sample s;
+        memset(&s, 0, sizeof s);
+        V2V_INIT(s);
+        int32_t rc = p_v2v_demux_next(d, &s);
+        if (rc == V2V_EOS) break;
+        CHECK(rc == V2V_OK, "audio: 取样本失败: %s", p_v2v_last_error());
+        if (s.stream != as.number) continue;
+        fed++;
+        CHECK(p_v2v_adec_feed(dec, s.data, s.data_len) == V2V_OK, "audio: 喂载荷失败: %s",
+              p_v2v_last_error());
+        for (;;) {
+            v2v_adec_frame f;
+            memset(&f, 0, sizeof f);
+            V2V_INIT(f);
+            int32_t r = p_v2v_adec_next(dec, &f);
+            if (r == V2V_EOS) break; /* 队列空了，**不是**流结束 */
+            CHECK(r == V2V_OK, "audio: 取帧失败: %s", p_v2v_last_error());
+            CHECK(f.planes != NULL, "audio: planes 是空指针");
+            CHECK(f.planes[0] != NULL, "audio: 第一条声道是空指针");
+            CHECK(f.channels == as.channels, "audio: 声道数变了（%u != %u）", f.channels,
+                  as.channels);
+            CHECK(f.sample_rate == as.sample_rate, "audio: 采样率变了（%u != %u）", f.sample_rate,
+                  as.sample_rate);
+            CHECK(f.samples > 0, "audio: 空帧");
+            frames++;
+            samples += (long long)f.samples;
+        }
+    }
+    CHECK(frames > 0, "audio: 一帧都没解出来");
+    p_v2v_adec_close(dec);
+    p_v2v_demux_close(d);
+    printf("ok  audio-decode（%d 帧 / %lld 个采样点 / %u ch @ %u Hz）\n", frames, samples,
+           as.channels, as.sample_rate);
+}
+
+/* demux → 解码 → 编码 → 封装，产物写进 `out_path`（视频 + 音频双轨）。
  *
  * 这一段的价值不只是「链路能跑」：它让 C 编译器去核对
  * `v2v_stream_info` / `v2v_picture` / `v2v_venc_cfg` / `v2v_packet` /
- * `v2v_mux_video` 这几个结构体的**字段顺序**。Rust 侧测试用的是同一份 Rust
- * 结构体，字段顺序写反了照样全绿 —— 只有从 C 填一遍才暴露。
+ * `v2v_mux_video` / `v2v_aenc_cfg` / `v2v_mux_audio` 这几个结构体的**字段顺序**。
+ * Rust 侧测试用的是同一份 Rust 结构体，字段顺序写反了照样全绿 ——
+ * 只有从 C 填一遍才暴露。
  *
- * 只取视频、只取前 `frames` 帧：这是形状测试，不是「转一个完整文件」。 */
+ * 只取前 `frames` 帧：这是形状测试，不是「转一个完整文件」。 */
 static void check_chain(const char *sample_path, const char *out_path, int frames) {
     v2v_demux *d = p_v2v_demux_open(sample_path);
     CHECK(d != NULL, "chain: demux 打开失败: %s", p_v2v_last_error());
@@ -307,6 +400,44 @@ static void check_chain(const char *sample_path, const char *out_path, int frame
     int32_t dsi_len = p_v2v_venc_header(enc, dsi, (uint32_t)sizeof dsi);
     CHECK(dsi_len > 0, "chain: 取 VOL 失败: %s", p_v2v_last_error());
 
+    /* ---- 音频：合成一段正弦，编成 AAC ----
+     *
+     * 故意**不**用刚解出来的 WMA：那要把解码结果攒够 1024 个采样点再喂 AAC
+     * （一个 WMA 载荷吐出来的帧长不固定），在 smoke 里写环形缓冲不值得。
+     * 这一段要验的是 `v2v_aenc_cfg` / `v2v_mux_audio` 的**字段顺序**（后者 15 个
+     * 字段、两组语义叠在一起，是最容易写错的），以及「双轨能一起封装」——
+     * 不是音画同步。 */
+    uint32_t a_ch = 2;
+    uint32_t a_sr = 44100;
+    for (uint32_t i = 0; i < n; i++) {
+        v2v_stream_info si;
+        memset(&si, 0xAA, sizeof si);
+        V2V_INIT(si);
+        CHECK(p_v2v_demux_stream(d, i, &si) == V2V_OK, "chain: 取第 %u 条流失败", i);
+        /* 只取标量：`si.extra` 的借用会被下一次 `v2v_demux_stream` 作废。 */
+        if (si.kind == V2V_STREAM_AUDIO && si.channels >= 1 && si.channels <= 2 &&
+            si.sample_rate >= 8000) {
+            a_ch = si.channels;
+            a_sr = si.sample_rate;
+            break;
+        }
+    }
+
+    v2v_aenc_cfg xc;
+    memset(&xc, 0, sizeof xc);
+    V2V_INIT(xc);
+    xc.channels = a_ch;
+    xc.sample_rate = a_sr;
+    xc.bitrate = 128000;
+    xc.ms_stereo = 1;
+    xc.threads = 1;
+    v2v_aenc *aenc = p_v2v_aenc_open(&xc);
+    CHECK(aenc != NULL, "chain: 建 AAC 编码器失败: %s", p_v2v_last_error());
+
+    uint8_t asc[64];
+    int32_t asc_len = p_v2v_aenc_asc(aenc, asc, (uint32_t)sizeof asc);
+    CHECK(asc_len > 0, "chain: 取 ASC 失败: %s", p_v2v_last_error());
+
     v2v_mux_video mv;
     memset(&mv, 0, sizeof mv);
     V2V_INIT(mv);
@@ -316,7 +447,18 @@ static void check_chain(const char *sample_path, const char *out_path, int frame
     mv.codec = V2V_MUX_VCODEC_MP4V;
     mv.decoder_specific_info = dsi;
     mv.dsi_len = (uint32_t)dsi_len;
-    v2v_mux *mux = p_v2v_mux_open(V2V_MUX_MP4, out_path, &mv, NULL);
+
+    v2v_mux_audio ma;
+    memset(&ma, 0, sizeof ma);
+    V2V_INIT(ma);
+    ma.timescale = a_sr; /* AAC 的时间基用采样率，别用毫秒 */
+    ma.object_type = 0x40; /* AAC */
+    ma.avg_bitrate = 128000;
+    ma.asc = asc;
+    ma.asc_len = (uint32_t)asc_len;
+    ma.priming = V2V_AAC_FRAME_SAMPLES; /* AAC 的编码器延迟 */
+
+    v2v_mux *mux = p_v2v_mux_open(V2V_MUX_MP4, out_path, &mv, &ma);
     CHECK(mux != NULL, "chain: 开封装器失败: %s", p_v2v_last_error());
 
     int got = 0;
@@ -348,12 +490,32 @@ static void check_chain(const char *sample_path, const char *out_path, int frame
                                     (uint32_t)dur) == V2V_OK,
               "chain: 写封装失败: %s", p_v2v_last_error());
         last_pts = s.timestamp_ms;
+
+        /* 一帧视频配一帧 AAC（内容无关，见上面那段说明）。 */
+        float pcm[2][V2V_AAC_FRAME_SAMPLES];
+        for (int i = 0; i < V2V_AAC_FRAME_SAMPLES; i++) {
+            float v = 0.1f * (float)(got + 1);
+            pcm[0][i] = v;
+            pcm[1][i] = -v;
+        }
+        const float *planes[2] = {pcm[0], pcm[1]};
+        v2v_packet apkt;
+        memset(&apkt, 0, sizeof apkt);
+        V2V_INIT(apkt);
+        CHECK(p_v2v_aenc_encode(aenc, planes, V2V_AAC_FRAME_SAMPLES, &apkt) == V2V_OK,
+              "chain: AAC 编码失败: %s", p_v2v_last_error());
+        int64_t apts = (int64_t)got * V2V_AAC_FRAME_SAMPLES * 1000 / (int64_t)a_sr;
+        CHECK(p_v2v_mux_write_audio(mux, apkt.data, apkt.len, apts, V2V_AAC_FRAME_SAMPLES) ==
+                  V2V_OK,
+              "chain: 写音频失败: %s", p_v2v_last_error());
+
         got++;
     }
     CHECK(got > 0, "chain: 一帧都没走通");
 
     CHECK(p_v2v_mux_finish(mux) == V2V_OK, "chain: finish 失败: %s", p_v2v_last_error());
     p_v2v_mux_close(mux);
+    p_v2v_aenc_close(aenc);
     p_v2v_venc_close(enc);
     p_v2v_vdec_close(dec);
     p_v2v_demux_close(d);
@@ -394,8 +556,17 @@ int main(int argc, char **argv) {
     LOAD(v2v_venc_encode);
     LOAD(v2v_venc_header);
     LOAD(v2v_venc_close);
+    LOAD(v2v_adec_open);
+    LOAD(v2v_adec_feed);
+    LOAD(v2v_adec_next);
+    LOAD(v2v_adec_close);
+    LOAD(v2v_aenc_open);
+    LOAD(v2v_aenc_encode);
+    LOAD(v2v_aenc_asc);
+    LOAD(v2v_aenc_close);
     LOAD(v2v_mux_open);
     LOAD(v2v_mux_write_video);
+    LOAD(v2v_mux_write_audio);
     LOAD(v2v_mux_finish);
     LOAD(v2v_mux_close);
 
@@ -406,11 +577,12 @@ int main(int argc, char **argv) {
     if (argc >= 3) {
         check_player(argv[2]);
         check_demux(argv[2]);
+        check_audio_decode(argv[2]);
         if (argc >= 4) {
             check_chain(argv[2], argv[3], 4);
         }
     } else {
-        printf("（没给样本，跳过 open / 读帧 / seek / demux / 转码那几段）\n");
+        printf("（没给样本，跳过 open / 读帧 / seek / demux / 音频 / 转码那几段）\n");
     }
 
     dlclose(lib);

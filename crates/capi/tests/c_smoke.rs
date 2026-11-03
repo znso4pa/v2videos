@@ -139,10 +139,8 @@ fn check_chain_output(mp4: &Path, c_stdout: &str) {
         .args([
             "-v",
             "error",
-            "-select_streams",
-            "v:0",
             "-show_entries",
-            "stream=codec_name,width,height,nb_frames",
+            "stream=codec_name,nb_frames",
             "-of",
             "default=nw=1",
         ])
@@ -155,8 +153,9 @@ fn check_chain_output(mp4: &Path, c_stdout: &str) {
     };
     let info = String::from_utf8_lossy(&probe.stdout).to_string();
     assert!(probe.status.success(), "ffprobe 读不了 C 写的 mp4：{info}");
-    assert!(info.contains("codec_name=mpeg4"), "编码不是 mpeg4：\n{info}");
-    assert!(info.contains("nb_frames=4"), "帧数不是 4：\n{info}");
+    assert!(info.contains("codec_name=mpeg4"), "视频轨不是 mpeg4：\n{info}");
+    assert!(info.contains("codec_name=aac"), "音频轨不是 aac：\n{info}");
+    assert_eq!(info.matches("nb_frames=4").count(), 2, "两轨的帧数都该是 4：\n{info}");
 
     // 「声明了 mpeg4」和「真能解」是两件事：解一遍到 null，有错就非零退出。
     if let Ok(dec) = Command::new("ffmpeg")
