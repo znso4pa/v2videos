@@ -8,7 +8,7 @@
 
 ## 现状
 
-**链路已经打通到 `.wmv → .mp4`**：**15 个 crate、约 6.9 万行 Rust**，**零第三方运行时依赖**
+**链路已经打通到 `.wmv → .mp4`**：**16 个 crate、约 7.3 万行 Rust**，**零第三方运行时依赖**
 （`Cargo.lock` 里只有本仓的包，外加 `cc` 那条**构建**链 —— 只服务 `android-encode` 的 C shim）。
 
 ```text
@@ -26,9 +26,19 @@ mp4v       MPEG-4 Part 2 编码（I / P + 码率控制）**+ 解码**（I / P）
 aac        AAC-LC 编码（MDCT / 短窗 / TNS / Huffman / 码率控制）
 mp4        MP4 / ISOBMFF 封装（mp4v + mp4a(AAC) 或 sowt PCM）
 player     顺时播放层：逐帧 / 逐样本、两轨独立、`seek(ms)`
-android-encode  **全仓唯一的 FFI crate**：硬件 H.264（VideoToolbox / MediaCodec）+ C ABI
+android-encode  平台硬编：硬件 H.264（VideoToolbox / MediaCodec）+ WMA→WAV 抽轨（**只有 rlib**）
+capi       **全仓唯一的 C ABI**：`v2v_*` 一族符号 + 唯一头文件 `crates/capi/include/v2v.h`
 cli        `v2v convert`：ASF / AVI → `.wmv`（MP43 + 音频直通）或 `.mp4`（mp4v + AAC）
 ```
+
+**C ABI 只有一个入口，就是 `capi`。** 别在别的 crate 里加 `#[no_mangle]`：一个进程里
+同名符号只能有一份定义，`capi` 把别的 crate 静态链进去时会直接撞符号；就算不撞，
+两个 `.so` 各有一个 `v2v_last_error`，调用方读到的错误可能来自另一个库的线程局部
+变量 —— 那种错不会报错，只会查不出来。`android-encode` 原来那层 `capi.rs` 就是这么
+搬走的（符号名与签名都没变，只是换了个 `.so` 导出）。
+
+`capi` 的产物是**两个**：`build-products.sh` 出 `min`（默认 feature，宿主用）与
+`full`（加 `hw` / `mpeg12`，诊断用）。同主版本就同 ABI。
 
 **输入编码认这些**（`crates/cli/src/lib.rs::open_video_decoder` 是唯一真源）：
 `MP42` / `MP43` / `WMV1` / `WMV2` / **`WMV3`（VC-1）** / `mp4v`（`FMP4`·`DIVX`·`XVID`）。

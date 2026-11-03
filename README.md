@@ -40,9 +40,11 @@ crates/
   player   顺时播放层：逐帧取视频、逐样本取音频、两轨独立、`seek(ms)`（Simple Index +
            关键帧回退 + 前向解码到目标）—— 对应 Android 播放服务需求的 Rust 侧。
            另有 `mpeg12` feature 下的 `MpgPlayer`（MPEG-1/2，**只有视频**，默认不编）
-  android-encode  **Android 硬件编码路径（全仓唯一的 FFI crate）**：MediaCodec H.264 +
-           MediaMuxer MP4。unsafe 全部收在 `c/media_encoder.c` + `src/ffi.rs`（详见
-           下面「FFI」一节）
+  android-encode  **Android 硬件编码路径**：MediaCodec H.264 + MediaMuxer MP4。
+           unsafe 全部收在 `c/media_encoder.c` + `src/ffi.rs`（详见下面「FFI」一节）
+  capi     **全仓唯一的 C ABI**（`libv2v_capi`）：一层一组 `v2v_*` 符号 +
+           一份手写头文件 `include/v2v.h`。容器 / 解码 / 编码 / 封装 / 播放 /
+           MPEG-1/2 / 硬件转码，全在一个 `.so` 里（详见下面「C ABI」一节）
   cli      `v2v` 命令行：**批量转码**（解封装 → 解码 → 编码 → 封装）
 tools/
   gen_tables.py     H.263 / MPEG-4 Part 2 的 VLC / 反量化表（附自检：前缀无关、Kraft 和、逐码往返）
@@ -66,8 +68,13 @@ tools/
 
 ## FFI：哪些 crate 碰了它，性能账怎么算
 
-**整个 workspace 只有一个 crate 用 FFI：`crates/android-encode`。** 其余全部纯 Rust
-（`msmpeg4` / `mp4v` 的 NEON 走 `std::arch` intrinsics，不跨语言边界，**不算 FFI**）。
+FFI 有两个方向，**每个方向都只有一个 crate**，别在别处加：
+
+- **进站（我们调 C）**：`crates/android-encode`。
+- **出站（C 调我们）**：`crates/capi`。
+
+其余全部纯 Rust（`msmpeg4` / `mp4v` 的 NEON 走 `std::arch` intrinsics，不跨语言
+边界，**不算 FFI**）。
 
 | | 边界在哪 | 为什么需要 |
 | --- | --- | --- |
@@ -75,6 +82,35 @@ tools/
 
 它的 API（`Mp4HwWriter`）是安全的：裸指针不外漏、`Drop` 兜底、`!Send`
 （MediaCodec 不是线程安全的）。非 Android 平台编译同名桩，运行时明确报 `Unsupported`。
+
+### C ABI：`libv2v_capi`
+
+`crates/capi` 是**全仓唯一的出站 C 表面**。一个 `.so`、一个 `v2v_abi_version()`、
+一个 `v2v_last_error()`（每线程）、一张派发表（`codec_id → 构造器` 只在那里 `match`）。
+头文件 `crates/capi/include/v2v.h` 只用 C11 标准头，**不需要 Rust 工具链就能编过**。
+
+| 层 | 符号 | 覆盖 |
+| --- | --- | --- |
+| 公共 | `v2v_abi_version` / `v2v_last_error` / `v2v_last_error_kind` | 版本、错误通道 |
+| 容器 | `v2v_probe` / `v2v_demux_*` | ASF、AVI |
+| 解码 | `v2v_vdec_*` / `v2v_adec_*` | VC-1、MS-MPEG-4 家族、MPEG-4 Part 2、WMA |
+| 编码 | `v2v_venc_*` / `v2v_aenc_*` | MP43、MPEG-4 Part 2、AAC |
+| 封装 | `v2v_mux_*` | ASF、MP4 |
+| 播放 | `v2v_player_*` | 解封装 + 解码，逐帧 / 逐样本，`seek(ms)` |
+| MPEG-1/2 | `v2v_mpeg_*` / `v2v_ps_*` | `mpeg12` feature，默认关 |
+| 硬件转码 | `v2v_transcode` / `v2v_hw_supported` / `v2v_wma_to_wav` | `hw` feature，默认关 |
+
+四条约定（头文件里也写了一遍）：**panic 不穿透**（每个入口 `catch_unwind`）、
+**谁分配谁释放**（借用指针都注明活到哪次调用）、**出参首字段是 `size`**（库按
+`min` 写，于是加字段不破坏 ABI）、**句柄只能在一个线程用**。
+
+两个产物：`crates/capi/build-products.sh` 出 `min`（默认 feature，38 个符号）与
+`full`（加 `hw` / `mpeg12`，50 个符号）。同主版本就同 ABI —— full 只是多一族符号。
+
+验收不靠「自己的 Rust 测试调自己」：`crates/capi/tests/smoke.c` 是个纯 C 程序，
+`dlopen` 打开产物、按头文件的声明取函数指针类型，走
+`probe → open → info → 读帧 → seek → demux`。头文件写错它编不过，符号不在 `.so` 里
+它 `dlsym` 不到 —— 这两件事 Rust 侧测不出来。
 
 ### 性能（真实样本：`testing/sample.wmv`，1280×720@30，4138 帧 / 138.4 s）
 
@@ -144,6 +180,17 @@ V2V_ASF_SAMPLE=/path/to/sample.wmv cargo test
 V2V_ASF_SAMPLE=/path/to/sample.wmv cargo test --release -- --ignored
 ```
 
+**C ABI 单独出产物**（`cargo test` 只编 rlib，不出 `.so`）：
+
+```bash
+crates/capi/build-products.sh            # → dist/libv2v_capi_{min,full}.<ext>
+
+# 验收：一个纯 C 程序 dlopen 它，走完 probe → open → 读帧 → seek → demux。
+# `cargo test` 里已经有一条 c_smoke 自动跑；要手动跑：
+cc -std=c11 -Wall -Wextra -Werror -I crates/capi/include \
+   crates/capi/tests/smoke.c -o /tmp/smoke && /tmp/smoke dist/libv2v_capi_full.so sample.wmv
+```
+
 ## 状态
 
 按「一段一段啃」推进。已经落到代码上的：
@@ -157,12 +204,13 @@ V2V_ASF_SAMPLE=/path/to/sample.wmv cargo test --release -- --ignored
 | **编码**   | MPEG-4 Part 2（`v2v-mp4v`）**I 帧 + P 帧**：DC / AC 预测（逐宏块比位数择优）、运动估计（**三起点菱形搜索 + 时间预测**，半像素细化）、中值 MV 预测、skip 宏块、逐宏块帧内/帧间判决；量化走 **MPEG 型**（`quant_type = 1`，规范默认 CSF 矩阵）+ **系数级 RD（trellis，默认关）**；`--video-bitrate` 时**逐帧调 qscale** 的码率控制 | 编出来的流交给 `ffmpeg` 解；与它的 mpeg4 同 qscale 比：**体积 0.96–1.06×、PSNR 在 ±0.1 dB 内、SSIM 每档更高**（§6 按分辨率扫了一遍）；**视频载荷比全 I 帧小 2.3 倍**；码率控制实测命中目标（371→373、621→618 kbps） |
 | **解码**   | MPEG-4 Part 2（`v2v-mp4v` 的 `decode`）：I / P、H.263 量化、16×16 半像素 —— 修了七个「能跑但不对」的 bug（`^` 优先级、亮度用错色度 DC 表、escape 步进、符号扩展、伪中值、resync 误拒、**escape 内层 level 没反量化**） | 两条判据同一把尺（`ffmpeg -idct 2 -fps_mode passthrough`）：自己编的 I P P P I P P P **逐像素 0 差**；**ffmpeg 自己编的流**（独立来源）10 帧全解、也 0 差 |
 | **播放**   | `v2v-player`：顺时取帧（视频逐帧、音频逐样本）、两轨独立、`seek(ms)`（Simple Index + 关键帧回退 + **前向解码到目标**） | black 首帧 PTS=0（preroll 真扣掉）、EOS 稳定返回 `None`；sample 全片两轨到 EOS、PTS 单调（修过一个不报错的坑：superframe 多帧只交第一帧 → 音频只剩 1/4）；seek(69.2 s) 实际落位 **69.2 s** |
-| **硬件编码** | `v2v-android`（**全仓唯一 FFI**，见「FFI」一节）：MediaCodec H.264 + MediaMuxer MP4，音频走我们的 AAC | C shim 用真 NDK 28.2（API 26）0 警告编译、双端 `cargo check` 0 错 0 警；真机实测**待补**（无设备连接，不写没量过的数） |
+| **硬件编码** | `v2v-android`（进站 FFI，见「FFI」一节）：MediaCodec H.264 + MediaMuxer MP4，音频走我们的 AAC | C shim 用真 NDK 28.2（API 26）0 警告编译、双端 `cargo check` 0 错 0 警；真机实测**待补**（无设备连接，不写没量过的数） |
 | **音频直通** | 转换时原样搬音频轨（ASF 多流复用）                                                                                         | 真样本整条音轨：输出音频与源**逐样本 0 差异**（整轨字节完全一致）                                           |
 | **音频解码** | WMA v1/v2（`v2v-wma`）→ PCM                                                                                   | 真样本整轨与 ffmpeg 的 PCM **最大差 2**（s16 满量程 32768）；转进 MP4 后**对齐偏移 0 采样点**                             |
 | **音频编码** | AAC-LC（`v2v-aac`）：MDCT + 量化 + Huffman 码本 + **短窗**（瞬态）+ 窗口分组 + **TNS**（长窗）+ **M/S 立体声**（逐帧决策）；预算**按声道需要分**、**逐带率-失真分配**（每带按 `失真 + λ·位数` 选，λ 从上一帧的答案出发搜）够目标码率；双声道可选**声道并行**（输出逐字节不变） | ffmpeg 解得开；码率命中目标；真素材上与 ffmpeg 的 AAC 同目标码率比：**128k +2.1 dB、192k +3.1 dB、256k +3.1 dB**（另一段素材 +7 ～ +8 dB；口径见 §4，`tools/snr.py` 搜对齐后再算）；瞬态素材上**短窗 vs 长窗 12.02 vs 10.49 dB、体积小 29%** |
 | **封装**   | ASF 写（`.wmv`，单视频流）：**多载荷打包** + **Simple Index**（每 1 秒一个 seek 槽） | `ffprobe` 认；自己解封装字节一致；ffmpeg 解出来的像素与我们的解码器**逐位一致**；真样本载荷占文件 **89%**（改前 24%）、体积小 3.8 倍；`ffmpeg -ss` 能读出我们写的索引 |
 | **封装**   | MP4 / ISOBMFF 写（`v2v-mp4`，视频 `mp4v`；音频 `mp4a`+`esds`（AAC）或 `sowt` PCM）                                     | 真样本 mp4v 轨的 `stsz`/`stts`/`stss`/`stco` 与 ffmpeg **逐项相同**、逐帧 MD5 一致；PCM 轨原样往返；AAC 轨 ffmpeg 解得开 |
+| **C ABI** | `v2v-capi`（出站 FFI）：容器 / 解码 / 编码 / 封装 / 播放 / MPEG-1/2 / 硬件转码，一层一组 `v2v_*` 符号 + 手写 `v2v.h`；`min` / `full` 两个产物 | 纯 C 程序 `dlopen` 打开自己产的 `.so`，按头文件的声明走完 `probe → open → info → 读帧（stride == width、pts 不倒退）→ seek → demux`；头文件在 `-Werror` 下编得过；`min`（38 个符号）与 `full`（50 个）都过 |
 
 **两条输出路**（`v2v convert`，默认 `.wmv`）：
 
