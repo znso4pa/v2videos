@@ -1,8 +1,13 @@
 /*
  * v2v.h —— v2video 全仓的 C ABI。
  *
- * 一份头文件，一层一组符号：容器 / 解码 / 编码 / 封装 / 播放 / 转码。
+ * 一份头文件，一层一组符号：容器 / 解码 / 编码 / 封装 / 播放 / MPEG-1/2 / 转码。
  * 只用 C11 标准头，不需要 Rust 工具链就能编过。
+ *
+ * MPEG-1/2 与硬件转码那两节是**可选的**：库编译时没开对应的 feature，
+ * 那几个符号就不存在。声明照留（头文件不知道你怎么编的库），
+ * 于是「有没有」由链接器回答 —— 静态链接报未定义符号，dlopen 的 dlsym 返回 NULL。
+ * 想按需决定调不调，就在配置期判断，别在运行期猜。
  *
  * ============================ 全局约定 ============================
  *
@@ -502,6 +507,69 @@ int32_t v2v_mux_write_audio(v2v_mux *h, const uint8_t *data, uint32_t len,
 
 /* 收尾并落盘。之后句柄不可再写。 */
 int32_t v2v_mux_finish(v2v_mux *h);
+
+
+/* ==================================================================
+ * MPEG-1/2（可选 —— 编译时开 mpeg12 feature 才有这几个符号）
+ *
+ * 为什么单开一套而不是并进 v2v_player_*：
+ *   MPEG-1/2 的解码是**图像级 + 引用管理**（B 帧要同时拿前后两个参考帧），
+ *   与「一包进、一帧出」那条路的形状不同。硬塞进同一套符号会把重排语义
+ *   丢掉、帧序静默错 —— 那比不提供更坏。所以这里给的是**已经按显示序
+ *   排好**的高层入口，只是不与 v2v_player 共用一个句柄类型。
+ *
+ * 只有视频 —— 本仓没有 MPEG 音频（MP2）解码器。
+ *
+ * 想自己拆包的话用下面的 v2v_ps_*；它不重排、也不保证 PES 边界等于帧边界。
+ * ================================================================== */
+
+typedef struct v2v_mpeg v2v_mpeg;
+
+typedef struct v2v_mpeg_stream_info {
+    uint32_t size;
+    uint32_t width;
+    uint32_t height;
+    uint32_t picture_count; /* 文件里一共有多少张图像（含 B 帧） */
+    double frame_ms;        /* 每帧多少毫秒（由帧率推出来） */
+} v2v_mpeg_stream_info;
+
+/* 打开一个 MPEG-1/2 program stream。失败返回 NULL（原因看 v2v_last_error）。 */
+v2v_mpeg *v2v_mpeg_open(const char *path);
+
+void v2v_mpeg_close(v2v_mpeg *h);
+
+int32_t v2v_mpeg_info(v2v_mpeg *h, v2v_mpeg_stream_info *out);
+
+/* 取下一帧（已按显示序排好）。V2V_EOS = 到头。
+ * 出参就是 v2v_frame（与 v2v_player_read_video 同一个结构），
+ * 指针活到本句柄的下一次 read_video / close。 */
+int32_t v2v_mpeg_read_video(v2v_mpeg *h, v2v_frame *out);
+
+/* ---- program stream 拆包 ---- */
+
+/* 一个 PES payload。
+ * stream_id: 0xE0..=0xEF 视频，0xC0..=0xDF 音频，0xBD 私有流。
+ * data 指向**整份文件缓冲**（open 时一次读进内存），活到 close —— 不是逐包拷贝。
+ * has_pts == 0 时 pts_ms 无意义（填 0）。 */
+typedef struct v2v_pes {
+    uint32_t size;
+    uint32_t stream_id;
+    int32_t has_pts;
+    int64_t pts_ms;
+    const uint8_t *data;
+    uint32_t len;
+} v2v_pes;
+
+typedef struct v2v_ps v2v_ps;
+
+/* 打开（**整文件读进内存** —— PS 没有索引，靠扫起始码切包）。失败返回 NULL。 */
+v2v_ps *v2v_ps_open(const char *path);
+
+void v2v_ps_close(v2v_ps *h);
+
+/* 取下一个 PES payload。V2V_EOS = 到头。 */
+int32_t v2v_ps_next(v2v_ps *h, v2v_pes *out);
+
 
 #ifdef __cplusplus
 } /* extern "C" */

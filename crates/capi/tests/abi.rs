@@ -826,3 +826,150 @@ fn muxes_mp4_with_a_valid_header() {
 
     let _ = std::fs::remove_file(&out);
 }
+
+// ---------------------------------------------------------------------------
+// MPEG-1/2（`mpeg12` feature）—— 真样本，缺就 SKIP
+// ---------------------------------------------------------------------------
+
+/// 先拿到样本路径，再决定验不验。缺样本就 SKIP（仓规：真样本一律 `.gitignore`，
+/// 靠环境变量找）；⚠️ 路径要给绝对的，cargo 跑测试时工作目录是本 crate。
+#[cfg(feature = "mpeg12")]
+fn mpeg_sample() -> Option<String> {
+    std::env::var("V2V_MPEG12_SAMPLE")
+        .ok()
+        .and_then(|s| s.split(':').find(|p| std::path::Path::new(p).is_file()).map(String::from))
+}
+
+/// MPEG-1/2 播放：open → info → 逐帧取到 EOS。
+///
+/// 验三件事：宽高与 info 一致、帧序**不倒着走**（重排真的管了）、指针在下次调用前有效。
+#[cfg(feature = "mpeg12")]
+#[test]
+fn plays_mpeg_through_the_abi() {
+    use v2v_capi::mpeg::*;
+    use v2v_capi::player::V2vFrame;
+
+    let Some(path) = mpeg_sample() else { return };
+    let c = CString::new(path).unwrap();
+    let h = unsafe { v2v_mpeg_open(c.as_ptr()) };
+    assert!(!h.is_null(), "打开失败：{}", unsafe {
+        std::ffi::CStr::from_ptr(v2v_last_error()).to_string_lossy()
+    });
+
+    let mut info: V2vMpegStreamInfo = unsafe { std::mem::zeroed() };
+    info.size = size_of::<V2vMpegStreamInfo>() as u32;
+    assert_eq!(unsafe { v2v_mpeg_info(h, &mut info) }, OK);
+    assert!(info.width > 0 && info.height > 0, "宽高没取到");
+    assert!(info.frame_ms > 0.0, "帧率没取到");
+    assert!(info.picture_count > 0, "图像数没取到");
+
+    let mut last_pts = i64::MIN;
+    let mut got = 0u32;
+    // 只取前 12 帧：这是形状测试，不是「解完整个文件」—— 全解在 debug 下能跑几十秒。
+    for _ in 0..12 {
+        let mut f: V2vFrame = unsafe { std::mem::zeroed() };
+        f.size = size_of::<V2vFrame>() as u32;
+        let rc = unsafe { v2v_mpeg_read_video(h, &mut f) };
+        if rc == EOS {
+            break;
+        }
+        assert_eq!(rc, OK, "取帧失败：{}", unsafe {
+            std::ffi::CStr::from_ptr(v2v_last_error()).to_string_lossy()
+        });
+        assert_eq!(f.planes.width, info.width, "帧宽与 info 不一致");
+        assert_eq!(f.planes.height, info.height, "帧高与 info 不一致");
+        assert!(!f.planes.y.is_null() && !f.planes.u.is_null() && !f.planes.v.is_null());
+        assert!(f.pts_ms >= last_pts, "帧序回退：{} < {}", f.pts_ms, last_pts);
+        last_pts = f.pts_ms;
+        got += 1;
+    }
+    assert!(got > 0, "一帧都没取到");
+    unsafe { v2v_mpeg_close(h) };
+}
+
+/// program stream 拆包：取前几个 PES，至少得有一个视频流。
+///
+/// 这里**不**要求 pts 单调：PES 是容器序，不保证按显示序排；
+/// 也不要求 PES 边界等于帧边界（那正是「想要帧就用 v2v_mpeg_*」的理由）。
+#[cfg(feature = "mpeg12")]
+#[test]
+fn demuxes_mpeg_ps_through_the_abi() {
+    use v2v_capi::ps::*;
+
+    let Some(path) = mpeg_sample() else { return };
+    let c = CString::new(path).unwrap();
+    let h = unsafe { v2v_ps_open(c.as_ptr()) };
+    assert!(!h.is_null(), "打开失败：{}", unsafe {
+        std::ffi::CStr::from_ptr(v2v_last_error()).to_string_lossy()
+    });
+
+    let mut video = 0u32;
+    for _ in 0..200 {
+        let mut p: V2vPes = unsafe { std::mem::zeroed() };
+        p.size = size_of::<V2vPes>() as u32;
+        let rc = unsafe { v2v_ps_next(h, &mut p) };
+        if rc == EOS {
+            break;
+        }
+        assert_eq!(rc, OK, "拆包失败：{}", unsafe {
+            std::ffi::CStr::from_ptr(v2v_last_error()).to_string_lossy()
+        });
+        assert!(!p.data.is_null() && p.len > 0, "PES 是空的");
+        if (0xE0..=0xEF).contains(&p.stream_id) {
+            video += 1;
+        }
+    }
+    assert!(video > 0, "一个视频 PES 都没看到");
+    unsafe { v2v_ps_close(h) };
+}
+
+/// 不是 MPEG 的字节：`open` 必须干净失败（返回 NULL + 错误通道有消息），不是崩。
+/// 这条**不需要真样本** —— 验的是围栏，不是解码。
+#[cfg(feature = "mpeg12")]
+#[test]
+fn mpeg_open_on_garbage_is_a_clean_failure() {
+    use v2v_capi::mpeg::*;
+
+    let p = std::env::temp_dir().join("v2v_abi_not_mpeg.mpg");
+    std::fs::write(&p, b"not a program stream at all, not even close").unwrap();
+    let c = CString::new(p.to_str().unwrap()).unwrap();
+
+    let h = unsafe { v2v_mpeg_open(c.as_ptr()) };
+    assert!(h.is_null(), "垃圾字节不该打开成功");
+    assert!(!v2v_last_error().is_null(), "失败时错误通道必须有消息");
+    unsafe { v2v_mpeg_close(h) }; // 传 NULL 必须是空操作
+
+    // 空句柄上的每个入口都必须是 ERR_ARG，而不是段错误。
+    let mut info: V2vMpegStreamInfo = unsafe { std::mem::zeroed() };
+    info.size = size_of::<V2vMpegStreamInfo>() as u32;
+    assert_eq!(unsafe { v2v_mpeg_info(std::ptr::null_mut(), &mut info) }, ERR_ARG);
+    let mut f: v2v_capi::player::V2vFrame = unsafe { std::mem::zeroed() };
+    f.size = size_of::<v2v_capi::player::V2vFrame>() as u32;
+    assert_eq!(unsafe { v2v_mpeg_read_video(std::ptr::null_mut(), &mut f) }, ERR_ARG);
+
+    let _ = std::fs::remove_file(&p);
+}
+
+/// PS 拆包对垃圾字节的反应：能打开（它就是读整份字节），但一个包都切不出来。
+#[cfg(feature = "mpeg12")]
+#[test]
+fn ps_on_garbage_yields_eos_not_a_crash() {
+    use v2v_capi::ps::*;
+
+    let p = std::env::temp_dir().join("v2v_abi_not_ps.mpg");
+    std::fs::write(&p, b"\x00\x00\x01\xb9garbage").unwrap();
+    let c = CString::new(p.to_str().unwrap()).unwrap();
+
+    let h = unsafe { v2v_ps_open(c.as_ptr()) };
+    assert!(!h.is_null(), "读字节不该失败：{}", unsafe {
+        std::ffi::CStr::from_ptr(v2v_last_error()).to_string_lossy()
+    });
+    let mut pes: V2vPes = unsafe { std::mem::zeroed() };
+    pes.size = size_of::<V2vPes>() as u32;
+    assert_eq!(unsafe { v2v_ps_next(h, &mut pes) }, EOS);
+    assert_eq!(unsafe { v2v_ps_next(std::ptr::null_mut(), &mut pes) }, ERR_ARG);
+    unsafe { v2v_ps_close(h) };
+    unsafe { v2v_ps_close(std::ptr::null_mut()) };
+
+    let _ = std::fs::remove_file(&p);
+}

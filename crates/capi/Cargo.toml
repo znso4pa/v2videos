@@ -17,6 +17,10 @@ default = []
 # **默认关**：它带平台相关的 C shim（Android MediaCodec / macOS VideoToolbox），
 # 只想要解码的产物不该背上它，也不该因为它在这个平台上编不过而卡住。
 hw = ["dep:v2v-android"]
+# MPEG-1/2（`v2v_mpeg_*` 播放 / `v2v_ps_*` 拆包）。
+# **默认关**：MPEG 的码表不小，只吃 WMV 的产物不该背上它。
+# 它同时打开 `v2v-player` 的同名 feature —— `v2v_player::mpeg` 在那里也是非默认的。
+mpeg12 = ["dep:v2v-mpeg12", "dep:v2v-mpegps", "v2v-player/mpeg12"]
 
 [dependencies]
 v2v-container = { path = "../container" }
@@ -30,6 +34,8 @@ v2v-aac = { path = "../aac" }
 v2v-mp4 = { path = "../mp4" }
 v2v-player = { path = "../player" }
 v2v-android = { path = "../android-encode", optional = true }
+v2v-mpeg12 = { path = "../mpeg12", optional = true }
+v2v-mpegps = { path = "../mpegps", optional = true }
 
 # 集成测试直接调 Rust 侧，用来验「ABI 吐出来的字节 == Rust 直调吐出来的字节」。
 [dev-dependencies]

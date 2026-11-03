@@ -8,6 +8,7 @@
 //! | 编码 | `v2v_venc_*` / `v2v_aenc_*` | MP43、MPEG-4 Part 2、AAC |
 //! | 封装 | `v2v_mux_*` | ASF、MP4 |
 //! | 播放 | `v2v_player_*` | 顺时播放（解封装 + 解码） |
+//! | MPEG | `v2v_mpeg_*` / `v2v_ps_*` | MPEG-1/2 播放、program stream 拆包（`mpeg12` feature） |
 //! | 转码 | `v2v_transcode` / `v2v_hw_supported` | 硬件编码（`hw` feature） |
 //!
 //! ## 为什么是**一个** crate 而不是每个 crate 一个 `.so`
@@ -39,6 +40,13 @@ pub mod mux;
 pub mod player;
 pub mod vdec;
 pub mod venc;
+
+/// MPEG-1/2 播放（`mpeg12` feature）。
+#[cfg(feature = "mpeg12")]
+pub mod mpeg;
+/// MPEG-1/2 program stream 拆包（`mpeg12` feature）。
+#[cfg(feature = "mpeg12")]
+pub mod ps;
 
 pub use common::{
     arg_err, cstr, guard, guard_ptr, rc, set_err, slice, write_sized, IntoAbi, ABI_MAJOR, ABI_MINOR,
