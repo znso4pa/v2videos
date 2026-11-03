@@ -30,6 +30,19 @@
 //! `Drop` 兜底释放、错误全部走 `Result`。**句柄不可跨线程移动**
 //! （`Mp4HwWriter` 是 `!Send`）—— MediaCodec 不是线程安全的，在哪个线程
 //! `open` 就在哪个线程用完。
+//!
+//! ## C ABI 不在这里
+//!
+//! 这里原来有一层 `capi.rs`，导出 `v2v_transcode` / `v2v_hw_supported` /
+//! `v2v_has_wma_audio` / `v2v_wma_to_wav` / `v2v_free` / `v2v_last_error`。
+//! 现在它们**全部搬到 `v2v-capi`**（`hw` feature），符号名与签名不变。
+//!
+//! 为什么必须搬而不是「两边都留」：同一个 `#[no_mangle]` 名字在一个进程里
+//! 只能有一份定义。`v2v-capi` 把本 crate 静态链进去时两份就撞符号；
+//! 就算不撞，两个 `.so` 各有一个 `v2v_last_error`，调用方读到的错误
+//! 可能来自另一个库的线程局部变量 —— 那种错**不会报错，只会查不出来**。
+//!
+//! 所以本 crate 从此只有 `rlib`，不再产出 `.so`。
 
 #![cfg_attr(not(any(target_os = "android", target_os = "macos")), forbid(unsafe_code))]
 // unsafe 只在两个后端模块里：Android 的 `ffi.rs`（MediaCodec）与
@@ -55,11 +68,6 @@ pub mod vt;
 /// 110× 实时，而引擎自带的那套是 0.19×（比实时慢 5.3×）——所以 WMV 一直
 /// 「能播画面没声音」，只能靠预转码 MP4 绕开。这条路径只解音轨，不解视频。
 pub mod wma_wav;
-
-/// 给宿主 App 的 C ABI（JNI 桥 / ctypes 用）。只在真有硬件后端的平台编译 ——
-/// 其它平台整个 crate 是 `forbid(unsafe_code)`，而这一层必须碰裸指针。
-#[cfg(any(target_os = "android", target_os = "macos"))]
-pub mod capi;
 
 /// 端到端管线：WMV → MP4（解码纯 Rust + 视频/音频 + 封装），示例与测试共用。
 ///

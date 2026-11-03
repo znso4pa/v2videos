@@ -571,6 +571,38 @@ void v2v_ps_close(v2v_ps *h);
 int32_t v2v_ps_next(v2v_ps *h, v2v_pes *out);
 
 
+/* ==================================================================
+ * 硬件转码（可选 —— 编译时开 hw feature 才有这几个符号）
+ *
+ * 走平台硬编（Android MediaCodec / macOS VideoToolbox），产出 H.264 + AAC 的 MP4。
+ * 软件路径见上面的 v2v_venc_* / v2v_aenc_*。
+ *
+ * 这些符号以前由硬件编码那个 crate 单独导出，现在收到同一个 .so 里，
+ * 名字与签名都没变 —— 调用方只换链接对象，代码不用动。
+ * ================================================================== */
+
+/* 这个平台有没有可用的硬件编码后端。1 = 有，0 = 没有。 */
+int32_t v2v_hw_supported(void);
+
+/* 把一个文件转成 MP4（硬件 H.264 + AAC）。
+ * video_bitrate / audio_bitrate 传 0 = 默认（4 Mbps / 128 kbps）。
+ * 返回 V2V_OK / V2V_ERR_ARG / V2V_ERR_UNSUPPORTED / V2V_ERR_FAILED。 */
+int32_t v2v_transcode(const char *input, const char *output,
+                      uint32_t video_bitrate, uint32_t audio_bitrate);
+
+/* 这个文件里有没有能解的 WMA 音轨。
+ * 1 = 有，0 = 没有，-1 = 出错（原因看 v2v_last_error）。
+ * 出错是负数而不是 1：以前「有音轨」和「参数非法」都返回 1，分不出来。 */
+int32_t v2v_has_wma_audio(const char *input);
+
+/* 把整条音轨解成 PCM16LE 的 WAV 字节（标准 RIFF/WAVE、声道交织）。
+ * **不解视频、不重编码**。成功时 *out_ptr / *out_len 已填，
+ * 用完必须 v2v_free(*out_ptr, *out_len)。 */
+int32_t v2v_wma_to_wav(const char *input, uint8_t **out_ptr, size_t *out_len);
+
+/* 释放 v2v_wma_to_wav 交出来的缓冲区（必须配对，只释放一次）。 */
+void v2v_free(uint8_t *ptr, size_t len);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

@@ -47,6 +47,9 @@ pub mod mpeg;
 /// MPEG-1/2 program stream 拆包（`mpeg12` feature）。
 #[cfg(feature = "mpeg12")]
 pub mod ps;
+/// 硬件编码 / 转码入口（`hw` feature）。
+#[cfg(feature = "hw")]
+pub mod transcode;
 
 pub use common::{
     arg_err, cstr, guard, guard_ptr, rc, set_err, slice, write_sized, IntoAbi, ABI_MAJOR, ABI_MINOR,

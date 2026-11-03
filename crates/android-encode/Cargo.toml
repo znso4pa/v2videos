@@ -7,10 +7,11 @@ license.workspace = true
 build = "build.rs"
 publish = false
 
-# `cdylib` 是给宿主 App 用的：`libv2v_android.so` 导出 `src/capi.rs` 里那几个
-# C ABI 函数，JNI 桥 dlopen 它就行。`rlib` 保持不变，测试与 CLI 照旧。
+# 只有 `rlib`：C ABI 已经搬到 `v2v-capi`（`hw` feature），这里不再产出 `.so`。
+# 一个进程里同名 `#[no_mangle]` 只能有一份定义，两个库各导一份的话
+# 要么链不起来，要么错误通道串到另一个库的线程局部变量上。
 [lib]
-crate-type = ["rlib", "cdylib"]
+crate-type = ["rlib"]
 
 [dependencies]
 v2v-player = { path = "../player" }
