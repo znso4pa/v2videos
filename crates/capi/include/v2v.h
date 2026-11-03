@@ -308,6 +308,52 @@ int32_t v2v_vdec_decode(v2v_vdec *h, const uint8_t *data, uint32_t len, v2v_pict
 
 void v2v_vdec_close(v2v_vdec *h);
 
+/* ==================================================================
+ * 音频解码（L2）：WMA v1 / v2
+ *
+ * 为什么是「喂一个载荷 + 逐个取帧」两件事：ASF 的一个音频载荷里常装着
+ * 好几个 WMA 帧（superframe），解码器一次吐一串。硬做成「一次调用 = 一帧」
+ * 会让调用方要么丢帧、要么自己攒。
+ *
+ * 注意：v2v_adec_next 返回 V2V_EOS 只表示**队列空了**（该喂下一个载荷），
+ * 不是流结束。
+ * ================================================================== */
+
+typedef struct v2v_adec v2v_adec;
+
+typedef struct v2v_adec_cfg {
+    uint32_t size;
+    uint32_t format_tag; /* 0x0160 = WMA v1, 0x0161 = WMA v2 */
+    uint32_t channels;
+    uint32_t sample_rate;
+    uint32_t avg_bytes_per_sec;
+    uint32_t block_align;
+    const uint8_t *extra;
+    uint32_t extra_len;
+    /* 1 = 丢掉编码器开头的静音（frame_len * 2 个采样点），与 ffmpeg 一致；
+     * 不丢的话音频整体晚约 90 ms。建议开。 */
+    uint32_t drop_priming;
+} v2v_adec_cfg;
+
+typedef struct v2v_adec_frame {
+    uint32_t size;
+    const float *const *planes; /* 借用，活到下次 next / close */
+    uint32_t channels;
+    uint32_t samples; /* 每声道 */
+    uint32_t sample_rate;
+    int64_t pts_ms; /* 按已交出的样本数推出来的 */
+} v2v_adec_frame;
+
+v2v_adec *v2v_adec_open(const v2v_adec_cfg *cfg);
+
+void v2v_adec_close(v2v_adec *h);
+
+/* 喂一个载荷（容器里的一个音频样本），解出来的帧进队列。 */
+int32_t v2v_adec_feed(v2v_adec *h, const uint8_t *data, uint32_t len);
+
+/* 取一帧。V2V_EOS = 队列空了（不是流结束）。 */
+int32_t v2v_adec_next(v2v_adec *h, v2v_adec_frame *out);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

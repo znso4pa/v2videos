@@ -165,6 +165,9 @@ pub unsafe fn write_sized<T>(out: *mut T, val: T) {
 // 跨层共用的出参结构
 // ---------------------------------------------------------------------------
 
+/// 一条音频最多几条声道。超过的流明确报不支持，**不静默截断**。
+pub const MAX_CHANNELS: usize = 8;
+
 /// YUV420P 三平面。**stride 恒等于 width**（色度是 `ceil(width/2)`）——
 /// 本仓不产 padding，每行紧排。调用方可以据此逐行 `memcpy`。
 ///

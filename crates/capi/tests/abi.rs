@@ -361,3 +361,106 @@ fn abi_decode_matches_direct_rust_decode() {
     unsafe { v2v_demux_close(d) };
 }
 
+/// 音频解码：从容器里找出音频流 → 建解码器 → 喂几个载荷 → 逐帧取。
+///
+/// 只喂前若干个载荷（整条轨可能要几秒），验的是「队列 + 编码器延迟 + PTS」
+/// 这一套形状对不对，不是音质。缺样本 / 样本没有音轨就 SKIP。
+#[test]
+fn decodes_audio_through_the_abi() {
+    use v2v_capi::adec::*;
+    use v2v_capi::demux::*;
+
+    let Some(path) = std::env::var("V2V_ASF_SAMPLE")
+        .ok()
+        .and_then(|s| s.split(':').find(|p| std::path::Path::new(p).is_file()).map(String::from))
+    else {
+        eprintln!("SKIP decodes_audio_through_the_abi：没设 V2V_ASF_SAMPLE");
+        return;
+    };
+
+    let c = CString::new(path).unwrap();
+    let d = unsafe { v2v_demux_open(c.as_ptr()) };
+    assert!(!d.is_null());
+
+    // 找音频流。
+    let n = unsafe { v2v_demux_stream_count(d) };
+    let mut audio: Option<V2vStreamInfo> = None;
+    for i in 0..n {
+        let mut si: V2vStreamInfo = unsafe { std::mem::zeroed() };
+        si.size = size_of::<V2vStreamInfo>() as u32;
+        assert_eq!(unsafe { v2v_demux_stream(d, i, &mut si) }, OK);
+        if si.kind == STREAM_AUDIO {
+            audio = Some(si);
+            break;
+        }
+    }
+    let Some(a) = audio else {
+        eprintln!("SKIP decodes_audio_through_the_abi：这个样本没有音轨");
+        unsafe { v2v_demux_close(d) };
+        return;
+    };
+
+    let cfg = V2vAdecCfg {
+        size: size_of::<V2vAdecCfg>() as u32,
+        format_tag: a.format_tag,
+        channels: a.channels,
+        sample_rate: a.sample_rate,
+        avg_bytes_per_sec: a.avg_bytes_per_sec,
+        block_align: a.block_align,
+        extra: a.extra,
+        extra_len: a.extra_len,
+        drop_priming: 1,
+    };
+    let dec = unsafe { v2v_adec_open(&cfg) };
+    assert!(!dec.is_null(), "建音频解码器失败：{}", unsafe {
+        std::ffi::CStr::from_ptr(v2v_last_error()).to_string_lossy()
+    });
+
+    // 只喂前 20 个音频载荷。
+    let mut fed = 0;
+    let mut frames = 0u32;
+    let mut last_pts = i64::MIN;
+    loop {
+        if fed >= 20 {
+            break;
+        }
+        let mut s: V2vSample = unsafe { std::mem::zeroed() };
+        s.size = size_of::<V2vSample>() as u32;
+        match unsafe { v2v_demux_next(d, &mut s) } {
+            OK => {
+                if s.stream != a.number {
+                    continue;
+                }
+                assert_eq!(unsafe { v2v_adec_feed(dec, s.data, s.data_len) }, OK);
+                fed += 1;
+                // 喂一个就把队列抽干。
+                loop {
+                    let mut f: V2vAdecFrame = unsafe { std::mem::zeroed() };
+                    f.size = size_of::<V2vAdecFrame>() as u32;
+                    match unsafe { v2v_adec_next(dec, &mut f) } {
+                        OK => {
+                            assert!(!f.planes.is_null());
+                            assert!(f.samples > 0);
+                            assert_eq!(f.channels, a.channels);
+                            assert_eq!(f.sample_rate, a.sample_rate);
+                            assert!(f.pts_ms >= last_pts, "pts 回退");
+                            last_pts = f.pts_ms;
+                            frames += 1;
+                        }
+                        EOS => break,
+                        other => panic!("adec_next 返回 {other}"),
+                    }
+                }
+            }
+            EOS => break,
+            other => panic!("next 返回 {other}"),
+        }
+    }
+    assert!(fed > 0, "一个音频载荷都没喂到");
+    assert!(frames > 0, "一帧音频都没解出来");
+    // 一个载荷装好几帧 —— 这正是「必须队列」的理由。
+    assert!(frames >= fed, "解出来的帧数不该少于载荷数");
+
+    unsafe { v2v_adec_close(dec) };
+    unsafe { v2v_demux_close(d) };
+}

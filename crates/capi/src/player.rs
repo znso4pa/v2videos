@@ -23,9 +23,6 @@ use v2v_player::{AudioFrame, Player, VideoFrame};
 
 use crate::common::*;
 
-/// 一条音频最多几条声道。超过的流明确报不支持，**不静默截断**。
-const MAX_CHANNELS: usize = 8;
-
 /// 播放器句柄（不透明）。
 pub struct V2vPlayer {
     p: Player,

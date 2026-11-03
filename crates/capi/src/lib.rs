@@ -31,6 +31,7 @@
 //! `f32`，`stride` 语义写死在头文件里 —— 转换是调用方渲染层的事，
 //! 在 ABI 里做一层只会多一次全帧拷贝，还多一份要维护的语义。
 
+pub mod adec;
 pub mod common;
 pub mod demux;
 pub mod player;
