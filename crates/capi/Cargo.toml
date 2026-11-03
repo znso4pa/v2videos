@@ -1,0 +1,32 @@
+[package]
+name = "v2v-capi"
+description = "全仓的 C ABI：容器 / 解码 / 编码 / 封装 / 播放，一层一组符号"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# `cdylib` 给宿主 dlopen / 动态链接；`staticlib` 给 iOS 那种只能静态链的场合；
+# `rlib` 让本仓自己的测试能直接调（集成测试走 `v2v_capi::`）。
+[lib]
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+[features]
+default = []
+# 硬件编码 + 转码入口（`v2v_transcode` / `v2v_hw_supported`）。
+# **默认关**：它带平台相关的 C shim（Android MediaCodec / macOS VideoToolbox），
+# 只想要解码的产物不该背上它，也不该因为它在这个平台上编不过而卡住。
+hw = ["dep:v2v-android"]
+
+[dependencies]
+v2v-container = { path = "../container" }
+v2v-asf = { path = "../asf" }
+v2v-avi = { path = "../avi" }
+v2v-vc1 = { path = "../vc1" }
+v2v-msmpeg4 = { path = "../msmpeg4" }
+v2v-mp4v = { path = "../mp4v" }
+v2v-wma = { path = "../wma" }
+v2v-aac = { path = "../aac" }
+v2v-mp4 = { path = "../mp4" }
+v2v-player = { path = "../player" }
+v2v-android = { path = "../android-encode", optional = true }
