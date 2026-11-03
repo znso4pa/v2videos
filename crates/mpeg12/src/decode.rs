@@ -26,29 +26,67 @@ pub struct Frame {
 
 /// 极简热点剖析（**只在显式 `enable(true)` 之后开**，否则零开销）。
 ///
-/// 目的是回答「下一个 unsafe 内核该上哪儿」—— 不凭感觉。四个桶：
-/// 码流/反量化、逆变换、运动补偿预测、其它（总时间减前三）。
+/// 目的是回答「下一个 unsafe 内核该上哪儿」—— 不凭感觉。六个桶：
+/// 码流/反量化、逆变换、运动补偿预测、写回、解析开销（总时间减前几项）。
 ///
 /// 开关由调用方（`examples/compare.rs` 的 `--prof`）给，**不读环境变量** ——
 /// 「参数全从命令行来」是 AGENTS.md 的规矩，环境变量是排查期残留的形状。
+///
+/// ## ⚠️ 抽样：剖析自己会拖慢解码，所以只量 1/16 的宏块
+///
+/// 每个 `Guard` 是一次 `Instant::now()` + 一次 `elapsed()`，而宏块里每个块都要
+/// 各来一次（BITS / IDCT / STORE）—— **每宏块 30~40 次读钟**。
+/// 实测代价：同一份样本 `--bench=3`，不带剖析 **1.80 ms/帧**、带剖析 **3.93**，
+/// **放大 2.18×**。放大之后「解析开销」甚至超过了不剖析时的整帧时间 ——
+/// 那种分布**不能拿来当优化目标**（2026-10-27 踩的坑）。
+///
+/// 所以现在按 [`SAMPLE_STRIDE`] 抽样：只有 1/16 的宏块插桩，`report()` 按比例放大。
+/// 相对分布仍然可用，扰动从 +118% 降到个位数百分比。
 pub mod prof {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Instant;
 
-    pub const BITS: usize = 0; // 位读取 + VLC（**含**嵌套的 DEQUANT —— 见下）
-    pub const IDCT: usize = 1;
-    pub const MC: usize = 2;
-    pub const DEQUANT: usize = 3; // 反量化（被 BITS 嵌套计时，报告时单列）
-    pub const PARSE: usize = 4; // slice/宏块头、运动矢量、cbp 等循环开销（含嵌套的 BITS/MC/STORE）
-    pub const STORE: usize = 5; // 残差/预测夹到 0..255 写回平面（被 PARSE 嵌套）
+    pub const MB_HDR: usize = 0; // 宏块头：mb_type / 量化器 / 运动矢量 / cbp（**叶子桶**）
+    pub const BITS: usize = 1; // 系数解码：位读取 + VLC + 反量化（已融在一起）
+    pub const IDCT: usize = 2;
+    pub const MC: usize = 3;
+    pub const DEQUANT: usize = 4; // 保留给以后单独拆反量化用；现在恒 0
+    pub const STORE: usize = 5; // 残差/预测夹到 0..255 写回平面
     pub const BUCKETS: usize = 6;
+
+    /// 每多少个宏块插桩一次。16 是量出来的折中：再密扰动就抬头，再疏样本太少。
+    pub const SAMPLE_STRIDE: u64 = 16;
 
     static NS: [AtomicU64; BUCKETS] =
         [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
     static ON: AtomicU64 = AtomicU64::new(0);
+    /// 被 `begin_mb()` 数过的宏块数（全局，跨帧累计）。
+    static MBS: AtomicU64 = AtomicU64::new(0);
+
+    thread_local! {
+        /// 当前这个宏块要不要插桩。`begin_mb()` 每个宏块刷一次。
+        static SAMPLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
 
     pub fn enabled() -> bool {
         ON.load(Ordering::Relaxed) != 0
+    }
+
+    /// 当前宏块要不要插桩 —— **所有 `Guard` 都该用它，不要用 [`enabled`]**。
+    ///
+    /// 一次 TLS 读（~1 ns），比一次 `Instant::now()`（~20 ns）便宜一个量级，
+    /// 所以用它来门控比「先插桩再扔掉」划算。
+    pub fn on() -> bool {
+        enabled() && SAMPLE.with(|s| s.get())
+    }
+
+    /// 在每个宏块循环的开头调一次：决定这个宏块要不要插桩。
+    pub fn begin_mb() {
+        if !enabled() {
+            return;
+        }
+        let n = MBS.fetch_add(1, Ordering::Relaxed);
+        SAMPLE.with(|s| s.set(n % SAMPLE_STRIDE == 0));
     }
 
     /// 开/关剖析，并清空已有的计数（基准跑多遍时不想混进上一遍的数）。
@@ -56,6 +94,7 @@ pub mod prof {
         for n in &NS {
             n.store(0, Ordering::Relaxed);
         }
+        MBS.store(0, Ordering::Relaxed);
         ON.store(on as u64, Ordering::Relaxed);
     }
 
@@ -72,22 +111,30 @@ pub mod prof {
         }
     }
 
-    pub fn report() {
+    /// 打一份分布。`wall_secs` 是**同一次运行**的墙钟总时长（`--bench` 已经量了），
+    /// 用它算「未归类」—— 这样就不必再靠「父桶减子桶」去猜，那种减法会把
+    /// 插桩自身的开销全算进余数（2026-10-27 的坑）。
+    pub fn report(wall_secs: f64) {
         if !enabled() {
             return;
         }
-        let bits = NS[BITS].load(Ordering::Relaxed) as f64 / 1e9;
-        let idct = NS[IDCT].load(Ordering::Relaxed) as f64 / 1e9;
-        let mc = NS[MC].load(Ordering::Relaxed) as f64 / 1e9;
-        let deq = NS[DEQUANT].load(Ordering::Relaxed) as f64 / 1e9;
-        let parse = NS[PARSE].load(Ordering::Relaxed) as f64 / 1e9;
-        let store = NS[STORE].load(Ordering::Relaxed) as f64 / 1e9;
-        // ⚠️ 嵌套关系：BITS 包住 DEQUANT；PARSE 包住 BITS/IDCT/MC/STORE；STORE 包住自身。
-        // 所以「纯解析开销」= PARSE - BITS - IDCT - MC - STORE；「纯 VLC」= BITS - DEQUANT。
-        let vlc = bits - deq;
-        let parse_only = parse - bits - idct - mc - store;
+        // 只有 1/SAMPLE_STRIDE 的宏块被插桩，所以按比例放大回全片。
+        let k = SAMPLE_STRIDE as f64 / 1e9;
+        let hdr = NS[MB_HDR].load(Ordering::Relaxed) as f64 * k;
+        let bits = NS[BITS].load(Ordering::Relaxed) as f64 * k;
+        let idct = NS[IDCT].load(Ordering::Relaxed) as f64 * k;
+        let mc = NS[MC].load(Ordering::Relaxed) as f64 * k;
+        let deq = NS[DEQUANT].load(Ordering::Relaxed) as f64 * k;
+        let store = NS[STORE].load(Ordering::Relaxed) as f64 * k;
+        let sum = hdr + bits + idct + mc + deq + store;
+        let rest = (wall_secs - sum).max(0.0);
         eprintln!(
-            "[prof] VLC {vlc:.3}s | 反量化 {deq:.3}s | 逆变换 {idct:.3}s | 运动补偿 {mc:.3}s | 写回 {store:.3}s | 解析开销 {parse_only:.3}s"
+            "[prof] 抽样 1/{SAMPLE_STRIDE}（已按比例放大；{} 个宏块 / 实测 {wall_secs:.3}s）",
+            MBS.load(Ordering::Relaxed)
+        );
+        eprintln!(
+            "[prof] 宏块头 {hdr:.3}s | 系数(VLC+反量化) {bits:.3}s | 逆变换 {idct:.3}s | \
+             运动补偿 {mc:.3}s | 写回 {store:.3}s | 未归类 {rest:.3}s"
         );
     }
 }
@@ -668,7 +715,7 @@ fn finish_mismatch(mut coeffs: [i32; 64], mismatch: i32, quant: Quant) -> [i32; 
 /// 输出是**未裁剪**的残差 —— 裁剪由调用方在「预测 + 残差」之后做，
 /// 与 ffmpeg 的 `idct_add` 语义一致。
 fn idct_residual(block: &[i32; 64]) -> [i32; 64] {
-    let _g = prof::enabled().then(|| prof::Guard::new(prof::IDCT));
+    let _g = prof::on().then(|| prof::Guard::new(prof::IDCT));
     const W1: u32 = 22725;
     const W2: u32 = 21407;
     const W3: u32 = 19266;
@@ -833,7 +880,7 @@ pub fn idct_cols_scalar(b: &[i32; 64], out: &mut [i32; 64]) {
 
 /// 把残差（+ 一个偏移）写到平面，夹到 0..=255。帧内块偏移 128。
 fn store_block(residual: &[i32; 64], offset: i32, out: &mut [u8], stride: usize, at: usize) {
-    let _g = prof::enabled().then(|| prof::Guard::new(prof::STORE));
+    let _g = prof::on().then(|| prof::Guard::new(prof::STORE));
     for y in 0..8 {
         // 一行先攒成 `[u8; 8]` 再整块写：直接逐像素下标的话，LLVM 既证明不了
         // 边界（每像素一次检查），也没法把 8 次单字节写合成一次 8 字节写。
@@ -850,7 +897,7 @@ fn store_block(residual: &[i32; 64], offset: i32, out: &mut [u8], stride: usize,
 ///
 /// 预测是 u8、残差是 i32：预测本来就在 0..=255，用 i32 存只是白烧 4 倍流量。
 fn store_pred(pred: &[u8; 64], residual: &[i32; 64], out: &mut [u8], stride: usize, at: usize) {
-    let _g = prof::enabled().then(|| prof::Guard::new(prof::STORE));
+    let _g = prof::on().then(|| prof::Guard::new(prof::STORE));
     for y in 0..8 {
         // 同 `store_block`：一行攒成 8 字节再整块写。
         let mut row = [0u8; 8];
@@ -864,7 +911,7 @@ fn store_pred(pred: &[u8; 64], residual: &[i32; 64], out: &mut [u8], stride: usi
 
 /// 只写预测（没有残差）：预测已经是 0..=255，不用再夹。
 fn store_pixels(pred: &[u8; 64], out: &mut [u8], stride: usize, at: usize) {
-    let _g = prof::enabled().then(|| prof::Guard::new(prof::STORE));
+    let _g = prof::on().then(|| prof::Guard::new(prof::STORE));
     for y in 0..8 {
         out[at + y * stride..at + y * stride + 8].copy_from_slice(&pred[y * 8..y * 8 + 8]);
     }
@@ -945,7 +992,7 @@ fn decode_intra_block(
     scan: &[usize; 64],
     eob: (u16, u8),
 ) -> Result<[i32; 64], DecodeError> {
-    let _g = prof::enabled().then(|| prof::Guard::new(prof::BITS));
+    let _g = prof::on().then(|| prof::Guard::new(prof::BITS));
     let mut coeffs = [0i32; 64];
 
     let size = decode_lut(r, dc_lut)
@@ -1095,7 +1142,7 @@ fn decode_inter_block(
     eob: (u16, u8),
     field_picture: bool,
 ) -> Result<[i32; 64], DecodeError> {
-    let _g = prof::enabled().then(|| prof::Guard::new(prof::BITS));
+    let _g = prof::on().then(|| prof::Guard::new(prof::BITS));
     let mut coeffs = [0i32; 64];
     let mut index = 0usize;
     // 反量化**融进解码**：解到一个系数就地乘，省掉原来那趟 64 元素 pass。
@@ -1388,7 +1435,7 @@ fn predict_block(
     mv_y_scale: i32,
     chroma_format: u8,
 ) -> [u8; 64] {
-    let _g = prof::enabled().then(|| prof::Guard::new(prof::MC));
+    let _g = prof::on().then(|| prof::Guard::new(prof::MC));
     let (mx, my) = if chroma {
         let (hs, vs) = match chroma_format {
             1 => (2, 2),
@@ -1626,7 +1673,11 @@ fn decode_i_frame_into(
         let mut mb_index = (row * mb_w) as isize - 1;
         let total_mb = mb_w * mb_h;
         loop {
-            let _g = prof::enabled().then(|| prof::Guard::new(prof::PARSE));
+            // 决定这个宏块要不要插桩（剖析开着时才做，且只做 1/SAMPLE_STRIDE）。
+            prof::begin_mb();
+            // 宏块头单独计时 —— **叶子桶**，不包住块循环。
+            // （包住就会把子桶的开销全算进「其余」，那正是上一版拿余数当目标的原因。）
+            let g = prof::on().then(|| prof::Guard::new(prof::MB_HDR));
             let Some(increment) = decode_mb_increment(&mut r) else {
                 break;
             };
@@ -1671,6 +1722,7 @@ fn decode_i_frame_into(
             }
 
             let quant = Quant::new(scale, sequence.mpeg2_stream(), non_linear, precision);
+            drop(g); // 宏块头到此为止；下面都是叶子桶
             for block in 0..mb_blocks {
                 let dc_lut = if block < 4 { dc_lum_lut() } else { dc_chroma_lut() };
                 let component = if block < 4 { 0 } else { (block - 4) % 2 + 1 };
@@ -1988,7 +2040,11 @@ fn decode_p_frame_into(
         let mut last_mv_f = [[0i32; 2]; 2];
         let mut mb_index = (row * mb_w) as isize - 1;
         loop {
-            let _g = prof::enabled().then(|| prof::Guard::new(prof::PARSE));
+            // 决定这个宏块要不要插桩（剖析开着时才做，且只做 1/SAMPLE_STRIDE）。
+            prof::begin_mb();
+            // 宏块头单独计时 —— **叶子桶**，不包住块循环。
+            // （包住就会把子桶的开销全算进「其余」，那正是上一版拿余数当目标的原因。）
+            let g = prof::on().then(|| prof::Guard::new(prof::MB_HDR));
             let Some(increment) = decode_mb_increment(&mut r) else {
                 break;
             };
@@ -2073,6 +2129,10 @@ fn decode_p_frame_into(
                 }
             }
             let quant = Quant::new(scale, sequence.mpeg2_stream(), non_linear, precision);
+            // ⚠️ 这里就收「宏块头」：**运动矢量解码留在「未归类」里** ——
+            // 它散在下面每个 match 分支里，逐个包一层会把代码搅乱。
+            // 读报告时记住：未归类 ≈ 帧级开销 + MV 解码 + 循环 + 插桩残差。
+            drop(g);
 
             if mb.intra {
                 last_mv_f = [[0, 0], [0, 0]];
@@ -2588,7 +2648,11 @@ fn decode_b_frame_into(
         let mut prev: Option<BPrev> = None;
         let mut mb_index = (row * mb_w) as isize - 1;
         loop {
-            let _g = prof::enabled().then(|| prof::Guard::new(prof::PARSE));
+            // 决定这个宏块要不要插桩（剖析开着时才做，且只做 1/SAMPLE_STRIDE）。
+            prof::begin_mb();
+            // 宏块头单独计时 —— **叶子桶**，不包住块循环。
+            // （包住就会把子桶的开销全算进「其余」，那正是上一版拿余数当目标的原因。）
+            let g = prof::on().then(|| prof::Guard::new(prof::MB_HDR));
             let Some(increment) = decode_mb_increment(&mut r) else {
                 break;
             };
@@ -2686,6 +2750,8 @@ fn decode_b_frame_into(
                 }
             }
             let quant = Quant::new(scale, sequence.mpeg2_stream(), non_linear, precision);
+            // 同 P 帧：运动矢量留在「未归类」，见那里的说明。
+            drop(g);
 
             if mb.intra {
                 last_mv_f = [[0, 0], [0, 0]];

@@ -84,7 +84,7 @@ fn run_bench(sample: &str, rounds: usize, threads: usize) -> std::process::ExitC
         "[bench] {} {w}x{h} {frames} 帧 / {} 遍：**{ms:.2} ms/帧**（threads={threads}）",
         sample, rounds
     );
-    v2v_mpeg12::decode::prof::report();
+    v2v_mpeg12::decode::prof::report(t0.elapsed().as_secs_f64());
     std::process::ExitCode::SUCCESS
 }
 
@@ -173,6 +173,8 @@ fn main() {
     } else {
         None
     };
+    // 只量解码本身（剖析的「未归类」要用墙钟减各桶，所以起点放在循环前）。
+    let t0 = std::time::Instant::now();
     for (header, data) in split_pictures(&es) {
         let kind = header.picture_type;
         let tr = header.temporal_reference;
@@ -268,7 +270,7 @@ fn main() {
     if let Some(path) = &dump {
         std::fs::write(path, &dumped).expect("写 dump");
     }
-    v2v_mpeg12::decode::prof::report();
+    v2v_mpeg12::decode::prof::report(t0.elapsed().as_secs_f64());
     let mut sorted: Vec<f64> = per_frame.iter().map(|(_, _, _, _, p)| *p).collect();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let median = sorted.get(sorted.len() / 2).copied().unwrap_or(0.0);
