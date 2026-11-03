@@ -70,6 +70,7 @@ DECL(v2v_abi_version);
 DECL(v2v_last_error);
 DECL(v2v_last_error_kind);
 DECL(v2v_probe);
+DECL(v2v_planes_copy_to);
 DECL(v2v_player_open);
 DECL(v2v_player_info);
 DECL(v2v_player_read_video);
@@ -178,6 +179,9 @@ static void check_player(const char *path) {
 
     int got = 0;
     long long last = -9223372036854775807LL - 1;
+    /* 留着最后一帧给下面的拷贝测试用（它的借用指针要等下次 read / seek 才作废）。 */
+    v2v_frame last_frame;
+    memset(&last_frame, 0, sizeof last_frame);
     for (int i = 0; i < 10; i++) {
         v2v_frame f;
         memset(&f, 0xAA, sizeof f);
@@ -191,9 +195,69 @@ static void check_player(const char *path) {
         CHECK(f.planes.stride_u == (f.planes.width + 1) / 2, "stride_u 不是 ceil(width/2)");
         CHECK((long long)f.pts_ms >= last, "时间戳回退：%lld < %lld", (long long)f.pts_ms, last);
         last = (long long)f.pts_ms;
+        last_frame = f;
         got++;
     }
     CHECK(got > 0, "一帧都没读到");
+
+    /* 拷贝出口：拷进**带 padding** 的目标，逐行比，并确认 padding 一个字节没被碰。
+     * 这是 `v2v_planes_copy_to` 唯一的用处 —— 紧排拷紧排本来 memcpy 就行。 */
+    {
+        const v2v_planes *p = &last_frame.planes;
+        uint32_t pw = p->width, ph = p->height;
+        uint32_t cw = (pw + 1) / 2, chh = (ph + 1) / 2;
+        uint32_t ys = pw + 16, us = cw + 8, vs = cw + 8;
+        unsigned char *dy = malloc((size_t)ys * ph);
+        unsigned char *du = malloc((size_t)us * chh);
+        unsigned char *dv = malloc((size_t)vs * chh);
+        CHECK(dy != NULL && du != NULL && dv != NULL, "copy: malloc 失败");
+        memset(dy, 0x5A, (size_t)ys * ph);
+        memset(du, 0x5A, (size_t)us * chh);
+        memset(dv, 0x5A, (size_t)vs * chh);
+
+        CHECK(p_v2v_planes_copy_to(p, dy, ys, du, us, dv, vs) == V2V_OK,
+              "copy: 拷贝失败: %s", p_v2v_last_error());
+        for (uint32_t r = 0; r < ph; r++) {
+            for (uint32_t c = 0; c < pw; c++) {
+                CHECK(dy[(size_t)r * ys + c] == p->y[(size_t)r * p->stride_y + c],
+                      "copy: 亮度第 %u 行第 %u 列不一致", r, c);
+            }
+            for (uint32_t c = pw; c < ys; c++) {
+                CHECK(dy[(size_t)r * ys + c] == 0x5A, "copy: 亮度 padding 被写了（第 %u 行）", r);
+            }
+        }
+        for (uint32_t r = 0; r < chh; r++) {
+            for (uint32_t c = 0; c < cw; c++) {
+                CHECK(du[(size_t)r * us + c] == p->u[(size_t)r * p->stride_u + c],
+                      "copy: U 第 %u 行第 %u 列不一致", r, c);
+                CHECK(dv[(size_t)r * vs + c] == p->v[(size_t)r * p->stride_v + c],
+                      "copy: V 第 %u 行第 %u 列不一致", r, c);
+            }
+            for (uint32_t c = cw; c < us; c++) {
+                CHECK(du[(size_t)r * us + c] == 0x5A, "copy: U padding 被写了（第 %u 行）", r);
+            }
+        }
+
+        /* stride 传 0 = 用源的 stride。源是紧排的，所以结果必须与源逐字节相同。 */
+        unsigned char *ty = malloc((size_t)pw * ph);
+        CHECK(ty != NULL, "copy: malloc 失败");
+        CHECK(p_v2v_planes_copy_to(p, ty, 0, NULL, 0, NULL, 0) == V2V_OK,
+              "copy: stride=0 那条路失败: %s", p_v2v_last_error());
+        CHECK(memcmp(ty, p->y, (size_t)pw * ph) == 0, "copy: stride=0 的结果与源不一致");
+        free(ty);
+
+        /* 三块都给空 = 没有目标，明确报错而不是静默成功。 */
+        CHECK(p_v2v_planes_copy_to(p, NULL, 0, NULL, 0, NULL, 0) == V2V_ERR_ARG,
+              "copy: 三块目标都空却没报错");
+        /* 目标 stride 比宽度小 = 会折行，必须拒绝。 */
+        CHECK(p_v2v_planes_copy_to(p, dy, pw - 1, NULL, 0, NULL, 0) == V2V_ERR_ARG,
+              "copy: 目标 stride 太小却没报错");
+
+        free(dy);
+        free(du);
+        free(dv);
+        printf("ok  planes-copy（%ux%u，目标 stride %u/%u，padding 未被动过）\n", pw, ph, ys, us);
+    }
 
     int64_t landed = p_v2v_player_seek_ms(pl, 0);
     CHECK(landed >= 0, "seek 到 0 失败");
@@ -538,6 +602,7 @@ int main(int argc, char **argv) {
     LOAD(v2v_last_error);
     LOAD(v2v_last_error_kind);
     LOAD(v2v_probe);
+    LOAD(v2v_planes_copy_to);
     LOAD(v2v_player_open);
     LOAD(v2v_player_info);
     LOAD(v2v_player_read_video);

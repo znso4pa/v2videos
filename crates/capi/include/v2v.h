@@ -102,6 +102,23 @@ typedef struct v2v_planes {
     uint32_t stride_v;
 } v2v_planes;
 
+/* 把一帧的像素拷进**你自己的**缓冲 —— 借用指针的「拷贝出口」。
+ *
+ * 拿到 v2v_frame / v2v_picture 之后想把它存起来（队列 / 换线程上屏 / 丢给硬件
+ * 编码器），用这个，别自己按 stride 逐行搬：「色度是 ceil(width/2) 宽、
+ * ceil(height/2) 高」这种细节写错只会花屏，不会报错。
+ *
+ *   - 每块目标指针传 NULL = 跳过那个平面（比如只要亮度）；
+ *   - 目标 stride 传 0 = 用源的 stride（紧排）；
+ *   - 目标 stride 比平面宽度小 -> V2V_ERR_ARG，不折行硬拷。
+ *
+ * 每块 dst 要么 NULL，要么至少「平面高 × 目标 stride」字节可写。
+ * src 必须是**还有效**的那一帧：借用指针在下次同类调用后就作废了。 */
+int32_t v2v_planes_copy_to(const v2v_planes *src,
+                           uint8_t *y, uint32_t y_stride,
+                           uint8_t *u, uint32_t u_stride,
+                           uint8_t *v, uint32_t v_stride);
+
 /* ==================================================================
  * 播放（L5）—— 打开一个文件，按自己的节奏交替拉视频帧与音频帧
  *

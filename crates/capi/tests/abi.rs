@@ -1020,3 +1020,71 @@ fn out_struct_size_is_enforced() {
 
     unsafe { v2v_venc_close(enc) };
 }
+
+/// `v2v_planes_copy_to`：拷进带 padding 的目标、逐行对、padding 不动。
+///
+/// 这条不需要样本 —— 用 `Gradient` 造一帧就够。C 侧 `smoke.c` 里还有一份等价
+/// 的（在真样本 720p 上跑），两份都要有：Rust 这份跑得快、C 那份证明头文件的
+/// 签名没写错。
+#[test]
+fn planes_copy_respects_destination_stride() {
+    let (w, h) = (64u32, 48u32);
+    let img = Gradient::new(w, h);
+    let src = img.as_planes();
+
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    let (ys, us, vs) = (w + 16, cw + 8, cw + 8);
+    let mut dy = vec![0x5Au8; (ys * h) as usize];
+    let mut du = vec![0x5Au8; (us * ch) as usize];
+    let mut dv = vec![0x5Au8; (vs * ch) as usize];
+
+    let rc = unsafe {
+        v2v_capi::common::v2v_planes_copy_to(
+            &src,
+            dy.as_mut_ptr(),
+            ys,
+            du.as_mut_ptr(),
+            us,
+            dv.as_mut_ptr(),
+            vs,
+        )
+    };
+    assert_eq!(rc, OK);
+
+    let sy = unsafe { std::slice::from_raw_parts(src.y, (w * h) as usize) };
+    let su = unsafe { std::slice::from_raw_parts(src.u, (cw * ch) as usize) };
+    for r in 0..h as usize {
+        assert_eq!(&dy[r * ys as usize..r * ys as usize + w as usize], &sy[r * w as usize..][..w as usize]);
+        assert!(
+            dy[r * ys as usize + w as usize..(r + 1) * ys as usize].iter().all(|b| *b == 0x5A),
+            "亮度第 {r} 行的 padding 被写了"
+        );
+    }
+    for r in 0..ch as usize {
+        assert_eq!(&du[r * us as usize..r * us as usize + cw as usize], &su[r * cw as usize..][..cw as usize]);
+        assert!(
+            du[r * us as usize + cw as usize..(r + 1) * us as usize].iter().all(|b| *b == 0x5A),
+            "U 第 {r} 行的 padding 被写了"
+        );
+    }
+
+    // stride 传 0 = 用源的 stride。源紧排，所以整块等于源。
+    let mut ty = vec![0u8; (w * h) as usize];
+    let rc = unsafe {
+        v2v_capi::common::v2v_planes_copy_to(&src, ty.as_mut_ptr(), 0, std::ptr::null_mut(), 0, std::ptr::null_mut(), 0)
+    };
+    assert_eq!(rc, OK);
+    assert_eq!(ty, sy, "stride = 0 那条路与源不一致");
+
+    // 三块目标都空 → 明确报错，不静默成功。
+    let rc = unsafe {
+        v2v_capi::common::v2v_planes_copy_to(&src, std::ptr::null_mut(), 0, std::ptr::null_mut(), 0, std::ptr::null_mut(), 0)
+    };
+    assert_eq!(rc, ERR_ARG);
+
+    // 目标 stride 比宽度小 → 拒绝（不折行硬拷）。
+    let rc = unsafe {
+        v2v_capi::common::v2v_planes_copy_to(&src, dy.as_mut_ptr(), w - 1, std::ptr::null_mut(), 0, std::ptr::null_mut(), 0)
+    };
+    assert_eq!(rc, ERR_ARG);
+}

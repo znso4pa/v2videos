@@ -211,6 +211,61 @@ pub fn planes_of(y: &[u8], u: &[u8], v: &[u8], width: u32, height: u32) -> V2vPl
     }
 }
 
+/// 把一帧的三个平面拷进**调用方自己的**缓冲（`v2v_planes_copy_to` 的实现）。
+///
+/// 为什么要有这个出口：借用指针省一次 720p 拷贝（≈1.4 MB/帧），但宿主一旦
+/// 想把帧存起来（队列 / 换线程上屏 / 丢给硬件编码器），就得自己按 stride 逐行
+/// 搬 —— 而「色度平面是 `ceil(width/2)` 宽、`ceil(height/2)` 高」这种细节写错
+/// **只会花屏，不会报错**。
+///
+/// `dst_stride == 0` 表示「用源的 stride」（即紧排）。这样最常见的用法
+/// （紧排拷到紧排）不用算任何东西，而要拷进带 padding 的表面时也不用另开一个函数。
+///
+/// # Safety
+/// 每块 `dst` 要么为空（跳过该平面），要么至少 `plane_h * dst_stride` 字节可写。
+pub unsafe fn copy_planes(
+    src: &V2vPlanes,
+    y: (*mut u8, u32),
+    u: (*mut u8, u32),
+    v: (*mut u8, u32),
+) -> c_int {
+    if src.y.is_null() || src.u.is_null() || src.v.is_null() {
+        return arg_err("源平面是空指针（这帧可能已经被下一次读取作废了）");
+    }
+    if y.0.is_null() && u.0.is_null() && v.0.is_null() {
+        return arg_err("三块目标缓冲都是空指针 —— 那这一趟拷什么？");
+    }
+    // 每个平面：(源指针, 源 stride, 目标指针, 目标 stride, 宽, 高)
+    let luma_w = src.width;
+    let luma_h = src.height;
+    let chroma_w = src.width.div_ceil(2);
+    let chroma_h = src.height.div_ceil(2);
+    let jobs = [
+        (src.y, src.stride_y, y.0, y.1, luma_w, luma_h),
+        (src.u, src.stride_u, u.0, u.1, chroma_w, chroma_h),
+        (src.v, src.stride_v, v.0, v.1, chroma_w, chroma_h),
+    ];
+    for (sp, ss, dp, ds, w, h) in jobs {
+        if dp.is_null() {
+            continue;
+        }
+        let ds = if ds == 0 { ss } else { ds };
+        if ds < w {
+            return arg_err("目标 stride 比平面宽度还小，拷进去会折行");
+        }
+        for row in 0..h as usize {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    sp.add(row * ss as usize),
+                    dp.add(row * ds as usize),
+                    w as usize,
+                );
+            }
+        }
+    }
+    OK
+}
+
 /// 编出来的一包码流（视频一帧 / 音频一帧）。
 ///
 /// `data` 是**借用**的：活到句柄的下一次 `encode` / `close`。
@@ -331,4 +386,36 @@ pub extern "C" fn v2v_last_error() -> *const c_char {
 #[no_mangle]
 pub extern "C" fn v2v_last_error_kind() -> c_int {
     LAST_ERR.with(|e| e.borrow().1)
+}
+
+/// 把一帧的像素拷进调用方自己的缓冲 —— **借用指针的「拷贝出口」**。
+///
+/// 拿到 `v2v_frame` / `v2v_picture` 之后想把它存起来（队列 / 换线程上屏 /
+/// 丢给硬件编码器），用这个，别自己按 stride 逐行搬：「色度是 `ceil(width/2)`
+/// 宽、`ceil(height/2)` 高」这种细节写错**只会花屏，不会报错**。
+///
+/// * 每块目标指针传空 = 跳过那个平面（比如只要亮度）。
+/// * 目标 stride 传 0 = 用源的 stride（紧排）。
+/// * 目标 stride 比平面宽度小 → [`ERR_ARG`]，不折行硬拷。
+///
+/// # Safety
+/// 每块 `dst` 要么为空，要么至少 `平面高 × 目标 stride` 字节可写；
+/// `src` 必须是**还有效**的那一帧（借用指针在下次同类调用后就作废了）。
+#[no_mangle]
+pub unsafe extern "C" fn v2v_planes_copy_to(
+    src: *const V2vPlanes,
+    y: *mut u8,
+    y_stride: u32,
+    u: *mut u8,
+    u_stride: u32,
+    v: *mut u8,
+    v_stride: u32,
+) -> c_int {
+    guard(|| {
+        if src.is_null() {
+            return arg_err("源平面是空指针");
+        }
+        let s = unsafe { &*src };
+        unsafe { copy_planes(s, (y, y_stride), (u, u_stride), (v, v_stride)) }
+    })
 }
