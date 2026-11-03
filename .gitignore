@@ -30,3 +30,6 @@ TODO.md
 # 会话记忆 / 工作数据（本地，含夹具出处等不入库的信息）
 .workbuddy-ai/
 testing/
+
+# 两个产物的输出目录（crates/capi/build-products.sh）
+/dist/
