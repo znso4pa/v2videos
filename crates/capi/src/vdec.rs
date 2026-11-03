@@ -205,8 +205,7 @@ pub unsafe extern "C" fn v2v_vdec_decode(
                     size: std::mem::size_of::<V2vPicture>() as u32,
                     planes: planes_of(&p.y, &p.u, &p.v, p.width, p.height),
                 };
-                unsafe { write_sized(out, v) };
-                OK
+                unsafe { write_sized(out, v) }
             }
             Err(e) => rc(&e),
         }

@@ -146,8 +146,7 @@ pub unsafe extern "C" fn v2v_player_info(h: *mut V2vPlayer, out: *mut V2vInfo) -
             has_audio: u32::from(i.has_audio),
             flags: i.flags,
         };
-        unsafe { write_sized(out, v) };
-        OK
+        unsafe { write_sized(out, v) }
     })
 }
 
@@ -175,8 +174,7 @@ pub unsafe extern "C" fn v2v_player_read_video(h: *mut V2vPlayer, out: *mut V2vF
                     key_frame: i32::from(fr.key_frame),
                     planes: planes_of(fr),
                 };
-                unsafe { write_sized(out, v) };
-                OK
+                unsafe { write_sized(out, v) }
             }
             Err(e) => rc(&e),
         }
@@ -224,8 +222,7 @@ pub unsafe extern "C" fn v2v_player_read_audio(
                     samples: ar.samples as u32,
                     sample_rate: ar.sample_rate,
                 };
-                unsafe { write_sized(out, v) };
-                OK
+                unsafe { write_sized(out, v) }
             }
             Err(e) => rc(&e),
         }

@@ -135,30 +135,35 @@ pub unsafe fn slice<'a>(ptr: *const u8, len: u32) -> Result<&'a [u8], String> {
     Ok(unsafe { std::slice::from_raw_parts(ptr, len as usize) })
 }
 
-/// 按调用方填的 `size` 截断写入一个出参结构体。
+/// 按调用方填的 `size` 截断写入一个出参结构体，**返回该出口的返回码**。
 ///
 /// 所有出参结构体的**首字段都是 `uint32_t size`**。调用方填自己的
 /// `sizeof`，库写 `min(调用方的 size, 库自己的 size)` 字节 ——
 /// 于是「库加了字段」对老调用方是安全的（多出来的字节不写），
 /// 「调用方比库新」也是安全的（库只写自己知道的那部分）。
 ///
+/// 返回 [`ERR_ARG`] 而不是 [`OK`] 的两种情况：`out` 是空指针、`size` 连 4 字节
+/// 都不到。**必须是返回码而不是只记一条错误** —— 以前这里记完就往下走，
+/// 出口照样返回 `OK`，于是「忘了填 `size`」的调用方拿到 `OK` 加一块没动过的内存，
+/// 那是最难查的一类 bug（头文件写着会报错，代码却不报）。
+///
 /// # Safety
 /// `out` 要么为空，要么指向一块可写、且首 4 字节是一个 `u32 size` 的内存，
 /// 大小至少 `size` 字节。
-pub unsafe fn write_sized<T>(out: *mut T, val: T) {
+pub unsafe fn write_sized<T>(out: *mut T, val: T) -> c_int {
     if out.is_null() {
-        return;
+        return arg_err("出参是空指针");
     }
     let cap = unsafe { *(out as *const u32) } as usize;
     let n = cap.min(std::mem::size_of::<T>());
     if n < std::mem::size_of::<u32>() {
         // 连 `size` 都放不下 —— 调用方给的缓冲不合法，别写。
-        set_err(KIND_BAD, "出参结构体的 size 字段不合法");
-        return;
+        return arg_err("出参结构体的 size 字段不合法（连 4 字节都不到）");
     }
     unsafe {
         std::ptr::copy_nonoverlapping(&val as *const T as *const u8, out as *mut u8, n);
     }
+    OK
 }
 
 // ---------------------------------------------------------------------------

@@ -102,7 +102,6 @@ pub unsafe extern "C" fn v2v_ps_next(h: *mut V2vPs, out: *mut V2vPes) -> c_int {
             data: unsafe { base.add(start) },
             len: len as u32,
         };
-        unsafe { write_sized(out, v) };
-        OK
+        unsafe { write_sized(out, v) }
     })
 }

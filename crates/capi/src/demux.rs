@@ -345,8 +345,7 @@ pub unsafe extern "C" fn v2v_demux_stream(
         };
         // 先把借用结束掉，再改 `hp.extra`。
         let info = fill_stream(s, &mut hp.extra);
-        unsafe { write_sized(out, info) };
-        OK
+        unsafe { write_sized(out, info) }
     })
 }
 
@@ -380,8 +379,7 @@ pub unsafe extern "C" fn v2v_demux_next(h: *mut V2vDemux, out: *mut V2vSample) -
                     data: s.data.as_ptr(),
                     data_len: s.data.len() as u32,
                 };
-                unsafe { write_sized(out, v) };
-                OK
+                unsafe { write_sized(out, v) }
             }
             Err((k, m)) => rc_kind(k, &m),
         }
@@ -448,7 +446,6 @@ pub unsafe extern "C" fn v2v_demux_index(h: *mut V2vDemux, out: *mut V2vIndex) -
             count: hp.packets.len() as u32,
             packets: hp.packets.as_ptr(),
         };
-        unsafe { write_sized(out, v) };
-        OK
+        unsafe { write_sized(out, v) }
     })
 }

@@ -95,8 +95,7 @@ pub unsafe extern "C" fn v2v_mpeg_info(h: *mut V2vMpeg, out: *mut V2vMpegStreamI
             picture_count: hp.p.picture_count() as u32,
             frame_ms: hp.p.frame_ms(),
         };
-        unsafe { write_sized(out, v) };
-        OK
+        unsafe { write_sized(out, v) }
     })
 }
 
@@ -122,8 +121,7 @@ pub unsafe extern "C" fn v2v_mpeg_read_video(h: *mut V2vMpeg, out: *mut crate::p
                     key_frame: i32::from(fr.key_frame),
                     planes: planes_of(&fr.y, &fr.u, &fr.v, fr.width, fr.height),
                 };
-                unsafe { write_sized(out, v) };
-                OK
+                unsafe { write_sized(out, v) }
             }
             Err(e) => rc(&e),
         }

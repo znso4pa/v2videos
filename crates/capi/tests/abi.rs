@@ -973,3 +973,50 @@ fn ps_on_garbage_yields_eos_not_a_crash() {
 
     let _ = std::fs::remove_file(&p);
 }
+
+/// 出参的 `size` 没填 / 填得太小必须**返回错误**，不是「悄悄不写然后返回 OK」。
+///
+/// 这条钉的是头文件那句「不填（size = 0）会返回 V2V_ERR_ARG」：
+/// 曾经代码只记一条错误就往下走，出口照样 `OK`，调用方拿到 `OK` 加一块
+/// 没动过的内存 —— 最难查的一类 bug。
+///
+/// 不需要真样本：编码器不用打开文件，拿它换一个句柄就够。
+#[test]
+fn out_struct_size_is_enforced() {
+    use v2v_capi::venc::*;
+
+    let (w, h) = (32u32, 32u32);
+    let cfg = V2vVencCfg {
+        size: size_of::<V2vVencCfg>() as u32,
+        width: w,
+        height: h,
+        qscale: 0,
+        bitrate: 0,
+        fps_num: 25,
+        ac_pred: 1,
+        mpeg_quant: 0,
+    };
+    let enc = unsafe { v2v_venc_open(CODEC_MP4V, &cfg) };
+    assert!(!enc.is_null(), "建编码器失败：{}", unsafe {
+        std::ffi::CStr::from_ptr(v2v_last_error()).to_string_lossy()
+    });
+    let img = Gradient::new(w, h);
+    let planes = img.as_planes();
+
+    // 忘了 `V2V_INIT` —— size 是 0。
+    let mut pkt: V2vPacket = unsafe { std::mem::zeroed() };
+    pkt.size = 0;
+    assert_eq!(unsafe { v2v_venc_encode(enc, &planes, 1, &mut pkt) }, ERR_ARG);
+    assert_eq!(v2v_last_error_kind(), KIND_BAD);
+
+    // 连 4 字节都不到 —— 同样不写、同样报错。
+    pkt.size = 2;
+    assert_eq!(unsafe { v2v_venc_encode(enc, &planes, 1, &mut pkt) }, ERR_ARG);
+
+    // 填对了才成功。
+    pkt.size = size_of::<V2vPacket>() as u32;
+    assert_eq!(unsafe { v2v_venc_encode(enc, &planes, 1, &mut pkt) }, OK);
+    assert!(pkt.len > 0);
+
+    unsafe { v2v_venc_close(enc) };
+}

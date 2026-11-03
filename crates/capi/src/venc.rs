@@ -248,8 +248,7 @@ pub unsafe extern "C" fn v2v_venc_encode(
                     len: hp.out.len() as u32,
                     key_frame: i32::from(want_i),
                 };
-                unsafe { write_sized(out, v) };
-                OK
+                unsafe { write_sized(out, v) }
             }
             Err(e) => rc(&e),
         }

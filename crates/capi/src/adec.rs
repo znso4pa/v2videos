@@ -245,8 +245,8 @@ pub unsafe extern "C" fn v2v_adec_next(h: *mut V2vAdec, out: *mut V2vAdecFrame) 
                 sample_rate: hp.sample_rate,
                 pts_ms: pts,
             };
-            unsafe { write_sized(out, v) };
-            return OK;
+            // 在 `loop` 里，块的尾表达式不是函数返回值 —— 必须显式 `return`。
+            return unsafe { write_sized(out, v) };
         }
     })
 }

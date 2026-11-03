@@ -141,8 +141,7 @@ pub unsafe extern "C" fn v2v_aenc_encode(
                     // AAC 每帧都是独立的（没有帧间预测），所以每一帧都是关键帧。
                     key_frame: 1,
                 };
-                unsafe { write_sized(out, v) };
-                OK
+                unsafe { write_sized(out, v) }
             }
             Err(e) => rc(&e),
         }
