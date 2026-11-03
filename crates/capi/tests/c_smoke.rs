@@ -98,11 +98,14 @@ fn c_smoke_through_dlopen() {
         }
     }
 
-    // 3) 跑。给了样本就多走 open / 读帧 / seek / demux 那几段。
+    // 3) 跑。给了样本就多走 open / 读帧 / seek / demux，再往下走一整条
+    //    demux → 解码 → 编码 → 封装，产物写到一个临时 mp4。
+    let out_mp4 = std::env::temp_dir().join(format!("v2v_abi_chain_{}.mp4", std::process::id()));
+    let _ = std::fs::remove_file(&out_mp4);
     let mut run = Command::new(&bin);
     run.arg(&dylib);
     if let Some(s) = sample() {
-        run.arg(s);
+        run.arg(s).arg(&out_mp4);
     }
     let o = run.output().expect("C 程序跑不起来");
     let _ = std::fs::remove_file(&bin);
@@ -113,8 +116,59 @@ fn c_smoke_through_dlopen() {
         "C smoke 失败（退出码 {:?}）：\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
         o.status.code()
     );
-    // 没样本时只验了三条，别让「全绿」看起来像验了全链。
+
     if sample().is_none() {
+        // 没样本时只验了四条，别让「全绿」看起来像验了全链。
         eprintln!("注意：没设 V2V_ASF_SAMPLE，只验了版本 / probe / 错误通道 / size 契约。");
+        return;
     }
+    check_chain_output(&out_mp4, &stdout);
+}
+
+/// C 写出来的 mp4 必须**真能被外部工具解开** —— 自己再读一遍自己的文件不算数。
+///
+/// `ffprobe` 说形状（编码、宽高、帧数），`ffmpeg` 说「真能解」（解一遍到 null，
+/// 有错就非零退出）。两个都不在就 SKIP 那半段，但会明说。
+fn check_chain_output(mp4: &Path, c_stdout: &str) {
+    let bytes = std::fs::read(mp4).unwrap_or_else(|e| panic!("C 没写出 {mp4:?}：{e}"));
+    assert!(bytes.len() > 32, "产物太小：{} 字节", bytes.len());
+    assert_eq!(&bytes[4..8], b"ftyp", "第一个 box 不是 ftyp");
+    assert!(bytes.windows(4).any(|w| w == b"mdat"), "没找到 mdat");
+
+    let Ok(probe) = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name,width,height,nb_frames",
+            "-of",
+            "default=nw=1",
+        ])
+        .arg(mp4)
+        .output()
+    else {
+        eprintln!("SKIP：没有 ffprobe，跳过「外部工具认得这个 mp4」那半段。");
+        let _ = std::fs::remove_file(mp4);
+        return;
+    };
+    let info = String::from_utf8_lossy(&probe.stdout).to_string();
+    assert!(probe.status.success(), "ffprobe 读不了 C 写的 mp4：{info}");
+    assert!(info.contains("codec_name=mpeg4"), "编码不是 mpeg4：\n{info}");
+    assert!(info.contains("nb_frames=4"), "帧数不是 4：\n{info}");
+
+    // 「声明了 mpeg4」和「真能解」是两件事：解一遍到 null，有错就非零退出。
+    if let Ok(dec) = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(mp4)
+        .args(["-f", "null", "-"])
+        .output()
+    {
+        let err = String::from_utf8_lossy(&dec.stderr);
+        assert!(dec.status.success() && err.trim().is_empty(), "ffmpeg 解不动 C 写的流：\n{err}");
+    }
+
+    println!("C smoke 全链通过：\n{c_stdout}");
+    let _ = std::fs::remove_file(mp4);
 }

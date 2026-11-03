@@ -81,6 +81,17 @@ DECL(v2v_demux_stream_count);
 DECL(v2v_demux_stream);
 DECL(v2v_demux_next);
 DECL(v2v_demux_close);
+DECL(v2v_vdec_open);
+DECL(v2v_vdec_decode);
+DECL(v2v_vdec_close);
+DECL(v2v_venc_open);
+DECL(v2v_venc_encode);
+DECL(v2v_venc_header);
+DECL(v2v_venc_close);
+DECL(v2v_mux_open);
+DECL(v2v_mux_write_video);
+DECL(v2v_mux_finish);
+DECL(v2v_mux_close);
 
 /* ---- 不需要样本的那几条 ---- */
 
@@ -226,9 +237,132 @@ static void check_demux(const char *path) {
     printf("ok  demux（%u 条流 / %d 个样本）\n", n, got);
 }
 
+/* FourCC 在文件里是四个字节，按小端读成一个 u32。 */
+static uint32_t fourcc(char a, char b, char c, char d) {
+    return (uint32_t)(uint8_t)a | ((uint32_t)(uint8_t)b << 8) | ((uint32_t)(uint8_t)c << 16) |
+           ((uint32_t)(uint8_t)d << 24);
+}
+
+/* 容器里的 fourcc → ABI 的 codec_id。认不出返回 -1。 */
+static int codec_of(uint32_t f) {
+    if (f == fourcc('W', 'M', 'V', '3')) return V2V_CODEC_WMV3;
+    if (f == fourcc('M', 'P', '4', '3')) return V2V_CODEC_MP43;
+    if (f == fourcc('M', 'P', '4', '2')) return V2V_CODEC_MP42;
+    if (f == fourcc('W', 'M', 'V', '1')) return V2V_CODEC_WMV1;
+    if (f == fourcc('W', 'M', 'V', '2')) return V2V_CODEC_WMV2;
+    if (f == fourcc('F', 'M', 'P', '4') || f == fourcc('D', 'I', 'V', 'X') ||
+        f == fourcc('X', 'V', 'I', 'D'))
+        return V2V_CODEC_MP4V;
+    return -1;
+}
+
+/* demux → 解码 → 编码 → 封装，产物写进 `out_path`。
+ *
+ * 这一段的价值不只是「链路能跑」：它让 C 编译器去核对
+ * `v2v_stream_info` / `v2v_picture` / `v2v_venc_cfg` / `v2v_packet` /
+ * `v2v_mux_video` 这几个结构体的**字段顺序**。Rust 侧测试用的是同一份 Rust
+ * 结构体，字段顺序写反了照样全绿 —— 只有从 C 填一遍才暴露。
+ *
+ * 只取视频、只取前 `frames` 帧：这是形状测试，不是「转一个完整文件」。 */
+static void check_chain(const char *sample_path, const char *out_path, int frames) {
+    v2v_demux *d = p_v2v_demux_open(sample_path);
+    CHECK(d != NULL, "chain: demux 打开失败: %s", p_v2v_last_error());
+
+    uint32_t n = p_v2v_demux_stream_count(d);
+    v2v_stream_info vs;
+    int found = 0;
+    memset(&vs, 0, sizeof vs);
+    for (uint32_t i = 0; i < n; i++) {
+        v2v_stream_info si;
+        memset(&si, 0xAA, sizeof si);
+        V2V_INIT(si);
+        CHECK(p_v2v_demux_stream(d, i, &si) == V2V_OK, "chain: 取第 %u 条流失败", i);
+        if (si.kind == V2V_STREAM_VIDEO) {
+            vs = si;
+            found = 1;
+            break;
+        }
+    }
+    CHECK(found, "chain: 没有视频流");
+    int codec = codec_of(vs.fourcc);
+    CHECK(codec >= 0, "chain: 认不出 fourcc 0x%08X", vs.fourcc);
+
+    v2v_vdec *dec =
+        p_v2v_vdec_open((uint32_t)codec, vs.extra, vs.extra_len, vs.width, vs.height);
+    CHECK(dec != NULL, "chain: 建解码器失败: %s", p_v2v_last_error());
+
+    v2v_venc_cfg vc;
+    memset(&vc, 0, sizeof vc);
+    V2V_INIT(vc);
+    vc.width = vs.width;
+    vc.height = vs.height;
+    vc.qscale = 4;
+    vc.fps_num = 25;
+    vc.ac_pred = 1;
+    vc.mpeg_quant = 0; /* 本仓解码器只做 quant_type = 0 */
+    v2v_venc *enc = p_v2v_venc_open(V2V_CODEC_MP4V, &vc);
+    CHECK(enc != NULL, "chain: 建编码器失败: %s", p_v2v_last_error());
+
+    uint8_t dsi[512];
+    int32_t dsi_len = p_v2v_venc_header(enc, dsi, (uint32_t)sizeof dsi);
+    CHECK(dsi_len > 0, "chain: 取 VOL 失败: %s", p_v2v_last_error());
+
+    v2v_mux_video mv;
+    memset(&mv, 0, sizeof mv);
+    V2V_INIT(mv);
+    mv.width = vs.width;
+    mv.height = vs.height;
+    mv.timescale = 1000; /* tick 就是毫秒，下面 duration 直接给 ms */
+    mv.codec = V2V_MUX_VCODEC_MP4V;
+    mv.decoder_specific_info = dsi;
+    mv.dsi_len = (uint32_t)dsi_len;
+    v2v_mux *mux = p_v2v_mux_open(V2V_MUX_MP4, out_path, &mv, NULL);
+    CHECK(mux != NULL, "chain: 开封装器失败: %s", p_v2v_last_error());
+
+    int got = 0;
+    int64_t last_pts = -1;
+    while (got < frames) {
+        v2v_sample s;
+        memset(&s, 0, sizeof s);
+        V2V_INIT(s);
+        int32_t rc = p_v2v_demux_next(d, &s);
+        if (rc == V2V_EOS) break;
+        CHECK(rc == V2V_OK, "chain: 取样本失败: %s", p_v2v_last_error());
+        if (s.stream != vs.number) continue;
+
+        v2v_picture pic;
+        memset(&pic, 0, sizeof pic);
+        V2V_INIT(pic);
+        CHECK(p_v2v_vdec_decode(dec, s.data, s.data_len, &pic) == V2V_OK,
+              "chain: 解码失败: %s", p_v2v_last_error());
+
+        v2v_packet pkt;
+        memset(&pkt, 0, sizeof pkt);
+        V2V_INIT(pkt);
+        CHECK(p_v2v_venc_encode(enc, &pic.planes, got == 0, &pkt) == V2V_OK,
+              "chain: 编码失败: %s", p_v2v_last_error());
+
+        int64_t dur = last_pts < 0 ? 40 : (s.timestamp_ms - last_pts);
+        if (dur <= 0) dur = 40;
+        CHECK(p_v2v_mux_write_video(mux, pkt.data, pkt.len, pkt.key_frame, s.timestamp_ms,
+                                    (uint32_t)dur) == V2V_OK,
+              "chain: 写封装失败: %s", p_v2v_last_error());
+        last_pts = s.timestamp_ms;
+        got++;
+    }
+    CHECK(got > 0, "chain: 一帧都没走通");
+
+    CHECK(p_v2v_mux_finish(mux) == V2V_OK, "chain: finish 失败: %s", p_v2v_last_error());
+    p_v2v_mux_close(mux);
+    p_v2v_venc_close(enc);
+    p_v2v_vdec_close(dec);
+    p_v2v_demux_close(d);
+    printf("ok  chain（%d 帧 %ux%u → %s）\n", got, vs.width, vs.height, out_path);
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "用法: %s <libv2v_capi 路径> [样本路径]\n", argv[0]);
+        fprintf(stderr, "用法: %s <libv2v_capi 路径> [样本路径] [输出.mp4]\n", argv[0]);
         return 1;
     }
 
@@ -253,6 +387,17 @@ int main(int argc, char **argv) {
     LOAD(v2v_demux_stream);
     LOAD(v2v_demux_next);
     LOAD(v2v_demux_close);
+    LOAD(v2v_vdec_open);
+    LOAD(v2v_vdec_decode);
+    LOAD(v2v_vdec_close);
+    LOAD(v2v_venc_open);
+    LOAD(v2v_venc_encode);
+    LOAD(v2v_venc_header);
+    LOAD(v2v_venc_close);
+    LOAD(v2v_mux_open);
+    LOAD(v2v_mux_write_video);
+    LOAD(v2v_mux_finish);
+    LOAD(v2v_mux_close);
 
     check_version();
     check_probe();
@@ -261,8 +406,11 @@ int main(int argc, char **argv) {
     if (argc >= 3) {
         check_player(argv[2]);
         check_demux(argv[2]);
+        if (argc >= 4) {
+            check_chain(argv[2], argv[3], 4);
+        }
     } else {
-        printf("（没给样本，跳过 open / 读帧 / seek / demux 那几段）\n");
+        printf("（没给样本，跳过 open / 读帧 / seek / demux / 转码那几段）\n");
     }
 
     dlclose(lib);
