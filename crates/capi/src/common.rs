@@ -168,6 +168,14 @@ pub unsafe fn write_sized<T>(out: *mut T, val: T) {
 /// 一条音频最多几条声道。超过的流明确报不支持，**不静默截断**。
 pub const MAX_CHANNELS: usize = 8;
 
+/// 编解码器编号 —— **解码与编码共用这一张表**（只此一份，别处 re-export）。
+pub const CODEC_WMV3: u32 = 0;
+pub const CODEC_MP43: u32 = 1;
+pub const CODEC_MP42: u32 = 2;
+pub const CODEC_WMV1: u32 = 3;
+pub const CODEC_WMV2: u32 = 4;
+pub const CODEC_MP4V: u32 = 5;
+
 /// YUV420P 三平面。**stride 恒等于 width**（色度是 `ceil(width/2)`）——
 /// 本仓不产 padding，每行紧排。调用方可以据此逐行 `memcpy`。
 ///
@@ -196,6 +204,18 @@ pub fn planes_of(y: &[u8], u: &[u8], v: &[u8], width: u32, height: u32) -> V2vPl
         stride_u: width.div_ceil(2),
         stride_v: width.div_ceil(2),
     }
+}
+
+/// 编出来的一包码流（视频一帧 / 音频一帧）。
+///
+/// `data` 是**借用**的：活到句柄的下一次 `encode` / `close`。
+#[repr(C)]
+pub struct V2vPacket {
+    pub size: u32,
+    pub data: *const u8,
+    pub len: u32,
+    /// 0 / 1。封装器写载荷的关键帧位要用它。
+    pub key_frame: i32,
 }
 
 // ---------------------------------------------------------------------------

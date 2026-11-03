@@ -23,19 +23,10 @@ use v2v_msmpeg4::Version;
 
 use crate::common::*;
 
-/// VC-1（容器里的 FourCC 是 `WMV3`）。
-pub const CODEC_WMV3: u32 = 0;
-/// MS-MPEG-4 v3（`MP43`）。
-pub const CODEC_MP43: u32 = 1;
-/// MS-MPEG-4 v2（`MP42`）。
-pub const CODEC_MP42: u32 = 2;
-/// WMV7（`WMV1`）。
-pub const CODEC_WMV1: u32 = 3;
-/// WMV8（`WMV2`）。**必须**给 extradata（能力位在它的前 4 字节里）。
-pub const CODEC_WMV2: u32 = 4;
-/// MPEG-4 Part 2（`FMP4` / `DIVX` / `XVID`）。extradata 里是 VOL；
-/// 传空则按「VOL 在码流里」处理（AVI 常见）。
-pub const CODEC_MP4V: u32 = 5;
+// 编号只有一份（在公共层）—— 解码与编码必须认同一张表。
+pub use crate::common::{
+    CODEC_MP42, CODEC_MP43, CODEC_MP4V, CODEC_WMV1, CODEC_WMV2, CODEC_WMV3,
+};
 
 /// 解出来的一帧（显示尺寸，YUV420P 三块分开）。
 struct Owned {

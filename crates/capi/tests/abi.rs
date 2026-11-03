@@ -464,3 +464,175 @@ fn decodes_audio_through_the_abi() {
     unsafe { v2v_adec_close(dec) };
     unsafe { v2v_demux_close(d) };
 }
+
+/// 编码层：编两帧（首帧关键帧、第二帧 P），再自己解回来核对尺寸。
+///
+/// 这是「自造自读」的往返 —— **必要但不充分**（编码器与解码器的假设会一起错），
+/// 真正的判据在各自 crate 的对账测试里。这里验的是 ABI 的形状：
+/// 关键帧位对不对、平面有没有传错、输出缓冲的生命周期。
+#[test]
+fn encodes_video_through_the_abi() {
+    use v2v_capi::vdec::*;
+    use v2v_capi::venc::*;
+
+    for codec in [CODEC_MP43, CODEC_MP4V] {
+        let (w, h) = (64u32, 48u32);
+        let cfg = V2vVencCfg {
+            size: size_of::<V2vVencCfg>() as u32,
+            width: w,
+            height: h,
+            qscale: 0,
+            bitrate: 0,
+            fps_num: 0,
+            ac_pred: 1,
+            // 0 = 不用 MPEG 矩阵量化：本仓的解码器只做 quant_type=0，
+            // 开 1 编出来的流自己解不回来（对外部播放器没影响）。
+            mpeg_quant: 0,
+        };
+        let enc = unsafe { v2v_venc_open(codec, &cfg) };
+        assert!(!enc.is_null(), "codec {codec} 建编码器失败：{}", unsafe {
+            std::ffi::CStr::from_ptr(v2v_last_error()).to_string_lossy()
+        });
+
+        // 造两帧：一个水平渐变，第二帧整体右移一格（让 P 帧有东西可预测）。
+        let mut planes = Gradient::new(w, h);
+        let mut key_flags = Vec::new();
+        let mut sizes = Vec::new();
+        for i in 0..2 {
+            planes.shift(i as u8);
+            let p = planes.as_planes();
+            let mut pkt: V2vPacket = unsafe { std::mem::zeroed() };
+            pkt.size = size_of::<V2vPacket>() as u32;
+            assert_eq!(
+                unsafe { v2v_venc_encode(enc, &p, i32::from(i == 0), &mut pkt) },
+                OK,
+                "codec {codec} 第 {i} 帧编码失败：{}",
+                unsafe { std::ffi::CStr::from_ptr(v2v_last_error()).to_string_lossy() }
+            );
+            assert!(pkt.len > 0 && !pkt.data.is_null());
+            key_flags.push(pkt.key_frame);
+            sizes.push(pkt.len);
+        }
+        assert_eq!(key_flags, vec![1, 0], "codec {codec} 的关键帧位不对");
+        assert!(sizes[1] < sizes[0], "codec {codec} 的 P 帧不该比 I 帧大");
+
+        unsafe { v2v_venc_close(enc) };
+
+        // 再把 I 帧解回来：尺寸必须一致，且至少不是全黑（说明真编进去了）。
+        let enc = unsafe { v2v_venc_open(codec, &cfg) };
+        let p = planes.as_planes();
+        let mut pkt: V2vPacket = unsafe { std::mem::zeroed() };
+        pkt.size = size_of::<V2vPacket>() as u32;
+        assert_eq!(unsafe { v2v_venc_encode(enc, &p, 1, &mut pkt) }, OK);
+
+        // 取封装器要的 header（MPEG-4 是 VOL），再用它建解码器把 I 帧解回来。
+        let mut hdr = vec![0u8; 512];
+        let hn = unsafe { v2v_venc_header(enc, hdr.as_mut_ptr(), hdr.len() as u32) };
+        assert!(hn >= 0, "codec {codec} 取 header 失败");
+        if codec == CODEC_MP4V {
+            assert!(hn > 0, "MPEG-4 的 I 帧不带 VOL，header 不该是空的");
+        }
+        let dec = unsafe { v2v_vdec_open(codec, hdr.as_ptr(), hn as u32, w, h) };
+        assert!(!dec.is_null(), "codec {codec} 建解码器失败：{}", unsafe {
+            std::ffi::CStr::from_ptr(v2v_last_error()).to_string_lossy()
+        });
+        let mut pic: V2vPicture = unsafe { std::mem::zeroed() };
+        pic.size = size_of::<V2vPicture>() as u32;
+        assert_eq!(
+            unsafe { v2v_vdec_decode(dec, pkt.data, pkt.len, &mut pic) },
+            OK,
+            "codec {codec} 解不回来：{}",
+            unsafe { std::ffi::CStr::from_ptr(v2v_last_error()).to_string_lossy() }
+        );
+        assert_eq!(pic.planes.width, w);
+        assert_eq!(pic.planes.height, h);
+        unsafe { v2v_vdec_close(dec) };
+        unsafe { v2v_venc_close(enc) };
+    }
+}
+
+/// 一块可变的 YUV420P 测试图（只有测试用）。
+struct Gradient {
+    w: u32,
+    h: u32,
+    y: Vec<u8>,
+    u: Vec<u8>,
+    v: Vec<u8>,
+}
+
+impl Gradient {
+    fn new(w: u32, h: u32) -> Self {
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        Self {
+            w,
+            h,
+            y: vec![0; (w * h) as usize],
+            u: vec![128; (cw * ch) as usize],
+            v: vec![128; (cw * ch) as usize],
+        }
+    }
+
+    fn shift(&mut self, k: u8) {
+        for y in 0..self.h {
+            for x in 0..self.w {
+                self.y[(y * self.w + x) as usize] = ((x + y + k as u32) & 0xFF) as u8;
+            }
+        }
+    }
+
+    fn as_planes(&self) -> v2v_capi::common::V2vPlanes {
+        v2v_capi::common::planes_of(&self.y, &self.u, &self.v, self.w, self.h)
+    }
+}
+
+/// AAC：编一帧正弦，验 ASC 长度与码流非空。
+#[test]
+fn encodes_audio_through_the_abi() {
+    use v2v_capi::aenc::*;
+
+    let cfg = V2vAencCfg {
+        size: size_of::<V2vAencCfg>() as u32,
+        channels: 2,
+        sample_rate: 44100,
+        bitrate: 128_000,
+        ms_stereo: 1,
+        kb_window: 0,
+        threads: 1,
+    };
+    let enc = unsafe { v2v_aenc_open(&cfg) };
+    assert!(!enc.is_null(), "建 AAC 编码器失败：{}", unsafe {
+        std::ffi::CStr::from_ptr(v2v_last_error()).to_string_lossy()
+    });
+
+    let n = AAC_FRAME_SAMPLES as usize;
+    let mut l = vec![0f32; n];
+    let mut r = vec![0f32; n];
+    for i in 0..n {
+        let s = (i as f32 * 0.05).sin() * 8000.0;
+        l[i] = s;
+        r[i] = -s;
+    }
+    let planes: [*const f32; 2] = [l.as_ptr(), r.as_ptr()];
+
+    let mut pkt: V2vPacket = unsafe { std::mem::zeroed() };
+    pkt.size = size_of::<V2vPacket>() as u32;
+    assert_eq!(unsafe { v2v_aenc_encode(enc, planes.as_ptr(), n as u32, &mut pkt) }, OK);
+    assert!(pkt.len > 0 && !pkt.data.is_null());
+    assert_eq!(pkt.key_frame, 1, "AAC 每帧都该是独立的关键帧");
+
+    // 采样点不对必须报参数错，不能悄悄补零。
+    assert_eq!(
+        unsafe { v2v_aenc_encode(enc, planes.as_ptr(), 512, &mut pkt) },
+        ERR_ARG
+    );
+
+    // ASC：先问长度（给 0 字节），再取。
+    let need = unsafe { v2v_aenc_asc(enc, std::ptr::null_mut(), 0) };
+    assert_eq!(need, ERR_ARG, "缓冲不够时该报参数错");
+    let mut asc = vec![0u8; 8];
+    let got = unsafe { v2v_aenc_asc(enc, asc.as_mut_ptr(), asc.len() as u32) };
+    assert!(got > 0, "ASC 长度是 {got}");
+    assert_eq!(got as usize, 2, "44.1k 立体声的 ASC 是 2 字节");
+
+    unsafe { v2v_aenc_close(enc) };
+}

@@ -32,10 +32,12 @@
 //! 在 ABI 里做一层只会多一次全帧拷贝，还多一份要维护的语义。
 
 pub mod adec;
+pub mod aenc;
 pub mod common;
 pub mod demux;
 pub mod player;
 pub mod vdec;
+pub mod venc;
 
 pub use common::{
     arg_err, cstr, guard, guard_ptr, rc, set_err, slice, write_sized, IntoAbi, ABI_MAJOR, ABI_MINOR,

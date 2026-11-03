@@ -354,6 +354,80 @@ int32_t v2v_adec_feed(v2v_adec *h, const uint8_t *data, uint32_t len);
 /* 取一帧。V2V_EOS = 队列空了（不是流结束）。 */
 int32_t v2v_adec_next(v2v_adec *h, v2v_adec_frame *out);
 
+/* ==================================================================
+ * 编码（L3）：MP43 / MPEG-4 Part 2 / AAC
+ *
+ * GOP 由**调用方**决定：force_key 说这一帧是不是关键帧。编码器内部那套
+ * 「距上个 I 帧多远」的判断被关掉了 —— 让 ABI 去复刻它迟早会漂，
+ * 而封装器写的关键帧位必须与实际编出来的东西一致。
+ *
+ * 输入帧会被拷一份（编码器要持有 Vec），720p 一帧约 1.4 MB。
+ * ================================================================== */
+
+/* 编出来的一包码流。data 借用，活到句柄的下一次 encode / close。 */
+typedef struct v2v_packet {
+    uint32_t size;
+    const uint8_t *data;
+    uint32_t len;
+    int32_t key_frame; /* 0 / 1 */
+} v2v_packet;
+
+typedef struct v2v_venc v2v_venc;
+
+typedef struct v2v_venc_cfg {
+    uint32_t size;
+    uint32_t width;
+    uint32_t height;
+    uint32_t qscale;  /* 1..=31；0 = 用默认值（MP43 是 8，MPEG-4 是 4） */
+    uint32_t bitrate; /* bit/s；0 = 不做码率控制（只有 MPEG-4 支持） */
+    uint32_t fps_num; /* MPEG-4 的时间分辨率；0 = 25 */
+    uint32_t ac_pred;   /* MPEG-4：逐宏块试 AC 预测，默认开 */
+    /* MPEG-4：矩阵量化。注意本仓的解码器只做 quant_type = 0 ——
+     * 传 1 编出来的流本仓自己解不了（外部播放器不受影响）。
+     * 要「编完能被本仓回放」就传 0。 */
+    uint32_t mpeg_quant;
+} v2v_venc_cfg;
+
+/* codec 用 V2V_CODEC_MP43 / V2V_CODEC_MP4V。失败返回 NULL。 */
+v2v_venc *v2v_venc_open(uint32_t codec, const v2v_venc_cfg *cfg);
+void v2v_venc_close(v2v_venc *h);
+
+/* 编一帧。force_key != 0 = 关键帧（I 帧）。首帧请传 1（传 0 也会当关键帧）。 */
+int32_t v2v_venc_encode(v2v_venc *h, const v2v_planes *planes, int32_t force_key,
+                        v2v_packet *out);
+
+/* 把「解码器专用信息」拷进 buf，返回字节数；cap 不够返回 V2V_ERR_ARG。
+ * MPEG-4 返回 VOL（封装 MP4 的 esds 要它）；MP43 返回 0 字节。 */
+int32_t v2v_venc_header(const v2v_venc *h, uint8_t *buf, uint32_t cap);
+
+/* ---- AAC ---- */
+
+/* 一帧的采样点数（语法规定，不是配置项）。 */
+#define V2V_AAC_FRAME_SAMPLES 1024
+
+typedef struct v2v_aenc v2v_aenc;
+
+typedef struct v2v_aenc_cfg {
+    uint32_t size;
+    uint32_t channels;    /* 1 或 2 */
+    uint32_t sample_rate;
+    uint32_t bitrate;     /* 目标值，不是保证值 */
+    uint32_t ms_stereo;   /* 双声道时允许 M/S，默认建议 1 */
+    uint32_t kb_window;   /* 用 KBD 窗而不是正弦窗，默认 0 */
+    uint32_t threads;     /* 编一帧用几个线程；0 = 1 */
+} v2v_aenc_cfg;
+
+v2v_aenc *v2v_aenc_open(const v2v_aenc_cfg *cfg);
+void v2v_aenc_close(v2v_aenc *h);
+
+/* 编一帧。samples 必须正好是 V2V_AAC_FRAME_SAMPLES。
+ * planes 指向 channels 个指针，每条 samples 个 float（刻度同 int16）。 */
+int32_t v2v_aenc_encode(v2v_aenc *h, const float *const *planes, uint32_t samples,
+                        v2v_packet *out);
+
+/* 把 AudioSpecificConfig 拷进 buf，返回字节数；cap 不够返回 V2V_ERR_ARG。 */
+int32_t v2v_aenc_asc(const v2v_aenc *h, uint8_t *buf, uint32_t cap);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif
