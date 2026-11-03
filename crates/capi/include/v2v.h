@@ -81,6 +81,22 @@ int32_t v2v_last_error_kind(void);
 /* 出参结构体统一用这个初始化（填 size）。忘了填会拿到 V2V_ERR_ARG。 */
 #define V2V_INIT(s) ((s).size = (uint32_t)sizeof(s))
 
+/* YUV420P 三平面 —— 解码 / 编码 / 播放三层共用。
+ *
+ * stride 恒等于 width（色度是 ceil(width/2)）—— 我们没有 padding，每行紧排，
+ * 所以想留一帧就是逐行 memcpy。
+ * 三个指针都是**借用**的：活到本句柄的下一次同类调用。 */
+typedef struct v2v_planes {
+    const uint8_t *y;
+    const uint8_t *u;
+    const uint8_t *v;
+    uint32_t width;
+    uint32_t height;
+    uint32_t stride_y;
+    uint32_t stride_u;
+    uint32_t stride_v;
+} v2v_planes;
+
 /* ==================================================================
  * 播放（L5）—— 打开一个文件，按自己的节奏交替拉视频帧与音频帧
  *
@@ -103,21 +119,6 @@ typedef struct v2v_player v2v_player;
 #define V2V_INFO_HAS_B_FRAMES 0x1u
 #define V2V_INFO_INTERLACED 0x2u
 #define V2V_INFO_ADVANCED_PROFILE 0x4u
-
-/* YUV420P 三平面。
- *
- * stride 恒等于 width（色度是 ceil(width/2)）—— 我们没有 padding，每行紧排。
- * 三个指针活到本句柄的下一次 read_video / seek_ms / close。 */
-typedef struct v2v_planes {
-    const uint8_t *y;
-    const uint8_t *u;
-    const uint8_t *v;
-    uint32_t width;
-    uint32_t height;
-    uint32_t stride_y;
-    uint32_t stride_u;
-    uint32_t stride_v;
-} v2v_planes;
 
 /* 一帧视频。pts_ms 是容器时间戳（已扣 preroll）。 */
 typedef struct v2v_frame {
@@ -272,6 +273,40 @@ int32_t v2v_demux_seek_packet(v2v_demux *h, uint64_t packet);
 
 /* 取索引。V2V_EOS = 这个文件没有索引。 */
 int32_t v2v_demux_index(v2v_demux *h, v2v_index *out);
+
+/* ==================================================================
+ * 视频解码（L2）
+ *
+ * 一包字节进，一帧 YUV 出。解码器是**有状态**的（P 帧参考前一帧）：
+ * 必须按显示顺序喂、不能跳帧、不能并发用。
+ * 要「从某个关键帧重来」就关掉重开一个句柄 —— 内部的参考帧没法半途清零。
+ *
+ * 不做错误隐藏：解不出来就返回错误，不会给一帧「大概是这样」的画面。
+ * ================================================================== */
+
+#define V2V_CODEC_WMV3 0 /* VC-1 */
+#define V2V_CODEC_MP43 1 /* MS-MPEG-4 v3 */
+#define V2V_CODEC_MP42 2 /* MS-MPEG-4 v2 */
+#define V2V_CODEC_WMV1 3 /* WMV7 */
+#define V2V_CODEC_WMV2 4 /* WMV8，必须给 extradata */
+#define V2V_CODEC_MP4V 5 /* MPEG-4 Part 2；extra 为空则按「VOL 在码流里」 */
+
+typedef struct v2v_vdec v2v_vdec;
+
+typedef struct v2v_picture {
+    uint32_t size;
+    v2v_planes planes;
+} v2v_picture;
+
+/* 建解码器。extra 用 v2v_stream_info.extra 原样传；width/height 用**显示尺寸**。
+ * 失败返回 NULL。 */
+v2v_vdec *v2v_vdec_open(uint32_t codec, const uint8_t *extra, uint32_t extra_len,
+                        uint32_t width, uint32_t height);
+
+/* 解一帧。data 是容器里的一个样本（裸帧数据，帧头在最前面）。 */
+int32_t v2v_vdec_decode(v2v_vdec *h, const uint8_t *data, uint32_t len, v2v_picture *out);
+
+void v2v_vdec_close(v2v_vdec *h);
 
 #ifdef __cplusplus
 } /* extern "C" */

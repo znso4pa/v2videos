@@ -30,3 +30,7 @@ v2v-aac = { path = "../aac" }
 v2v-mp4 = { path = "../mp4" }
 v2v-player = { path = "../player" }
 v2v-android = { path = "../android-encode", optional = true }
+
+# 集成测试直接调 Rust 侧，用来验「ABI 吐出来的字节 == Rust 直调吐出来的字节」。
+[dev-dependencies]
+v2v-vc1 = { path = "../vc1" }

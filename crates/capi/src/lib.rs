@@ -34,6 +34,7 @@
 pub mod common;
 pub mod demux;
 pub mod player;
+pub mod vdec;
 
 pub use common::{
     arg_err, cstr, guard, guard_ptr, rc, set_err, slice, write_sized, IntoAbi, ABI_MAJOR, ABI_MINOR,

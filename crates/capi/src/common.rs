@@ -162,6 +162,40 @@ pub unsafe fn write_sized<T>(out: *mut T, val: T) {
 }
 
 // ---------------------------------------------------------------------------
+// 跨层共用的出参结构
+// ---------------------------------------------------------------------------
+
+/// YUV420P 三平面。**stride 恒等于 width**（色度是 `ceil(width/2)`）——
+/// 本仓不产 padding，每行紧排。调用方可以据此逐行 `memcpy`。
+///
+/// 三个指针都是**借用**的：活到句柄的下一次同类调用。
+#[repr(C)]
+pub struct V2vPlanes {
+    pub y: *const u8,
+    pub u: *const u8,
+    pub v: *const u8,
+    pub width: u32,
+    pub height: u32,
+    pub stride_y: u32,
+    pub stride_u: u32,
+    pub stride_v: u32,
+}
+
+/// 把一帧的三块平面填成 [`V2vPlanes`]（stride 按 YUV420P 的规则算）。
+pub fn planes_of(y: &[u8], u: &[u8], v: &[u8], width: u32, height: u32) -> V2vPlanes {
+    V2vPlanes {
+        y: y.as_ptr(),
+        u: u.as_ptr(),
+        v: v.as_ptr(),
+        width,
+        height,
+        stride_y: width,
+        stride_u: width.div_ceil(2),
+        stride_v: width.div_ceil(2),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 各 crate 的错误 → 三分类
 // ---------------------------------------------------------------------------
 

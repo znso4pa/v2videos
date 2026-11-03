@@ -190,3 +190,138 @@ fn demuxes_a_real_sample() {
 
     unsafe { v2v_demux_close(h) };
 }
+
+/// 解封装 + 解码串起来：样本从容器来，帧从解码器来，全程只经 ABI。
+/// 缺样本就 SKIP（路径要给绝对的）。
+#[test]
+fn decodes_a_real_sample_through_the_abi() {
+    use v2v_capi::demux::*;
+    use v2v_capi::vdec::*;
+
+    let Some(path) = std::env::var("V2V_ASF_SAMPLE")
+        .ok()
+        .and_then(|s| s.split(':').find(|p| std::path::Path::new(p).is_file()).map(String::from))
+    else {
+        eprintln!("SKIP decodes_a_real_sample_through_the_abi：没设 V2V_ASF_SAMPLE");
+        return;
+    };
+
+    let c = CString::new(path).unwrap();
+    let d = unsafe { v2v_demux_open(c.as_ptr()) };
+    assert!(!d.is_null());
+
+    // 视频流的信息（extra 里就是 VC-1 的序列头）。
+    let mut si: V2vStreamInfo = unsafe { std::mem::zeroed() };
+    si.size = size_of::<V2vStreamInfo>() as u32;
+    assert_eq!(unsafe { v2v_demux_stream(d, 0, &mut si) }, OK);
+    assert_eq!(si.kind, STREAM_VIDEO);
+
+    let dec = unsafe { v2v_vdec_open(CODEC_WMV3, si.extra, si.extra_len, si.width, si.height) };
+    assert!(!dec.is_null(), "建解码器失败：{}", unsafe {
+        std::ffi::CStr::from_ptr(v2v_last_error()).to_string_lossy()
+    });
+
+    // 只喂视频轨的样本，逐帧解。
+    let mut frames = 0u32;
+    loop {
+        let mut s: V2vSample = unsafe { std::mem::zeroed() };
+        s.size = size_of::<V2vSample>() as u32;
+        match unsafe { v2v_demux_next(d, &mut s) } {
+            OK => {
+                if s.stream != si.number {
+                    continue;
+                }
+                let mut p: V2vPicture = unsafe { std::mem::zeroed() };
+                p.size = size_of::<V2vPicture>() as u32;
+                assert_eq!(unsafe { v2v_vdec_decode(dec, s.data, s.data_len, &mut p) }, OK);
+                assert_eq!(p.planes.width, si.width);
+                assert_eq!(p.planes.height, si.height);
+                assert!(!p.planes.y.is_null() && !p.planes.u.is_null());
+                frames += 1;
+            }
+            EOS => break,
+            other => panic!("next 返回 {other}"),
+        }
+    }
+    assert!(frames > 0, "一帧都没解出来");
+
+    unsafe { v2v_vdec_close(dec) };
+    unsafe { v2v_demux_close(d) };
+}
+
+/// ABI 不该改变任何一个像素：同一批样本分别喂给 ABI 与 Rust 直调，逐帧比字节。
+///
+/// 这不是「独立 oracle」（真正的 oracle 是 ffmpeg，由各 crate 自己的对账测试管），
+/// 它验的是**中间那一层没把平面/stride 搞错** —— 那正是 ABI 最容易引入的 bug。
+#[test]
+fn abi_decode_matches_direct_rust_decode() {
+    use v2v_capi::demux::*;
+    use v2v_capi::vdec::*;
+
+    let Some(path) = std::env::var("V2V_ASF_SAMPLE")
+        .ok()
+        .and_then(|s| s.split(':').find(|p| std::path::Path::new(p).is_file()).map(String::from))
+    else {
+        eprintln!("SKIP abi_decode_matches_direct_rust_decode：没设 V2V_ASF_SAMPLE");
+        return;
+    };
+
+    let c = CString::new(path).unwrap();
+    let d = unsafe { v2v_demux_open(c.as_ptr()) };
+    assert!(!d.is_null());
+
+    let mut si: V2vStreamInfo = unsafe { std::mem::zeroed() };
+    si.size = size_of::<V2vStreamInfo>() as u32;
+    assert_eq!(unsafe { v2v_demux_stream(d, 0, &mut si) }, OK);
+
+    // Rust 直调那一路：自己解析序列头、自己建解码器。
+    let extra = unsafe { std::slice::from_raw_parts(si.extra, si.extra_len as usize) }.to_vec();
+    let seq = v2v_vc1::SeqHeader::parse(&extra).unwrap();
+    let mut direct = v2v_vc1::Decoder::new(seq, si.width, si.height).unwrap();
+
+    let dec = unsafe { v2v_vdec_open(CODEC_WMV3, si.extra, si.extra_len, si.width, si.height) };
+    assert!(!dec.is_null());
+
+    let mut compared = 0u32;
+    loop {
+        let mut s: V2vSample = unsafe { std::mem::zeroed() };
+        s.size = size_of::<V2vSample>() as u32;
+        match unsafe { v2v_demux_next(d, &mut s) } {
+            OK => {
+                if s.stream != si.number {
+                    continue;
+                }
+                let payload =
+                    unsafe { std::slice::from_raw_parts(s.data, s.data_len as usize) }.to_vec();
+
+                let mut p: V2vPicture = unsafe { std::mem::zeroed() };
+                p.size = size_of::<V2vPicture>() as u32;
+                assert_eq!(unsafe { v2v_vdec_decode(dec, s.data, s.data_len, &mut p) }, OK);
+
+                direct.decode_frame(&payload).unwrap();
+                let want = direct.frame();
+
+                let got_y = unsafe {
+                    std::slice::from_raw_parts(p.planes.y, (p.planes.width * p.planes.height) as usize)
+                };
+                let cw = p.planes.width.div_ceil(2);
+                let ch = p.planes.height.div_ceil(2);
+                let got_u =
+                    unsafe { std::slice::from_raw_parts(p.planes.u, (cw * ch) as usize) };
+                let got_v =
+                    unsafe { std::slice::from_raw_parts(p.planes.v, (cw * ch) as usize) };
+
+                assert_eq!(got_y, want.y.as_slice(), "第 {compared} 帧的 Y 平面不一致");
+                assert_eq!(got_u, want.u.as_slice(), "第 {compared} 帧的 U 平面不一致");
+                assert_eq!(got_v, want.v.as_slice(), "第 {compared} 帧的 V 平面不一致");
+                compared += 1;
+            }
+            EOS => break,
+            other => panic!("next 返回 {other}"),
+        }
+    }
+    assert!(compared > 0, "一帧都没比到");
+
+    unsafe { v2v_vdec_close(dec) };
+    unsafe { v2v_demux_close(d) };
+}

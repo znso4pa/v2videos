@@ -37,18 +37,8 @@ pub struct V2vPlayer {
     audio_ptrs: [*const f32; MAX_CHANNELS],
 }
 
-/// YUV420P 三平面。**stride 恒等于 width**（没有 padding，每行紧排）。
-#[repr(C)]
-pub struct V2vPlanes {
-    pub y: *const u8,
-    pub u: *const u8,
-    pub v: *const u8,
-    pub width: u32,
-    pub height: u32,
-    pub stride_y: u32,
-    pub stride_u: u32,
-    pub stride_v: u32,
-}
+/// YUV420P 三平面（定义在公共层，解码 / 编码 / 播放三处共用）。
+pub use crate::common::V2vPlanes;
 
 /// 一帧视频。
 #[repr(C)]
@@ -92,17 +82,7 @@ pub struct V2vInfo {
 }
 
 fn planes_of(f: &VideoFrame) -> V2vPlanes {
-    V2vPlanes {
-        y: f.y.as_ptr(),
-        u: f.u.as_ptr(),
-        v: f.v.as_ptr(),
-        width: f.width,
-        height: f.height,
-        // YUV420P：色度平面每行 ceil(width/2) 字节。
-        stride_y: f.width,
-        stride_u: f.width.div_ceil(2),
-        stride_v: f.width.div_ceil(2),
-    }
+    crate::common::planes_of(&f.y, &f.u, &f.v, f.width, f.height)
 }
 
 /// 打开一个文件。失败返回空指针（原因看 `v2v_last_error()`）。
