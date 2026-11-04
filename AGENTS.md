@@ -190,6 +190,10 @@ df -h /System/Volumes/Data  # 磁盘 <10% 可用会让 macOS 整体变卡（换�
   ⚠️ **本仓的 release 还额外设了 `codegen-units = 1`**（见根 `Cargo.toml`，为 VC-1 解码
   快 9%），所以 **release 编译比默认更慢、更吃单核** —— 更别反复全量 `--release`。
 - **限并发**：`cargo build -j 4` / `cargo test -j 4`。不要让它吃满所有核。
+- **重构期用 `cargo check`，别用 `build`。** 「改一点 → 全量编一遍」这个循环本身就是
+  资源陷阱：`check` 不产码、不链接，通常只有 `build` 的三分之一。要跑就
+  `cargo check -p <改动的 crate> --all-targets`，**全量 `test` / `clippy` 留到最后收尾
+  跑一次**。clippy 门禁也可以 `-p` 限定到改动过的 crate + `-j 2`，不必全量。
 - **不要多个会话同时跑同一个仓库的全量 `cargo test --workspace`。** 既费电，
   也会互相抢 `target/` 的锁。同仓库并行请走 `git worktree` 换目录（各自的 `target/` 独立，
   代价是重复编译与双份磁盘 —— 这个权衡要主动跟用户说）。
