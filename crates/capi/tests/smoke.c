@@ -1,14 +1,20 @@
 /*
- * 纯 C 的 ABI 冒烟：dlopen 打开 libv2v_capi，按 v2v.h 里写的那套约定走一遍。
+ * 纯 C 的 ABI 冒烟：按 v2v.h 里写的那套约定走一遍。
  *
  * 为什么值得单独写：Rust 集成测试调的是 `v2v_capi::` 里的函数，**绕过了头文件** ——
- * 头文件把参数写反了它照样绿。只有 C 编译器能回答「头文件自洽吗」，
- * 而 dlopen 顺带回答了「符号真的在 .so 里吗、签名真的是这个吗」。
+ * 头文件把参数写反了它照样绿。只有 C 编译器能回答「头文件自洽吗」。
  *
- * 用法：
- *     smoke <libv2v_capi 的路径> [样本路径]
+ * 两种链接方式，同一份程序：
  *
- *   给了样本就多走一段 open → info → 读帧 → seek → close；
+ *     smoke <libv2v_capi 的路径> [样本路径] [输出.mp4]
+ *         dlopen 打开 `.so`，逐个 `dlsym` 取符号 —— 顺带回答「符号真的在 .so 里吗」。
+ *
+ *     cc -DV2V_STATIC smoke.c libv2v_capi.a ...
+ *         符号在**链接期**就解析，`p_xxx` 直接指向真函数。于是「静态库缺符号」
+ *         变成**链接失败** —— 链接器就是判据。这一模式要 full 产物：
+ *         `hw` / `mpeg12` 那几族在 min 里不存在，静态引用会链接失败。
+ *
+ *   给了样本就多走 open → info → 读帧 → seek → demux → 音频 → 转码全链；
  *   没给就只验「不需要文件」的那几条：版本、probe、错误通道、size 契约。
  *
  * 退出码：0 全过；否则是第一个失败点的行号（便于定位）。
@@ -21,7 +27,9 @@
 #define _POSIX_C_SOURCE 200809L
 #endif
 
+#ifndef V2V_STATIC
 #include <dlfcn.h>
+#endif
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -30,8 +38,6 @@
 #include <string.h>
 
 #include "v2v.h"
-
-static void *lib;
 
 static void fail(int line, const char *fmt, ...) {
     va_list ap;
@@ -48,6 +54,20 @@ static void fail(int line, const char *fmt, ...) {
         if (!(cond)) fail(__LINE__, __VA_ARGS__); \
     } while (0)
 
+/* 函数指针直接从**头文件里的声明**取类型 —— 于是「头文件写错了」会在这里
+ * 编不过，而不是等到运行期参数错位才发现。 */
+#ifdef V2V_STATIC
+
+/* 静态链接：`p_xxx` 是个指向真函数的常量。声明了却没定义 → **链接期**就报
+ * undefined symbol，不用等 dlsym 返回 NULL。 */
+#define DECL(fn) static __typeof__(fn) *const p_##fn = &fn
+#define LOAD(fn) ((void)0)
+#define LOAD_OPT(fn) ((void)0)
+
+#else
+
+static void *lib;
+
 static void *need(const char *name) {
     void *p = dlsym(lib, name);
     if (!p) {
@@ -57,8 +77,6 @@ static void *need(const char *name) {
     return p;
 }
 
-/* 函数指针直接从**头文件里的声明**取类型 —— 于是「头文件写错了」会在这里
- * 编不过，而不是等到运行期参数错位才发现。 */
 #define DECL(fn) static __typeof__(fn) *p_##fn
 #define LOAD(fn) \
     do { \
@@ -73,6 +91,8 @@ static void *need(const char *name) {
         void *s_ = dlsym(lib, #fn); \
         if (s_) memcpy(&p_##fn, &s_, sizeof(p_##fn)); \
     } while (0)
+
+#endif
 
 DECL(v2v_abi_version);
 DECL(v2v_last_error);
@@ -682,6 +702,12 @@ static void check_hw_optional(const char *sample_path) {
 }
 
 int main(int argc, char **argv) {
+#ifdef V2V_STATIC
+    /* 静态链接：没有库路径可给，argv[1] 直接就是样本。 */
+    if (argc < 1) return 1;
+    int ai = 1;
+    printf("（静态链接：符号由链接器解析，不走 dlsym）\n");
+#else
     if (argc < 2) {
         fprintf(stderr, "用法: %s <libv2v_capi 路径> [样本路径] [输出.mp4]\n", argv[0]);
         return 1;
@@ -692,6 +718,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "dlopen(%s) 失败: %s\n", argv[1], dlerror());
         return 1;
     }
+    int ai = 2;
+#endif
 
     LOAD(v2v_abi_version);
     LOAD(v2v_last_error);
@@ -739,19 +767,21 @@ int main(int argc, char **argv) {
     check_error_channel();
     check_size_contract();
 
-    if (argc >= 3) {
-        check_player(argv[2]);
-        check_demux(argv[2]);
-        check_audio_decode(argv[2]);
-        check_hw_optional(argv[2]);
-        if (argc >= 4) {
-            check_chain(argv[2], argv[3], 4);
+    if (argc > ai) {
+        check_player(argv[ai]);
+        check_demux(argv[ai]);
+        check_audio_decode(argv[ai]);
+        check_hw_optional(argv[ai]);
+        if (argc > ai + 1) {
+            check_chain(argv[ai], argv[ai + 1], 4);
         }
     } else {
         printf("（没给样本，跳过 open / 读帧 / seek / demux / 音频 / 转码那几段）\n");
     }
 
+#ifndef V2V_STATIC
     dlclose(lib);
+#endif
     printf("PASS\n");
     return 0;
 }

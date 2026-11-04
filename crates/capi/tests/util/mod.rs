@@ -24,6 +24,14 @@ pub fn dylib_in(dir: &Path) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
+/// 静态库。`staticlib` 是 `Cargo.toml` 里声明过的第三种产物。
+pub fn staticlib_in(dir: &Path) -> Option<PathBuf> {
+    ["libv2v_capi.a", "v2v_capi.lib"]
+        .iter()
+        .map(|n| dir.join(n))
+        .find(|p| p.is_file())
+}
+
 /// 测试可执行文件在 `<target>/[<triple>/]debug/deps/` 下，往上两级就是产物目录。
 pub fn debug_dir() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
