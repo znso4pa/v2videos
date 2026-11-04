@@ -3,7 +3,7 @@ name = "v2v-bench"
 description = "性能测量的格式与寿命管理：TSV 读写、机器指纹、回归比较（不测量任何东西）"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license = "MIT"
 repository.workspace = true
 publish = false
 

@@ -750,17 +750,29 @@ escape 码本无符号、符号位单独发）。负系数的误差于是被估�
 
 ## 许可证
 
-**LGPL-2.1-or-later**，见 [LICENSE](LICENSE)。
+**分两种**：
 
-选 LGPL 的**原因很直接：编解码需要的 VLC / 反量化 / Huffman 码表**  
-（`crates/msmpeg4/src/tables.rs`、`crates/mp4v/src/tables.rs`、`crates/aac/src/tables.rs`、  
-`crates/wma/src/tables.rs`）是从 FFmpeg 的数据文件读出来的（同为 LGPL-2.1-or-later）。  
-表本身是 H.263 / MPEG-4 Part 2 / MPEG-4 Audio / WMA 的**格式定义**、与实现无关，  
-也可以换数据源重新生成（`tools/` 下的生成器就是为此留的）；但与其搞「单文件例外」  
-这种容易说错的安排，不如整个仓库统一按 LGPL 走。  
-**逐个上游文件、它们的版权声明、以及生成器与产出的对应关系见 [NOTICE](NOTICE)。**  
+| 范围 | 许可证 |
+|---|---|
+| `crates/{msmpeg4, vc1, aac, wma, mp4v, mpeg12}` | **LGPL-2.1-or-later**（[LICENSE](LICENSE)） |
+| 其余 12 个 crate：`kernel` / `container` / `asf` / `avi` / `mpegps` / `mp4` / `player` / `cli` / `bench` / `capi` / `android-encode` / `mpeg12-simd` | **MIT**（[LICENSE-MIT](LICENSE-MIT)） |
+
+分界的**唯一依据是码表**：上面六个 crate 含从 FFmpeg 数据文件读出的 VLC / 反量化 /
+Huffman 表（`crates/*/src/tables.rs`，同为 LGPL-2.1-or-later）。表本身是
+H.263 / MPEG-4 Part 2 / MPEG-4 Audio / WMA / VC-1 / MPEG-1/2 的**格式定义**、
+与实现无关，也可以换数据源重新生成（`tools/` 下的生成器就是为此留的）。
+
+其余代码是照着公开规范自己写的（不是从任何实现逐行翻译），所以可以按 MIT 分发。
+边界落在 **crate** 上而不是单个文件上 —— 每个 crate 只有一种许可证，不存在「同一个
+crate 里两种许可」那种看错的情况。
+
+⚠️ **产物仍整体 LGPL**：任何链接了上面六个 crate 的 `.so` / 可执行文件
+（`libv2v_capi`、`v2v` CLI……）按 LGPL-2.1-or-later 分发 —— MIT 只覆盖那些 crate 的**源码**。
+只取用 MIT 侧的 crate（例如只拿 `container` / `kernel`）不受影响。
+
+**逐个上游文件、它们的版权声明、以及生成器与产出的对应关系见 [NOTICE](NOTICE)。**
 （重新生成表需要自备 FFmpeg 源码 —— 生成器的默认路径是作者的本地路径，见上面的「目录」。）
 
-**代价**：GPL 侧的编码器（x264/x265）链不了，编码只能走宽松许可的实现或硬件  
-（Android MediaCodec）；引第三方 crate 也只挑宽松许可的（Apache-2.0 / MIT / BSD）。  
-LGPL 作为**库**被 MIT 的应用依赖是没问题的；反过来（把 LGPL 代码并进 MIT 的库再改许可）不行
+**代价**：LGPL 侧的 crate 不能链 GPL 的编码器（x264/x265），编码只能走宽松许可的实现
+或硬件（Android MediaCodec）；引第三方 crate 也只挑宽松许可的（Apache-2.0 / MIT / BSD）。
+LGPL 作为**库**被 MIT 的应用依赖是没问题的；反过来（把 LGPL 代码并进 MIT 的库再改许可）不行。

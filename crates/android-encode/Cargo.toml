@@ -3,7 +3,7 @@ name = "v2v-android"
 description = "Android 硬件编码路径（MediaCodec H.264 + MediaMuxer MP4）—— unsafe / FFI 集中在这里"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license = "MIT"
 build = "build.rs"
 publish = false
 

@@ -60,13 +60,16 @@ CLI 级还有一条 `crates/cli/tests/convert.rs::converts_wmv3_input`。
 
 ## 约定（现在起生效）
 
-- **许可证是 LGPL-2.1-or-later。** 原因：MP43 解码需要的表（`crates/msmpeg4/src/tables.rs`）
-  是从 FFmpeg 的数据文件读出来的（同为 LGPL）—— 与其搞「单文件例外」这种容易说错的
-  安排，不如整个仓库统一按 LGPL 走。**代价**：GPL 侧的编码器（x264/x265/…）链不了，
-  编码只能走宽松许可的实现或硬件（Android MediaCodec）；引第三方 crate 也要挑宽松许可的
-  （Apache-2.0 / MIT / BSD），**MPL 这类 copyleft 一律不引**（UsefulUnpack 就是这么拒绝
-  `symphonia` 的）。LGPL 作为**库**被 MIT 的应用依赖是可以的；别把 LGPL 代码并进
-  MIT 的库再改许可。
+- **许可证按 crate 分两种。** 含 FFmpeg 派生码表的六个 crate（`msmpeg4` / `vc1` / `aac` /
+  `wma` / `mp4v` / `mpeg12`）是 **LGPL-2.1-or-later**，其余 crate 是 **MIT**。
+  分界唯一依据是 `crates/*/src/tables.rs` 这些**生成的**表文件（从 FFmpeg 数据读出）；
+  代码是照公开规范自研的，所以能按 MIT 分发。边界落在 **crate** 上而不是单个文件上 ——
+  每个 crate 只有一种许可证。**但链接了 LGPL 侧 crate 的产物仍整体 LGPL**（MIT 只覆盖源码）。
+  **代价**：LGPL 侧的 crate 不能链 GPL 的编码器（x264/x265/…），编码只能走宽松许可的实现
+  或硬件（Android MediaCodec）。引第三方 crate 也要挑宽松许可的（Apache-2.0 / MIT / BSD），
+  **MPL 这类 copyleft 一律不引**。别把 LGPL 代码并进 MIT 的库再改许可。
+  `tools/check_license.py` 是这条的**机器约束**（CI 跑）：改任何 crate 的 `license` 字段、
+  或新增/移动生成表文件，都要同时过它和 `NOTICE` 的重新生成。
 - **提交信息**：`type(scope): 中文描述`。Subject 一行；正文 3–6 条 `-` 单行要点、不折行，
   说「改了什么、为什么重要」，不复述 diff。**考古细节**（试过哪些候选、某个夹具怎么骗人、
   量出来的数字）写 `TODO.md`，不进提交。
@@ -217,7 +220,8 @@ df -h /System/Volumes/Data  # 磁盘 <10% 可用会让 macOS 整体变卡（换�
    `VideoFormat`）。上层（解码器、`v2v convert`）**不认识容器** —— 加一种容器 = 加一个
    「字节 → Stream / Sample」的实现，上层不动。
 2. **零第三方依赖。** 所有 crate 只依赖本仓内部包。要引 crates.io 上的东西，先过许可证
-   （LGPL 兼容：Apache-2.0 / MIT / BSD；MPL 这类 copyleft 一律不引），并说清现有代码
+   （LGPL 侧的 crate 只挑 LGPL 兼容的：Apache-2.0 / MIT / BSD；MIT 侧同样不引
+   copyleft（MPL 等）—— 整仓一个口径，别按 crate 各搞一套），并说清现有代码
    为什么做不到。
 3. **共享数值内核住在 `v2v-kernel`**：`BitReader` / `BitWriter`（MSB 优先）/ FDCT / IDCT /
    FFT / VLC / RL 表容器 / 帧缓冲（`Frame` / `Planes`）/ 运动补偿 / SAD / 宏块层预测 /

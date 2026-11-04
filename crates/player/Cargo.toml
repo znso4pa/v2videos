@@ -3,7 +3,7 @@ name = "v2v-player"
 description = "顺时播放：解封装 + 解码接成一个能逐帧 / 逐样本取数的播放器"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license = "MIT"
 
 [features]
 default = []

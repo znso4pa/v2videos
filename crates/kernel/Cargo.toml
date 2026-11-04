@@ -2,7 +2,7 @@
 name = "v2v-kernel"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license = "MIT"
 repository.workspace = true
 publish = false
 description = "编解码器共用的信号处理内核：位流、VLC、DCT/IDCT、FFT、运动补偿、SIMD"

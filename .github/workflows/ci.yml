@@ -36,6 +36,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 许可证是**按 crate 分两种**的：六个含 FFmpeg 派生码表的 crate 是 LGPL-2.1+，
+      # 其余是 MIT（见 NOTICE / README「许可证」）。
+      #
+      # 这条只能靠机器守：`license` 字段抄错一个字母、或者新增了一张生成表却没进
+      # NOTICE，**编译、测试、clippy 全都不会有反应** —— 它只在法务意义上存在。
+      - name: 许可证与 NOTICE 一致性
+        run: python3 tools/check_license.py
+
       # 工具链由 `rust-toolchain.toml` 钉死，**不在这里另写版本** ——
       # 写两处就有两个真相。`rustup show` 会读到那个文件并把缺的装上。
       #

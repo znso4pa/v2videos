@@ -40,7 +40,33 @@ OUTPUTS = [
     ("tools/gen_wma_tables.py", "crates/wma/src/tables.rs", ["wmadata.h", "wma_freqs.c", "aactab.c"]),
     ("tools/gen_intrax8_tables.py", "crates/msmpeg4/src/intrax8_tables.rs", ["intrax8huf.h", "intrax8.c", "intrax8dsp.c"]),
     ("tools/gen_vc1_tables.py", "crates/vc1/src/tables.rs", ["vc1data.c", "vc1_vlc_data.h", "vc1.h", "vc1_common.h"]),
+    ("tools/gen_mpeg12_tables.py", "crates/mpeg12/src/tables.rs", ["mpeg12data.c", "mpeg12.c", "mpegvideodata.c"]),
 ]
+
+# 含上面那些生成码表的 crate —— 它们是 LGPL 派生数据，必须按 LGPL-2.1-or-later 分发。
+LGPL_CRATES = ["aac", "mpeg12", "mp4v", "msmpeg4", "vc1", "wma"]
+
+# 其余 crate：源码自研，按 MIT 分发（**不含**链接后产物，见下文）。
+MIT_CRATES = [
+    "android-encode",
+    "asf",
+    "avi",
+    "bench",
+    "capi",
+    "cli",
+    "container",
+    "kernel",
+    "mpeg12-simd",
+    "mpegps",
+    "mp4",
+    "player",
+]
+
+
+def crate_lines(names, per_line=3):
+    """把 crate 列表按每行 N 个折开 —— 一行十几个名字读不动。"""
+    for i in range(0, len(names), per_line):
+        yield "    " + "、".join(f"`crates/{c}`" for c in names[i : i + per_line])
 
 
 def main():
@@ -50,7 +76,21 @@ def main():
     w("v2video —— 第三方代码与数据来源")
     w("=" * 34)
     w("")
-    w("本仓以 **LGPL-2.1-or-later** 发布（全文见 [LICENSE](LICENSE)）。")
+    w("本仓**分两种许可证**：")
+    w("")
+    w("  - **LGPL-2.1-or-later**（全文见 [LICENSE](LICENSE)）：")
+    for line in crate_lines(LGPL_CRATES):
+        w(line)
+    w("    —— 这几个 crate 含**从 FFmpeg 的数据文件读出的码表**（见下文一、）。")
+    w("  - **MIT**（全文见 [LICENSE-MIT](LICENSE-MIT)）：")
+    for line in crate_lines(MIT_CRATES):
+        w(line)
+    w("    —— 源码自研，不含任何派生数据。")
+    w("")
+    w("⚠️ **链接了 LGPL 侧 crate 的产物（`.so` / 可执行文件）整体按 LGPL-2.1-or-later 分发。**")
+    w("MIT 只覆盖那些 crate 的**源码**：单独取用 MIT 侧的 crate（例如只拿 `container` /")
+    w("`kernel`）不受影响，但任何把它们与上面六个 crate 链在一起的产物仍是 LGPL。")
+    w("")
     w("本文件列出**不是本仓原创**的部分、它们的来源、以及上游的版权声明 ——")
     w("依 LGPL-2.1 §4(a)「保留版权声明与许可声明」的要求。")
     w("")
@@ -109,7 +149,8 @@ def main():
     w("除上面列出的生成码表之外，本仓的代码是自研的，没有链接任何第三方库")
     w("（`Cargo.lock` 里只有本仓自己的包）。编解码器的**算法**来自公开规范")
     w("（ITU-T H.263、ISO/IEC 14496-2、ISO/IEC 14496-3、ASF 规范），")
-    w("不是从任何实现逐行翻译的。")
+    w("不是从任何实现逐行翻译的 —— 所以除码表所在的六个 crate 之外，")
+    w("其余 crate 的源码按 MIT 分发。")
     w("")
 
     text = "\n".join(out).rstrip() + "\n"

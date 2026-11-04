@@ -3,7 +3,7 @@ name = "v2v-capi"
 description = "全仓的 C ABI：容器 / 解码 / 编码 / 封装 / 播放，一层一组符号"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license = "MIT"
 publish = false
 
 # `cdylib` 给宿主 dlopen / 动态链接；`staticlib` 给 iOS 那种只能静态链的场合；
