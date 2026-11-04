@@ -6,9 +6,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-# 编解码器共用的那一层（位读写 / VLC / DCT / IDCT / FFT / SAD / NEON）。
-# 本 crate 是它最大的用户：`simd` 那套 NEON 目前唯一的调用方就是这边的运动估计。
-v2v-kernel = { path = "../kernel" }
+# 编解码器共用的那一层（位读写 / VLC / RL / DCT / IDCT / FFT / 帧缓冲 / 运动补偿 / SAD）。
+# 本 crate 是它最大的用户：`simd` 那套 NEON 目前唯一的调用方就是这边的运动估计，
+# 所以**只有这里**打开 `unsafe-kernels`（别的 crate 拿到的仍是纯标量实现）。
+v2v-kernel = { path = "../kernel", features = ["unsafe-kernels"] }
 
 [dev-dependencies]
 # 只给 example / 集成测试用：从 ASF 里取视频样本做验证。

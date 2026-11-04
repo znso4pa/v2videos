@@ -22,7 +22,8 @@ kernel     编解码器**共用的信号处理内核**：位读写 / VLC / RL �
 msmpeg4    MP42 / MP43 / WMV1 / WMV2 解码（I / P，WMV2 含 IntraX8）**+ MP43 编码**（I / P，含运动估计）
 wma        WMA v1 / v2 解码（**只有解码器**）
 vc1        VC-1（WMV3）解码（I / P，含 ABT / ¼ 像素 MC / 环路滤波；**只有解码器**）
-mpeg12     MPEG-1/2 解码（I / P / B、隔行、4:2:2 / 4:4:4）—— **本 crate 自身零 unsafe，当参考实现**
+mpeg12     MPEG-1/2 解码（I / P / B、隔行、4:2:2 / 4:4:4）—— **本 crate 自身零 unsafe，
+           且依赖闭包里也没有 unsafe**（kernel 的 NEON 是 opt-in feature，这里不开），当参考实现
 mpeg12-simd  同一内核的 unsafe / FFI 变体，可单独编 .so / .a
 mp4v       MPEG-4 Part 2 编码（I / P + 码率控制）**+ 解码**（I / P）
 aac        AAC-LC 编码（MDCT / 短窗 / TNS / Huffman / 码率控制）
@@ -228,6 +229,12 @@ df -h /System/Volumes/Data  # 磁盘 <10% 可用会让 macOS 整体变卡（换�
    `ABT_SCAN_A` / `ABT_SCAN_B` / `MB_INTRA` / `DC`）。那是**数据**不是逻辑，两边的码
    本来就一样；要彻底断开得把那几张表搬进 kernel 并改 `tools/gen_tables.py` 的产物
    布局，单独拍板（见 TODO）。
+   **`unsafe` 是 opt-in 的**：`kernel::simd` 那段 NEON 挂在 `unsafe-kernels` feature
+   后面，默认不编译（纯标量、逐位等价）。所以「依赖闭包里零 unsafe」对只吃安全路径
+   的 crate 成立 —— `v2v-mpeg12` 就是，`v2v-msmpeg4` 显式打开它。
+   ⚠️ feature 是**并集**：同一次构建里只要有一个 crate 打开，整棵图都带上。
+   这条保证由 `crates/kernel/tests/feature_gate.rs`（`cargo tree -e features`）钉住，
+   **别只写注释**。
 4. **码表只有一份真源**：`crates/*/src/tables.rs` 是唯一落点，生成与自检脚本在
    `tools/`（`gen_tables.py` / `gen_aac_tables.py` / `gen_wma_tables.py` / `check_tables.py`）。
    加格式只改那一处，别的地方转发。
@@ -267,7 +274,9 @@ df -h /System/Volumes/Data  # 磁盘 <10% 可用会让 macOS 整体变卡（换�
 
 ## 完成任务前
 
-1. `cargo test --workspace -j 4` 绿，**并且**编译**无警告**（本仓现在是零警告）。
+1. `RUSTFLAGS="-D warnings" cargo test --workspace -j 2` 退出码 0（本仓现在是零警告）。
+   ⚠️ 要带 `-D warnings`：光靠「我看了没警告」是**人的习惯**，带上它才是**机器在守**。
+   `-j` 别开大，理由见上面「构建资源纪律」。
 2. 动了编解码 / 容器：对着**真样本 + `ffmpeg` / `ffprobe`** 比一遍 —— 合成往返**不算数**，
    而且**没设环境变量时的「全绿」也不算**（那些测试跳过了）。优先「字节 / 像素相同」
    而不是「没报错」。

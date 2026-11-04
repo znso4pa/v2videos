@@ -1,7 +1,18 @@
 //! **共享的 SIMD 内核**（NEON + 标量回退）。
 //!
-//! ⚠️ **这是本仓唯一允许 `unsafe` 的地方。** crate 根上挂着 `#![deny(unsafe_code)]`，
+//! ⚠️ **这是本仓唯一允许 `unsafe` 的地方。** crate 根上挂着 `#![deny(unsafe_code)`，
 //! 只有本模块显式放开 —— 「别处不许写 unsafe」由编译器保证，不靠人记。
+//!
+//! ## 默认是纯标量，NEON 要显式开
+//!
+//! 整块 NEON 代码挂在 **`unsafe-kernels`** feature 后面（`crates/kernel/Cargo.toml`）。
+//! 不打开时本模块只有标量实现，**一条 `unsafe` 都不编译** —— 于是「依赖闭包里零
+//! unsafe」这句话对只吃安全路径的 crate（`v2v-mpeg12`）是真的，不是靠人记。
+//!
+//! ⚠️ Cargo 的 feature 是**并集**：同一次构建里只要有一个 crate 打开它
+//! （`v2v-msmpeg4` 就是，它的运动估计靠这个内核），整个 `v2v-kernel` 都会带上。
+//! 所以这条保证是**按依赖闭包**成立的 —— `crates/kernel/tests/feature_gate.rs`
+//! 拿 `cargo tree` 把它钉住。
 //!
 //! ## 为什么这一个值得写（而解码器那批不值得）
 //!
@@ -18,7 +29,7 @@
 //!   调用方只做 `s < best` 的比较、`best ≤ cap` 恒成立，所以「返回真值」与「返回 cap」
 //!   等价 —— 但**绝不能返回小于真值的数**（那会让本该输的候选赢）。这里保持
 //!   「每行查一次、命中返回 cap」的原语义，行为与旧实现逐位相同。
-//! - 只在 `aarch64` 上走 NEON（目标是 macOS ARM 与 Android arm64）；别的架构落标量。
+//! - 只在 `aarch64` + `unsafe-kernels` 上走 NEON；别的组合一律落标量。
 
 #![allow(unsafe_code)]
 
@@ -39,20 +50,26 @@ pub fn sad_block16(
     no_rounding: bool,
     cap: u32,
 ) -> u32 {
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(feature = "unsafe-kernels", target_arch = "aarch64"))]
     {
         // SAFETY: 调用方保证半像素相位最多读到 `base + (15+1)*pw + 16 + 1`，
         // 与旧实现的切片范围完全一致；`cur` 是定长 256。
         unsafe { neon::sad_block16(cur.as_ptr(), refp.as_ptr(), pw, base, dxy, no_rounding, cap) }
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(not(all(feature = "unsafe-kernels", target_arch = "aarch64")))]
     {
         scalar::sad_block16(cur, refp, pw, base, dxy, no_rounding, cap)
     }
 }
 
-/// 标量参考实现 —— 非 aarch64 平台**就是它**在跑，测试里也拿它当判据。
-#[allow(dead_code)] // aarch64 上只有测试用它
+/// 标量参考实现 —— **默认就是它**在跑（NEON 要开 feature），测试里也拿它当判据。
+///
+/// ⚠️ 开了 `unsafe-kernels` 且是 aarch64 时，生产路径走 NEON，本模块只剩测试在用
+/// —— 那种组合下才允许 `dead_code`，别无条件 `allow`（会把「没人用」的真相盖掉）。
+#[cfg_attr(
+    all(feature = "unsafe-kernels", target_arch = "aarch64"),
+    allow(dead_code)
+)]
 mod scalar {
     pub fn sad_block16(
         cur: &[u8; 256],
@@ -109,7 +126,7 @@ mod scalar {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(feature = "unsafe-kernels", target_arch = "aarch64"))]
 mod neon {
     use core::arch::aarch64::*;
 

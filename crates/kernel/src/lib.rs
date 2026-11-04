@@ -26,8 +26,13 @@
 //! crate 根上 `#![deny(unsafe_code)]`，只有 [`simd`] 显式放开。「别处不许写 unsafe」
 //! 由编译器保证，不靠人记。
 //!
-//! 默认**不**开 SIMD 的 `unsafe` 路径这件事还没做（见 TODO 的 C 步）：现在只要
-//! 依赖本 crate，就依赖了那 12 处 `unsafe`。
+//! 而且 [`simd`] 里那段 NEON **默认不编译**：它在 `unsafe-kernels` feature 后面
+//! （见 `Cargo.toml`）。不开就是纯标量实现，逐位等价、只是慢。于是「依赖闭包里
+//! 零 unsafe」对只吃安全路径的 crate 是真的 —— `v2v-mpeg12` 就是这种用法，
+//! 而 `v2v-msmpeg4` 显式打开它（运动估计要靠这个内核）。
+//!
+//! ⚠️ Cargo 的 feature 是**并集**，所以这条保证按**依赖闭包**成立，不按 crate 名。
+//! `tests/feature_gate.rs` 用 `cargo tree` 把它钉住，不靠注释。
 #![deny(unsafe_code)]
 
 pub mod bitreader;

@@ -13,11 +13,14 @@
 //!
 //! 设计约束：本 crate **自身不用 unsafe、不调 FFI**，全部安全 Rust，按位读取走一个游标。
 //!
-//! 注意别把这句话扩大成「整条依赖链无 unsafe」：共用的 `v2v-kernel` 里有一份 NEON
-//! 内核（`kernel::simd`），那是全仓唯一有 `unsafe` 的地方。kernel 根上是
-//! `#![deny(unsafe_code)]`、只对它单独放开，所以「哪里可以写 unsafe」仍然有明确边界；
-//! 但**要拿到「依赖闭包里零 unsafe」这句话，还得把 `simd` 做成 opt-in feature**
-//! —— 见 TODO 的 C 步。
+//! 而且这条能再说强一步：**它的依赖闭包里也没有 `unsafe`**。共用的 `v2v-kernel` 里
+//! 确实有一份 NEON 内核（`kernel::simd`，全仓唯一有 `unsafe` 的地方），但那是
+//! `unsafe-kernels` feature 后面的 opt-in 路径，**本 crate 不开** —— 于是拿到的
+//! 是逐位等价的纯标量实现。
+//!
+//! ⚠️ 这句话是**机器守着的**，不是人记的：`crates/kernel/tests/feature_gate.rs`
+//! 拿 `cargo tree -e features` 断言「`v2v-mpeg12` 的闭包里没有 `unsafe-kernels`」。
+//! 谁要是给这条链上的某个依赖加上了那个 feature，那条测试会红。
 
 /// MPEG-1 的帧率表（`frame_rate_code` 1..=8），单位 1/1000 帧每秒。
 const FRAME_RATE_TABLE: [u32; 9] = [0, 23_976, 24_000, 25_000, 29_970, 30_000, 50_000, 59_940, 60_000];
