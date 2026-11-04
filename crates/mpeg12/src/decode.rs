@@ -812,6 +812,9 @@ pub fn set_idct_cols(f: IdctCols) {
 ///
 /// 注意 `c(0) + 32` 里的 32：它是 `(1 << (COL_SHIFT-1)) / W4 = 524288/16383`
 /// 的**整数商**，不是 `2^19 / W4`。换成后者就不是同一个 IDCT 了。
+// ⚠️ 下面 `out[0 * 8 + u]` 的 `0 *` 是**为了与 1..7 行对齐**才这么写的，
+// 不是漏改。clippy 的 `erasing_op` 只看得见「乘 0 等于 0」，看不见这层排版意图。
+#[allow(clippy::erasing_op)]
 pub fn idct_cols_scalar(b: &[i32; 64], out: &mut [i32; 64]) {
     const W1: u32 = 22725;
     const W2: u32 = 21407;
@@ -1454,7 +1457,7 @@ fn predict_block(
     // 存 i32 要多 4 倍内存流量，而且挡住 u8 的向量化平均。
     let mut out = [0u8; 64];
     let sx = origin_x as i32 + ix;
-    let sy = origin_y as i32 + row_step * 0 + iy; // 块左上角的参考坐标
+    let sy = origin_y as i32 + iy; // 块左上角的参考坐标
     // 四个抽头在这一块上覆盖的包围盒。整块都在帧内 → 一个像素都不用 clamp
     //（clamp 只对帧边界有意义，而边界块是极少数）。
     let last_y = 7 * row_step + fy * row_step;

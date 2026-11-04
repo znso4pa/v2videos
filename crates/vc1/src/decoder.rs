@@ -366,6 +366,11 @@ impl Decoder {
     }
 
     /// 最近解出的那一帧的**宏块对齐、未裁剪**平面（对账测试用：ffmpeg 吐的也是这个尺寸）。
+    ///
+    /// ⚠️ 名字叫 `planes` 而返回 `ref_planes` 是**故意的**，不是拷错了字段：
+    /// 解码完一帧后 `ref_planes` 就是「那一帧」。clippy 的 `misnamed_getters`
+    /// 只看名字与字段名像不像，看不出这层语义。
+    #[allow(clippy::misnamed_getters)]
     pub fn planes(&self) -> &Planes {
         &self.ref_planes
     }

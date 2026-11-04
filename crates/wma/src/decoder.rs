@@ -979,8 +979,14 @@ impl WmaDecoder {
                 p *= w - lsp[j];
                 j += 2;
             }
-            p *= p * (2.0 - w);
-            q *= q * (2.0 + w);
+            // ⚠️ `p *= p * …` 看着像写错了，其实是**故意的**：这里是 `p = p²·(2-w)`，
+            // 与 ffmpeg `wma_lsp_to_curve` 里那两行逐字相同。clippy 的
+            // `misrefactored_assign_op` 只认「两边都有 p」，认不出这是在平方。
+            #[allow(clippy::misrefactored_assign_op)]
+            {
+                p *= p * (2.0 - w);
+                q *= q * (2.0 + w);
+            }
             let v = self.pow_m1_4(p + q);
             if v > val_max {
                 val_max = v;

@@ -115,9 +115,17 @@ fn main() {
                 for (dst, src) in pcm_buf.iter_mut().zip(a.planes) {
                     dst.extend(src);
                 }
-                // 攒够 1024 帧一段就编一帧 AAC。
-                let samples = pcm_buf.first().map_or(0, |p| p.len());
-                while samples >= 1024 {
+                // 攒够 1024 个采样点就编一帧 AAC。
+                //
+                // ⚠️ 写成 `loop { 取长度 → 不够就 break → 编 }`，不要写成
+                // `while 长度 >= 1024 { … 体内再 `let` 一个新长度 … }`：那样
+                // `while` 的条件读的是循环外那个**再也没变过**的值，靠体内的
+                // `break` 才没变成死循环 —— 条件是一句假话，读代码的人会看错。
+                loop {
+                    let samples = pcm_buf.first().map_or(0, |p| p.len());
+                    if samples < 1024 {
+                        break;
+                    }
                     let mut planes = Vec::with_capacity(ch);
                     for p in &mut pcm_buf {
                         planes.push(p.drain(..1024).collect::<Vec<_>>());
@@ -126,10 +134,6 @@ fn main() {
                     pcm_emitted += 1024;
                     let bytes = enc.encode_frame(&AacFrame { planes }).expect("AAC 编码出错");
                     hw.write_aac(&bytes, pts_us).expect("写音频出错");
-                    let samples = pcm_buf.first().map_or(0, |p| p.len());
-                    if samples < 1024 {
-                        break;
-                    }
                 }
             }
         }
