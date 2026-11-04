@@ -8,7 +8,7 @@
 
 ## 现状
 
-**链路已经打通到 `.wmv → .mp4`**：**18 个 crate、约 7.4 万行 Rust**，**零第三方运行时依赖**
+**链路已经打通到 `.wmv → .mp4`**：**18 个 crate、约 7.6 万行 Rust**，**零第三方运行时依赖**
 （`Cargo.lock` 里只有本仓的包，外加 `cc` 那条**构建**链 —— 只服务 `android-encode` 的 C shim）。
 
 ```text
@@ -103,8 +103,8 @@ CLI 级还有一条 `crates/cli/tests/convert.rs::converts_wmv3_input`。
 ## 命令
 
 ```bash
-cargo test --workspace -j 4     # 单元 + 不依赖样本的集成测试（缺样本的会打 `SKIP` 并通过）
-cargo build -j 4                # 并发**限 4** —— 见下一节「构建资源纪律」
+cargo test --workspace -j 2     # 单元 + 不依赖样本的集成测试（缺样本的会打 `SKIP` 并通过）
+cargo build -j 2                # 并发**限 2** —— 见下一节「构建资源纪律」
 
 cargo run -p v2v-cli -- convert in.wmv -o out/              # .wmv：MP43 + 音频直通
 cargo run -p v2v-cli -- convert --mp4 -g 12 in.wmv -o out/  # .mp4：mp4v + AAC
@@ -124,6 +124,7 @@ V2V_ASF_SAMPLE=/path/x.wmv cargo test -p v2v-vc1 --release --test frames -- --no
 | `V2V_MP4_OUT` / `V2V_MP4_OUT_AV` | 上面那两条把我们的产物**落到哪个路径**（不设就落 `/tmp/v2v_ours*.mp4`） |
 | `V2V_BENCH_SAMPLE`       | 解码速度对表（msmpeg4 / vc1 的 `decode_bench`，`:` 分隔多个样本；不设就 SKIP） |
 | `V2V_BENCH_FRAMES` / `V2V_BENCH_REPS` | 上面那条的「只比前 N 帧」/「取几次里最快」（默认全解 / 3 次）        |
+| `V2V_BENCH_TSV`          | 各 bench 把结果**额外**写成 TSV 到该路径（不设就只打人读的表，行为与以前相同） |
 | `V2V_MAX_FRAMES` / `V2V_PFRAME_MAP` | 限量跑 / 逐帧定位（msmpeg4、vc1 调试用）                    |
 | `V2V_FRAME_LOG`          | 逐帧打印「用掉多少位 / 差多少像素」（vc1）                      |
 | `V2V_FUZZ_ROUNDS`        | 模糊测试的轮数（见下；不设就用各局自己的默认）                          |
@@ -138,7 +139,7 @@ V2V_ASF_SAMPLE=/path/x.wmv cargo test -p v2v-vc1 --release --test frames -- --no
 
 ```bash
 # 例：带样本跑全套；最重的是 #[ignore] 那一层
-V2V_ASF_SAMPLE='/path/a.wmv:/path/b.asf' cargo test --workspace -j 4 -- --ignored
+V2V_ASF_SAMPLE='/path/a.wmv:/path/b.asf' cargo test --workspace -j 2 -- --ignored
 ```
 
 ⚠️ **「`cargo test` 全绿」≠「对账过了」** —— 没设环境变量时那些对账测试只是 **SKIP 了**。
@@ -152,8 +153,8 @@ V2V_ASF_SAMPLE='/path/a.wmv:/path/b.asf' cargo test --workspace -j 4 -- --ignore
 一条 panic 会把整个转换流程带走。
 
 ```bash
-cargo test --workspace -j 4                          # 轻局：几百轮，秒级
-V2V_FUZZ_ROUNDS=30000 cargo test --release -j 4 --workspace -- --ignored --nocapture   # 重局
+cargo test --workspace -j 2                          # 轻局：几百轮，秒级
+V2V_FUZZ_ROUNDS=30000 cargo test --release -j 2 --workspace -- --ignored --nocapture   # 重局
 ```
 
 ⚠️ **两个坑，改这些测试之前先读**（都踩过）：
@@ -193,7 +194,9 @@ df -h /System/Volumes/Data  # 磁盘 <10% 可用会让 macOS 整体变卡（换�
   只为跑测试、看报错、量体积以外的东西，debug 足够。
   ⚠️ **本仓的 release 还额外设了 `codegen-units = 1`**（见根 `Cargo.toml`，为 VC-1 解码
   快 9%），所以 **release 编译比默认更慢、更吃单核** —— 更别反复全量 `--release`。
-- **限并发**：`cargo build -j 4` / `cargo test -j 4`。不要让它吃满所有核。
+- **限并发**：`cargo build -j 2` / `cargo test -j 2`。不要让它吃满所有核。
+  8 核给一半（4）听起来合理，但**本仓经常有两个会话同时开着** —— 两边各 4 就是满载，
+  再叠上 `rustc` 自己的子进程，实测会顶到 11.8。给 2 更稳；真赶时间再显式调大。
 - **重构期用 `cargo check`，别用 `build`。** 「改一点 → 全量编一遍」这个循环本身就是
   资源陷阱：`check` 不产码、不链接，通常只有 `build` 的三分之一。要跑就
   `cargo check -p <改动的 crate> --all-targets`，**全量 `test` / `clippy` 留到最后收尾
@@ -219,7 +222,7 @@ df -h /System/Volumes/Data  # 磁盘 <10% 可用会让 macOS 整体变卡（换�
 3. **共享数值内核住在 `v2v-kernel`**：`BitReader` / `BitWriter`（MSB 优先）/ FDCT / IDCT /
    FFT / VLC / RL 表容器 / 帧缓冲（`Frame` / `Planes`）/ 运动补偿 / SAD / 宏块层预测 /
    NEON 内核 / `Error` 被 `v2v-msmpeg4`、`v2v-mp4v`、`v2v-aac`、`v2v-wma`、`v2v-vc1`、
-   `v2v-mpeg12`、`v2v-player` 复用。**不要复刻第二份** —— 会漂的就是第二份。改这些
+   `v2v-mpeg12`、`v2v-player`、`v2v-cli` 复用。**不要复刻第二份** —— 会漂的就是第二份。改这些
    共享件要**同时**跑 mp4v / aac / wma / vc1 / mpeg12 的对账测试。
    （`vc1` 只借位读取器、前缀码、帧缓冲与中值预测，**它自己的逆变换是独立的** ——
    VC-1 的 8×8 核与 H.263 那套不是一回事，别为了「统一」把两套混成一套。）
@@ -247,6 +250,13 @@ df -h /System/Volumes/Data  # 磁盘 <10% 可用会让 macOS 整体变卡（换�
    质量 / 体积指标（PSNR、码率、压缩比）写 README / TODO 没问题，那是测量结果不是出处。
 6. **正确性由「真样本 + 外部 oracle」钉住**：解码逐像素对 `ffmpeg`、封装逐 box 对
    `ffprobe`、编出来的流交回 `ffmpeg` 解。自造往返**必要但不充分**，不能单独当判据。
+7. **性能数字必须有来源。** README / 提交信息里的毫秒数只有两种身份：要么来自
+   `bench/baseline/*.tsv`（机器指纹 + 样本 + profile 齐全，`v2v bench --check` 能复核），
+   要么**明确标成**「某一版代码在某台机器上的快照」。没有来源的数字不许当门、不许当结论 ——
+   三个月后没人说得清 `22.33 ms/帧` 还算不算数，而那张表恰恰是项目最硬的资产之一。
+   口径、门与提醒的分层、实测噪声见 `bench/README.md`。
+   ⚠️ **比两路数字之前先确认是同一把尺子**（同机器 / 同样本 / 同 profile / 同线程数）——
+   `v2v_bench::compare` 会拒绝跨这几项比，人手工比的时候没有这层保护。
 
 ## 已经踩过的坑（从 UsefulUnpack 的视频链路带过来，直接相关）
 
@@ -283,8 +293,15 @@ df -h /System/Volumes/Data  # 磁盘 <10% 可用会让 macOS 整体变卡（换�
 2. 动了编解码 / 容器：对着**真样本 + `ffmpeg` / `ffprobe`** 比一遍 —— 合成往返**不算数**，
    而且**没设环境变量时的「全绿」也不算**（那些测试跳过了）。优先「字节 / 像素相同」
    而不是「没报错」。
-3. 清调试残留：`grep -rn 'V2V_' crates/*/src` 只应剩下测试里的样本变量；排查期随手写的
-   example / 脚本 / 写死路径已经删掉（AGENTS.md「本地调试残留」那条）。
+3. 清调试残留：**样本**环境变量不许漏进 `src` ——
+   ```bash
+   grep -rn 'V2V_[A-Z_]*SAMPLE\|V2V_MAX_FRAMES\|V2V_FRAME_LOG\|V2V_FUZZ_ROUNDS' crates/*/src
+   ```
+   应当**没有输出**（它们只该出现在 `tests/` 与 `examples/` 里）。排查期随手写的
+   example / 脚本 / 写死路径已经删掉（「本地调试残留」那条）。
+   ⚠️ 别用裸的 `grep -rn 'V2V_'`：`crates/capi/src` 里的 `V2V_ERR_*` / `V2V_INFO_*`
+   是 **C ABI 的常量名**、`crates/bench` 的 `V2V_BENCH_TSV` 是**正经的环境变量开关**
+   —— 那些匹配全是噪音，会让人以为清理不干净。
 4. 判据、量出来的数字、试过又撤掉的候选 —— 写 `TODO.md`，**不进提交信息**。
 5. 动了**性能敏感**的路径（解码内层循环 / 编码器 / 容器写入）：跑一次
    `v2v bench --check bench/baseline/<机器指纹>.tsv <样本>`。**「我们 / 参考实现」
