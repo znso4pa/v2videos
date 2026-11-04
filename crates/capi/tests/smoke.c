@@ -66,6 +66,14 @@ static void *need(const char *name) {
         memcpy(&p_##fn, &s_, sizeof(p_##fn)); \
     } while (0)
 
+/* 可选符号：`min` 产物里没有（`hw` / `mpeg12` 那两族）。缺了就跳过对应那几段，
+ * 而不是整条 smoke 失败 —— 同一份 C 程序要能对两个产物都跑。 */
+#define LOAD_OPT(fn) \
+    do { \
+        void *s_ = dlsym(lib, #fn); \
+        if (s_) memcpy(&p_##fn, &s_, sizeof(p_##fn)); \
+    } while (0)
+
 DECL(v2v_abi_version);
 DECL(v2v_last_error);
 DECL(v2v_last_error_kind);
@@ -102,6 +110,11 @@ DECL(v2v_mux_write_video);
 DECL(v2v_mux_write_audio);
 DECL(v2v_mux_finish);
 DECL(v2v_mux_close);
+/* 可选（`hw` feature） */
+DECL(v2v_hw_supported);
+DECL(v2v_has_wma_audio);
+DECL(v2v_wma_to_wav);
+DECL(v2v_free);
 
 /* ---- 不需要样本的那几条 ---- */
 
@@ -144,6 +157,81 @@ static void check_error_channel(void) {
     CHECK(p_v2v_demux_stream_count(NULL) == 0, "空句柄的流数该是 0");
 }
 
+/* ---- 不需要样本、但要一个句柄的那几条 ---- */
+
+/* 出参 `size` 契约。
+ *
+ * 为什么值得单独一条：`size` 填 0（忘了 `V2V_INIT`）时，库如果「不写、但返回
+ * OK」，调用方拿到的是**一块没动过的内存**加一个成功码 —— 宽高是垃圾值，而且
+ * 永远不报错。这是最难查的一类。
+ *
+ * 用编码器换句柄来验：它不读文件，所以**没有样本的机器上也跑得起来** ——
+ * 真样本都在 `.gitignore` 里，新机器 / CI 上就只有这一段在守 ABI。 */
+static void check_size_contract(void) {
+    enum { W = 32, H = 32 };
+    v2v_venc_cfg cfg;
+    memset(&cfg, 0, sizeof cfg);
+    V2V_INIT(cfg);
+    cfg.width = W;
+    cfg.height = H;
+    cfg.fps_num = 25;
+    v2v_venc *enc = p_v2v_venc_open(V2V_CODEC_MP4V, &cfg);
+    CHECK(enc != NULL, "建编码器失败: %s", p_v2v_last_error());
+
+    /* 一块 32x32 的灰阶渐变，紧排。 */
+    uint8_t *py = malloc(W * H);
+    uint8_t *pu = malloc(W * H / 4);
+    uint8_t *pv = malloc(W * H / 4);
+    CHECK(py && pu && pv, "malloc 失败");
+    for (int i = 0; i < W * H; i++) py[i] = (uint8_t)(i * 3);
+    memset(pu, 128, W * H / 4);
+    memset(pv, 128, W * H / 4);
+
+    v2v_planes planes;
+    memset(&planes, 0, sizeof planes);
+    planes.y = py;
+    planes.u = pu;
+    planes.v = pv;
+    planes.width = W;
+    planes.height = H;
+    planes.stride_y = W;
+    planes.stride_u = W / 2;
+    planes.stride_v = W / 2;
+
+    /* 1) `size` 填 0 / 填得连 4 字节都不到 → 必须报错，不能返回 OK。 */
+    v2v_packet pkt;
+    memset(&pkt, 0xAA, sizeof pkt);
+    pkt.size = 0;
+    CHECK(p_v2v_venc_encode(enc, &planes, 1, &pkt) == V2V_ERR_ARG, "size = 0 必须返回 V2V_ERR_ARG");
+    pkt.size = 2;
+    CHECK(p_v2v_venc_encode(enc, &planes, 1, &pkt) == V2V_ERR_ARG, "size = 2 必须返回 V2V_ERR_ARG");
+
+    /* 2) 截断写：`size` 只到 `len` 之前，后面的字节一个都不许碰。 */
+    {
+        unsigned char buf[sizeof(v2v_packet)];
+        size_t keep = offsetof(v2v_packet, len);
+        memset(buf, 0xAA, sizeof buf);
+        *(uint32_t *)buf = (uint32_t)keep;
+        CHECK(p_v2v_venc_encode(enc, &planes, 1, (v2v_packet *)(void *)buf) == V2V_OK,
+              "截断写该成功: %s", p_v2v_last_error());
+        for (size_t i = keep; i < sizeof buf; i++) {
+            CHECK(buf[i] == 0xAA, "第 %zu 字节被越界写了", i);
+        }
+    }
+
+    /* 3) 填对了才成功。 */
+    memset(&pkt, 0, sizeof pkt);
+    V2V_INIT(pkt);
+    CHECK(p_v2v_venc_encode(enc, &planes, 1, &pkt) == V2V_OK, "encode 失败: %s", p_v2v_last_error());
+    CHECK(pkt.len > 0 && pkt.data != NULL, "编码成功却没给码流");
+
+    p_v2v_venc_close(enc);
+    free(py);
+    free(pu);
+    free(pv);
+    printf("ok  size 契约（0 / 2 报错，截断写不越界）\n");
+}
+
 /* ---- 需要样本的那几条 ---- */
 
 static void check_player(const char *path) {
@@ -156,26 +244,6 @@ static void check_player(const char *path) {
     CHECK(p_v2v_player_info(pl, &info) == V2V_OK, "info 失败: %s", p_v2v_last_error());
     CHECK(info.width > 0 && info.height > 0, "宽高是 0");
     CHECK(info.video_fourcc != 0, "video_fourcc 是 0");
-
-    /* size 契约：填 0 / 填太小必须报错，不能「返回 OK 却没写」。 */
-    v2v_info bad;
-    memset(&bad, 0xAA, sizeof bad);
-    bad.size = 0;
-    CHECK(p_v2v_player_info(pl, &bad) == V2V_ERR_ARG, "size = 0 必须返回 V2V_ERR_ARG");
-    bad.size = 2;
-    CHECK(p_v2v_player_info(pl, &bad) == V2V_ERR_ARG, "size = 2 必须返回 V2V_ERR_ARG");
-
-    /* 截断写：只给到 has_audio 之前，后面的字节一个都不许碰。 */
-    {
-        unsigned char buf[sizeof(v2v_info)];
-        size_t keep = offsetof(v2v_info, has_audio);
-        memset(buf, 0xAA, sizeof buf);
-        *(uint32_t *)buf = (uint32_t)keep;
-        CHECK(p_v2v_player_info(pl, (v2v_info *)(void *)buf) == V2V_OK, "截断写该成功");
-        for (size_t i = keep; i < sizeof buf; i++) {
-            CHECK(buf[i] == 0xAA, "第 %zu 字节被越界写了", i);
-        }
-    }
 
     int got = 0;
     long long last = -9223372036854775807LL - 1;
@@ -586,6 +654,33 @@ static void check_chain(const char *sample_path, const char *out_path, int frame
     printf("ok  chain（%d 帧 %ux%u → %s）\n", got, vs.width, vs.height, out_path);
 }
 
+/* `hw` 那族（可选）：`min` 产物里没有，缺了就跳过。
+ *
+ * 这一段最值得跑的是 `v2v_wma_to_wav` + `v2v_free`：**全仓唯一一对
+ * 「库分配、调用方释放」**的符号。其余出口交的都是借用指针，错了会崩或花屏；
+ * 这一对错了是**泄漏或双重释放** —— 那种错只有在真跑一遍之后过几天才看得见。 */
+static void check_hw_optional(const char *sample_path) {
+    if (!p_v2v_hw_supported || !p_v2v_wma_to_wav || !p_v2v_free || !p_v2v_has_wma_audio) {
+        printf("（这个产物没有 hw 那族符号，跳过）\n");
+        return;
+    }
+    printf("ok  hw_supported = %d\n", p_v2v_hw_supported());
+
+    int has = p_v2v_has_wma_audio(sample_path);
+    CHECK(has == 1, "这个样本该有 WMA 音轨，has_wma_audio 返回 %d", has);
+
+    uint8_t *buf = NULL;
+    size_t len = 0;
+    CHECK(p_v2v_wma_to_wav(sample_path, &buf, &len) == V2V_OK, "wma_to_wav 失败: %s",
+          p_v2v_last_error());
+    CHECK(buf != NULL, "成功却没给缓冲");
+    CHECK(len > 44, "WAV 比 44 字节的头还短：%zu", len);
+    CHECK(memcmp(buf, "RIFF", 4) == 0 && memcmp(buf + 8, "WAVE", 4) == 0, "不是 RIFF/WAVE");
+
+    p_v2v_free(buf, len); /* 必须配对，且只释放一次 —— 之后 buf 就是野指针了 */
+    printf("ok  wma→wav（%zu 字节，已 v2v_free）\n", len);
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "用法: %s <libv2v_capi 路径> [样本路径] [输出.mp4]\n", argv[0]);
@@ -634,15 +729,21 @@ int main(int argc, char **argv) {
     LOAD(v2v_mux_write_audio);
     LOAD(v2v_mux_finish);
     LOAD(v2v_mux_close);
+    LOAD_OPT(v2v_hw_supported);
+    LOAD_OPT(v2v_has_wma_audio);
+    LOAD_OPT(v2v_wma_to_wav);
+    LOAD_OPT(v2v_free);
 
     check_version();
     check_probe();
     check_error_channel();
+    check_size_contract();
 
     if (argc >= 3) {
         check_player(argv[2]);
         check_demux(argv[2]);
         check_audio_decode(argv[2]);
+        check_hw_optional(argv[2]);
         if (argc >= 4) {
             check_chain(argv[2], argv[3], 4);
         }
