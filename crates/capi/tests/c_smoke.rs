@@ -14,23 +14,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-fn manifest() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
-
-/// `.so` / `.dylib` / `.dll` 都可能 —— 测试不该假设平台。
-fn dylib_in(dir: &Path) -> Option<PathBuf> {
-    ["libv2v_capi.dylib", "libv2v_capi.so", "v2v_capi.dll"]
-        .iter()
-        .map(|n| dir.join(n))
-        .find(|p| p.is_file())
-}
-
-/// 测试可执行文件在 `<target>/[<triple>/]debug/deps/` 下，往上两级就是产物目录。
-fn debug_dir() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    Some(exe.parent()?.parent()?.to_path_buf())
-}
+mod util;
+use util::{build_product, manifest};
 
 /// 样本路径：`V2V_ASF_SAMPLE` 可以是 `:` 分隔的多个，取第一个存在的。
 fn sample() -> Option<String> {
@@ -66,28 +51,6 @@ fn compile_smoke() -> Option<PathBuf> {
             None
         }
     }
-}
-
-/// 按给定 feature 编一次 `.so`，返回产物路径。
-fn build_product(feats: &[&str]) -> Option<PathBuf> {
-    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-    let mut b = Command::new(&cargo);
-    b.args(["build", "-p", "v2v-capi"]);
-    if !feats.is_empty() {
-        b.arg("--features").arg(feats.join(","));
-    }
-    let out = b.output().expect("调不动 cargo");
-    assert!(
-        out.status.success(),
-        "嵌套 cargo build（{feats:?}）失败：\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let dir = debug_dir()?;
-    let p = dylib_in(&dir);
-    if p.is_none() {
-        eprintln!("SKIP：{} 下没找到 libv2v_capi", dir.display());
-    }
-    p
 }
 
 /// 跑一遍 C 程序。给了样本就多走 open / 读帧 / seek / demux / 音频那几段；
