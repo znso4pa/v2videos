@@ -5,7 +5,7 @@
 //!
 //! ## 与 MP43 编码器的关系：**地基复用，语法各写**
 //!
-//! | 能复用（`v2v_msmpeg4`） | 不能复用 |
+//! | 能复用（`v2v-kernel`） | 不能复用 |
 //! |---|---|
 //! | `fdct` / `fdct_i`（正向 DCT，定标一致） | 宏块类型表：MP43 是 `MB_INTRA`/`MB_NON_INTRA`，这里是 H.263 的 `ff_h263_{intra,inter}_MCBPC` |
 //! | `BitWriter`（MSB 优先） | DC 熵编码：MP43 是「符号 + 8 位 escape」，这里是「**位长** VLC」 |
@@ -72,7 +72,8 @@
 //! 所以每帧重建与跨帧复用**结果相同** —— 重建更省心，也就没有跨帧脏状态可错。
 
 use v2v_kernel::{fdct, fdct_i, idct_add, idct_put, BitWriter, Error, Result};
-use v2v_msmpeg4::{mc_chroma8, mc_luma16, mc_mb, mc_params, mid_pred, sad_luma16, Frame, Planes, RlTable, ZIGZAG};
+use v2v_kernel::mc::{mc_chroma8, mc_luma16, mc_mb, mc_params, mid_pred, sad_luma16, Frame, Planes, ZIGZAG};
+use v2v_kernel::rl::RlTable;
 
 use crate::header::{
     time_increment_bits, write_user_data, write_visual_object_header, write_vol, write_vop_header,
@@ -633,7 +634,7 @@ impl Encoder {
     /// 它必须与解码器解同一帧的结果**逐像素相同** —— 这条比 PSNR 直接得多，
     /// 重建一旦漂移（失配控制、逆量化、IDCT 哪一处写错）PSNR 可能只掉一点点甚至不掉，
     /// 而逐像素比会立刻红。判据在 `tests/ffmpeg_roundtrip.rs::reconstruction_matches_ffmpeg_decode`。
-    pub fn reconstruction(&self) -> Option<&v2v_msmpeg4::Planes> {
+    pub fn reconstruction(&self) -> Option<&v2v_kernel::mc::Planes> {
         self.reference.as_ref()
     }
 

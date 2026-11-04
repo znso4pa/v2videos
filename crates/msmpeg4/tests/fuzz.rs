@@ -38,7 +38,8 @@ mod common;
 
 use common::mutate::{self, Rng};
 use v2v_kernel::Error;
-use v2v_msmpeg4::{Decoder, Encoder, EncoderConfig, Frame};
+use v2v_msmpeg4::{Decoder, Encoder, EncoderConfig};
+use v2v_kernel::mc::{Frame};
 
 /// 16×16 —— 一个宏块。够小，所以「逐字节、逐位」的全扫也很快。
 const W: u32 = 16;

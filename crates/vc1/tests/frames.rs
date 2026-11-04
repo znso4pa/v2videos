@@ -34,7 +34,7 @@ fn read_frame(r: &mut impl Read, buf: &mut [u8]) -> bool {
 /// 我们的平面是**宏块对齐**的（宽 = mb_width*16，高 = mb_height*16），
 /// ffmpeg 吐的是**裁剪到显示尺寸**的，所以按行比可见部分。
 fn compare(
-    ours: &v2v_msmpeg4::Planes,
+    ours: &v2v_kernel::mc::Planes,
     theirs: &[u8],
     w: usize,
     h: usize,
@@ -81,7 +81,7 @@ fn compare(
 /// 按**宏块**（而不是像素）找第一处不一致 —— 宏块层一错就整块错，
 /// 而环路滤波只改边上的两列/两行，两者要分开看。
 fn first_mismatching_mb(
-    ours: &v2v_msmpeg4::Planes,
+    ours: &v2v_kernel::mc::Planes,
     theirs: &[u8],
     w: usize,
     h: usize,

@@ -181,7 +181,7 @@ fn check(path: &str) {
 
 /// 逐宏块、**分平面**打印最大差 —— 用来判断「整片错」还是「零星错」，
 /// 以及错在亮度还是色度（这两者的根因完全不同）。
-fn mb_map(f: &v2v_msmpeg4::Frame, r: &[u8], w: u32, h: u32) {
+fn mb_map(f: &v2v_kernel::mc::Frame, r: &[u8], w: u32, h: u32) {
     let (wi, hi) = (w as usize, h as usize);
     let (cw, ch) = (wi / 2, hi / 2);
     let (ysz, csz) = (wi * hi, cw * ch);

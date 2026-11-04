@@ -6,11 +6,14 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-# 位读取器 / 前缀码（VLC）/ 错误类型 / ABT 的 4:8 8:4 落位这几件「与具体编解码格式
-# 无关」的东西，直接复用共享内核 —— 不复刻一遍（复刻出来的第二份才是真会跑偏的那份）。
+# 位读取器 / 前缀码（VLC）/ 错误类型 / 帧缓冲（`Planes`）/ 中值预测 / ABT 的 4:8 8:4
+# 落位，都走共享内核 —— 不复刻一遍（复刻出来的第二份才是真会跑偏的那份）。
 v2v-kernel = { path = "../kernel" }
-# `Planes` / `mid_pred` / `tables::SCAN` 目前还在 msmpeg4 里，等下一步搬进 kernel
-# （见 TODO）。搬完这一行就能删。
+# ⚠️ 只剩**码表**这一处：`tables::SCAN` / `ABT_SCAN_A` / `ABT_SCAN_B` / `MB_INTRA` /
+# `DC`。VC-1 的 8×8 扫描与 MB 类型 / DC 码确实就是 MS-MPEG-4 那几张（VC-1 从 WMV 那
+# 一支继承来的），所以直接借，不复刻。代价是「改 MS-MPEG-4 会重编 VC-1」——
+# 要彻底断开得把这几张表搬进 kernel，那会动到 `tools/gen_tables.py` 的产物布局，
+# 单独拍板（见 TODO）。
 v2v-msmpeg4 = { path = "../msmpeg4" }
 
 [dev-dependencies]

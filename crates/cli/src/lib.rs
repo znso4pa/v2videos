@@ -42,7 +42,8 @@ use std::path::{Path, PathBuf};
 pub use v2v_asf::{AsfDemuxer, AsfMuxer, StreamKind, VideoStreamInfo};
 pub use v2v_avi::AviDemuxer;
 pub use v2v_container::{AudioFormat, Sample};
-pub use v2v_msmpeg4::{Decoder, Encoder, EncoderConfig, Frame, Version};
+pub use v2v_msmpeg4::{Decoder, Encoder, EncoderConfig, Version};
+use v2v_kernel::mc::{Frame};
 
 /// 认 FourCC → 版本，**只放逐像素对账过的版本进来**。
 ///
@@ -99,7 +100,7 @@ pub const WMV3: u32 = u32::from_le_bytes(*b"WMV3");
 ///
 /// 存在的理由：VC-1 与 MS-MPEG-4 **不是同一套骨架**（帧头、宏块层、变换、MC 全不同），
 /// 没法共用一个实现；但**下游只认一种形状** —— 所以这里只做「出口归一」：
-/// 两种解码器都吐 `v2v_msmpeg4::Frame`（已裁到显示尺寸的 YUV420P），
+/// 两种解码器都吐 `v2v_kernel::mc::Frame`（已裁到显示尺寸的 YUV420P），
 /// 编码器与封装器一行都不用改。
 ///
 /// ⚠️ **不要**为了「省一次拷贝」让下游认 `v2v_vc1::Frame` —— 那会把 VC-1 的类型

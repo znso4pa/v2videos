@@ -20,7 +20,7 @@
 
 use std::os::raw::c_int;
 
-use v2v_msmpeg4::Frame;
+use v2v_kernel::mc::Frame;
 
 use crate::common::*;
 

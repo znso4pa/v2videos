@@ -35,7 +35,7 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use v2v_mp4v::{Decoder, Encoder, EncoderConfig, Vol};
-use v2v_msmpeg4::Frame;
+use v2v_kernel::mc::Frame;
 
 const W: u32 = 320;
 const H: u32 = 240;

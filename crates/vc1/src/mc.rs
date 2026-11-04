@@ -17,7 +17,7 @@
 //! 亮度插值的取整偏置与色度走哪张表（`rnd=0` 走 h264 的 `+32`，`rnd=1` 走 VC-1 的 `+28`）。
 //! 少一处就是「一半的帧偏半个像素」。
 
-use v2v_msmpeg4::mid_pred;
+use v2v_kernel::mc::mid_pred;
 
 use crate::decoder::Ctx;
 

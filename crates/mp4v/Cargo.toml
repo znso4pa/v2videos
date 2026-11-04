@@ -6,12 +6,12 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-# DCT / 位写入器 / 前缀码 / RL 表 / IDCT 这几件「与具体编码格式无关」的东西，
-# 直接复用共享内核 —— 不复刻一遍（复刻出来的第二份才是真会跑偏的那份）。
+# DCT / 位写入器 / 前缀码 / RL 表 / IDCT / 帧缓冲 / 运动补偿 / AC 预测 / DC 反量化，
+# 全在共享内核里 —— 直接复用，不复刻一遍（复刻出来的第二份才是真会跑偏的那份）。
+#
+# ⚠️ 这里**没有** `v2v-msmpeg4`：MPEG-4 Part 2 与 MS-MPEG-4 只在「数值内核」这一层
+# 相通，语法层各写各的。哪天想从这边借 MS-MPEG-4 的东西，先想清楚它是不是该进 kernel。
 v2v-kernel = { path = "../kernel" }
-# `Frame` / `Planes` / `mc_*` / `mid_pred` / `ZIGZAG` 目前还在 msmpeg4 里，
-# 等下一步搬进 kernel（见 TODO）。搬完这一行就能删。
-v2v-msmpeg4 = { path = "../msmpeg4" }
 
 [dev-dependencies]
 # 对账测试要把编出来的流封成 MP4 再让 ffmpeg 解，所以容器也要能用。

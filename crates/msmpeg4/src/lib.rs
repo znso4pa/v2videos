@@ -46,12 +46,9 @@ mod v12;
 // 位流 / VLC / DCT / FFT / SAD / SIMD 都在 `v2v-kernel`（编解码器共用）。
 // 本 crate **不再**把它们重新导出：`v2v_msmpeg4::fft_in_place` 这种路径正是
 // 当初要拆掉的东西 —— 写 AAC 的人不该从 MS-MPEG-4 里找 FFT。
-pub use block::{AcCtx, RlTable};
+pub use block::{rl_table_for_standard, AcCtx};
 pub use encode::{Encoder, EncoderConfig};
-pub use frame::{
-    dc_unscale, decode_i_frame, mc_chroma8, mc_luma16, mc_mb, mc_mb_mspel, mc_params, mid_pred,
-    sad_luma16, AcPredRead, Decoder, Frame, McParams, Planes, Stats, ZIGZAG,
-};
+pub use frame::{decode_i_frame, mc_mb_mspel, AcPredRead, Decoder, Stats};
 pub use header::{
     decode012, parse_frame_header, parse_wmv2_frame, FrameHeader, HeaderState, PictureType,
     Wmv2Flags, Wmv2Frame, Wmv2Header, II_BITRATE, MBAC_BITRATE,
@@ -59,7 +56,7 @@ pub use header::{
 // ABT 的 4:8 / 8:4 落位在 kernel（要用 kernel 内部的单列变换），WMV2 自己那套在本 crate。
 pub use idct_wmv2::{wmv2_idct_add, wmv2_idct_put};
 pub use v2v_kernel::idct::{idct48_add, idct84_add};
-pub use predict::{ac_predict, coded_block_predict, dc_predict, AcVal};
+pub use predict::dc_predict;
 pub use version::Version;
 
 /// 宏块尺寸（MPEG-4 / H.263 系固定 16×16）。

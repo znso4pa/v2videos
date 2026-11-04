@@ -217,7 +217,7 @@ pub fn decode_one_frame(
     h: u32,
     version: v2v_msmpeg4::Version,
     extra: &[u8],
-) -> Option<v2v_msmpeg4::Frame> {
+) -> Option<v2v_kernel::mc::Frame> {
     decoder_for(version, extra)?.decode(bytes, w, h).ok()
 }
 

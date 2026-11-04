@@ -24,7 +24,7 @@
 //! 里那两行 `loop_filter` 不能挪。
 
 use v2v_kernel::{BitReader, Error, Result};
-use v2v_msmpeg4::Planes;
+use v2v_kernel::mc::Planes;
 
 use crate::header::{FrameHeader, HeaderState, PictType, SeqHeader};
 use crate::tables;

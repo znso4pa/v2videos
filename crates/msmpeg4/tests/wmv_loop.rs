@@ -10,7 +10,8 @@ mod common;
 
 use common::{compare, ffmpeg_frames, unique_temp};
 use v2v_asf::{AsfDemuxer, AsfMuxer, StreamKind, VideoStreamInfo};
-use v2v_msmpeg4::{Decoder, Encoder, EncoderConfig, Frame};
+use v2v_msmpeg4::{Decoder, Encoder, EncoderConfig};
+use v2v_kernel::mc::{Frame};
 
 /// 合成一段有运动的序列（纹理背景 + 平移方块），与 `encode_p.rs` 同思路。
 fn moving_sequence(w: u32, h: u32, n: usize) -> Vec<Frame> {

@@ -10,7 +10,8 @@ use std::process::Command;
 
 use v2v_asf::{AsfDemuxer, AsfMuxer, StreamKind, VideoStreamInfo};
 use v2v_cli::{convert_file, ConvertOptions, OutputFormat, MP43};
-use v2v_msmpeg4::{Decoder, Encoder, EncoderConfig, Frame};
+use v2v_msmpeg4::{Decoder, Encoder, EncoderConfig};
+use v2v_kernel::mc::{Frame};
 
 /// 源样本视频轨的**版本 + extradata**（认不出 FourCC 给 `None`）。
 fn src_version(path: &Path) -> Option<(v2v_msmpeg4::Version, Vec<u8>)> {

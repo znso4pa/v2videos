@@ -16,7 +16,8 @@ container  解封装共用的数据模型（Stream / Sample / AudioFormat / Vide
 asf        ASF（.wmv / .wma）解封装 **+ 封装**（多载荷打包 + Simple Index）
 avi        AVI（RIFF）解封装
 mpegps     MPEG-1/2 program stream（`.mpg` / `.dat` / `.vob`）解封装
-kernel     编解码器**共用的信号处理内核**：位读写 / VLC / FDCT / IDCT / FFT / SAD / NEON
+kernel     编解码器**共用的信号处理内核**：位读写 / VLC / RL 表容器 / FDCT / IDCT / FFT /
+           帧缓冲（`Frame` / `Planes`）/ 运动补偿 / SAD / 宏块层预测 / NEON
            —— 全仓唯一允许 `unsafe` 的地方，且只有 `simd` 一个模块
 msmpeg4    MP42 / MP43 / WMV1 / WMV2 解码（I / P，WMV2 含 IntraX8）**+ MP43 编码**（I / P，含运动估计）
 wma        WMA v1 / v2 解码（**只有解码器**）
@@ -208,15 +209,21 @@ df -h /System/Volumes/Data  # 磁盘 <10% 可用会让 macOS 整体变卡（换�
    （LGPL 兼容：Apache-2.0 / MIT / BSD；MPL 这类 copyleft 一律不引），并说清现有代码
    为什么做不到。
 3. **共享数值内核住在 `v2v-kernel`**：`BitReader` / `BitWriter`（MSB 优先）/ FDCT / IDCT /
-   FFT / VLC / SAD / NEON 内核 / `Error` 被 `v2v-msmpeg4`、`v2v-mp4v`、`v2v-aac`、`v2v-vc1`、
-   `v2v-mpeg12` 复用。**不要复刻第二份** —— 会漂的就是第二份。改这些共享件要**同时**跑
-   mp4v / aac / vc1 / mpeg12 的对账测试。
-   （`vc1` 只借位读取器与前缀码解码，**它自己的逆变换是独立的** —— VC-1 的 8×8 核
-   与 H.263 那套不是一回事，别为了「统一」把两套混成一套。）
+   FFT / VLC / RL 表容器 / 帧缓冲（`Frame` / `Planes`）/ 运动补偿 / SAD / 宏块层预测 /
+   NEON 内核 / `Error` 被 `v2v-msmpeg4`、`v2v-mp4v`、`v2v-aac`、`v2v-wma`、`v2v-vc1`、
+   `v2v-mpeg12`、`v2v-player` 复用。**不要复刻第二份** —— 会漂的就是第二份。改这些
+   共享件要**同时**跑 mp4v / aac / wma / vc1 / mpeg12 的对账测试。
+   （`vc1` 只借位读取器、前缀码、帧缓冲与中值预测，**它自己的逆变换是独立的** ——
+   VC-1 的 8×8 核与 H.263 那套不是一回事，别为了「统一」把两套混成一套。）
    **判据**：把任意一个编解码器整个删掉，`kernel` 里不该有函数变成死代码。所以
-   「只有一个编解码器用」的东西（WMV2 的 `wmv2_idct_*`、帧头解析、宏块语法、运动补偿
-   策略）**一律留在各自 crate**，不许图省事往 kernel 里塞。
+   「只有一个编解码器用」的东西（WMV2 的 `wmv2_idct_*` 与 mspel 运动补偿、DC 预测的
+   版本分支、帧头解析、宏块语法、运动矢量编解码、环路滤波）**一律留在各自 crate**，
+   不许图省事往 kernel 里塞。
    **别再让 `kernel` 反向依赖任何编解码器** —— 它一旦依赖 msmpeg4，这次拆分就白做了。
+   **当前唯一的例外**：`v2v-vc1` 还借 `v2v-msmpeg4` 的 5 张码表（`SCAN` /
+   `ABT_SCAN_A` / `ABT_SCAN_B` / `MB_INTRA` / `DC`）。那是**数据**不是逻辑，两边的码
+   本来就一样；要彻底断开得把那几张表搬进 kernel 并改 `tools/gen_tables.py` 的产物
+   布局，单独拍板（见 TODO）。
 4. **码表只有一份真源**：`crates/*/src/tables.rs` 是唯一落点，生成与自检脚本在
    `tools/`（`gen_tables.py` / `gen_aac_tables.py` / `gen_wma_tables.py` / `check_tables.py`）。
    加格式只改那一处，别的地方转发。

@@ -24,16 +24,18 @@
 //!   I 帧 `qscale` 会自动抬高来保证这一点（见 `pick_qscale`）。
 
 use v2v_kernel::bitwriter::BitWriter;
-use crate::block::RlTable;
+use crate::block::rl_table_for_standard;
+use v2v_kernel::rl::RlTable;
 use v2v_kernel::error::{Error, Result};
 use v2v_kernel::fdct::{fdct, fdct_i};
 use crate::version::Version;
-use crate::frame::{
-    dc_unscale, mc_mb, mc_params, pred_motion, sad_luma16_capped, Frame, Planes, ZIGZAG,
-};
+use crate::frame::pred_motion;
+use v2v_kernel::predict::dc_unscale;
+use v2v_kernel::mc::{mc_mb, mc_params, sad_luma16_capped, Frame, Planes, ZIGZAG};
 use v2v_kernel::idct::{idct_add, idct_put};
 use crate::grid::Grid;
-use crate::predict::{coded_block_predict, dc_predict};
+use crate::predict::dc_predict;
+use v2v_kernel::predict::coded_block_predict;
 use crate::tables;
 use v2v_kernel::vlc::Vlc;
 
@@ -176,8 +178,8 @@ impl Encoder {
         wtr.put(self.cfg.dc_table_index as u32, 1);
 
         // ---- 表 ----
-        let rl_luma = RlTable::for_standard(self.cfg.rl_table_index as usize)?;
-        let rl_chroma = RlTable::for_standard(3 + self.cfg.rl_chroma_table_index as usize)?;
+        let rl_luma = rl_table_for_standard(self.cfg.rl_table_index as usize)?;
+        let rl_chroma = rl_table_for_standard(3 + self.cfg.rl_chroma_table_index as usize)?;
         let dc_vlc = Vlc::new(&tables::DC[self.cfg.dc_table_index as usize][0]);
         let dc_vlc_c = Vlc::new(&tables::DC[self.cfg.dc_table_index as usize][1]);
         let mb_intra_vlc = Vlc::new(&tables::MB_INTRA);
@@ -381,11 +383,11 @@ impl Encoder {
         let y_dc_scale = tables::OLD_Y_DC_SCALE[q_target as usize] as i32;
         let c_dc_scale = tables::C_DC_SCALE[q_target as usize] as i32;
 
-        let rl_inter = RlTable::for_standard(3 + self.cfg.rl_table_index as usize)?;
+        let rl_inter = rl_table_for_standard(3 + self.cfg.rl_table_index as usize)?;
         // P 帧里的帧内宏块：亮度用帧内表（下标即 `rl_table_index`），色度用
         // `3 + rl_table_index`（P 帧头只写一个下标，解码端 `rl_chroma_table_index`
         // 直接抄它 —— 见 `msmpeg4dec.c` 的 P 分支）。
-        let rl_intra_luma = RlTable::for_standard(self.cfg.rl_table_index as usize)?;
+        let rl_intra_luma = rl_table_for_standard(self.cfg.rl_table_index as usize)?;
         let mb_non_intra_vlc = Vlc::new(&tables::MB_NON_INTRA);
         let dc_vlc = Vlc::new(&tables::DC[self.cfg.dc_table_index as usize][0]);
         let dc_vlc_c = Vlc::new(&tables::DC[self.cfg.dc_table_index as usize][1]);

@@ -1,7 +1,8 @@
 //! 生成一个小的测试 .wmv（编码 + 封装），给 ffprobe/ffmpeg 手动检查用。
 use std::io::Write;
 use v2v_asf::{AsfMuxer, VideoStreamInfo};
-use v2v_msmpeg4::{Encoder, EncoderConfig, Frame};
+use v2v_msmpeg4::{Encoder, EncoderConfig};
+use v2v_kernel::mc::{Frame};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out = std::env::args().nth(1).unwrap_or("/tmp/loop.wmv".into());

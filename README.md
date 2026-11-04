@@ -24,7 +24,8 @@ crates/
   container 各容器共用的数据模型（流 / 格式 / 样本）—— 零依赖
   asf      ASF（.wmv / .wma）解封装 + **封装** —— 纯 std
   avi      AVI（RIFF）解封装
-  kernel   **编解码器共用的信号处理内核**：位读写器 / VLC / FDCT / IDCT / FFT / SAD / NEON
+  kernel   **编解码器共用的信号处理内核**：位读写器 / VLC / RL 表容器 / FDCT / IDCT / FFT /
+           帧缓冲（`Frame` / `Planes`）/ 运动补偿 / SAD / 宏块层预测 / NEON
            —— 全仓唯一允许 `unsafe` 的地方，而且只有 `simd` 一个模块
   msmpeg4  MS-MPEG-4 v2/v3（MP42 / MP43）/ WMV1 / WMV2 解码（I / P + **IntraX8**）+ MP43 编码（I / P，含运动估计与帧内/帧间判决）
   wma      WMA v1/v2 音频解码（帧头 / LSP 指数 / 系数 / IMDCT）

@@ -10,7 +10,7 @@
 //!   首列还有一个特例偏移。
 
 use v2v_kernel::Result;
-use v2v_msmpeg4::mid_pred;
+use v2v_kernel::mc::mid_pred;
 
 use crate::decoder::Ctx;
 use crate::header::MvMode;

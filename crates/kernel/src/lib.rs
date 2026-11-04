@@ -14,11 +14,12 @@
 //!
 //! 判断标准只有一条：**把任意一个编解码器整个删掉，本 crate 里不该有函数变成死代码。**
 //!
-//! - 收：位流读写、VLC、8×8 DCT/IDCT（含 ABT 的 4:8 / 8:4）、FFT、SAD、NEON 内核、
-//!   以及编解码器共用的 `Error` / `Result`。
-//! - 不收：WMV2 那套 `wmv2_idct_*`（只有 WMV2 用，留在 `v2v-msmpeg4`）、
-//!   帧头解析、宏块语法、运动补偿的**策略**（`mc_*` 目前还在 `v2v-msmpeg4`，
-//!   等下一步搬 —— 见 TODO）。
+//! - 收：位流读写、VLC、RL 表容器、8×8 DCT/IDCT（含 ABT 的 4:8 / 8:4）、FFT、
+//!   帧缓冲（`Frame` / `Planes`）、运动补偿内核、SAD、宏块层的预测内核、
+//!   NEON、以及编解码器共用的 `Error` / `Result`。
+//! - 不收：WMV2 那套 `wmv2_idct_*` 与 mspel 运动补偿（只有 WMV2 用，留在
+//!   `v2v-msmpeg4`）、帧头解析、宏块语法、运动矢量的解码/编码、环路滤波，
+//!   以及各家自己的码表（`crates/*/src/tables.rs`）。
 //!
 //! ## unsafe
 //!
@@ -35,6 +36,9 @@ pub mod error;
 pub mod fdct;
 pub mod fft;
 pub mod idct;
+pub mod mc;
+pub mod predict;
+pub mod rl;
 pub mod simd;
 pub mod vlc;
 
@@ -44,4 +48,10 @@ pub use error::{Error, Result};
 pub use fdct::{fdct, fdct_i, fdct_i_float, fdct_llm};
 pub use fft::fft_in_place;
 pub use idct::{idct48_add, idct84_add, idct_add, idct_put};
+pub use mc::{
+    edge_emu_into, mc_chroma8, mc_luma16, mc_mb, mc_params, mid_pred, put_pixels, sad_luma16,
+    sad_luma16_capped, Frame, McParams, Planes, ZIGZAG,
+};
+pub use predict::{ac_predict, coded_block_predict, dc_unscale, AcVal};
+pub use rl::RlTable;
 pub use vlc::Vlc;

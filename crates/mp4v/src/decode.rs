@@ -36,10 +36,12 @@
 //! 帧率重采样、静默丢帧**（10 帧的流只吐 3 帧）。必须加 `-fps_mode passthrough`，
 //! 否则「逐像素对账」只比了前几帧、照样全绿。
 //!
-//! ## 与 MP43（`v2v-msmpeg4`）的关系
+//! ## 与 MP43 的关系
 //!
-//! 复用的是**数值内核**：`BitReader` / `Vlc` / `RlTable` / `idct_put` / `idct_add` /
-//! `mc_mb` / `Planes` / `ac_predict` / `dc_unscale`。不复用的是**语法**：
+//! 复用的是**数值内核**（都在 `v2v-kernel`）：`BitReader` / `Vlc` / `RlTable` /
+//! `idct_put` / `idct_add` / `mc_mb` / `Planes` / `ac_predict` / `dc_unscale`。
+//! 本 crate **不依赖 `v2v-msmpeg4`** —— 两个编解码器只在「数值内核」这一层相通。
+//! 不复用的是**语法**：
 //!
 //! - MCBPC / CBPY / MV 的**表不同**（MPEG-4 用 `ff_mvtab` 的 33 项，MP43 用 1100 项）；
 //! - DC 预测的**平手方向相反**（MPEG-4 用严格 `<`，MP43 的 V3 用 `<=`）；
@@ -48,7 +50,9 @@
 //! - 第二 escape 的 run 修正：MPEG-4 恒 `+1`，MP43 按版本（V2 是 0）。
 
 use v2v_kernel::{idct_add, idct_put, BitReader, Error, Result, Vlc};
-use v2v_msmpeg4::{ac_predict, dc_unscale, mc_mb, AcVal, Frame, Planes, RlTable, ZIGZAG};
+use v2v_kernel::predict::{ac_predict, dc_unscale, AcVal};
+use v2v_kernel::mc::{mc_mb, Frame, Planes, ZIGZAG};
+use v2v_kernel::rl::RlTable;
 
 use crate::tables;
 
@@ -562,10 +566,10 @@ fn pred_motion(g: &Grid<(i32, i32)>, mbx: usize, mby: usize) -> (i32, i32) {
 }
 
 fn mid(a: i32, b: i32, c: i32) -> i32 {
-    // ⚠️ 直接复用 msmpeg4 里那份（已对着 ffmpeg 逐像素验过）。
+    // ⚠️ 直接复用共享内核里那份（已对着 ffmpeg 逐像素验过）。
     // 这里原先自己写了一版 `a.max(b).min(c).max(...)` —— 它不是中值：
     // `(3,2,1)` 会返回 1 而不是 2。中值错了，P 帧的运动矢量预测就整片偏。
-    v2v_msmpeg4::mid_pred(a, b, c)
+    v2v_kernel::mc::mid_pred(a, b, c)
 }
 
 /// 一个 MV 分量：`ff_mvtab` + 符号位 + `f_code - 1` 个低位，然后加预测、按

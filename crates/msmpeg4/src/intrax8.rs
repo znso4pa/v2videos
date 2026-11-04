@@ -23,7 +23,7 @@ use std::sync::OnceLock;
 
 use v2v_kernel::bitreader::BitReader;
 use v2v_kernel::error::{Error, Result};
-use crate::frame::Planes;
+use v2v_kernel::mc::Planes;
 use crate::idct_wmv2::wmv2_idct_add;
 use crate::intrax8_tables as t;
 use crate::tables::SCAN;

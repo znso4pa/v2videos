@@ -37,8 +37,8 @@ struct Owned {
     v: Vec<u8>,
 }
 
-impl From<v2v_msmpeg4::Frame> for Owned {
-    fn from(f: v2v_msmpeg4::Frame) -> Self {
+impl From<v2v_kernel::mc::Frame> for Owned {
+    fn from(f: v2v_kernel::mc::Frame) -> Self {
         Self {
             width: f.width,
             height: f.height,
