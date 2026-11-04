@@ -21,6 +21,7 @@
 
 use std::time::Instant;
 
+use v2v_bench::Row;
 use v2v_mp4::{AudioCodec, AudioTrack, Mp4Muxer, VideoTrack};
 
 /// 视频样本：模拟 1080p / 30 fps / 约 1.5 Mbps 的 mp4v 帧（关键帧更大）。
@@ -122,4 +123,27 @@ fn mux_throughput() {
         mbps > 50.0,
         "封装吞吐只有 {mbps:.0} MiB/s —— 内存追加不该这么慢，先查是不是有隐藏拷贝"
     );
+
+    // 机器可读的那一份：`V2V_BENCH_TSV` 给了路径才写。
+    //
+    // 拆成两行而不是一行：`write_*` 是 O(帧数)、`finish()` 是 O(总字节) 的**一次**调用，
+    // 混在一起算「每帧毫秒」等于把两种不同的成本平均掉，那种平均出来的数看不出任何东西。
+    let mut report = v2v_bench::start("mp4/mux_bench");
+    report.push(Row::new(
+        "mux/mp4/write/1920x1080",
+        VIDEO_FRAMES as u64,
+        write_elapsed.as_secs_f64() * 1000.0,
+        "frame",
+    ));
+    report.push(Row::new(
+        "mux/mp4/finish/1920x1080",
+        1,
+        finish_elapsed.as_secs_f64() * 1000.0,
+        "call",
+    ));
+    match v2v_bench::write_if_requested(&report) {
+        Ok(Some(path)) => eprintln!("TSV 已写入 {}", path.display()),
+        Ok(None) => {}
+        Err(e) => eprintln!("TSV 写失败：{e}"),
+    }
 }

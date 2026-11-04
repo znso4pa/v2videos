@@ -30,6 +30,7 @@ mod common;
 use std::process::Command;
 use std::time::Instant;
 
+use v2v_bench::Row;
 use v2v_msmpeg4::{Decoder, Version};
 
 /// 解我们这一侧：返回 `(解了多少帧, 秒)`。
@@ -116,11 +117,25 @@ fn decode_speed_vs_ffmpeg() {
     );
     println!("|---|---|---|---|---|---|---|---|---|---|");
 
-    for p in &paths {
+    // 机器可读的那一份：`V2V_BENCH_TSV` 给了路径才写，否则本测试的行为与以前逐字节相同。
+    // 注意存的是**去启动之后**的数 —— 与人类表的「**去启动倍数**」列同口径，
+    // 否则 `per_unit / ref_per_unit` 会是一个含进程启动的假比值。
+    let mut report = v2v_bench::start("msmpeg4/decode_bench");
+
+    for (i, p) in paths.iter().enumerate() {
         let name = std::path::Path::new(p)
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| p.clone());
+        let stem = std::path::Path::new(&name)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| name.clone());
+        report.add_sample(
+            i,
+            &name,
+            std::fs::metadata(p).map(|m| m.len()).unwrap_or(0),
+        );
         let (w, h, codec) = match common::video_fourcc(p) {
             Some((w, h, fc)) => (w, h, v2v_asf::fourcc_string(fc)),
             None => (0, 0, "?".into()),
@@ -147,6 +162,18 @@ fn decode_speed_vs_ffmpeg() {
             ff_s * 1000.0 / n as f64,
             our_pure / ff_pure,
         );
+        report.push(
+            Row::new(
+                format!(
+                    "decode/{}/{stem}/{w}x{h}",
+                    codec.to_ascii_lowercase().replace(['/', ' '], "-")
+                ),
+                n as u64,
+                our_pure * 1000.0,
+                "frame",
+            )
+            .with_ref(ff_pure * 1000.0 / n as f64),
+        );
     }
     println!();
     eprintln!(
@@ -154,4 +181,9 @@ fn decode_speed_vs_ffmpeg() {
          （「原始倍数」含进程启动，「**去启动倍数**」= (我们 N 帧 − 我们 1 帧) / (ffmpeg N 帧 − ffmpeg 1 帧)——\
          帧少的样本只看后者）"
     );
+    match v2v_bench::write_if_requested(&report) {
+        Ok(Some(path)) => eprintln!("TSV 已写入 {}", path.display()),
+        Ok(None) => {}
+        Err(e) => eprintln!("TSV 写失败：{e}"),
+    }
 }

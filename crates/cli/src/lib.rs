@@ -43,7 +43,14 @@ pub use v2v_asf::{AsfDemuxer, AsfMuxer, StreamKind, VideoStreamInfo};
 pub use v2v_avi::AviDemuxer;
 pub use v2v_container::{AudioFormat, Sample};
 pub use v2v_msmpeg4::{Decoder, Encoder, EncoderConfig, Version};
-use v2v_kernel::mc::{Frame};
+use v2v_kernel::mc::Frame;
+
+/// `v2v bench`：把测量写成 TSV，可选对着基线卡回归。
+///
+/// 它是**唯一**往 `bench/baseline/` 写文件的地方，也是唯一读 `--check` 的地方。
+/// 各 crate 自己的 bench（`vc1/tests/decode_bench.rs` 那些）不依赖这个模块 ——
+/// 它们只需要 `v2v-bench` 那个格式库，不需要把整个转码器拖进来。
+pub mod bench;
 
 /// 认 FourCC → 版本，**只放逐像素对账过的版本进来**。
 ///

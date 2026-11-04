@@ -37,7 +37,9 @@ fn main() -> std::process::ExitCode {
     // 把本 crate 的内核装进解码器（关掉 `unsafe-kernels` 时是空操作）。
     v2v_mpeg12_simd::install();
 
-    let bytes = std::fs::read(&sample).expect("read the program stream");    let mut demux = PsDemuxer::new(bytes);
+    let bytes = std::fs::read(&sample).expect("read the program stream");
+    let bytes_len = bytes.len() as u64;
+    let mut demux = PsDemuxer::new(bytes);
     let mut es = Vec::new();
     while let Some(packet) = demux.next_packet() {
         if packet.is_video() {
@@ -113,7 +115,8 @@ fn main() -> std::process::ExitCode {
     if let Some(path) = &dump {
         std::fs::write(path, &dumped).expect("写 dump");
     }
-    let ms = t0.elapsed().as_secs_f64() * 1000.0 / frames as f64;
+    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let ms = elapsed_ms / frames as f64;
     let (w, h) = (sequence.width, sequence.height);
     eprintln!(
         "[bench] {sample} {w}x{h} {frames} 帧 / {rounds} 遍：**{ms:.2} ms/帧**（threads={threads}）"
@@ -125,5 +128,41 @@ fn main() -> std::process::ExitCode {
         v2v_mpeg12_simd::kernels::KERNEL_AVG,
         v2v_mpeg12_simd::kernels::KERNEL_IDCT_COLS
     );
+
+    // 机器可读的那一份：`V2V_BENCH_TSV` 给了路径才写。
+    // ⚠️ case 名里带 `t{threads}`：`--threads 4` 与单线程是**两个用例**，
+    // 混在一个名字下会让基线与现在的数字对不上却看不出来。
+    let mut report = v2v_bench::start("mpeg12-simd/simd_bench");
+    report.add_sample(0, &file_name(&sample), bytes_len);
+    report.push(v2v_bench::Row::new(
+        format!(
+            "decode/mpeg12-simd/{}/{w}x{h}/t{threads}",
+            stem_of(&sample)
+        ),
+        frames as u64,
+        elapsed_ms,
+        "frame",
+    ));
+    match v2v_bench::write_if_requested(&report) {
+        Ok(Some(path)) => eprintln!("TSV 已写入 {}", path.display()),
+        Ok(None) => {}
+        Err(e) => eprintln!("TSV 写失败：{e}"),
+    }
     std::process::ExitCode::SUCCESS
+}
+
+/// 文件名（带扩展名）。样本标识用它 —— 与 `v2v bench` 的口径一致。
+fn file_name(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string())
+}
+
+/// 文件名去扩展名（case 名里用，短一些）。
+fn stem_of(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "sample".into())
 }

@@ -105,11 +105,25 @@ fn decode_scaling_by_workers() {
     println!();
     println!("| worker | 墙钟 s | ms/帧 | 伸缩比 | 并行效率 |");
     println!("|---|---|---|---|---|");
+    // 机器可读的那一份：`V2V_BENCH_TSV` 给了路径才写。
+    //
+    // 这里的 `ref_per_unit` 是**同一次运行里 1 worker 的 per_unit** ——
+    // 这正是「同一进程内、我们 vs 参考实现」的那种比值：机器整体快慢会被约掉，
+    // 剩下的是**伸缩比**本身。所以这个文件的基线能当门用。
+    let mut report = v2v_bench::start("vc1/decode_parallel_bench");
+    report.add_sample(
+        0,
+        &file_name(&path),
+        std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+    );
+    let stem = stem_of(&path);
     let mut base = 0.0;
+    let mut base_per_unit = 0.0;
     for workers in [1usize, 2, 4, 6, 8] {
         let t = decode_parallel(&frames, seq, (w, h), workers);
         if workers == 1 {
             base = t;
+            base_per_unit = t * 1000.0 / n as f64;
         }
         println!(
             "| {workers} | {t:.3} | {:.2} | {:.2}× | {:.0}% |",
@@ -117,7 +131,39 @@ fn decode_scaling_by_workers() {
             base / t,
             100.0 * (base / t) / workers as f64
         );
+        let mut row = v2v_bench::Row::new(
+            format!("decode/vc1-parallel/{stem}/{w}x{h}/w{workers}"),
+            n as u64,
+            t * 1000.0,
+            "frame",
+        );
+        // 1 worker 自己就是基准，不该拿自己跟自己比（那会恒等于 1）。
+        if workers != 1 {
+            row = row.with_ref(base_per_unit);
+        }
+        report.push(row);
     }
     println!();
     println!("（{n} 帧 / {w}×{h} / GOP={GOP}；伸缩比相对 1 worker，同一会话内背靠背）");
+    match v2v_bench::write_if_requested(&report) {
+        Ok(Some(path)) => eprintln!("TSV 已写入 {}", path.display()),
+        Ok(None) => {}
+        Err(e) => eprintln!("TSV 写失败：{e}"),
+    }
+}
+
+/// 文件名（带扩展名），与 `v2v bench` 的样本标识同口径。
+fn file_name(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string())
+}
+
+/// 文件名去扩展名（case 名里用）。
+fn stem_of(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "sample".into())
 }

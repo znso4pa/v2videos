@@ -88,5 +88,18 @@ jobs:
           RUSTFLAGS: -D warnings
         run: cargo test --workspace -j 4 --no-fail-fast
 
+      # `v2v bench` 的**接线**检查 —— 只确认子命令还挂在分派上、帮助打得出来。
+      #
+      # 这里**故意不量任何东西**：CI 没有真样本（版权 + 体积，不入库），而合成样本
+      # 是 MP43、`v2v bench` 走 `v2v-player`（只认 WMV3）打不开。硬凑一个「跑通了」
+      # 的假绿比不跑更坏。
+      #
+      # 性能门在本地：`v2v bench --check bench/baseline/<机器指纹>.tsv`，
+      # 口径与「门卡比值不卡毫秒」的理由见 `bench/README.md`。
+      # 格式 / 指纹 / 比较这三块是纯函数，由 `crates/bench` 的单元测试守着，
+      # 上面那步 `cargo test --workspace` 已经跑了。
+      - name: bench 子命令接线
+        run: cargo run -q -p v2v-cli -- bench --help > /dev/null
+
 # 不加 `cargo fmt`：仓里没有 `rustfmt.toml`，3 万行按默认风格重排会炸出一片
 # 与本次改动无关的 diff。要加得先单独一轮把全仓格式化，那是另一件事。

@@ -60,6 +60,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "v2v-bench"
+version = "0.0.0"
+
+[[package]]
 name = "v2v-capi"
 version = "0.0.0"
 dependencies = [
@@ -86,11 +90,13 @@ dependencies = [
  "v2v-aac",
  "v2v-asf",
  "v2v-avi",
+ "v2v-bench",
  "v2v-container",
  "v2v-kernel",
  "v2v-mp4",
  "v2v-mp4v",
  "v2v-msmpeg4",
+ "v2v-player",
  "v2v-vc1",
  "v2v-wma",
 ]
@@ -106,6 +112,9 @@ version = "0.0.0"
 [[package]]
 name = "v2v-mp4"
 version = "0.0.0"
+dependencies = [
+ "v2v-bench",
+]
 
 [[package]]
 name = "v2v-mp4v"
@@ -127,6 +136,7 @@ dependencies = [
 name = "v2v-mpeg12-simd"
 version = "0.0.0"
 dependencies = [
+ "v2v-bench",
  "v2v-mpeg12",
  "v2v-mpegps",
 ]
@@ -141,6 +151,7 @@ version = "0.0.0"
 dependencies = [
  "v2v-asf",
  "v2v-avi",
+ "v2v-bench",
  "v2v-kernel",
 ]
 
@@ -162,6 +173,7 @@ name = "v2v-vc1"
 version = "0.0.0"
 dependencies = [
  "v2v-asf",
+ "v2v-bench",
  "v2v-container",
  "v2v-kernel",
  "v2v-msmpeg4",

@@ -48,7 +48,10 @@ crates/
   capi     **全仓唯一的 C ABI**（`libv2v_capi`）：一层一组 `v2v_*` 符号 +
            一份手写头文件 `include/v2v.h`。容器 / 解码 / 编码 / 封装 / 播放 /
            MPEG-1/2 / 硬件转码，全在一个 `.so` 里（详见下面「C ABI」一节）
-  cli      `v2v` 命令行：**批量转码**（解封装 → 解码 → 编码 → 封装）
+  cli      `v2v` 命令行：**批量转码**（解封装 → 解码 → 编码 → 封装）+ `v2v bench`
+           （测量写成 TSV、可选对着基线卡回归）
+  bench    性能测量的**格式与寿命管理**：TSV 读写 / 机器指纹 / 回归比较 —— **零依赖**，
+           自己不测量任何东西（见 `bench/README.md`）
 tools/
   gen_tables.py     H.263 / MPEG-4 Part 2 的 VLC / 反量化表（附自检：前缀无关、Kraft 和、逐码往返）
   check_tables.py   用**第二个独立来源**核对 msmpeg4 的表
@@ -138,6 +141,12 @@ FFI 有两个方向，**每个方向都只有一个 crate**，别在别处加：
 
 ⚠️ **「持平」只对这份 720p 样本成立**：换成 1920×1080 那份（3719 帧），单线程是 **1.80×**
 （`crates/vc1/tests/decode_bench.rs`，口径见下面 §1）。两份样本不要混着引用。
+
+📏 **这些数字现在有机器可读的基线了**：`v2v bench --baseline-dir bench/baseline <样本>`
+打 TSV（`case` / `n` / `total_ms` / `per_unit` / `unit` / `ref_per_unit`），
+`--check` 对着基线卡回归 —— **只卡「我们 / ffmpeg」的比值**，绝对毫秒只提醒
+（CI runner 上绝对量能差 2×，比值才是稳定的）。下面这些手工表仍然是「某一版代码在某台
+机器上」的快照，**别拿它当门**；口径与限制见 `bench/README.md`。
 
 **FFI 硬件路径（同一个样本、同码率 4 Mbps，2026-10-20 实测）—— 两个差距都解决了：**
 
@@ -650,6 +659,11 @@ SSIM 0.969486）对合并前 q=8（1709 kbps / 37.14 dB / 0.963555）—— **�
 cargo run --release -p v2v-cli -- convert <输入.wmv>... -o <输出目录> [-q 6] [-g 250] [-n 100]
 cargo run --release -p v2v-cli -- convert --mp4 <输入.wmv>... -o <输出目录> [-q 6] [-g 12] [--fps 25]
 cargo run --release -p v2v-cli -- convert --mp4 --video-bitrate 500k <输入.wmv>... -o <输出目录>
+
+# 性能：打 TSV、存基线、对着基线卡回归（只卡比值，见 bench/README.md）
+cargo run --release -p v2v-cli -- bench <样本.wmv>...
+cargo run --release -p v2v-cli -- bench --baseline-dir bench/baseline <样本.wmv>...
+cargo run --release -p v2v-cli -- bench --check bench/baseline/<机器指纹>.tsv <样本.wmv>...
 ```
 
 `.mp4` 的音频默认 AAC：`--aac-bitrate 128000` 给目标码率，`--pcm` 退回未压缩 `sowt`，

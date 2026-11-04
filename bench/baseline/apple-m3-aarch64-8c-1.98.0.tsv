@@ -1,0 +1,13 @@
+# v2v-bench 1
+# cpu	Apple M3
+# arch	aarch64
+# cores	8
+# rustc	1.98.0
+# profile	release
+# tool	v2v bench
+# load	4.09 5.05 5.27
+# sample.0	sample.wmv:144678549
+case	n	total_ms	per_unit	unit	ref_per_unit
+decode/video/sample/1280x720	4138	10583.389042	2.557609724987917	frame	1.8252696652972453
+decode/audio/sample/44100hz	6082560	587.597125	0.00009660358878498527	sample	0.00001031235203598485
+transcode/mp4/sample	4138	52715.801	12.73943958434026	frame	

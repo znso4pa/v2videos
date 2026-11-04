@@ -1,9 +1,10 @@
-//! `v2v` —— WMV/ASF 批量转码命令行。
+//! `v2v` —— WMV/ASF 批量转码 + 基准测量命令行。
 //!
 //! ```text
 //! v2v convert [选项] <输入>...
+//! v2v bench   [选项] <样本>...
 //!
-//! 选项：
+//! convert 的选项：
 //!   -o, --out-dir <DIR>   输出目录（默认：输入所在目录）
 //!   -q, --qscale <1..31>  量化尺度（默认 6；越大越小越糊）
 //!       --threads <N>     编码线程数（默认 1）
@@ -15,13 +16,16 @@
 //!       --no-audio        不搬/不转音频
 //!       --no-verify       不校验输出（默认会解码回来比 PSNR；只对 WMV 有效）
 //!   -h, --help            帮助
+//!
+//! bench 的选项见 `BENCH_USAGE`。
 //! ```
 //!
-//! 退出码：全部成功 0；有失败 1；用法错误 2。
+//! 退出码：全部成功 0；有失败 / 有超过门限的性能回归 1；用法错误 2。
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use v2v_cli::bench::{self, Options as BenchOptions};
 use v2v_cli::{convert_batch, ConvertOptions, Mp4Audio, OutputFormat};
 
 const USAGE: &str = "\
@@ -29,6 +33,7 @@ v2v —— WMV/ASF 批量转码（纯 Rust：解封装 → 解码 → 编码 →
 
 用法：
   v2v convert [选项] <输入>...
+  v2v bench   [选项] <样本>...   （性能测量：打 TSV、可选对着基线卡回归）
 
 选项：
   -o, --out-dir <DIR>   输出目录（默认：与输入同目录）
@@ -67,6 +72,45 @@ v2v —— WMV/ASF 批量转码（纯 Rust：解封装 → 解码 → 编码 →
         -g 0 会编成全 I 帧（文件大得多，但每帧独立可解、适合剪辑）。
 ";
 
+/// `v2v bench` 的帮助。**单独一份**，因为它和 convert 的选项一个都不重叠 ——
+/// 混在一个 USAGE 里会让人以为 `--out-dir` 对 bench 也有意义。
+const BENCH_USAGE: &str = "\
+v2v bench —— 性能测量：把结果写成 TSV，可选对着基线卡回归
+
+用法：
+  v2v bench [选项] <样本>...        （.wmv = VC-1 / WMV3；.mpg = MPEG-1/2）
+
+选项：
+      --out <FILE>          TSV 写到文件（默认 stdout）
+      --check <BASELINE>    跑完与这份基线比；有超过门限的**比值**回归就退出码 1
+      --baseline-dir <DIR>  把这次结果写成 <DIR>/<机器指纹>.tsv（目录不存在会建）
+      --ratio-tolerance P   比值恶化的门限百分比（默认 15）—— 这条**会拦住人**
+      --abs-tolerance P     绝对量恶化的提醒阈值（默认 30）—— 这条**只提醒**
+      --reps N              每个用例跑 N 遍取最快（默认 3；大样本转码建议 1）
+      --frames N            每个用例最多处理 N 个单位（默认全部）
+      --cases LIST          只跑 case 名以这些前缀开头的（逗号分隔，如 decode,transcode）
+      --no-ref              不跑 ffmpeg 参考实现（TSV 里 ref_per_unit 会留空）
+  -h, --help                显示本帮助
+
+用例（TSV 的 `case` 列）：
+  decode/video/<样本>/<w>x<h>       VC-1 解码（Player::open 在计时之外）
+  decode/audio/<样本>/<rate>hz      WMA 解码（单位是**每声道样本数**）
+  transcode/mp4/<样本>              整条 .wmv → .mp4（-g 12、AAC 128k、不校验）
+  decode/mpeg12/<样本>/<w>x<h>      MPEG-1/2 解码
+
+为什么分「门」和「提醒」：
+  绝对毫秒在 CI runner 上没有意义（同一份代码换台机器差 2×），只有
+  「我们 / 参考实现」的比值对机器不敏感。所以比值恶化超过 --ratio-tolerance
+  才失败；绝对量只打印提醒。基线按机器指纹分文件，换机器就不比 —— 见
+  `bench/baseline/` 与 `crates/bench` 的模块文档。
+
+例：
+  # 量一遍，存成基线
+  v2v bench --baseline-dir bench/baseline testing/sample.wmv
+  # 改完代码再量，对着基线看有没有退化
+  v2v bench --check bench/baseline/$(...).tsv testing/sample.wmv
+";
+
 /// 解析码率：纯数字按 bit/s 算，也接受 `k` / `M` 后缀（`500k`、`1.5M`）。
 fn parse_bitrate(s: &str) -> Result<u32, String> {
     let t = s.trim();
@@ -97,18 +141,110 @@ fn main() -> ExitCode {
     }
 }
 
-/// `Ok(true)` = 全部成功；`Ok(false)` = 有文件失败。
+/// `Ok(true)` = 全部成功（或没有超过门限的回归）；`Ok(false)` = 有文件失败 / 有回归。
 fn run(args: &[String]) -> Result<bool, String> {
     let mut it = args.iter();
-    let cmd = it.next().ok_or("缺少子命令（目前只有 convert）")?;
-    if cmd == "-h" || cmd == "--help" {
-        print!("{USAGE}");
-        return Ok(true);
+    let cmd = it.next().ok_or("缺少子命令（convert / bench）")?;
+    match cmd.as_str() {
+        "-h" | "--help" => {
+            print!("{USAGE}");
+            Ok(true)
+        }
+        "convert" => run_convert(&mut it),
+        "bench" => run_bench(&mut it),
+        other => Err(format!("未知子命令 `{other}`（有 convert / bench）")),
     }
-    if cmd != "convert" {
-        return Err(format!("未知子命令 `{cmd}`"));
-    }
+}
 
+/// `v2v bench`：解析参数后交给 `v2v_cli::bench`。
+///
+/// 这里只做**参数**的事 —— 测量、写 TSV、比基线全在库里，那样它才能被测试直接调用
+/// （见 `crates/cli/src/bench.rs` 的 `mod tests`）。
+fn run_bench(it: &mut std::slice::Iter<'_, String>) -> Result<bool, String> {
+    let mut opts = BenchOptions::default();
+    let mut samples: Vec<PathBuf> = Vec::new();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--out" => {
+                opts.out = Some(PathBuf::from(it.next().ok_or("--out 后面要跟文件")?));
+            }
+            "--check" => {
+                opts.check = Some(PathBuf::from(it.next().ok_or("--check 后面要跟基线文件")?));
+            }
+            "--baseline-dir" => {
+                opts.baseline_dir = Some(PathBuf::from(
+                    it.next().ok_or("--baseline-dir 后面要跟目录")?,
+                ));
+            }
+            "--ratio-tolerance" => {
+                opts.thresholds.ratio_pct = parse_pct(it.next(), "--ratio-tolerance")?;
+            }
+            "--abs-tolerance" => {
+                opts.thresholds.abs_pct = parse_pct(it.next(), "--abs-tolerance")?;
+            }
+            "--reps" => {
+                let v: usize = it
+                    .next()
+                    .ok_or("--reps 后面要跟数字")?
+                    .parse()
+                    .map_err(|_| "--reps 要正整数".to_string())?;
+                if v == 0 {
+                    return Err("--reps 要正整数".into());
+                }
+                opts.reps = v;
+            }
+            "--frames" => {
+                let v: usize = it
+                    .next()
+                    .ok_or("--frames 后面要跟数字")?
+                    .parse()
+                    .map_err(|_| "--frames 要正整数".to_string())?;
+                if v == 0 {
+                    return Err("--frames 要正整数".into());
+                }
+                opts.frames = Some(v);
+            }
+            "--cases" => {
+                let v = it.next().ok_or("--cases 后面要跟逗号分隔的前缀")?;
+                opts.cases = v
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect();
+                if opts.cases.is_empty() {
+                    return Err("--cases 给了一串空前缀".into());
+                }
+            }
+            "--no-ref" => opts.with_ref = false,
+            "-h" | "--help" => {
+                print!("{BENCH_USAGE}");
+                return Ok(true);
+            }
+            other if other.starts_with('-') => {
+                return Err(format!("未知选项 `{other}`"));
+            }
+            _ => samples.push(PathBuf::from(a)),
+        }
+    }
+    bench::run(&samples, &opts)
+}
+
+/// 解析一个百分比（`15` / `15%` 都收）。
+fn parse_pct(v: Option<&String>, flag: &str) -> Result<f64, String> {
+    let raw = v.ok_or_else(|| format!("{flag} 后面要跟百分比"))?;
+    let t = raw.trim().trim_end_matches('%');
+    let n: f64 = t
+        .parse()
+        .map_err(|_| format!("{flag} 要一个非负数（可以带 %），读到 `{raw}`"))?;
+    if !(n >= 0.0 && n.is_finite()) {
+        return Err(format!("{flag} 要一个非负数，读到 `{raw}`"));
+    }
+    Ok(n)
+}
+
+/// `v2v convert`：解析参数后交给 `v2v_cli::convert_batch`。
+fn run_convert(it: &mut std::slice::Iter<'_, String>) -> Result<bool, String> {
     let mut opts = ConvertOptions::default();
     let mut out_dir: Option<PathBuf> = None;
     let mut inputs: Vec<PathBuf> = Vec::new();

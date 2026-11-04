@@ -1,0 +1,18 @@
+[package]
+name = "v2v-bench"
+description = "性能测量的格式与寿命管理：TSV 读写、机器指纹、回归比较（不测量任何东西）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# ⚠️ 本 crate **不许**依赖任何编解码器 / 容器 / 平台库。
+#
+# 它只做三件事：把测量结果写成一种文本、从那种文本读回来、比较两份文本。
+# 测量本身留在各自的 crate 里（`vc1/tests/decode_bench.rs`、`player/examples/bench.rs`、
+# `v2v bench` 子命令……）。这个分界是刻意的：**测量方法各不相同，但结果的寿命管理
+# 必须只有一套**，否则「这张表还算不算数」又会变成每个 crate 各说各话。
+
+[dependencies]
+# 无。刻意不加 `serde` / `num_cpus` / `sha2` —— 见 lib.rs 文档「为什么零依赖」。

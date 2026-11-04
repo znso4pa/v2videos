@@ -27,6 +27,7 @@ mod common;
 use std::process::Command;
 use std::time::Instant;
 
+use v2v_bench::Row;
 use v2v_vc1::{Decoder, SeqHeader};
 
 /// 解我们这一侧：返回 `(解了多少帧, 秒)`。
@@ -114,11 +115,23 @@ fn decode_speed_vs_ffmpeg() {
     println!("|---|---|---|---|---|---|---|---|---|");
 
     let mut checked = 0usize;
-    for p in &paths {
+    // 机器可读的那一份：`V2V_BENCH_TSV` 给了路径才写。
+    // 存的是**去启动之后**的数，与人类表的「**去启动倍数**」列同口径。
+    let mut report = v2v_bench::start("vc1/decode_bench");
+    for (i, p) in paths.iter().enumerate() {
         let name = std::path::Path::new(p)
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| p.clone());
+        let stem = std::path::Path::new(&name)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| name.clone());
+        report.add_sample(
+            i,
+            &name,
+            std::fs::metadata(p).map(|m| m.len()).unwrap_or(0),
+        );
         let Some(track) = common::video_track(p) else {
             eprintln!("SKIP: 读不出 {name} 的视频轨");
             continue;
@@ -150,6 +163,15 @@ fn decode_speed_vs_ffmpeg() {
             ff_s * 1000.0 / n as f64,
             our_pure / ff_pure,
         );
+        report.push(
+            Row::new(
+                format!("decode/vc1/{stem}/{w}x{h}"),
+                n as u64,
+                our_pure * 1000.0,
+                "frame",
+            )
+            .with_ref(ff_pure * 1000.0 / n as f64),
+        );
         checked += 1;
     }
     assert!(checked > 0, "给了样本但没有一个是能对表的 WMV3");
@@ -158,4 +180,9 @@ fn decode_speed_vs_ffmpeg() {
         "（两边都含解封装、都单线程、都只解视频；取 {reps} 次里最快的一次）\n\
          （「原始倍数」含进程启动，「**去启动倍数**」= (我们 N 帧 − 我们 1 帧) / (ffmpeg N 帧 − ffmpeg 1 帧)）"
     );
+    match v2v_bench::write_if_requested(&report) {
+        Ok(Some(path)) => eprintln!("TSV 已写入 {}", path.display()),
+        Ok(None) => {}
+        Err(e) => eprintln!("TSV 写失败：{e}"),
+    }
 }

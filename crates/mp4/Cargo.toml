@@ -7,3 +7,7 @@ license.workspace = true
 
 [dependencies]
 # 无。纯 std。
+
+[dev-dependencies]
+# `tests/mux_bench.rs` 用它的 TSV 格式（`V2V_BENCH_TSV` 给了路径才写）。
+v2v-bench = { path = "../bench" }

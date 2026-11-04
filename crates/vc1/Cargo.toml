@@ -20,3 +20,6 @@ v2v-msmpeg4 = { path = "../msmpeg4" }
 # 只给集成测试用：从 ASF 里取视频样本 + extradata 做对账。
 v2v-asf = { path = "../asf" }
 v2v-container = { path = "../container" }
+# `tests/decode_bench.rs` / `decode_parallel_bench.rs` 用它的 TSV 格式
+# （`V2V_BENCH_TSV` 给了路径才写）。
+v2v-bench = { path = "../bench" }

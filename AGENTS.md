@@ -8,7 +8,7 @@
 
 ## 现状
 
-**链路已经打通到 `.wmv → .mp4`**：**17 个 crate、约 7.4 万行 Rust**，**零第三方运行时依赖**
+**链路已经打通到 `.wmv → .mp4`**：**18 个 crate、约 7.4 万行 Rust**，**零第三方运行时依赖**
 （`Cargo.lock` 里只有本仓的包，外加 `cc` 那条**构建**链 —— 只服务 `android-encode` 的 C shim）。
 
 ```text
@@ -32,6 +32,9 @@ player     顺时播放层：逐帧 / 逐样本、两轨独立、`seek(ms)`
 android-encode  平台硬编：硬件 H.264（VideoToolbox / MediaCodec）+ WMA→WAV 抽轨（**只有 rlib**）
 capi       **全仓唯一的 C ABI**：`v2v_*` 一族符号 + 唯一头文件 `crates/capi/include/v2v.h`
 cli        `v2v convert`：ASF / AVI → `.wmv`（MP43 + 音频直通）或 `.mp4`（mp4v + AAC）
+           **+ `v2v bench`**：测量写成 TSV、可选对着基线卡回归
+bench      性能测量的**格式与寿命管理**：TSV 读写 / 机器指纹 / 回归比较 —— **零依赖**，
+           不测量任何东西（测量在各 crate 自己的 bench 里）
 ```
 
 **C ABI 只有一个入口，就是 `capi`。** 别在别的 crate 里加 `#[no_mangle]`：一个进程里
@@ -283,3 +286,10 @@ df -h /System/Volumes/Data  # 磁盘 <10% 可用会让 macOS 整体变卡（换�
 3. 清调试残留：`grep -rn 'V2V_' crates/*/src` 只应剩下测试里的样本变量；排查期随手写的
    example / 脚本 / 写死路径已经删掉（AGENTS.md「本地调试残留」那条）。
 4. 判据、量出来的数字、试过又撤掉的候选 —— 写 `TODO.md`，**不进提交信息**。
+5. 动了**性能敏感**的路径（解码内层循环 / 编码器 / 容器写入）：跑一次
+   `v2v bench --check bench/baseline/<机器指纹>.tsv <样本>`。**「我们 / 参考实现」
+   的比值**涨超 15% 就是退化，别用「机器今天有点忙」解释 —— 比值存在的意义就是
+   消掉这个。绝对毫秒涨了只当提醒。没有基线就先 `--baseline-dir` 生成一份，
+   口径与「为什么只有比值能当门」见 `bench/README.md`。
+   ⚠️ 量之前先 `uptime`：负载 13 时量出来的「解码慢 1.7×」是负载的错，不是代码的错
+   （2026-10-20 实测过一次）。
