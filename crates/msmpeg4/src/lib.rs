@@ -34,10 +34,10 @@ mod frame;
 mod grid;
 mod header;
 mod intrax8;
-mod intrax8_tables;
+use v2v_tables::intrax8 as intrax8_tables;
 mod idct_wmv2;
 mod predict;
-pub mod tables;
+pub use v2v_tables::msmpeg4 as tables;
 #[cfg(test)]
 mod testbit;
 mod version;

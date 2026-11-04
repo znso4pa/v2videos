@@ -34,17 +34,17 @@ FFMPEG_VERSION = "7.1"
 
 # (生成器, 产出, [上游文件...]) —— 与各生成器里自己的来源清单一致。
 OUTPUTS = [
-    ("tools/gen_tables.py", "crates/msmpeg4/src/tables.rs", ["msmpeg4data.c", "msmpeg4_vc1_data.c"]),
-    ("tools/gen_tables.py", "crates/mp4v/src/tables.rs", ["h263data.c", "mpeg4data.h", "mpegvideodata.c"]),
-    ("tools/gen_aac_tables.py", "crates/aac/src/tables.rs", ["aactab.c", "aacenctab.h"]),
-    ("tools/gen_wma_tables.py", "crates/wma/src/tables.rs", ["wmadata.h", "wma_freqs.c", "aactab.c"]),
-    ("tools/gen_intrax8_tables.py", "crates/msmpeg4/src/intrax8_tables.rs", ["intrax8huf.h", "intrax8.c", "intrax8dsp.c"]),
-    ("tools/gen_vc1_tables.py", "crates/vc1/src/tables.rs", ["vc1data.c", "vc1_vlc_data.h", "vc1.h", "vc1_common.h"]),
-    ("tools/gen_mpeg12_tables.py", "crates/mpeg12/src/tables.rs", ["mpeg12data.c", "mpeg12.c", "mpegvideodata.c"]),
+    ("tools/gen_tables.py", "crates/tables/src/msmpeg4.rs", ["msmpeg4data.c", "msmpeg4_vc1_data.c"]),
+    ("tools/gen_tables.py", "crates/tables/src/mp4v.rs", ["h263data.c", "mpeg4data.h", "mpegvideodata.c"]),
+    ("tools/gen_aac_tables.py", "crates/tables/src/aac.rs", ["aactab.c", "aacenctab.h"]),
+    ("tools/gen_wma_tables.py", "crates/tables/src/wma.rs", ["wmadata.h", "wma_freqs.c", "aactab.c"]),
+    ("tools/gen_intrax8_tables.py", "crates/tables/src/intrax8.rs", ["intrax8huf.h", "intrax8.c", "intrax8dsp.c"]),
+    ("tools/gen_vc1_tables.py", "crates/tables/src/vc1.rs", ["vc1data.c", "vc1_vlc_data.h", "vc1.h", "vc1_common.h"]),
+    ("tools/gen_mpeg12_tables.py", "crates/tables/src/mpeg12.rs", ["mpeg12data.c", "mpeg12.c", "mpegvideodata.c"]),
 ]
 
 # 含上面那些生成码表的 crate —— 它们是 LGPL 派生数据，必须按 LGPL-2.1-or-later 分发。
-LGPL_CRATES = ["aac", "mpeg12", "mp4v", "msmpeg4", "vc1", "wma"]
+LGPL_CRATES = ["aac", "mpeg12", "mp4v", "msmpeg4", "tables", "vc1", "wma"]
 
 # 其余 crate：源码自研，按 MIT 分发（**不含**链接后产物，见下文）。
 MIT_CRATES = [
@@ -81,7 +81,8 @@ def main():
     w("  - **LGPL-2.1-or-later**（全文见 [LICENSE](LICENSE)）：")
     for line in crate_lines(LGPL_CRATES):
         w(line)
-    w("    —— 这几个 crate 含**从 FFmpeg 的数据文件读出的码表**（见下文一、）。")
+    w("    —— 码表全在 `crates/tables`（从 FFmpeg 的数据文件读出，见下文一、），")
+    w("    另外六个编解码器 crate 依赖它。")
     w("  - **MIT**（全文见 [LICENSE-MIT](LICENSE-MIT)）：")
     for line in crate_lines(MIT_CRATES):
         w(line)

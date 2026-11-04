@@ -34,7 +34,7 @@ pub mod test_support {
     pub use crate::mc::BUF_STRIDE;
 }
 mod mv;
-pub mod tables;
+pub use v2v_tables::vc1 as tables;
 
 pub use bitplane::{Bitplane, Imode};
 pub use decoder::{Decoder, Frame};

@@ -21,7 +21,7 @@
 用法：
     python3 tools/gen_vc1_tables.py [ffmpeg_src_dir]
 
-写 `crates/vc1/src/tables.rs`（路径相对仓库根，自动定位，不依赖当前工作目录）。
+写 `crates/tables/src/vc1.rs`（路径相对仓库根，自动定位，不依赖当前工作目录）。
 表来自 `libavcodec/vc1data.c` 与 `libavcodec/vc1_vlc_data.h`，枚举来自
 `libavcodec/vc1.h` 与 `libavcodec/vc1_common.h`。
 
@@ -467,4 +467,4 @@ def write(rel, text):
 if not os.path.isdir(f"{SRC}/libavcodec"):
     raise SystemExit(f"源目录不对：{SRC}/libavcodec 不存在（用 `python3 tools/gen_vc1_tables.py <ffmpeg_src>`）")
 
-write("crates/vc1/src/tables.rs", gen())
+write("crates/tables/src/vc1.rs", gen())

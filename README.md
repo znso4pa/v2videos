@@ -22,6 +22,8 @@
 ```text
 crates/
   container 各容器共用的数据模型（流 / 格式 / 样本）—— 零依赖
+  tables   **从 FFmpeg 数据文件生成的码表** —— 本仓唯一的 LGPL 派生数据，零依赖、零逻辑。
+           单独一个 crate：将来换数据源只改这一处，「要不要带 LGPL」= 一个依赖的有无
   asf      ASF（.wmv / .wma）解封装 + **封装** —— 纯 std
   avi      AVI（RIFF）解封装
   kernel   **编解码器共用的信号处理内核**：位读写器 / VLC / RL 表容器 / FDCT / IDCT / FFT /
@@ -754,13 +756,14 @@ escape 码本无符号、符号位单独发）。负系数的误差于是被估�
 
 | 范围 | 许可证 |
 |---|---|
-| `crates/{msmpeg4, vc1, aac, wma, mp4v, mpeg12}` | **LGPL-2.1-or-later**（[LICENSE](LICENSE)） |
+| `crates/{tables, msmpeg4, vc1, aac, wma, mp4v, mpeg12}` | **LGPL-2.1-or-later**（[LICENSE](LICENSE)） |
 | 其余 12 个 crate：`kernel` / `container` / `asf` / `avi` / `mpegps` / `mp4` / `player` / `cli` / `bench` / `capi` / `android-encode` / `mpeg12-simd` | **MIT**（[LICENSE-MIT](LICENSE-MIT)） |
 
-分界的**唯一依据是码表**：上面六个 crate 含从 FFmpeg 数据文件读出的 VLC / 反量化 /
-Huffman 表（`crates/*/src/tables.rs`，同为 LGPL-2.1-or-later）。表本身是
-H.263 / MPEG-4 Part 2 / MPEG-4 Audio / WMA / VC-1 / MPEG-1/2 的**格式定义**、
-与实现无关，也可以换数据源重新生成（`tools/` 下的生成器就是为此留的）。
+分界的**唯一依据是码表**：**全部码表都在 `crates/tables`**（从 FFmpeg 数据文件读出的
+VLC / 反量化 / Huffman 表，同为 LGPL-2.1-or-later），另外六个编解码器 crate 依赖它。
+表本身是 H.263 / MPEG-4 Part 2 / MPEG-4 Audio / WMA / VC-1 / MPEG-1/2 的**格式定义**、
+与实现无关，也可以换数据源重新生成（`tools/` 下的生成器就是为此留的）——
+**换源只改 `crates/tables` 一个 crate**，其余 crate 一行都不用动。
 
 其余代码是照着公开规范自己写的（不是从任何实现逐行翻译），所以可以按 MIT 分发。
 边界落在 **crate** 上而不是单个文件上 —— 每个 crate 只有一种许可证，不存在「同一个

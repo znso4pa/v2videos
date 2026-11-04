@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""从 FFmpeg 的数据文件生成 `crates/mpeg12/src/tables.rs`。
+"""从 FFmpeg 的数据文件生成 `crates/tables/src/mpeg12.rs`。
 
 用法：
 `python3 tools/gen_mpeg12_tables.py <ffmpeg 源码根>/libavcodec/mpeg12data.c <ffmpeg 源码根>/libavcodec/mpeg12.c <ffmpeg 源码根>/libavcodec/mpegvideodata.c`
@@ -19,7 +19,7 @@ import sys
 SRC = sys.argv[1] if len(sys.argv) > 1 else "libavcodec/mpeg12data.c"
 SRC2 = sys.argv[2] if len(sys.argv) > 2 else "libavcodec/mpeg12.c"
 SRC3 = sys.argv[3] if len(sys.argv) > 3 else "libavcodec/mpegvideodata.c"
-OUT = "crates/mpeg12/src/tables.rs"
+OUT = "crates/tables/src/mpeg12.rs"
 
 
 def body(src, name):

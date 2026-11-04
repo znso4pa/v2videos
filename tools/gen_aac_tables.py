@@ -18,7 +18,7 @@
 自己准备一份 FFmpeg 7.1 源码（`https://ffmpeg.org/download.html`），然后：
 - 前三个脚本：把路径作为**第一个参数**传进去；
 - `gen_wma_tables.py`：用 `--src <ffmpeg>/libavcodec`。
-写 `crates/aac/src/tables.rs`。表来自 `libavcodec/aactab.c` 与
+写 `crates/tables/src/aac.rs`。表来自 `libavcodec/aactab.c` 与
 `libavcodec/aacenctab.h`。
 """
 
@@ -336,4 +336,4 @@ def write(rel, text):
 if not os.path.isdir(f"{SRC}/libavcodec"):
     raise SystemExit(f"源目录不对：{SRC}/libavcodec 不存在")
 
-write("crates/aac/src/tables.rs", gen())
+write("crates/tables/src/aac.rs", gen())

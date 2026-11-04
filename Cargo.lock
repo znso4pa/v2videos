@@ -29,6 +29,7 @@ name = "v2v-aac"
 version = "0.0.0"
 dependencies = [
  "v2v-kernel",
+ "v2v-tables",
 ]
 
 [[package]]
@@ -122,6 +123,7 @@ version = "0.0.0"
 dependencies = [
  "v2v-kernel",
  "v2v-mp4",
+ "v2v-tables",
 ]
 
 [[package]]
@@ -130,6 +132,7 @@ version = "0.0.0"
 dependencies = [
  "v2v-kernel",
  "v2v-mpegps",
+ "v2v-tables",
 ]
 
 [[package]]
@@ -153,6 +156,7 @@ dependencies = [
  "v2v-avi",
  "v2v-bench",
  "v2v-kernel",
+ "v2v-tables",
 ]
 
 [[package]]
@@ -169,6 +173,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "v2v-tables"
+version = "0.0.0"
+
+[[package]]
 name = "v2v-vc1"
 version = "0.0.0"
 dependencies = [
@@ -177,6 +185,7 @@ dependencies = [
  "v2v-container",
  "v2v-kernel",
  "v2v-msmpeg4",
+ "v2v-tables",
 ]
 
 [[package]]
@@ -185,4 +194,5 @@ version = "0.0.0"
 dependencies = [
  "v2v-asf",
  "v2v-kernel",
+ "v2v-tables",
 ]

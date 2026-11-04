@@ -34,7 +34,7 @@
 mod decode;
 mod encode;
 mod header;
-pub mod tables;
+pub use v2v_tables::mp4v as tables;
 
 pub use decode::{Decoder, Vol};
 pub use encode::{Encoder, EncoderConfig};

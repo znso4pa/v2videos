@@ -5,8 +5,10 @@ v2video —— 第三方代码与数据来源
 
   - **LGPL-2.1-or-later**（全文见 [LICENSE](LICENSE)）：
     `crates/aac`、`crates/mpeg12`、`crates/mp4v`
-    `crates/msmpeg4`、`crates/vc1`、`crates/wma`
-    —— 这几个 crate 含**从 FFmpeg 的数据文件读出的码表**（见下文一、）。
+    `crates/msmpeg4`、`crates/tables`、`crates/vc1`
+    `crates/wma`
+    —— 码表全在 `crates/tables`（从 FFmpeg 的数据文件读出，见下文一、），
+    另外六个编解码器 crate 依赖它。
   - **MIT**（全文见 [LICENSE-MIT](LICENSE-MIT)）：
     `crates/android-encode`、`crates/asf`、`crates/avi`
     `crates/bench`、`crates/capi`、`crates/cli`
@@ -32,19 +34,19 @@ MIT 只覆盖那些 crate 的**源码**：单独取用 MIT 侧的 crate（例如
 下面这些 Rust 源文件是**生成的**（文件头都标了「不要手改」），
 数据由 `tools/` 下的生成器从 FFmpeg 7.1 的 `libavcodec/` 读出：
 
-    crates/msmpeg4/src/tables.rs
+    crates/tables/src/msmpeg4.rs
         ← tools/gen_tables.py
-    crates/mp4v/src/tables.rs
+    crates/tables/src/mp4v.rs
         ← tools/gen_tables.py
-    crates/aac/src/tables.rs
+    crates/tables/src/aac.rs
         ← tools/gen_aac_tables.py
-    crates/wma/src/tables.rs
+    crates/tables/src/wma.rs
         ← tools/gen_wma_tables.py
-    crates/msmpeg4/src/intrax8_tables.rs
+    crates/tables/src/intrax8.rs
         ← tools/gen_intrax8_tables.py
-    crates/vc1/src/tables.rs
+    crates/tables/src/vc1.rs
         ← tools/gen_vc1_tables.py
-    crates/mpeg12/src/tables.rs
+    crates/tables/src/mpeg12.rs
         ← tools/gen_mpeg12_tables.py
 
 这些表是 H.263 / MPEG-4 Part 2 / MPEG-4 Audio / WMA / VC-1 / IntraX8 的**格式定义**

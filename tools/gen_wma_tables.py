@@ -6,7 +6,7 @@
 ```bash
 python3 tools/gen_wma_tables.py \
     --src <你自己的 ffmpeg 源码>/libavcodec \
-    --out crates/wma/src/tables.rs
+    --out crates/tables/src/wma.rs
 ```
 
 ⚠️ `--src` 的**默认值是作者的本地路径**（`/tmp/ffsize/ffmpeg-7.1/libavcodec`），
@@ -169,7 +169,7 @@ def main() -> int:
         help="ffmpeg 的 libavcodec 目录。⚠️ 默认值是**作者的本地路径**，" 
              "第三方 clone 里不存在 —— 自己下一份 FFmpeg 源码再用这个参数指过来",
     )
-    ap.add_argument("--out", default="crates/wma/src/tables.rs")
+    ap.add_argument("--out", default="crates/tables/src/wma.rs")
     ap.add_argument(
         "--aactab",
         default="",

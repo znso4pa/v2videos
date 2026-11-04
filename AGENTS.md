@@ -8,11 +8,13 @@
 
 ## 现状
 
-**链路已经打通到 `.wmv → .mp4`**：**18 个 crate、约 7.6 万行 Rust**，**零第三方运行时依赖**
+**链路已经打通到 `.wmv → .mp4`**：**19 个 crate、约 7.6 万行 Rust**，**零第三方运行时依赖**
 （`Cargo.lock` 里只有本仓的包，外加 `cc` 那条**构建**链 —— 只服务 `android-encode` 的 C shim）。
 
 ```text
 container  解封装共用的数据模型（Stream / Sample / AudioFormat / VideoFormat）—— 零依赖
+tables     从 FFmpeg 数据文件生成的码表 —— **本仓唯一的 LGPL 派生数据**，零依赖、零逻辑；
+           六个编解码器 crate 依赖它。「脱离 LGPL」时只替换这一个 crate
 asf        ASF（.wmv / .wma）解封装 **+ 封装**（多载荷打包 + Simple Index）
 avi        AVI（RIFF）解封装
 mpegps     MPEG-1/2 program stream（`.mpg` / `.dat` / `.vob`）解封装
@@ -60,11 +62,12 @@ CLI 级还有一条 `crates/cli/tests/convert.rs::converts_wmv3_input`。
 
 ## 约定（现在起生效）
 
-- **许可证按 crate 分两种。** 含 FFmpeg 派生码表的六个 crate（`msmpeg4` / `vc1` / `aac` /
-  `wma` / `mp4v` / `mpeg12`）是 **LGPL-2.1-or-later**，其余 crate 是 **MIT**。
-  分界唯一依据是 `crates/*/src/tables.rs` 这些**生成的**表文件（从 FFmpeg 数据读出）；
+- **许可证按 crate 分两种。** **全部派生码表都在 `crates/tables`**（从 FFmpeg 数据读出），
+  它和依赖它的六个编解码器 crate（`msmpeg4` / `vc1` / `aac` / `wma` / `mp4v` / `mpeg12`）
+  是 **LGPL-2.1-or-later**，其余 crate 是 **MIT**。
   代码是照公开规范自研的，所以能按 MIT 分发。边界落在 **crate** 上而不是单个文件上 ——
   每个 crate 只有一种许可证。**但链接了 LGPL 侧 crate 的产物仍整体 LGPL**（MIT 只覆盖源码）。
+  `crates/tables` 是**唯一**的 LGPL 孤岛：换数据源只改它一个，其余 crate 一行都不用动。
   **代价**：LGPL 侧的 crate 不能链 GPL 的编码器（x264/x265/…），编码只能走宽松许可的实现
   或硬件（Android MediaCodec）。引第三方 crate 也要挑宽松许可的（Apache-2.0 / MIT / BSD），
   **MPL 这类 copyleft 一律不引**。别把 LGPL 代码并进 MIT 的库再改许可。

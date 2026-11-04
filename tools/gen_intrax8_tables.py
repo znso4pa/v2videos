@@ -19,7 +19,7 @@
 用法：
     python3 tools/gen_intrax8_tables.py [ffmpeg_src_dir]
 
-写 `crates/msmpeg4/src/intrax8_tables.rs`（路径相对仓库根，自动定位）。
+写 `crates/tables/src/intrax8.rs`（路径相对仓库根，自动定位）。
 表来自 `libavcodec/intrax8huf.h`、`libavcodec/intrax8.c`、`libavcodec/intrax8dsp.c`。
 
 默认源目录 `/tmp/ffsize/ffmpeg-7.1`。
@@ -320,4 +320,4 @@ def write(rel, text):
 if not os.path.isdir(f"{SRC}/libavcodec"):
     raise SystemExit(f"源目录不对：{SRC}/libavcodec 不存在（用 `python3 tools/gen_intrax8_tables.py <ffmpeg_src>`）")
 
-write("crates/msmpeg4/src/intrax8_tables.rs", gen())
+write("crates/tables/src/intrax8.rs", gen())

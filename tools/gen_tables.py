@@ -17,8 +17,8 @@
 
 同时写两个文件（路径相对仓库根，自动定位，不依赖当前工作目录）：
 
-    crates/msmpeg4/src/tables.rs    MS-MPEG-4（MP43）用
-    crates/mp4v/src/tables.rs       MPEG-4 Part 2 用
+    crates/tables/src/msmpeg4.rs    MS-MPEG-4（MP43）用
+    crates/tables/src/mp4v.rs       MPEG-4 Part 2 用
 
 默认源目录 `/tmp/ffsize/ffmpeg-7.1`。
 ⚠️ **默认源目录 `/tmp/ffsize/ffmpeg-7.1` 是作者的本地路径**，第三方 clone 里不存在。
@@ -184,7 +184,7 @@ def gen_msmpeg4():
             "//!\n"
             "//! 这些表是 **MS-MPEG-4 家族自用**的：宏块类型表（`MB_INTRA` / `MB_NON_INTRA`\n"
             "//! / `V2_*` / `WMV2_*`）、三套 escape 的 RL 表、WMV1 的 DC 缩放表、\n"
-            "//! 以及 WMV2 的 ABT 扫描表。**MPEG-4 Part 2 不能用**，那边见 `crates/mp4v/src/tables.rs`。\n",
+            "//! 以及 WMV2 的 ABT 扫描表。**MPEG-4 Part 2 不能用**，那边见 `crates/tables/src/mp4v.rs`。\n",
         )
     )
 
@@ -221,7 +221,7 @@ def gen_msmpeg4():
 
     # ---- V1 走的是 **H.263** 的宏块语法，表在 `h263data.c` 里 ----
     #
-    # ⚠️ 这几张与 `crates/mp4v/src/tables.rs` 里的**同名同源**（同一个生成器读同一个
+    # ⚠️ 这几张与 `crates/tables/src/mp4v.rs` 里的**同名同源**（同一个生成器读同一个
     # 文件）—— 不是「复刻第二份」：两个 crate 各自持有一份是既有格局
     # （`RL_INTRA` / `RL_INTER` / `H_SCAN` / `V_SCAN` 早就两边都有）。
     hd = read("h263data.c")
@@ -320,7 +320,7 @@ def gen_mp4v():
             "MPEG-4 Part 2（`mp4v`）编解码需要的表。",
             MP4V_SOURCES,
             "//!\n"
-            "//! 与 `crates/msmpeg4/src/tables.rs` 的区别：那边是 MP43 的私有表\n"
+            "//! 与 `crates/tables/src/msmpeg4.rs` 的区别：那边是 MP43 的私有表\n"
             "//! （`MB_INTRA` / `MB_NON_INTRA`、三套 escape 的 RL 表、WMV1 的 DC 缩放），\n"
             "//! **这里一张都不能用**。MPEG-4 Part 2 的宏块语法是纯 H.263 的，\n"
             "//! DC 走 `ff_mpeg4_DCtab_*` 的「位长 VLC」，DC 缩放走 `ff_mpeg4_*_dc_scale_table`。\n",
@@ -411,5 +411,5 @@ def write(rel, text):
 if not os.path.isdir(f"{SRC}/libavcodec"):
     raise SystemExit(f"源目录不对：{SRC}/libavcodec 不存在（用 `python3 tools/gen_tables.py <ffmpeg_src>`）")
 
-write("crates/msmpeg4/src/tables.rs", gen_msmpeg4())
-write("crates/mp4v/src/tables.rs", gen_mp4v())
+write("crates/tables/src/msmpeg4.rs", gen_msmpeg4())
+write("crates/tables/src/mp4v.rs", gen_mp4v())

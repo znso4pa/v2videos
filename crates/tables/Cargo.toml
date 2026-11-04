@@ -1,0 +1,15 @@
+[package]
+name = "v2v-tables"
+version.workspace = true
+edition.workspace = true
+# 工作区默认值 = LGPL-2.1-or-later。本 crate 就是那个「LGPL 孤岛」。
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "从 FFmpeg 数据文件生成的码表 —— 本仓唯一的 LGPL 派生数据"
+
+# 本 crate **只有数据**：零依赖、零逻辑。它是「脱离 LGPL」时唯一要替换的地方 ——
+# 换成从规范（或别的宽松来源）生成的同名模块，其余 crate 一行都不用改。
+# 迁移判据：新表必须与这里的表**逐值相同**（表就是格式定义，等价即正确）。
+
+[dependencies]

@@ -569,7 +569,7 @@ mod tests {
 }
 
 pub mod decode;
-pub mod tables;
+pub use v2v_tables::mpeg12 as tables;
 
 #[cfg(test)]
 mod table_tests {

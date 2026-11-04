@@ -52,7 +52,7 @@
 
 mod encode;
 pub mod mdct;
-pub mod tables;
+pub use v2v_tables::aac as tables;
 mod tns;
 
 pub use encode::{AudioSpecificConfig, Encoder, EncoderConfig, Frame, AOT_AAC_LC};

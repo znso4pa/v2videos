@@ -7,6 +7,8 @@ repository.workspace = true
 description = "MPEG-1/2 video elementary stream parser"
 
 [dependencies]
+# 码表（LGPL 派生数据）单独一个 crate —— 见 crates/tables/src/lib.rs
+v2v-tables = { path = "../tables" }
 # 位读取器 / IDCT / FDCT —— 与具体编解码格式无关的那几件，走共享内核。
 v2v-kernel = { path = "../kernel" }
 

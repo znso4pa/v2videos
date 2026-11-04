@@ -29,7 +29,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # 与 tools/gen_notice.py 的 LGPL_CRATES / MIT_CRATES 必须一致。
 # 两边都列是**故意的**：这里读的是「期望值」，生成器读的是「写进 NOTICE 的值」，
 # 两边同时改错才会一起骗过人。
-LGPL_CRATES = ["aac", "mpeg12", "mp4v", "msmpeg4", "vc1", "wma"]
+LGPL_CRATES = ["aac", "mpeg12", "mp4v", "msmpeg4", "tables", "vc1", "wma"]
 MIT_CRATES = [
     "android-encode",
     "asf",

@@ -35,7 +35,7 @@ mod bitreader;
 mod decoder;
 mod params;
 mod superframe;
-pub mod tables;
+pub use v2v_tables::wma as tables;
 
 pub use bitreader::BitReader;
 pub use decoder::WmaDecoder;
