@@ -16,7 +16,7 @@
 //!   没有真样本之前不下结论。
 
 use v2v_msmpeg4::{decode_i_frame, Decoder, Encoder, EncoderConfig, Version};
-use v2v_kernel::mc::{Frame};
+use v2v_kernel::mc::Frame;
 
 /// 一帧 64×48 的 YUV420P：一块 16×16 的方块从左上往右下平移，背景是渐变。
 fn make_frame(w: u32, h: u32, t: usize) -> Frame {

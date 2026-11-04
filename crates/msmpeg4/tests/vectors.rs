@@ -7,7 +7,7 @@
 
 use v2v_kernel::BitReader;
 use v2v_msmpeg4::{decode012, parse_frame_header, PictureType};
-use v2v_kernel::mc::{ZIGZAG};
+use v2v_kernel::mc::ZIGZAG;
 use v2v_asf::fourcc_string;
 use v2v_kernel::Vlc;
 use v2v_kernel::predict::AcVal;

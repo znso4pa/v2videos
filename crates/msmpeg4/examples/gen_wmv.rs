@@ -2,7 +2,7 @@
 use std::io::Write;
 use v2v_asf::{AsfMuxer, VideoStreamInfo};
 use v2v_msmpeg4::{Encoder, EncoderConfig};
-use v2v_kernel::mc::{Frame};
+use v2v_kernel::mc::Frame;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out = std::env::args().nth(1).unwrap_or("/tmp/loop.wmv".into());

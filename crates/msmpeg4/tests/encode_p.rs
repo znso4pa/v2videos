@@ -9,7 +9,7 @@ mod common;
 
 use common::{compare, ffmpeg_frames, unique_temp, wrap_avi};
 use v2v_msmpeg4::{Decoder, Encoder, EncoderConfig};
-use v2v_kernel::mc::{Frame};
+use v2v_kernel::mc::Frame;
 
 /// 合成一段**有运动**的序列：纹理背景 + 一个每帧平移的方块。
 /// 背景有纹理是为了让运动估计真的有东西可匹配（纯色背景测不出 ME）。

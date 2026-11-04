@@ -11,7 +11,7 @@ mod common;
 
 use common::{compare, ffmpeg_frames, first_video_frames, sample, unique_temp, wrap_single_frame_avi};
 use v2v_msmpeg4::{decode_i_frame, parse_frame_header, parse_wmv2_frame, Decoder, Encoder, EncoderConfig, HeaderState, PictureType, Version, Wmv2Flags, Wmv2Frame};
-use v2v_kernel::mc::{Frame};
+use v2v_kernel::mc::Frame;
 
 /// 按**版本**解一帧原始 I 帧（只用来给编码器当输入）。
 ///
