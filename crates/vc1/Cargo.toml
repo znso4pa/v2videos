@@ -10,7 +10,7 @@ license.workspace = true
 v2v-tables = { path = "../tables" }
 # 位读取器 / 前缀码（VLC）/ 错误类型 / 帧缓冲（`Planes`）/ 中值预测 / ABT 的 4:8 8:4
 # 落位，都走共享内核 —— 不复刻一遍（复刻出来的第二份才是真会跑偏的那份）。
-v2v-kernel = { path = "../kernel" }
+v2v-kernel = { path = "../v2v-kernel" }
 # ⚠️ 只剩**码表**这一处：`tables::SCAN` / `ABT_SCAN_A` / `ABT_SCAN_B` / `MB_INTRA` /
 # `DC`。VC-1 的 8×8 扫描与 MB 类型 / DC 码确实就是 MS-MPEG-4 那几张（VC-1 从 WMV 那
 # 一支继承来的），所以直接借，不复刻。代价是「改 MS-MPEG-4 会重编 VC-1」——
@@ -20,8 +20,8 @@ v2v-msmpeg4 = { path = "../msmpeg4" }
 
 [dev-dependencies]
 # 只给集成测试用：从 ASF 里取视频样本 + extradata 做对账。
-v2v-asf = { path = "../asf" }
-v2v-container = { path = "../container" }
+v2v-asf = { path = "../v2v-asf" }
+v2v-container = { path = "../v2v-container" }
 # `tests/decode_bench.rs` / `decode_parallel_bench.rs` 用它的 TSV 格式
 # （`V2V_BENCH_TSV` 给了路径才写）。
-v2v-bench = { path = "../bench" }
+v2v-bench = { path = "../v2v-bench" }

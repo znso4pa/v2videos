@@ -11,12 +11,12 @@ v2v-tables = { path = "../tables" }
 # 编解码器共用的那一层（位读写 / VLC / RL / DCT / IDCT / FFT / 帧缓冲 / 运动补偿 / SAD）。
 # 本 crate 是它最大的用户：`simd` 那套 NEON 目前唯一的调用方就是这边的运动估计，
 # 所以**只有这里**打开 `unsafe-kernels`（别的 crate 拿到的仍是纯标量实现）。
-v2v-kernel = { path = "../kernel", features = ["unsafe-kernels"] }
+v2v-kernel = { path = "../v2v-kernel", features = ["unsafe-kernels"] }
 
 [dev-dependencies]
 # 只给 example / 集成测试用：从 ASF 里取视频样本做验证。
-v2v-asf = { path = "../asf" }
+v2v-asf = { path = "../v2v-asf" }
 # MP42 的对账样本只有 AVI 能装（ffmpeg 的 `msmpeg4v2` 编码器出 .avi）。
-v2v-avi = { path = "../avi" }
+v2v-avi = { path = "../v2v-avi" }
 # `tests/decode_bench.rs` 用它的 TSV 格式（`V2V_BENCH_TSV` 给了路径才写）。
-v2v-bench = { path = "../bench" }
+v2v-bench = { path = "../v2v-bench" }

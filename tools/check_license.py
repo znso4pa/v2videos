@@ -31,18 +31,18 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # 两边同时改错才会一起骗过人。
 LGPL_CRATES = ["aac", "mpeg12", "mp4v", "msmpeg4", "tables", "vc1", "wma"]
 MIT_CRATES = [
-    "android-encode",
-    "asf",
-    "avi",
-    "bench",
-    "capi",
-    "cli",
-    "container",
-    "kernel",
-    "mpeg12-simd",
-    "mpegps",
-    "mp4",
-    "player",
+    "v2v-android",
+    "v2v-asf",
+    "v2v-avi",
+    "v2v-bench",
+    "v2v-capi",
+    "v2v-cli",
+    "v2v-container",
+    "v2v-kernel",
+    "v2v-mpeg12-simd",
+    "v2v-mpegps",
+    "v2v-mp4",
+    "v2v-player",
 ]
 
 LGPL = "LGPL-2.1-or-later"

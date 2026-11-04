@@ -105,4 +105,4 @@ cargo build --release -p v2v-cli
 
 - **本地 / 发布前**：人手工跑 `--check`，对着自己机器的基线看有没有退化。
 - **CI**：不跑。CI 里没有真样本（版权 + 体积，不入库），而合成样本是 MP43、
-  `v2v bench` 打不开。格式与比较逻辑本身是纯函数，由 `crates/bench` 的单元测试守着。
+  `v2v bench` 打不开。格式与比较逻辑本身是纯函数，由 `crates/v2v-bench` 的单元测试守着。

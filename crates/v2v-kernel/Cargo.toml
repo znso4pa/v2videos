@@ -1,0 +1,28 @@
+[package]
+name = "v2v-kernel"
+version.workspace = true
+edition.workspace = true
+license = "MIT"
+repository.workspace = true
+publish = false
+description = "编解码器共用的信号处理内核：位流、VLC、DCT/IDCT、FFT、运动补偿、SIMD"
+
+# 这里**只能有与具体编解码器无关**的东西。判断标准：把任意一个编解码器整个删掉，
+# 本 crate 里不该有任何一个函数变成死代码。
+#
+# 反例（因此不在这里）：WMV2 那套 `wmv2_idct_*` 留在 `v2v-msmpeg4`；
+# 帧头解析、宏块语法、预测器一律留在各自的编解码器里。
+
+[features]
+default = []
+# 打开后 `simd` 走 NEON 的 `unsafe` 路径；**不开就纯标量**（逐位等价，只是慢）。
+#
+# 为什么要做成 feature 而不是无条件开：`mpeg12` 那条线的卖点之一是「参考实现、
+# 零 unsafe」。它是**依赖闭包**里一个 unsafe 都没有 —— 这句话只有在下面这条
+# 成立时才是真的：`mpeg12` 的依赖里没有谁打开这个 feature。
+# `crates/v2v-kernel/tests/feature_gate.rs` 就是拿 `cargo tree` 钉住这一条的。
+#
+# ⚠️ Cargo 的 feature 是**并集**：同一个构建里只要有一个 crate 打开它（比如
+# `v2v-msmpeg4`，它的运动估计靠这个 NEON 内核），整个 `v2v-kernel` 都会带上。
+# 所以这条保证是**按依赖闭包**成立的，不是按 crate 名成立的。
+unsafe-kernels = []

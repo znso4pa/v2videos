@@ -48,18 +48,18 @@ LGPL_CRATES = ["aac", "mpeg12", "mp4v", "msmpeg4", "tables", "vc1", "wma"]
 
 # 其余 crate：源码自研，按 MIT 分发（**不含**链接后产物，见下文）。
 MIT_CRATES = [
-    "android-encode",
-    "asf",
-    "avi",
-    "bench",
-    "capi",
-    "cli",
-    "container",
-    "kernel",
-    "mpeg12-simd",
-    "mpegps",
-    "mp4",
-    "player",
+    "v2v-android",
+    "v2v-asf",
+    "v2v-avi",
+    "v2v-bench",
+    "v2v-capi",
+    "v2v-cli",
+    "v2v-container",
+    "v2v-kernel",
+    "v2v-mpeg12-simd",
+    "v2v-mpegps",
+    "v2v-mp4",
+    "v2v-player",
 ]
 
 

@@ -13,8 +13,8 @@ v2v-tables = { path = "../tables" }
 #
 # ⚠️ 这里**没有** `v2v-msmpeg4`：MPEG-4 Part 2 与 MS-MPEG-4 只在「数值内核」这一层
 # 相通，语法层各写各的。哪天想从这边借 MS-MPEG-4 的东西，先想清楚它是不是该进 kernel。
-v2v-kernel = { path = "../kernel" }
+v2v-kernel = { path = "../v2v-kernel" }
 
 [dev-dependencies]
 # 对账测试要把编出来的流封成 MP4 再让 ffmpeg 解，所以容器也要能用。
-v2v-mp4 = { path = "../mp4" }
+v2v-mp4 = { path = "../v2v-mp4" }

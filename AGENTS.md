@@ -12,13 +12,13 @@
 （`Cargo.lock` 里只有本仓的包，外加 `cc` 那条**构建**链 —— 只服务 `android-encode` 的 C shim）。
 
 ```text
-container  解封装共用的数据模型（Stream / Sample / AudioFormat / VideoFormat）—— 零依赖
+v2v-container  解封装共用的数据模型（Stream / Sample / AudioFormat / VideoFormat）—— 零依赖
 tables     从 FFmpeg 数据文件生成的码表 —— **本仓唯一的 LGPL 派生数据**，零依赖、零逻辑；
            六个编解码器 crate 依赖它。「脱离 LGPL」时只替换这一个 crate
-asf        ASF（.wmv / .wma）解封装 **+ 封装**（多载荷打包 + Simple Index）
-avi        AVI（RIFF）解封装
-mpegps     MPEG-1/2 program stream（`.mpg` / `.dat` / `.vob`）解封装
-kernel     编解码器**共用的信号处理内核**：位读写 / VLC / RL 表容器 / FDCT / IDCT / FFT /
+v2v-asf    ASF（.wmv / .wma）解封装 **+ 封装**（多载荷打包 + Simple Index）
+v2v-avi    AVI（RIFF）解封装
+v2v-mpegps MPEG-1/2 program stream（`.mpg` / `.dat` / `.vob`）解封装
+v2v-kernel 编解码器**共用的信号处理内核**：位读写 / VLC / RL 表容器 / FDCT / IDCT / FFT /
            帧缓冲（`Frame` / `Planes`）/ 运动补偿 / SAD / 宏块层预测 / NEON
            —— 全仓唯一允许 `unsafe` 的地方，且只有 `simd` 一个模块
 msmpeg4    MP42 / MP43 / WMV1 / WMV2 解码（I / P，WMV2 含 IntraX8）**+ MP43 编码**（I / P，含运动估计）
@@ -26,36 +26,39 @@ wma        WMA v1 / v2 解码（**只有解码器**）
 vc1        VC-1（WMV3）解码（I / P，含 ABT / ¼ 像素 MC / 环路滤波；**只有解码器**）
 mpeg12     MPEG-1/2 解码（I / P / B、隔行、4:2:2 / 4:4:4）—— **本 crate 自身零 unsafe，
            且依赖闭包里也没有 unsafe**（kernel 的 NEON 是 opt-in feature，这里不开），当参考实现
-mpeg12-simd  同一内核的 unsafe / FFI 变体，可单独编 .so / .a
+v2v-mpeg12-simd  同一内核的 unsafe / FFI 变体，可单独编 .so / .a
 mp4v       MPEG-4 Part 2 编码（I / P + 码率控制）**+ 解码**（I / P）
 aac        AAC-LC 编码（MDCT / 短窗 / TNS / Huffman / 码率控制）
-mp4        MP4 / ISOBMFF 封装（mp4v + mp4a(AAC) 或 sowt PCM）
-player     顺时播放层：逐帧 / 逐样本、两轨独立、`seek(ms)`
-android-encode  平台硬编：硬件 H.264（VideoToolbox / MediaCodec）+ WMA→WAV 抽轨（**只有 rlib**）
-capi       **全仓唯一的 C ABI**：`v2v_*` 一族符号 + 唯一头文件 `crates/capi/include/v2v.h`
-cli        `v2v convert`：ASF / AVI → `.wmv`（MP43 + 音频直通）或 `.mp4`（mp4v + AAC）
+v2v-mp4    MP4 / ISOBMFF 封装（mp4v + mp4a(AAC) 或 sowt PCM）
+v2v-player 顺时播放层：逐帧 / 逐样本、两轨独立、`seek(ms)`
+v2v-android  平台硬编：硬件 H.264（VideoToolbox / MediaCodec）+ WMA→WAV 抽轨（**只有 rlib**）
+v2v-capi   **全仓唯一的 C ABI**：`v2v_*` 一族符号 + 唯一头文件 `crates/v2v-capi/include/v2v.h`
+v2v-cli    `v2v convert`：ASF / AVI → `.wmv`（MP43 + 音频直通）或 `.mp4`（mp4v + AAC）
            **+ `v2v bench`**：测量写成 TSV、可选对着基线卡回归
-bench      性能测量的**格式与寿命管理**：TSV 读写 / 机器指纹 / 回归比较 —— **零依赖**，
+v2v-bench  性能测量的**格式与寿命管理**：TSV 读写 / 机器指纹 / 回归比较 —— **零依赖**，
            不测量任何东西（测量在各 crate 自己的 bench 里）
 ```
 
-**C ABI 只有一个入口，就是 `capi`。** 别在别的 crate 里加 `#[no_mangle]`：一个进程里
-同名符号只能有一份定义，`capi` 把别的 crate 静态链进去时会直接撞符号；就算不撞，
+> 目录名带 `v2v-` 的是 **MIT** 侧；不带前缀的（`tables` / `msmpeg4` / `vc1` / `wma` /
+> `mp4v` / `aac` / `mpeg12`）是 **LGPL** 侧 —— `ls crates/` 就能看出边界。
+
+**C ABI 只有一个入口，就是 `v2v-capi`。** 别在别的 crate 里加 `#[no_mangle]`：一个进程里
+同名符号只能有一份定义，`v2v-capi` 把别的 crate 静态链进去时会直接撞符号；就算不撞，
 两个 `.so` 各有一个 `v2v_last_error`，调用方读到的错误可能来自另一个库的线程局部
-变量 —— 那种错不会报错，只会查不出来。`android-encode` 原来那层 `capi.rs` 就是这么
+变量 —— 那种错不会报错，只会查不出来。`v2v-android` 原来那层 `capi.rs` 就是这么
 搬走的（符号名与签名都没变，只是换了个 `.so` 导出）。
 
 `capi` 的产物是**两个**：`build-products.sh` 出 `min`（默认 feature，宿主用）与
 `full`（加 `hw` / `mpeg12`，诊断用）。同主版本就同 ABI。
 
-**输入编码认这些**（`crates/cli/src/lib.rs::open_video_decoder` 是唯一真源）：
+**输入编码认这些**（`crates/v2v-cli/src/lib.rs::open_video_decoder` 是唯一真源）：
 `MP42` / `MP43` / `WMV1` / `WMV2` / **`WMV3`（VC-1）** / `mp4v`（`FMP4`·`DIVX`·`XVID`）。
 其余明确报 `Unsupported`（MP41 没有可对账的样本，拒绝而不是猜）。
 
 ⚠️ **VC-1 已经接进 CLI**（`open_video_decoder` 的 `WMV3` 分支 + `VideoDecoder::Vc1`），
 GOP 并行解码也开了 —— 「解码顺序 ≠ 显示顺序」由「按 PTS 出帧」处理，
 前提「从任意 I 帧起解 == 整链解到那里」由 `crates/vc1/tests/gop_start.rs` 钉着。
-CLI 级还有一条 `crates/cli/tests/convert.rs::converts_wmv3_input`。
+CLI 级还有一条 `crates/v2v-cli/tests/convert.rs::converts_wmv3_input`。
 
 下面的**约定**与**架构不变量**是硬约束（从隔壁 UsefulUnpack 的实战里换来的，不是摆设）——
 动手前先读完；**进度、判据、下一步**在 `TODO.md`（本地、不入库、唯一真源），面向人的状态表在 README。
@@ -246,7 +249,7 @@ df -h /System/Volumes/Data  # 磁盘 <10% 可用会让 macOS 整体变卡（换�
    后面，默认不编译（纯标量、逐位等价）。所以「依赖闭包里零 unsafe」对只吃安全路径
    的 crate 成立 —— `v2v-mpeg12` 就是，`v2v-msmpeg4` 显式打开它。
    ⚠️ feature 是**并集**：同一次构建里只要有一个 crate 打开，整棵图都带上。
-   这条保证由 `crates/kernel/tests/feature_gate.rs`（`cargo tree -e features`）钉住，
+   这条保证由 `crates/v2v-kernel/tests/feature_gate.rs`（`cargo tree -e features`）钉住，
    **别只写注释**。
 4. **码表只有一份真源**：`crates/*/src/tables.rs` 是唯一落点，生成与自检脚本在
    `tools/`（`gen_tables.py` / `gen_aac_tables.py` / `gen_wma_tables.py` / `check_tables.py`）。
@@ -306,8 +309,8 @@ df -h /System/Volumes/Data  # 磁盘 <10% 可用会让 macOS 整体变卡（换�
    ```
    应当**没有输出**（它们只该出现在 `tests/` 与 `examples/` 里）。排查期随手写的
    example / 脚本 / 写死路径已经删掉（「本地调试残留」那条）。
-   ⚠️ 别用裸的 `grep -rn 'V2V_'`：`crates/capi/src` 里的 `V2V_ERR_*` / `V2V_INFO_*`
-   是 **C ABI 的常量名**、`crates/bench` 的 `V2V_BENCH_TSV` 是**正经的环境变量开关**
+   ⚠️ 别用裸的 `grep -rn 'V2V_'`：`crates/v2v-capi/src` 里的 `V2V_ERR_*` / `V2V_INFO_*`
+   是 **C ABI 的常量名**、`crates/v2v-bench` 的 `V2V_BENCH_TSV` 是**正经的环境变量开关**
    —— 那些匹配全是噪音，会让人以为清理不干净。
 4. 判据、量出来的数字、试过又撤掉的候选 —— 写 `TODO.md`，**不进提交信息**。
 5. 动了**性能敏感**的路径（解码内层循环 / 编码器 / 容器写入）：跑一次

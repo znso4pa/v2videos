@@ -1,0 +1,10 @@
+[package]
+name = "v2v-asf"
+description = "纯 Rust ASF（.wmv / .wma）解封装 —— 无 C、无 FFI"
+version.workspace = true
+edition.workspace = true
+license = "MIT"
+
+[dependencies]
+# 容器无关的共用类型（流 / 样本 / 格式）。
+v2v-container = { path = "../v2v-container" }

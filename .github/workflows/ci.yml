@@ -107,7 +107,7 @@ jobs:
       #
       # 性能门在本地：`v2v bench --check bench/baseline/<机器指纹>.tsv`，
       # 口径与「门卡比值不卡毫秒」的理由见 `bench/README.md`。
-      # 格式 / 指纹 / 比较这三块是纯函数，由 `crates/bench` 的单元测试守着，
+      # 格式 / 指纹 / 比较这三块是纯函数，由 `crates/v2v-bench` 的单元测试守着，
       # 上面那步 `cargo test --workspace` 已经跑了。
       - name: bench 子命令接线
         run: cargo run -q -p v2v-cli -- bench --help > /dev/null

@@ -18,7 +18,7 @@
 //! `unsafe-kernels` feature 后面的 opt-in 路径，**本 crate 不开** —— 于是拿到的
 //! 是逐位等价的纯标量实现。
 //!
-//! ⚠️ 这句话是**机器守着的**，不是人记的：`crates/kernel/tests/feature_gate.rs`
+//! ⚠️ 这句话是**机器守着的**，不是人记的：`crates/v2v-kernel/tests/feature_gate.rs`
 //! 拿 `cargo tree -e features` 断言「`v2v-mpeg12` 的闭包里没有 `unsafe-kernels`」。
 //! 谁要是给这条链上的某个依赖加上了那个 feature，那条测试会红。
 

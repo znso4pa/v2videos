@@ -10,4 +10,4 @@ license.workspace = true
 v2v-tables = { path = "../tables" }
 # MDCT 的 FFT 与位写入器（`BitWriter` 的 MSB 优先语义正好与 AAC 一致）——
 # 都是与具体编码格式无关的东西，复用共享内核里已经验证过的那一份。
-v2v-kernel = { path = "../kernel" }
+v2v-kernel = { path = "../v2v-kernel" }

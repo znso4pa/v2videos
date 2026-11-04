@@ -19,41 +19,44 @@
 
 ## 目录
 
+> 目录名带 `v2v-` 前缀的是 **MIT** 侧；不带前缀的（`tables` / `msmpeg4` / `vc1` / `wma` /
+> `mp4v` / `aac` / `mpeg12`）是 **LGPL** 侧 —— `ls crates/` 就能看出边界。
+
 ```text
 crates/
-  container 各容器共用的数据模型（流 / 格式 / 样本）—— 零依赖
-  tables   **从 FFmpeg 数据文件生成的码表** —— 本仓唯一的 LGPL 派生数据，零依赖、零逻辑。
-           单独一个 crate：将来换数据源只改这一处，「要不要带 LGPL」= 一个依赖的有无
-  asf      ASF（.wmv / .wma）解封装 + **封装** —— 纯 std
-  avi      AVI（RIFF）解封装
-  kernel   **编解码器共用的信号处理内核**：位读写器 / VLC / RL 表容器 / FDCT / IDCT / FFT /
-           帧缓冲（`Frame` / `Planes`）/ 运动补偿 / SAD / 宏块层预测 / NEON
-           —— 全仓唯一允许 `unsafe` 的地方，而且只有 `simd` 一个模块
-  msmpeg4  MS-MPEG-4 v2/v3（MP42 / MP43）/ WMV1 / WMV2 解码（I / P + **IntraX8**）+ MP43 编码（I / P，含运动估计与帧内/帧间判决）
-  wma      WMA v1/v2 音频解码（帧头 / LSP 指数 / 系数 / IMDCT）
-  vc1      VC-1（**WMV3**）解码：Simple/Main profile、渐进、I/P —— 序列头 → 帧头 → 位平面 →
-           宏块层 → 逆变换（8×8 + ABT）→ 运动补偿（¼ 像素）→ 环路滤波 → YUV420P
-  mp4v     MPEG-4 Part 2（mp4v）编码：I / P + 码率控制；**解码**：I / P 对 ffmpeg 逐像素 0 差
-  aac      **AAC-LC 编码**：MDCT（长/短窗）+ TNS + Huffman 码本 + 码率控制
-  mp4      MP4 / ISOBMFF **封装**（ftyp / mdat / moov；音频 AAC 或 PCM）
-  mpegps   MPEG-1/2 **program stream** 解封装（`.mpg` / `.dat` / `.vob` 那类 PS 容器）
-  mpeg12   MPEG-1/2 **解码**（本 crate 自身零 unsafe，**且依赖闭包里也没有 unsafe**
-           —— kernel 的 NEON 是 opt-in feature，这里不开；当参考实现/oracle）：MPEG-1 的 I/P/B；
-           MPEG-2 的 progressive 帧图、隔行帧图的场 DCT / 场运动、4:2:2 / 4:4:4 色度
-  mpeg12-simd  同一个解码内核的 **unsafe / FFI 变体**：可单独编 `.so` / `.a` 给宿主链；
-           每个内核都要逐字节对 `mpeg12` 验
-  player   顺时播放层：逐帧取视频、逐样本取音频、两轨独立、`seek(ms)`（Simple Index +
-           关键帧回退 + 前向解码到目标）—— 对应 Android 播放服务需求的 Rust 侧。
-           另有 `mpeg12` feature 下的 `MpgPlayer`（MPEG-1/2，**只有视频**，默认不编）
-  android-encode  **Android 硬件编码路径**：MediaCodec H.264 + MediaMuxer MP4。
-           unsafe 全部收在 `c/media_encoder.c` + `src/ffi.rs`（详见下面「FFI」一节）
-  capi     **全仓唯一的 C ABI**（`libv2v_capi`）：一层一组 `v2v_*` 符号 +
-           一份手写头文件 `include/v2v.h`。容器 / 解码 / 编码 / 封装 / 播放 /
-           MPEG-1/2 / 硬件转码，全在一个 `.so` 里（详见下面「C ABI」一节）
-  cli      `v2v` 命令行：**批量转码**（解封装 → 解码 → 编码 → 封装）+ `v2v bench`
-           （测量写成 TSV、可选对着基线卡回归）
-  bench    性能测量的**格式与寿命管理**：TSV 读写 / 机器指纹 / 回归比较 —— **零依赖**，
-           自己不测量任何东西（见 `bench/README.md`）
+  tables            **从 FFmpeg 数据文件生成的码表** —— 本仓唯一的 LGPL 派生数据，零依赖、零逻辑。
+                    单独一个 crate：将来换数据源只改这一处，「要不要带 LGPL」= 一个依赖的有无
+  v2v-container     各容器共用的数据模型（流 / 格式 / 样本）—— 零依赖
+  v2v-asf           ASF（.wmv / .wma）解封装 + **封装** —— 纯 std
+  v2v-avi           AVI（RIFF）解封装
+  v2v-kernel        **编解码器共用的信号处理内核**：位读写器 / VLC / RL 表容器 / FDCT / IDCT / FFT /
+                    帧缓冲（`Frame` / `Planes`）/ 运动补偿 / SAD / 宏块层预测 / NEON
+                    —— 全仓唯一允许 `unsafe` 的地方，而且只有 `simd` 一个模块
+  msmpeg4           MS-MPEG-4 v2/v3（MP42 / MP43）/ WMV1 / WMV2 解码（I / P + **IntraX8**）+ MP43 编码（I / P，含运动估计与帧内/帧间判决）
+  wma               WMA v1/v2 音频解码（帧头 / LSP 指数 / 系数 / IMDCT）
+  vc1               VC-1（**WMV3**）解码：Simple/Main profile、渐进、I/P —— 序列头 → 帧头 → 位平面 →
+                    宏块层 → 逆变换（8×8 + ABT）→ 运动补偿（¼ 像素）→ 环路滤波 → YUV420P
+  mp4v              MPEG-4 Part 2（mp4v）编码：I / P + 码率控制；**解码**：I / P 对 ffmpeg 逐像素 0 差
+  aac               **AAC-LC 编码**：MDCT（长/短窗）+ TNS + Huffman 码本 + 码率控制
+  v2v-mp4           MP4 / ISOBMFF **封装**（ftyp / mdat / moov；音频 AAC 或 PCM）
+  v2v-mpegps        MPEG-1/2 **program stream** 解封装（`.mpg` / `.dat` / `.vob` 那类 PS 容器）
+  mpeg12            MPEG-1/2 **解码**（本 crate 自身零 unsafe，**且依赖闭包里也没有 unsafe**
+                    —— kernel 的 NEON 是 opt-in feature，这里不开；当参考实现/oracle）：MPEG-1 的 I/P/B；
+                    MPEG-2 的 progressive 帧图、隔行帧图的场 DCT / 场运动、4:2:2 / 4:4:4 色度
+  v2v-mpeg12-simd   同一个解码内核的 **unsafe / FFI 变体**：可单独编 `.so` / `.a` 给宿主链；
+                    每个内核都要逐字节对 `mpeg12` 验
+  v2v-player        顺时播放层：逐帧取视频、逐样本取音频、两轨独立、`seek(ms)`（Simple Index +
+                    关键帧回退 + 前向解码到目标）—— 对应 Android 播放服务需求的 Rust 侧。
+                    另有 `mpeg12` feature 下的 `MpgPlayer`（MPEG-1/2，**只有视频**，默认不编）
+  v2v-android       **Android 硬件编码路径**：MediaCodec H.264 + MediaMuxer MP4。
+                    unsafe 全部收在 `c/media_encoder.c` + `src/ffi.rs`（详见下面「FFI」一节）
+  v2v-capi          **全仓唯一的 C ABI**（`libv2v_capi`）：一层一组 `v2v_*` 符号 +
+                    一份手写头文件 `include/v2v.h`。容器 / 解码 / 编码 / 封装 / 播放 /
+                    MPEG-1/2 / 硬件转码，全在一个 `.so` 里（详见下面「C ABI」一节）
+  v2v-cli           `v2v` 命令行：**批量转码**（解封装 → 解码 → 编码 → 封装）+ `v2v bench`
+                    （测量写成 TSV、可选对着基线卡回归）
+  v2v-bench         性能测量的**格式与寿命管理**：TSV 读写 / 机器指纹 / 回归比较 —— **零依赖**，
+                    自己不测量任何东西（见 `bench/README.md`）
 tools/
   gen_tables.py     H.263 / MPEG-4 Part 2 的 VLC / 反量化表（附自检：前缀无关、Kraft 和、逐码往返）
   check_tables.py   用**第二个独立来源**核对 msmpeg4 的表
@@ -78,24 +81,24 @@ tools/
 
 FFI 有两个方向，**每个方向都只有一个 crate**，别在别处加：
 
-- **进站（我们调 C）**：`crates/android-encode`。
-- **出站（C 调我们）**：`crates/capi`。
+- **进站（我们调 C）**：`crates/v2v-android`。
+- **出站（C 调我们）**：`crates/v2v-capi`。
 
 其余全部纯 Rust（`msmpeg4` / `mp4v` 的 NEON 走 `std::arch` intrinsics，不跨语言
 边界，**不算 FFI**）。
 
 | | 边界在哪 | 为什么需要 |
 | --- | --- | --- |
-| `android-encode` | C：`c/media_encoder.c`（NDK 的全部句柄/生命周期/错误收在这一个文件）<br>Rust：`src/ffi.rs`（唯一的 `extern` 声明 + 调用边界） | Android 的**硬件** H.264 编码器只能走 NDK（`AMediaCodec` / `AMediaMuxer`）—— 纯 Rust 侧链不了厂商的编解码 HAL |
+| `v2v-android` | C：`c/media_encoder.c`（NDK 的全部句柄/生命周期/错误收在这一个文件）<br>Rust：`src/ffi.rs`（唯一的 `extern` 声明 + 调用边界） | Android 的**硬件** H.264 编码器只能走 NDK（`AMediaCodec` / `AMediaMuxer`）—— 纯 Rust 侧链不了厂商的编解码 HAL |
 
 它的 API（`Mp4HwWriter`）是安全的：裸指针不外漏、`Drop` 兜底、`!Send`
 （MediaCodec 不是线程安全的）。非 Android 平台编译同名桩，运行时明确报 `Unsupported`。
 
 ### C ABI：`libv2v_capi`
 
-`crates/capi` 是**全仓唯一的出站 C 表面**。一个 `.so`、一个 `v2v_abi_version()`、
+`crates/v2v-capi` 是**全仓唯一的出站 C 表面**。一个 `.so`、一个 `v2v_abi_version()`、
 一个 `v2v_last_error()`（每线程）、一张派发表（`codec_id → 构造器` 只在那里 `match`）。
-头文件 `crates/capi/include/v2v.h` 只用 C11 标准头，**不需要 Rust 工具链就能编过**。
+头文件 `crates/v2v-capi/include/v2v.h` 只用 C11 标准头，**不需要 Rust 工具链就能编过**。
 
 | 层 | 符号 | 覆盖 |
 | --- | --- | --- |
@@ -116,13 +119,13 @@ FFI 有两个方向，**每个方向都只有一个 crate**，别在别处加：
 `v2v_planes_copy_to`：拷进你自己的缓冲，可以带 padding，不用自己按 stride 逐行搬 ——
 「色度是 `ceil(width/2)` 宽、`ceil(height/2)` 高」这种细节写错**只会花屏，不会报错**。
 
-两个产物：`crates/capi/build-products.sh` 出 `min`（默认 feature）与 `full`（加
+两个产物：`crates/v2v-capi/build-products.sh` 出 `min`（默认 feature）与 `full`（加
 `hw` / `mpeg12`）。同主版本就同 ABI —— full 只是多出 MPEG-1/2 与硬件转码那两族符号。
 
 （**别把符号个数写进文档**：加一个函数它就变，而它是「数出来的」不是契约。
 要知道当下几个，`nm -gU dist/libv2v_capi_min.so | grep -c ' _v2v_'`。）
 
-验收不靠「自己的 Rust 测试调自己」：`crates/capi/tests/smoke.c` 是个纯 C 程序，
+验收不靠「自己的 Rust 测试调自己」：`crates/v2v-capi/tests/smoke.c` 是个纯 C 程序，
 `dlopen` 打开产物、按头文件的声明取函数指针类型，走
 `probe → open → info → 读帧 → seek → demux`。头文件写错它编不过，符号不在 `.so` 里
 它 `dlsym` 不到 —— 这两件事 Rust 侧测不出来。
@@ -204,12 +207,12 @@ V2V_ASF_SAMPLE=/path/to/sample.wmv cargo test --release -- --ignored
 **C ABI 单独出产物**（`cargo test` 只编 rlib，不出 `.so`）：
 
 ```bash
-crates/capi/build-products.sh            # → dist/libv2v_capi_{min,full}.<ext>
+crates/v2v-capi/build-products.sh            # → dist/libv2v_capi_{min,full}.<ext>
 
 # 验收：一个纯 C 程序 dlopen 它，走完 probe → open → 读帧 → seek → demux。
 # `cargo test` 里已经有一条 c_smoke 自动跑；要手动跑：
-cc -std=c11 -Wall -Wextra -Werror -I crates/capi/include \
-   crates/capi/tests/smoke.c -o /tmp/smoke && /tmp/smoke dist/libv2v_capi_full.so sample.wmv
+cc -std=c11 -Wall -Wextra -Werror -I crates/v2v-capi/include \
+   crates/v2v-capi/tests/smoke.c -o /tmp/smoke && /tmp/smoke dist/libv2v_capi_full.so sample.wmv
 ```
 
 ## 状态
@@ -430,7 +433,7 @@ MP4 的分片 / `co64`、其他容器与编解码器。
 **`--threads 1` 逐字节不变**（老路一条没动）。`--threads > 1` 的产物与串行**逐字节相同** ——
 MP43 编码器没有跨 GOP 状态，所以每个 worker 起新编码器编出来的字节完全一样；
 `.wmv` 的包排布也一样（结果按 GOP 序号归位后与音频按 pts 合并，正好等于串行读到的顺序）。
-这条不变量有测试钉着（`crates/cli/tests/convert.rs::parallel_gop_encoding_is_byte_identical`，
+这条不变量有测试钉着（`crates/v2v-cli/tests/convert.rs::parallel_gop_encoding_is_byte_identical`，
 合成源、无样本、CI 里真跑）。
 
 一段 720p（1280×720）真样本的**前 300 帧**，`-q 3`，两边同 qscale、同帧数上限：
@@ -616,7 +619,7 @@ SSIM 0.969486）对合并前 q=8（1709 kbps / 37.14 dB / 0.963555）—— **�
 | **MPEG-1**（`.mpg`） | ✅ I / P / B | ❌ | 走 `mpegps`（PS 容器）+ `mpeg12`。对 ffmpeg 逐帧比，容差 2（参考件是浮点 IDCT、我们是整数 IDCT）；真样本 50 帧全对 |
 | **MPEG-2** | ✅ I / P / B（progressive + 隔行帧图） | ❌ | 含场 DCT、场运动、4:2:2 / 4:4:4 色度。**隔行流的 B 帧场预测还没收敛**（PSNR 47 dB，个别像素差 165）—— 测试里只报数不卡断言，见 TODO |
 | **MPEG-4 Part 2**（`mp4v`） | ✅ I / P（H.263 量化） | ✅ I / P   | 解码：AVI 里的 `FMP4` / `mp4v` / `DIVX` / `XVID` 都认，I / P 对 ffmpeg **逐像素 0 差**（`crates/mp4v/tests/ffmpeg_roundtrip.rs`，含独立来源的流）。**不支持**：`quant_type = 1`（MPEG 矩阵量化 —— 我们自己编的 `.mp4` 就是这一档，所以「读回自己写的」还没通）、B / S 帧、4MV、`dquant`、隔行、GMC、数据分割、resync marker。编码默认走 **MPEG 型**（同体积下 SSIM 更高）+ 可选的**系数级 RD（trellis，默认关）** |
-| **H.264 / AVC**          | ❌         | ⭕ 硬件（FFI）：macOS VideoToolbox / Android MediaCodec | 软件侧不在范围内（LGPL 侧链不了 x264，见「许可证」）；硬件侧走 `crates/android-encode`（见「FFI」一节）—— 真实样本实测 PSNR 42.45 dB（同码率反超 ffmpeg 的 mpeg4 1.7 dB） |
+| **H.264 / AVC**          | ❌         | ⭕ 硬件（FFI）：macOS VideoToolbox / Android MediaCodec | 软件侧不在范围内（LGPL 侧链不了 x264，见「许可证」）；硬件侧走 `crates/v2v-android`（见「FFI」一节）—— 真实样本实测 PSNR 42.45 dB（同码率反超 ffmpeg 的 mpeg4 1.7 dB） |
 
 ### 音频编码
 
@@ -647,7 +650,7 @@ SSIM 0.969486）对合并前 q=8（1709 kbps / 37.14 dB / 0.963555）—— **�
 
 **一句话**：解码侧是「逐像素 / 逐字节」（**速度** 720p 持平、1080p 差 1.80×）；编码侧 `mp4v` 等码率
 **打平**、AAC 同码率**反超**、转码全栈体积与 `ffmpeg` 差 0.4% 而**编码质量差 1.9 dB**——
-质量与速度的短板在设备上有出路：`crates/android-encode` 的硬件路径（见「FFI」一节）。
+质量与速度的短板在设备上有出路：`crates/v2v-android` 的硬件路径（见「FFI」一节）。
 剩下的已知短板在「状态」一节里那两段（`plan_group` 的量化下界、
 按可闻度分配 / 心理声学模型）。
 
@@ -678,7 +681,7 @@ cargo run --release -p v2v-cli -- bench --check bench/baseline/<机器指纹>.ts
 
 - **`.wmv`（MP43）：逐字节相同。** 编码器没有跨 GOP 的状态，所以每块起新编码器编出来的字节
   完全一样，包排布也一样（结果按 GOP 序号归位后与音频按 pts 合并 = 串行读到的顺序）。
-  有测试钉着（`crates/cli/tests/convert.rs::parallel_gop_encoding_is_byte_identical`）。
+  有测试钉着（`crates/v2v-cli/tests/convert.rs::parallel_gop_encoding_is_byte_identical`）。
 - **`.mp4`（mp4v）：不完全相同。** 每个 GOP 的第一个 P 帧少一个搜索起点、码控从头收敛 ——
   质量与体积在同一档，但不是同一个文件。
 
@@ -757,7 +760,7 @@ escape 码本无符号、符号位单独发）。负系数的误差于是被估�
 | 范围 | 许可证 |
 |---|---|
 | `crates/{tables, msmpeg4, vc1, aac, wma, mp4v, mpeg12}` | **LGPL-2.1-or-later**（[LICENSE](LICENSE)） |
-| 其余 12 个 crate：`kernel` / `container` / `asf` / `avi` / `mpegps` / `mp4` / `player` / `cli` / `bench` / `capi` / `android-encode` / `mpeg12-simd` | **MIT**（[LICENSE-MIT](LICENSE-MIT)） |
+| 其余 12 个 crate：`v2v-kernel` / `v2v-container` / `v2v-asf` / `v2v-avi` / `v2v-mpegps` / `v2v-mp4` / `v2v-player` / `v2v-cli` / `v2v-bench` / `v2v-capi` / `v2v-android` / `v2v-mpeg12-simd` | **MIT**（[LICENSE-MIT](LICENSE-MIT)） |
 
 分界的**唯一依据是码表**：**全部码表都在 `crates/tables`**（从 FFmpeg 数据文件读出的
 VLC / 反量化 / Huffman 表，同为 LGPL-2.1-or-later），另外六个编解码器 crate 依赖它。
@@ -771,7 +774,7 @@ crate 里两种许可」那种看错的情况。
 
 ⚠️ **产物仍整体 LGPL**：任何链接了上面六个 crate 的 `.so` / 可执行文件
 （`libv2v_capi`、`v2v` CLI……）按 LGPL-2.1-or-later 分发 —— MIT 只覆盖那些 crate 的**源码**。
-只取用 MIT 侧的 crate（例如只拿 `container` / `kernel`）不受影响。
+只取用 MIT 侧的 crate（例如只拿 `v2v-container` / `v2v-kernel`）不受影响。
 
 **逐个上游文件、它们的版权声明、以及生成器与产出的对应关系见 [NOTICE](NOTICE)。**
 （重新生成表需要自备 FFmpeg 源码 —— 生成器的默认路径是作者的本地路径，见上面的「目录」。）

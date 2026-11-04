@@ -33,7 +33,7 @@ const GOP: usize = 12;
 
 /// 用 `workers` 个线程按 GOP 切分解码，返回墙钟秒数。
 ///
-/// 做法与 `crates/cli/src/lib.rs` 的解码池一致：**每个 GOP 一条全新解码器**
+/// 做法与 `crates/v2v-cli/src/lib.rs` 的解码池一致：**每个 GOP 一条全新解码器**
 /// （前提是「从任意 I 帧起解 == 整条链解到那里」，由 `gop_start.rs` 钉着）。
 fn decode_parallel(
     frames: &Arc<Vec<Vec<u8>>>,
