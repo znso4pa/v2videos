@@ -3,8 +3,8 @@
 //! 这样两边数字可以直接对。
 //!
 //! ```text
-//! cargo run --release -p v2v-mpeg12-simd --example bench -- <sample.mpg> [--rounds=N] [--threads=N]
-//! cargo run --release -p v2v-mpeg12-simd --features unsafe-kernels --example bench -- <sample.mpg>
+//! cargo run --release -p v2v-mpeg12-simd --example simd_bench -- <sample.mpg> [--rounds=N] [--threads=N]
+//! cargo run --release -p v2v-mpeg12-simd --features unsafe-kernels --example simd_bench -- <sample.mpg>
 //! ```
 //!
 //! 同时打印 `kernels::available()`：它报的是**实际会用到**的内核，
