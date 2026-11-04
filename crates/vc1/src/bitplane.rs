@@ -13,7 +13,7 @@
 //! `decode_colskip()`。**逐字节等价**是判据 —— 位平面错了，宏块层的跳过标志就全错，
 //! 而且是「大部分帧看着还行」的那种错。
 
-use v2v_msmpeg4::{BitReader, Result, Vlc};
+use v2v_kernel::{BitReader, Result, Vlc};
 
 use crate::tables;
 
@@ -166,12 +166,12 @@ pub(crate) fn decode(r: &mut BitReader, width: usize, height: usize) -> Result<B
     // （`FrameHeader::parse` 已经挡过一次，这里再挡一次 —— 这是 pub(crate) 的入口，
     // 不该指望调用方替它守住不变量。）
     if width == 0 || height == 0 {
-        return Err(v2v_msmpeg4::Error::Bad("vc1: 位平面的网格尺寸为 0"));
+        return Err(v2v_kernel::Error::Bad("vc1: 位平面的网格尺寸为 0"));
     }
     let stride = width + 1;
     let invert = r.bit()? != 0;
     let imode = Imode::from_u32(vlc_imode().decode(r)? as u32)
-        .ok_or(v2v_msmpeg4::Error::Bad("vc1: 非法的位平面 imode"))?;
+        .ok_or(v2v_kernel::Error::Bad("vc1: 非法的位平面 imode"))?;
 
     let mut data = vec![0u8; stride * height];
     // 宏块 `(x, y)` 在 `data` 里的下标。

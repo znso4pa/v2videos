@@ -6,6 +6,6 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-# MDCT / 窗函数 / 位写入器这几件与具体编码格式无关的东西，复用 msmpeg4 那边已经
-# 验证过的实现（`BitWriter` 的 MSB 优先语义正好与 AAC 一致）。
-v2v-msmpeg4 = { path = "../msmpeg4" }
+# MDCT 的 FFT 与位写入器（`BitWriter` 的 MSB 优先语义正好与 AAC 一致）——
+# 都是与具体编码格式无关的东西，复用共享内核里已经验证过的那一份。
+v2v-kernel = { path = "../kernel" }

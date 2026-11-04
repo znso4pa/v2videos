@@ -1,0 +1,14 @@
+[package]
+name = "v2v-kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "编解码器共用的信号处理内核：位流、VLC、DCT/IDCT、FFT、SIMD"
+
+# 这里**只能有与具体编解码器无关**的东西。判断标准：把任意一个编解码器整个删掉，
+# 本 crate 里不该有任何一个函数变成死代码。
+#
+# 反例（因此不在这里）：WMV2 那套 `wmv2_idct_*` 留在 `v2v-msmpeg4`；
+# 帧头解析、宏块语法、预测器一律留在各自的编解码器里。

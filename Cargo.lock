@@ -28,7 +28,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 name = "v2v-aac"
 version = "0.0.0"
 dependencies = [
- "v2v-msmpeg4",
+ "v2v-kernel",
 ]
 
 [[package]]
@@ -68,6 +68,7 @@ dependencies = [
  "v2v-asf",
  "v2v-avi",
  "v2v-container",
+ "v2v-kernel",
  "v2v-mp4",
  "v2v-mp4v",
  "v2v-mpeg12",
@@ -86,6 +87,7 @@ dependencies = [
  "v2v-asf",
  "v2v-avi",
  "v2v-container",
+ "v2v-kernel",
  "v2v-mp4",
  "v2v-mp4v",
  "v2v-msmpeg4",
@@ -98,6 +100,10 @@ name = "v2v-container"
 version = "0.0.0"
 
 [[package]]
+name = "v2v-kernel"
+version = "0.0.0"
+
+[[package]]
 name = "v2v-mp4"
 version = "0.0.0"
 
@@ -105,6 +111,7 @@ version = "0.0.0"
 name = "v2v-mp4v"
 version = "0.0.0"
 dependencies = [
+ "v2v-kernel",
  "v2v-mp4",
  "v2v-msmpeg4",
 ]
@@ -113,8 +120,8 @@ dependencies = [
 name = "v2v-mpeg12"
 version = "0.0.0"
 dependencies = [
+ "v2v-kernel",
  "v2v-mpegps",
- "v2v-msmpeg4",
 ]
 
 [[package]]
@@ -135,6 +142,7 @@ version = "0.0.0"
 dependencies = [
  "v2v-asf",
  "v2v-avi",
+ "v2v-kernel",
 ]
 
 [[package]]
@@ -143,9 +151,9 @@ version = "0.0.0"
 dependencies = [
  "v2v-asf",
  "v2v-container",
+ "v2v-kernel",
  "v2v-mpeg12",
  "v2v-mpegps",
- "v2v-msmpeg4",
  "v2v-vc1",
  "v2v-wma",
 ]
@@ -156,6 +164,7 @@ version = "0.0.0"
 dependencies = [
  "v2v-asf",
  "v2v-container",
+ "v2v-kernel",
  "v2v-msmpeg4",
 ]
 
@@ -164,5 +173,5 @@ name = "v2v-wma"
 version = "0.0.0"
 dependencies = [
  "v2v-asf",
- "v2v-msmpeg4",
+ "v2v-kernel",
 ]

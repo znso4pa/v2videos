@@ -7,5 +7,9 @@ repository.workspace = true
 description = "MPEG-1/2 video elementary stream parser"
 
 [dependencies]
+# 位读取器 / IDCT / FDCT —— 与具体编解码格式无关的那几件，走共享内核。
+v2v-kernel = { path = "../kernel" }
+
+[dev-dependencies]
+# 测试与 example 要从 MPEG-PS 里取样本；`src/` 本身不碰容器层。
 v2v-mpegps = { path = "../mpegps" }
-v2v-msmpeg4 = { path = "../msmpeg4" }

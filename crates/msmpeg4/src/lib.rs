@@ -4,7 +4,8 @@
 //! WMV1/WMV2（v1/v2）的帧头与宏块语法不同，还没实现（实测一个 WMV1 样本会解不动，
 //! 对账测试里显式 SKIP 掉了）。见 TODO。
 //!
-//! 目标：把 ASF 解封装吐出的裸视频帧解成 YUV420P。无 C、无 FFI、零依赖。
+//! 目标：把 ASF 解封装吐出的裸视频帧解成 YUV420P。无 C、无 FFI、零第三方依赖
+//! （唯一的 workspace 内依赖是 `v2v-kernel`，位流 / DCT / VLC 那些共用内核）。
 //!
 //! ## 现状
 //!
@@ -23,39 +24,30 @@
 //! ASF 封装**不在这个 crate 里**，见 `v2v-asf`（本 crate 只管裸 MP43 帧）。
 //! 编出来的也只是 **MP43（v3）**，不是 WMV9/VC-1 —— 原因见 README 的能力矩阵。
 //!
-//! 实现按 H.263 / MPEG-4 Part 2 的语法写，**不链 ffmpeg、不引依赖** ——
+//! 实现按 H.263 / MPEG-4 Part 2 的语法写，**不链 ffmpeg、不引第三方依赖** ——
 //! ffmpeg 只当**交叉验证的 oracle**（测试里解同一条流、逐像素对账），不进产物。
 #![deny(unsafe_code)]
 
-mod bitreader;
-pub mod bitwriter;
 mod block;
 mod encode;
-mod error;
-mod fdct;
-mod fft;
 mod frame;
 mod grid;
 mod header;
 mod intrax8;
 mod intrax8_tables;
-mod idct;
+mod idct_wmv2;
 mod predict;
-pub mod simd;
 pub mod tables;
 #[cfg(test)]
 mod testbit;
 mod version;
 mod v12;
-mod vlc;
 
-pub use bitreader::BitReader;
-pub use bitwriter::BitWriter;
+// 位流 / VLC / DCT / FFT / SAD / SIMD 都在 `v2v-kernel`（编解码器共用）。
+// 本 crate **不再**把它们重新导出：`v2v_msmpeg4::fft_in_place` 这种路径正是
+// 当初要拆掉的东西 —— 写 AAC 的人不该从 MS-MPEG-4 里找 FFT。
 pub use block::{AcCtx, RlTable};
 pub use encode::{Encoder, EncoderConfig};
-pub use error::{Error, Result};
-pub use fdct::{fdct, fdct_i};
-pub use fft::fft_in_place;
 pub use frame::{
     dc_unscale, decode_i_frame, mc_chroma8, mc_luma16, mc_mb, mc_mb_mspel, mc_params, mid_pred,
     sad_luma16, AcPredRead, Decoder, Frame, McParams, Planes, Stats, ZIGZAG,
@@ -64,10 +56,11 @@ pub use header::{
     decode012, parse_frame_header, parse_wmv2_frame, FrameHeader, HeaderState, PictureType,
     Wmv2Flags, Wmv2Frame, Wmv2Header, II_BITRATE, MBAC_BITRATE,
 };
-pub use version::Version;
-pub use idct::{idct_add, idct_put};
+// ABT 的 4:8 / 8:4 落位在 kernel（要用 kernel 内部的单列变换），WMV2 自己那套在本 crate。
+pub use idct_wmv2::{wmv2_idct_add, wmv2_idct_put};
+pub use v2v_kernel::idct::{idct48_add, idct84_add};
 pub use predict::{ac_predict, coded_block_predict, dc_predict, AcVal};
-pub use vlc::Vlc;
+pub use version::Version;
 
 /// 宏块尺寸（MPEG-4 / H.263 系固定 16×16）。
 pub const MB_SIZE: u32 = 16;

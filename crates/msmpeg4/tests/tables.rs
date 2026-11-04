@@ -10,7 +10,7 @@
 //!
 //! 再对几个已知项做**点值抽查**，挡住整体错位。
 
-use v2v_msmpeg4::tables as t;
+use v2v_msmpeg4::{tables as t};
 
 /// 返回 `(是否前缀无关, Kraft 和是否为 1)`。
 fn check_prefix_code(table: &[[u32; 2]]) -> (bool, bool) {
@@ -128,7 +128,7 @@ fn every_generated_table_decodes_to_its_own_index() {
         ("MV0", &mv0[..]),
         ("MV1", &mv1[..]),
     ] {
-        let v = v2v_msmpeg4::Vlc::new(table);
+        let v = v2v_kernel::Vlc::new(table);
         for (i, &[code, len]) in table.iter().enumerate() {
             if len == 0 {
                 continue;
@@ -140,7 +140,7 @@ fn every_generated_table_decodes_to_its_own_index() {
                     bytes[(b / 8) as usize] |= 1 << (7 - (b % 8));
                 }
             }
-            let mut r = v2v_msmpeg4::BitReader::new(&bytes);
+            let mut r = v2v_kernel::BitReader::new(&bytes);
             assert_eq!(
                 v.decode(&mut r).unwrap(),
                 i,

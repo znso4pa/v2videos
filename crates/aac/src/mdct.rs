@@ -34,11 +34,11 @@
 //!
 //! 「难对账」这条担心的解法不是不换算法，而是**加一条直接按定义算的 oracle 测试**
 //! （`fast_mdct_matches_the_definition`）—— 换算法时只有它能把折叠/旋转/定标写错
-//! 当场抓住。FFT 本身搬去了共享内核 `v2v-msmpeg4`（见那边的 `fft.rs`）。
+//! 当场抓住。FFT 本身搬去了共享内核 `v2v-kernel`（见那边的 `fft.rs`）。
 
 use std::f64::consts::PI;
 
-use v2v_msmpeg4::fft_in_place;
+use v2v_kernel::fft_in_place;
 
 /// 长块的样本数（MDCT 输出点数）。
 pub const LONG_LEN: usize = 1024;

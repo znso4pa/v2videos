@@ -321,11 +321,11 @@ impl IntoAbi for v2v_avi::Error {
     }
 }
 
-impl IntoAbi for v2v_msmpeg4::Error {
+impl IntoAbi for v2v_kernel::Error {
     fn kind(&self) -> c_int {
         match self {
-            v2v_msmpeg4::Error::Eof | v2v_msmpeg4::Error::Bad(_) => KIND_BAD,
-            v2v_msmpeg4::Error::Unsupported(_) => KIND_UNSUPPORTED,
+            v2v_kernel::Error::Eof | v2v_kernel::Error::Bad(_) => KIND_BAD,
+            v2v_kernel::Error::Unsupported(_) => KIND_UNSUPPORTED,
         }
     }
     fn message(&self) -> String {

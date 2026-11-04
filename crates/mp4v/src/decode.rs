@@ -47,10 +47,8 @@
 //!   MP43 反过来（`1` → 第一、`01` → 第二、`00` → 第三）；
 //! - 第二 escape 的 run 修正：MPEG-4 恒 `+1`，MP43 按版本（V2 是 0）。
 
-use v2v_msmpeg4::{
-    ac_predict, dc_unscale, idct_add, idct_put, mc_mb, AcVal, BitReader, Error, Frame, Planes,
-    Result, RlTable, Vlc, ZIGZAG,
-};
+use v2v_kernel::{idct_add, idct_put, BitReader, Error, Result, Vlc};
+use v2v_msmpeg4::{ac_predict, dc_unscale, mc_mb, AcVal, Frame, Planes, RlTable, ZIGZAG};
 
 use crate::tables;
 

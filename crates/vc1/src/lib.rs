@@ -43,6 +43,6 @@ pub use header::{
     SeqHeader,
 };
 
-// 位读取器 / 前缀码 / 错误类型都复用 msmpeg4 那一套 —— 与 mp4v 一样，
+// 位读取器 / 前缀码 / 错误类型都复用共享内核 `v2v-kernel` 那一套 —— 与 mp4v 一样，
 // 不另立一份（复刻出来的第二份才是真会跑偏的那份）。
-pub use v2v_msmpeg4::{Error, Result};
+pub use v2v_kernel::{Error, Result};

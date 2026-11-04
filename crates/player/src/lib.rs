@@ -58,7 +58,7 @@ const WMV3: u32 = u32::from_le_bytes(*b"WMV3");
 
 /// 播放器自己的错误类型。
 ///
-/// ## 为什么不复用 `v2v_msmpeg4::Error`
+/// ## 为什么不复用 `v2v_kernel::Error`
 ///
 /// 那个类型已经是「编解码器的通用错误」，mp4v / aac 都在用 —— 但它**没有 `Io`**，
 /// 而播放器要自己开文件；asf / wma 又各有一份自己的 `Error`（变体几乎一样但不通
@@ -105,12 +105,12 @@ impl From<v2v_asf::Error> for Error {
     }
 }
 
-impl From<v2v_msmpeg4::Error> for Error {
-    fn from(e: v2v_msmpeg4::Error) -> Self {
+impl From<v2v_kernel::Error> for Error {
+    fn from(e: v2v_kernel::Error) -> Self {
         match e {
-            v2v_msmpeg4::Error::Eof => Error::Bad("位流提前结束".into()),
-            v2v_msmpeg4::Error::Bad(m) => Error::Bad(m.to_string()),
-            v2v_msmpeg4::Error::Unsupported(m) => Error::Unsupported(m),
+            v2v_kernel::Error::Eof => Error::Bad("位流提前结束".into()),
+            v2v_kernel::Error::Bad(m) => Error::Bad(m.to_string()),
+            v2v_kernel::Error::Unsupported(m) => Error::Unsupported(m),
         }
     }
 }

@@ -33,9 +33,9 @@
 //! （`v_edge_pos = mb_height*16`，比真实高度最多多出 15 行），
 //! 所以 `Decoder` 内部存的是宏块对齐、未裁剪的平面；对外吐的 `Frame` 才是裁过的。
 
-use crate::bitreader::BitReader;
+use v2v_kernel::bitreader::BitReader;
 use crate::block::RlTable;
-use crate::error::{Error, Result};
+use v2v_kernel::error::{Error, Result};
 use crate::grid::Grid;
 use crate::block::AcCtx;
 use crate::intrax8::IntraX8;
@@ -44,10 +44,11 @@ use crate::header::{
     PictureType, Wmv2Flags, Wmv2Frame,
 };
 use crate::version::Version;
-use crate::idct::{idct48_add, idct84_add, idct_add, idct_put, wmv2_idct_add, wmv2_idct_put};
+use crate::idct_wmv2::{wmv2_idct_add, wmv2_idct_put};
+use v2v_kernel::idct::{idct48_add, idct84_add, idct_add, idct_put};
 use crate::predict::{ac_predict, coded_block_predict, dc_predict, AcVal};
 use crate::tables;
-use crate::vlc::Vlc;
+use v2v_kernel::vlc::Vlc;
 
 /// MPEG-4 的标准 zig-zag 扫描顺序（`ff_zigzag_direct`）。
 /// 帧内（无 ac_pred）与**所有帧间块**都用它（`inter_scantable` 也是 zig-zag）。
@@ -1674,7 +1675,7 @@ pub fn sad_luma16_capped(
     // 非边界（绝大多数候选）：走共享 SIMD 内核 —— 一个 16×16 整块**一次调用**，
     // 半像素插值在寄存器里做，不再先写 `rv[16]` 临时数组再读一遍。
     // 提前退出的语义（每行查一次 cap、命中返回 cap）与旧实现逐位相同。
-    crate::simd::sad_block16(cur, &refp.y, pw, base, p.dxy, no_rounding, cap)
+    v2v_kernel::simd::sad_block16(cur, &refp.y, pw, base, p.dxy, no_rounding, cap)
 }
 
 /// 8×8 色度块的半像素搬运（`which`：0 = U，1 = V）。半像素相位由 `uvdxy` 表示。

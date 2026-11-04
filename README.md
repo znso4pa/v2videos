@@ -24,8 +24,9 @@ crates/
   container 各容器共用的数据模型（流 / 格式 / 样本）—— 零依赖
   asf      ASF（.wmv / .wma）解封装 + **封装** —— 纯 std
   avi      AVI（RIFF）解封装
+  kernel   **编解码器共用的信号处理内核**：位读写器 / VLC / FDCT / IDCT / FFT / SAD / NEON
+           —— 全仓唯一允许 `unsafe` 的地方，而且只有 `simd` 一个模块
   msmpeg4  MS-MPEG-4 v2/v3（MP42 / MP43）/ WMV1 / WMV2 解码（I / P + **IntraX8**）+ MP43 编码（I / P，含运动估计与帧内/帧间判决）
-           **兼共享数值内核**：位读写器 / FDCT / IDCT / FFT / VLC 表 —— mp4v、aac、wma 都从这里取
   wma      WMA v1/v2 音频解码（帧头 / LSP 指数 / 系数 / IMDCT）
   vc1      VC-1（**WMV3**）解码：Simple/Main profile、渐进、I/P —— 序列头 → 帧头 → 位平面 →
            宏块层 → 逆变换（8×8 + ABT）→ 运动补偿（¼ 像素）→ 环路滤波 → YUV420P
@@ -33,10 +34,10 @@ crates/
   aac      **AAC-LC 编码**：MDCT（长/短窗）+ TNS + Huffman 码本 + 码率控制
   mp4      MP4 / ISOBMFF **封装**（ftyp / mdat / moov；音频 AAC 或 PCM）
   mpegps   MPEG-1/2 **program stream** 解封装（`.mpg` / `.dat` / `.vob` 那类 PS 容器）
-  mpeg12   MPEG-1/2 **解码**（纯安全、零 unsafe，作为参考实现/oracle）：MPEG-1 的 I/P/B；
+  mpeg12   MPEG-1/2 **解码**（本 crate 自身零 unsafe，作为参考实现/oracle）：MPEG-1 的 I/P/B；
            MPEG-2 的 progressive 帧图、隔行帧图的场 DCT / 场运动、4:2:2 / 4:4:4 色度
-  mpeg12-simd  同一个解码内核的 **unsafe / FFI 变体**：可单独编 `.so` / `.a` 给宿主链，
-           unsafe 只允许出现在这个 crate；每个内核都要逐字节对 `mpeg12` 验
+  mpeg12-simd  同一个解码内核的 **unsafe / FFI 变体**：可单独编 `.so` / `.a` 给宿主链；
+           每个内核都要逐字节对 `mpeg12` 验
   player   顺时播放层：逐帧取视频、逐样本取音频、两轨独立、`seek(ms)`（Simple Index +
            关键帧回退 + 前向解码到目标）—— 对应 Android 播放服务需求的 Rust 侧。
            另有 `mpeg12` feature 下的 `MpgPlayer`（MPEG-1/2，**只有视频**，默认不编）
@@ -294,7 +295,8 @@ MP4 的分片 / `co64`、其他容器与编解码器。
 （这张表比提速前**快了 1.75–2.67×**：位读取器从逐位读改成字宽、VLC 加 9 位快表、
 列变换 4 通道一批（读的时候不再拷块）、RL 符号编进快表、几处内层写法 ——
 **WMV2 那三行已经追平 ffmpeg**（1.03–1.11×），MP43 还慢 1.5–1.9 倍。
-再往下要动 IDCT 的 SIMD intrinsics，那会引入本仓目前没有的 `unsafe`，见 `TODO.md`。）
+再往下要动 IDCT 的 SIMD intrinsics —— 那要新写 `unsafe` 内核（本仓唯一放开 `unsafe` 的地方
+是 `kernel::simd`，目前只放了**编码器**的 SAD），见 `TODO.md`。）
 
 **VC-1 那一档**（`crates/vc1/tests/decode_bench.rs`，口径同上：只解视频、单线程、
 两边都减掉「解 1 帧」那一趟）：
@@ -327,9 +329,12 @@ MP4 的分片 / `co64`、其他容器与编解码器。
 ⚠️ **试过但没用的**：给这几个内核手写 NEON intrinsics 只快 **1.3%**（原因：热点是**串行位解析**，
 能向量化的 MC 只占 ~21%，而内核是按**行**调的、一行 16 像素就是一条 NEON 指令，
 调用开销把向量宽度吃干净了；何况 `sad_row16` 那边 LLVM 本来就生成 `uabd.16b` + `udot.4s`）。
-结论与教训记在本地 `TODO.md`，分支已删 —— 那个 `unsafe` 不值得为它破例。
+结论与教训记在本地 `TODO.md`，分支已删 —— **解码器**上那个 `unsafe` 不值得为它破例
+（后来只给**编码器**的 SAD 破了一次，就是 `kernel::simd` 那一份：它每个候选是一整块
+16×16、调用开销摊得开，实测收益是真的）。
 
-**剩下的 1.80× 是什么**：ffmpeg 的 MC / IDCT / 环路滤波是手写汇编核，本仓纯标量、零 `unsafe`；
+**剩下的 1.80× 是什么**：ffmpeg 的 MC / IDCT / 环路滤波是手写汇编核，本仓解码侧纯标量、
+零 `unsafe`（全仓唯一那处 `unsafe` 在 `kernel::simd`，服务编码器的运动估计）；
 再加上它的解码器按片并行、我们是单线程。再往上要动架构（编译期行宽、帧级流水），
 不是「再抠几个循环」能到的。
 
@@ -697,7 +702,8 @@ cargo run --release -p v2v-cli -- convert --mp4 --video-bitrate 500k <输入.wmv
 ① **变换是 O(N²)**：AAC 的前向 MDCT 与 WMA 的 IMDCT 原来都逐点调 `cos()`。
 AAC 那半先治（`预旋转 → 2N 点 FFT → 后旋转`：单编 20 秒 13.85 → 2.81 s，**4.9×**）；
 WMA 这半走同一条路（`n` 点 DCT-IV 折成三段对称 + 一次 `2n` 点 FFT）：
-**WMA 解码 1.73 → 0.10 s（约 17×）**。FFT 住在共享内核 `v2v-msmpeg4`，aac 与 wma 调同一份。
+**WMA 解码 1.73 → 0.10 s（约 17×）**。FFT 住在共享内核（现在是 `v2v-kernel`，当时还在
+`v2v-msmpeg4` 里），aac 与 wma 调同一份。
 （WMA 这条是**唯一**不是逐字节的：PCM 里 550/716800 个样本差 ±1 LSB —— 旧版逐项舍 f32、
 新版 f64 累完收一次，**新版更准**。）
 

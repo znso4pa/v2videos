@@ -6,8 +6,11 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-# DCT / 位写入器 / 前缀码 / RL 表这几件「与具体编码格式无关」的东西在 msmpeg4 里，
-# 直接复用 —— 不复刻一遍（复刻出来的第二份才是真会跑偏的那份）。
+# DCT / 位写入器 / 前缀码 / RL 表 / IDCT 这几件「与具体编码格式无关」的东西，
+# 直接复用共享内核 —— 不复刻一遍（复刻出来的第二份才是真会跑偏的那份）。
+v2v-kernel = { path = "../kernel" }
+# `Frame` / `Planes` / `mc_*` / `mid_pred` / `ZIGZAG` 目前还在 msmpeg4 里，
+# 等下一步搬进 kernel（见 TODO）。搬完这一行就能删。
 v2v-msmpeg4 = { path = "../msmpeg4" }
 
 [dev-dependencies]

@@ -172,7 +172,7 @@ fn decode_aac_file(path: &std::path::Path) -> Vec<Vec<f32>> {
 fn adts_header(payload: usize, channels: u8) -> [u8; 7] {
     let full = 7 + payload;
     assert!(full < (1 << 13), "ADTS 的 frame_length 只有 13 位");
-    let mut w = v2v_msmpeg4::BitWriter::new();
+    let mut w = v2v_kernel::BitWriter::new();
     w.put(0xFFF, 12); // syncword
     w.put(0, 1); // MPEG-4
     w.put(0, 2); // layer

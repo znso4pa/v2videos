@@ -11,7 +11,13 @@
 //!   sequence end    00 00 01 B7
 //! ```
 //!
-//! 设计约束：**不用 unsafe、不调 FFI**，全部安全 Rust，按位读取走一个游标。
+//! 设计约束：本 crate **自身不用 unsafe、不调 FFI**，全部安全 Rust，按位读取走一个游标。
+//!
+//! 注意别把这句话扩大成「整条依赖链无 unsafe」：共用的 `v2v-kernel` 里有一份 NEON
+//! 内核（`kernel::simd`），那是全仓唯一有 `unsafe` 的地方。kernel 根上是
+//! `#![deny(unsafe_code)]`、只对它单独放开，所以「哪里可以写 unsafe」仍然有明确边界；
+//! 但**要拿到「依赖闭包里零 unsafe」这句话，还得把 `simd` 做成 opt-in feature**
+//! —— 见 TODO 的 C 步。
 
 /// MPEG-1 的帧率表（`frame_rate_code` 1..=8），单位 1/1000 帧每秒。
 const FRAME_RATE_TABLE: [u32; 9] = [0, 23_976, 24_000, 25_000, 29_970, 30_000, 50_000, 59_940, 60_000];
@@ -19,10 +25,10 @@ const FRAME_RATE_TABLE: [u32; 9] = [0, 23_976, 24_000, 25_000, 29_970, 30_000, 5
 /// 宽高比表（`aspect_ratio_information` 1..=4）。
 const ASPECT_TABLE: [(u32, u32); 5] = [(0, 0), (1, 1), (4, 3), (16, 9), (2, 21)];
 
-/// 位读取器**复用 `v2v-msmpeg4` 的那一份**（架构不变量 3：共享数值内核只有一份）。
+/// 位读取器**复用 `v2v-kernel` 的那一份**（架构不变量 3：共享数值内核只有一份）。
 ///
 /// 这里只做再导出，不新增实现 —— 第二份一定会漂。
-pub use v2v_msmpeg4::BitReader;
+pub use v2v_kernel::BitReader;
 
 /// sequence header 里我们关心的字段。
 #[derive(Debug, Clone, PartialEq, Eq)]

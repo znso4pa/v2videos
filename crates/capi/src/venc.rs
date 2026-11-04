@@ -122,7 +122,7 @@ pub unsafe extern "C" fn v2v_venc_open(codec: u32, cfg: *const V2vVencCfg) -> *m
             return std::ptr::null_mut();
         };
 
-        let built: Result<Venc, v2v_msmpeg4::Error> = match codec {
+        let built: Result<Venc, v2v_kernel::Error> = match codec {
             CODEC_MP43 => {
                 let mut ec = v2v_msmpeg4::EncoderConfig::default();
                 if let Some(q) = qscale {
@@ -222,7 +222,7 @@ pub unsafe extern "C" fn v2v_venc_encode(
             ));
         }
         let want_i = force_key != 0 || hp.frames == 0;
-        let got: Result<Vec<u8>, v2v_msmpeg4::Error> = match &mut hp.enc {
+        let got: Result<Vec<u8>, v2v_kernel::Error> = match &mut hp.enc {
             Venc::Ms(e) => {
                 if want_i {
                     e.encode_i_frame(&frame)

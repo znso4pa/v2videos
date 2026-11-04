@@ -10,7 +10,7 @@
 //!
 //! 这里只放「表」这一层；宏块层的分支在 `frame.rs`（它需要 `Decoder` 的状态）。
 
-use crate::vlc::Vlc;
+use v2v_kernel::vlc::Vlc;
 
 /// `ff_mpeg4_DCtab_lum`：`size` → `(code, len)`。
 ///

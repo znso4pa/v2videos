@@ -8,7 +8,7 @@
 
 ## 现状
 
-**链路已经打通到 `.wmv → .mp4`**：**16 个 crate、约 7.3 万行 Rust**，**零第三方运行时依赖**
+**链路已经打通到 `.wmv → .mp4`**：**17 个 crate、约 7.4 万行 Rust**，**零第三方运行时依赖**
 （`Cargo.lock` 里只有本仓的包，外加 `cc` 那条**构建**链 —— 只服务 `android-encode` 的 C shim）。
 
 ```text
@@ -16,12 +16,13 @@ container  解封装共用的数据模型（Stream / Sample / AudioFormat / Vide
 asf        ASF（.wmv / .wma）解封装 **+ 封装**（多载荷打包 + Simple Index）
 avi        AVI（RIFF）解封装
 mpegps     MPEG-1/2 program stream（`.mpg` / `.dat` / `.vob`）解封装
-msmpeg4    MP42 / MP43 / WMV1 / WMV2 解码（I / P，WMV2 含 IntraX8）**+ MP43 编码**（I / P，含运动估计）；
-           兼**共享数值内核**（位读写器 / DCT / FFT / VLC 表）
+kernel     编解码器**共用的信号处理内核**：位读写 / VLC / FDCT / IDCT / FFT / SAD / NEON
+           —— 全仓唯一允许 `unsafe` 的地方，且只有 `simd` 一个模块
+msmpeg4    MP42 / MP43 / WMV1 / WMV2 解码（I / P，WMV2 含 IntraX8）**+ MP43 编码**（I / P，含运动估计）
 wma        WMA v1 / v2 解码（**只有解码器**）
 vc1        VC-1（WMV3）解码（I / P，含 ABT / ¼ 像素 MC / 环路滤波；**只有解码器**）
-mpeg12     MPEG-1/2 解码（I / P / B、隔行、4:2:2 / 4:4:4）—— **纯安全、零 unsafe，当参考实现**
-mpeg12-simd  同一内核的 unsafe / FFI 变体，可单独编 .so / .a（unsafe 只允许出现在这里）
+mpeg12     MPEG-1/2 解码（I / P / B、隔行、4:2:2 / 4:4:4）—— **本 crate 自身零 unsafe，当参考实现**
+mpeg12-simd  同一内核的 unsafe / FFI 变体，可单独编 .so / .a
 mp4v       MPEG-4 Part 2 编码（I / P + 码率控制）**+ 解码**（I / P）
 aac        AAC-LC 编码（MDCT / 短窗 / TNS / Huffman / 码率控制）
 mp4        MP4 / ISOBMFF 封装（mp4v + mp4a(AAC) 或 sowt PCM）
@@ -206,11 +207,16 @@ df -h /System/Volumes/Data  # 磁盘 <10% 可用会让 macOS 整体变卡（换�
 2. **零第三方依赖。** 所有 crate 只依赖本仓内部包。要引 crates.io 上的东西，先过许可证
    （LGPL 兼容：Apache-2.0 / MIT / BSD；MPL 这类 copyleft 一律不引），并说清现有代码
    为什么做不到。
-3. **`v2v-msmpeg4` 兼共享数值内核**：`BitReader` / `BitWriter`（MSB 优先）/ FDCT / IDCT /
-   VLC 表 / `Error` 被 `v2v-mp4v`、`v2v-aac`、`v2v-vc1` 复用。**不要复刻第二份** ——
-   会漂的就是第二份。改这些共享件要**同时**跑 mp4v / aac / vc1 的对账测试。
+3. **共享数值内核住在 `v2v-kernel`**：`BitReader` / `BitWriter`（MSB 优先）/ FDCT / IDCT /
+   FFT / VLC / SAD / NEON 内核 / `Error` 被 `v2v-msmpeg4`、`v2v-mp4v`、`v2v-aac`、`v2v-vc1`、
+   `v2v-mpeg12` 复用。**不要复刻第二份** —— 会漂的就是第二份。改这些共享件要**同时**跑
+   mp4v / aac / vc1 / mpeg12 的对账测试。
    （`vc1` 只借位读取器与前缀码解码，**它自己的逆变换是独立的** —— VC-1 的 8×8 核
    与 H.263 那套不是一回事，别为了「统一」把两套混成一套。）
+   **判据**：把任意一个编解码器整个删掉，`kernel` 里不该有函数变成死代码。所以
+   「只有一个编解码器用」的东西（WMV2 的 `wmv2_idct_*`、帧头解析、宏块语法、运动补偿
+   策略）**一律留在各自 crate**，不许图省事往 kernel 里塞。
+   **别再让 `kernel` 反向依赖任何编解码器** —— 它一旦依赖 msmpeg4，这次拆分就白做了。
 4. **码表只有一份真源**：`crates/*/src/tables.rs` 是唯一落点，生成与自检脚本在
    `tools/`（`gen_tables.py` / `gen_aac_tables.py` / `gen_wma_tables.py` / `check_tables.py`）。
    加格式只改那一处，别的地方转发。

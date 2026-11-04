@@ -23,6 +23,8 @@ hw = ["dep:v2v-android"]
 mpeg12 = ["dep:v2v-mpeg12", "dep:v2v-mpegps", "v2v-player/mpeg12"]
 
 [dependencies]
+# 只用它的 `Error`（全仓编解码器共用那一个），做错误码映射。
+v2v-kernel = { path = "../kernel" }
 v2v-container = { path = "../container" }
 v2v-asf = { path = "../asf" }
 v2v-avi = { path = "../avi" }

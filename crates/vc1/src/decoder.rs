@@ -23,7 +23,8 @@
 //! （它依赖「哪个宏块已经写好了」），所以 `decode_i_blocks` / `decode_p_blocks`
 //! 里那两行 `loop_filter` 不能挪。
 
-use v2v_msmpeg4::{BitReader, Error, Planes, Result};
+use v2v_kernel::{BitReader, Error, Result};
+use v2v_msmpeg4::Planes;
 
 use crate::header::{FrameHeader, HeaderState, PictType, SeqHeader};
 use crate::tables;

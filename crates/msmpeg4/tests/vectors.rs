@@ -5,10 +5,13 @@
 //!
 //! 对应 AGENTS.md：合成往返测试**必要但不充分**，所以它们只守分量，不替代 oracle。
 
-use v2v_msmpeg4::{decode012, parse_frame_header, BitReader, PictureType, ZIGZAG};
+use v2v_kernel::BitReader;
+use v2v_msmpeg4::{decode012, parse_frame_header, PictureType, ZIGZAG};
 use v2v_asf::fourcc_string;
-use v2v_msmpeg4::{AcVal, Vlc};
-use v2v_msmpeg4::{ac_predict, coded_block_predict, dc_predict, idct_put};
+use v2v_kernel::Vlc;
+use v2v_msmpeg4::AcVal;
+use v2v_kernel::idct_put;
+use v2v_msmpeg4::{ac_predict, coded_block_predict, dc_predict};
 use v2v_msmpeg4::tables;
 
 /// 本地位写入器（`testbit` 模块是 `#[cfg(test)]`，集成测试拿不到）。

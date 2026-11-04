@@ -27,7 +27,7 @@
 //! 编码器仍可自行决定不插 —— 所以写 0 是合法的，且与 ffmpeg 的输出逐位一致，
 //! 便于直接对账。ffmpeg 的解码器根本不看这一位。
 
-use v2v_msmpeg4::BitWriter;
+use v2v_kernel::BitWriter;
 
 /// 视觉对象序列起始码（`VOS_STARTCODE`）。
 pub const VOS_STARTCODE: u32 = 0x0000_01B0;

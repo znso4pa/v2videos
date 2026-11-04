@@ -22,7 +22,7 @@ use crate::tables::*;
 use crate::{Error, Result};
 
 // FFT 走共享数值内核（AGENTS.md 不变量 3：不许复刻第二份）。
-use v2v_msmpeg4::fft_in_place;
+use v2v_kernel::fft_in_place;
 
 const NB_LSP_COEFS: usize = 10;
 const LSP_POW_BITS: u32 = 7;
@@ -48,11 +48,11 @@ const BLOCK_MAX_SIZE: usize = 2048;
 /// `sample` 采样（整轨 208 秒）显示 `Vlc::decode` 一个人占了 WMA 解码的 **58%**
 /// （349/605 个样本）。
 ///
-/// 现在内部直接用 `v2v-msmpeg4` 的**二叉树** `Vlc`（`O(码长)`）——
+/// 现在内部直接用 `v2v-kernel` 的**二叉树** `Vlc`（`O(码长)`）——
 /// 走树/建树的逻辑只有那一份，这里只做「表格式转换 + 位源适配」，
 /// 不把树复刻第二遍（AGENTS.md 不变量 3）。
 struct Vlc {
-    inner: v2v_msmpeg4::Vlc,
+    inner: v2v_kernel::Vlc,
 }
 
 impl Vlc {
@@ -61,7 +61,7 @@ impl Vlc {
         // 符号 = 数组下标（`Vlc::new` 的约定）。
         let table: Vec<[u32; 2]> = codes.iter().map(|&(c, l)| [c, u32::from(l)]).collect();
         Self {
-            inner: v2v_msmpeg4::Vlc::new(&table),
+            inner: v2v_kernel::Vlc::new(&table),
         }
     }
 
@@ -97,7 +97,7 @@ impl Vlc {
             code += 1u64 << (32 - len as u32);
         }
         Self {
-            inner: v2v_msmpeg4::Vlc::new(&table),
+            inner: v2v_kernel::Vlc::new(&table),
         }
     }
 

@@ -11,7 +11,7 @@
 //! | IMDCT + 重叠相加 | MDCT + 50% 重叠 |
 //! | 反量化（指数 → 系数） | 量化（`pow(·, 3/4)` + sf） |
 //! | 6 张 RL 表的 Huffman 解码 | 11 本 Huffman 码本的频谱编码 |
-//! | 位读取器 | `BitWriter`（复用 `v2v_msmpeg4` 的，MSB 优先语义一致） |
+//! | 位读取器 | `BitWriter`（复用 `v2v-kernel` 的，MSB 优先语义一致） |
 //!
 //! ## 现状
 //!
@@ -56,5 +56,6 @@ pub mod tables;
 mod tns;
 
 pub use encode::{AudioSpecificConfig, Encoder, EncoderConfig, Frame, AOT_AAC_LC};
-// 错误类型复用 msmpeg4 的（`mp4v` 也是这么做的）—— 它本来就是「编解码器的通用错误」。
-pub use v2v_msmpeg4::{Error, Result};
+// 错误类型复用共享内核的（`mp4v` / `vc1` / `mpeg12` 也是这么做的）—— 它本来就是
+// 「编解码器的通用错误」。
+pub use v2v_kernel::{Error, Result};

@@ -15,7 +15,7 @@
 //! 3. **AC 预测的「左 / 上」是内存布局里的行 / 列**：`res_fasttx` 下
 //!    `left_blk_sh = 0`、`top_blk_sh = 3`（转置布局），别按名字想当然。
 
-use v2v_msmpeg4::{Error, Result, Vlc};
+use v2v_kernel::{Error, Result, Vlc};
 
 use crate::decoder::Ctx;
 use crate::idct;

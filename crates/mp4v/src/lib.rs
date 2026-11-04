@@ -38,13 +38,12 @@ pub mod tables;
 
 pub use decode::{Decoder, Vol};
 pub use encode::{Encoder, EncoderConfig};
-// 错误类型直接用 `msmpeg4` 的 —— 它本来就是「编解码器的通用错误」，
-// 而且 `mp4v` 已经依赖那个 crate 拿 DCT / 位写入器 / RL 表了。
 pub use header::{
     time_increment_bits, VolParams, VopParams, PROFILE_SIMPLE_LEVEL1, USER_DATA_STARTCODE,
     VISUAL_OBJ_STARTCODE, VOP_STARTCODE, VOS_STARTCODE,
 };
-pub use v2v_msmpeg4::{Error, Result};
+// 错误类型直接用共享内核 `v2v-kernel` 的 —— 它本来就是「编解码器的通用错误」。
+pub use v2v_kernel::{Error, Result};
 
 /// 宏块尺寸（MPEG-4 Part 2 固定 16×16）。
 pub const MB_SIZE: u32 = 16;

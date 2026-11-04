@@ -325,9 +325,9 @@ pub struct ConvertReport {
 pub enum Error {
     Io(std::io::Error),
     Asf(v2v_asf::Error),
-    /// 视频编解码错误。**MP43 与 MPEG-4 Part 2 共用这一个** ——
-    /// `v2v_mp4v::Error` 就是 `v2v_msmpeg4::Error`（见那个 crate 的 `lib.rs`）。
-    Msmpeg4(v2v_msmpeg4::Error),
+    /// 编解码错误。**MP43 / MPEG-4 Part 2 / VC-1 共用这一个** ——
+    /// 它们的 `Error` 都是 `v2v_kernel::Error`（共享内核里那一份）。
+    Codec(v2v_kernel::Error),
     Avi(v2v_avi::Error),
     Mp4(v2v_mp4::Error),
     Wma(v2v_wma::Error),
@@ -339,7 +339,7 @@ impl std::fmt::Display for Error {
         match self {
             Error::Io(e) => write!(f, "IO 错误：{e}"),
             Error::Asf(e) => write!(f, "容器错误：{e}"),
-            Error::Msmpeg4(e) => write!(f, "编解码错误：{e}"),
+            Error::Codec(e) => write!(f, "编解码错误：{e}"),
             Error::Avi(e) => write!(f, "AVI 错误：{e}"),
             Error::Mp4(e) => write!(f, "MP4 封装错误：{e}"),
             Error::Wma(e) => write!(f, "WMA 解码错误：{e}"),
@@ -360,9 +360,9 @@ impl From<v2v_asf::Error> for Error {
         Error::Asf(e)
     }
 }
-impl From<v2v_msmpeg4::Error> for Error {
-    fn from(e: v2v_msmpeg4::Error) -> Self {
-        Error::Msmpeg4(e)
+impl From<v2v_kernel::Error> for Error {
+    fn from(e: v2v_kernel::Error) -> Self {
+        Error::Codec(e)
     }
 }
 impl From<v2v_avi::Error> for Error {
@@ -628,12 +628,12 @@ fn convert_to_asf(
             f64,
             u64,
         )>|
-              -> std::result::Result<(), v2v_msmpeg4::Error> {
+              -> std::result::Result<(), v2v_kernel::Error> {
             loop {
                 let job = {
                     let rx = jrx
                         .lock()
-                        .map_err(|_| v2v_msmpeg4::Error::Bad("worker 接收端锁坏了"))?;
+                        .map_err(|_| v2v_kernel::Error::Bad("worker 接收端锁坏了"))?;
                     rx.recv()
                 };
                 let Ok((idx, gop)) = job else { break };
@@ -719,11 +719,11 @@ fn convert_to_asf(
         for w in workers {
             match w.join() {
                 Ok(Ok(())) => {}
-                Ok(Err(e)) => return Err(Error::Msmpeg4(e)),
+                Ok(Err(e)) => return Err(Error::Codec(e)),
                 Err(_) => return Err(Error::Unsupported("视频 worker 线程 panic".into())),
             }
         }
-        main_res.map_err(Error::Msmpeg4)?;
+        main_res.map_err(Error::Codec)?;
 
         // 结果乱序回来 → 按 GOP 序号归位，再按 pts 合并视频与音频。
         let mut gops: Vec<Vec<(u32, Vec<u8>, bool)>> = vec![Vec::new(); n_gop];

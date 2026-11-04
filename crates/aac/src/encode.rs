@@ -37,7 +37,7 @@
 //! 好处是「谁更优」这件事完全不依赖任何模型 —— 与 MPEG-4 那边的
 //! 「帧内/帧间两种都写完比位数」是同一个思路。
 
-use v2v_msmpeg4::BitWriter;
+use v2v_kernel::BitWriter;
 
 use crate::mdct::{kbd_aac_window, mdct, sine_window, LONG_LEN, SHORT_LEN};
 use crate::tables;

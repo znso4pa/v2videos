@@ -39,8 +39,8 @@
 //!
 //! 它给出的**码率**还会反过来决定 WMV1 帧头后面的字段读不读（`per_mb_rl_table`）。
 
-use crate::bitreader::BitReader;
-use crate::error::{Error, Result};
+use v2v_kernel::bitreader::BitReader;
+use v2v_kernel::error::{Error, Result};
 use crate::version::Version;
 
 /// 码率高于它，WMV1 的帧头里才多一个 `per_mb_rl_table` 位（ffmpeg 的 `MBAC_BITRATE`）。

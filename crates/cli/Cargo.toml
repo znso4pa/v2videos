@@ -10,6 +10,8 @@ name = "v2v"
 path = "src/main.rs"
 
 [dependencies]
+# 只用它的 `Error`（全仓编解码器共用那一个），`Error::Codec` 收的就是它。
+v2v-kernel = { path = "../kernel" }
 v2v-asf = { path = "../asf" }
 v2v-avi = { path = "../avi" }
 v2v-container = { path = "../container" }

@@ -6,6 +6,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# 编解码器共用的那一层（位读写 / VLC / DCT / IDCT / FFT / SAD / NEON）。
+# 本 crate 是它最大的用户：`simd` 那套 NEON 目前唯一的调用方就是这边的运动估计。
+v2v-kernel = { path = "../kernel" }
 
 [dev-dependencies]
 # 只给 example / 集成测试用：从 ASF 里取视频样本做验证。

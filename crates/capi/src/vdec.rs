@@ -113,7 +113,7 @@ pub unsafe extern "C" fn v2v_vdec_open(
             set_err(KIND_BAD, "宽高不能为 0");
             return std::ptr::null_mut();
         }
-        let built: Result<Vdec, v2v_msmpeg4::Error> = match codec {
+        let built: Result<Vdec, v2v_kernel::Error> = match codec {
             CODEC_WMV3 => v2v_vc1::SeqHeader::parse(extra)
                 .and_then(|seq| v2v_vc1::Decoder::new(seq, width, height))
                 .map(Vdec::Vc1),
@@ -192,7 +192,7 @@ pub unsafe extern "C" fn v2v_vdec_decode(
             Err(e) => return arg_err(&e),
         };
         let hp = unsafe { &mut *h };
-        let got: Result<Owned, v2v_msmpeg4::Error> = match &mut hp.dec {
+        let got: Result<Owned, v2v_kernel::Error> = match &mut hp.dec {
             Vdec::Vc1(d) => d.decode_frame(bytes).map(|_| Owned::from(d.frame())),
             Vdec::Ms { d, w, h } => d.decode(bytes, *w, *h).map(Owned::from),
             Vdec::Mp4v(d) => d.decode(bytes).map(Owned::from),

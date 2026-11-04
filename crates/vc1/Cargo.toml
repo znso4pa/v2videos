@@ -6,8 +6,11 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-# 位读取器与前缀码（VLC）这两件「与具体编解码格式无关」的东西在 msmpeg4 里，
-# 直接复用 —— 不复刻一遍（复刻出来的第二份才是真会跑偏的那份）。
+# 位读取器 / 前缀码（VLC）/ 错误类型 / ABT 的 4:8 8:4 落位这几件「与具体编解码格式
+# 无关」的东西，直接复用共享内核 —— 不复刻一遍（复刻出来的第二份才是真会跑偏的那份）。
+v2v-kernel = { path = "../kernel" }
+# `Planes` / `mid_pred` / `tables::SCAN` 目前还在 msmpeg4 里，等下一步搬进 kernel
+# （见 TODO）。搬完这一行就能删。
 v2v-msmpeg4 = { path = "../msmpeg4" }
 
 [dev-dependencies]

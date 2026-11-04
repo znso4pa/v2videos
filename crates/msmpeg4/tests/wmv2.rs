@@ -20,7 +20,8 @@
 mod common;
 
 use common::{all_video_frames, compare, ffmpeg_frames, sample_list, video_extra};
-use v2v_msmpeg4::{Decoder, Error, Version, Wmv2Flags, Wmv2Frame};
+use v2v_kernel::Error;
+use v2v_msmpeg4::{Decoder, Version, Wmv2Flags, Wmv2Frame};
 
 /// 每个样本比几帧。`V2V_MAX_FRAMES=0` = **整段**（别写成「比 0 帧」——
 /// 那样 `want` 会是 0，ffmpeg 那条路起不来，于是打出一句**误导的**

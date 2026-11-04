@@ -9,7 +9,7 @@
 //! 与上游的对照：`vc1.c` 的 `ff_vc1_decode_sequence_header()`（Simple/Main 分支）与
 //! `ff_vc1_parse_frame_header()`。
 
-use v2v_msmpeg4::{BitReader, Error, Result};
+use v2v_kernel::{BitReader, Error, Result};
 
 use crate::bitplane::{self, Bitplane};
 use crate::tables;

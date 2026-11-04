@@ -28,7 +28,7 @@
 use std::process::ExitCode;
 
 use v2v_aac::{Encoder, EncoderConfig, Frame};
-use v2v_msmpeg4::BitWriter;
+use v2v_kernel::BitWriter;
 
 /// 一帧 AAC 的采样点数（长窗）。
 const FRAME_LEN: usize = 1024;

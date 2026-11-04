@@ -12,11 +12,12 @@ default = []
 mpeg12 = ["dep:v2v-mpeg12", "dep:v2v-mpegps"]
 
 [dependencies]
+# 只用它的 `Error`（全仓编解码器共用那一个），在 `From` 里换成播放器自己的错误。
+v2v-kernel = { path = "../kernel" }
 # 容器无关的共用类型（流 / 样本 / 格式）。
 v2v-container = { path = "../container" }
 v2v-asf = { path = "../asf" }
 v2v-vc1 = { path = "../vc1" }
-v2v-msmpeg4 = { path = "../msmpeg4" }
 v2v-wma = { path = "../wma" }
 v2v-mpeg12 = { path = "../mpeg12", optional = true }
 v2v-mpegps = { path = "../mpegps", optional = true }

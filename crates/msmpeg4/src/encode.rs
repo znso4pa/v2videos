@@ -23,19 +23,19 @@
 //! - **level 的 8 位上限**：第三 escape 用 8 位有符号写 level，所以 |level| ≤ 127。
 //!   I 帧 `qscale` 会自动抬高来保证这一点（见 `pick_qscale`）。
 
-use crate::bitwriter::BitWriter;
+use v2v_kernel::bitwriter::BitWriter;
 use crate::block::RlTable;
-use crate::error::{Error, Result};
-use crate::fdct::{fdct, fdct_i};
+use v2v_kernel::error::{Error, Result};
+use v2v_kernel::fdct::{fdct, fdct_i};
 use crate::version::Version;
 use crate::frame::{
     dc_unscale, mc_mb, mc_params, pred_motion, sad_luma16_capped, Frame, Planes, ZIGZAG,
 };
-use crate::idct::{idct_add, idct_put};
+use v2v_kernel::idct::{idct_add, idct_put};
 use crate::grid::Grid;
 use crate::predict::{coded_block_predict, dc_predict};
 use crate::tables;
-use crate::vlc::Vlc;
+use v2v_kernel::vlc::Vlc;
 
 /// `DC_MAX`：DC VLC 的 escape 符号（超过它就用 8 位明文）。
 const DC_MAX: i32 = 119;

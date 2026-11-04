@@ -21,13 +21,13 @@
 
 use std::sync::OnceLock;
 
-use crate::bitreader::BitReader;
-use crate::error::{Error, Result};
+use v2v_kernel::bitreader::BitReader;
+use v2v_kernel::error::{Error, Result};
 use crate::frame::Planes;
-use crate::idct::wmv2_idct_add;
+use crate::idct_wmv2::wmv2_idct_add;
 use crate::intrax8_tables as t;
 use crate::tables::SCAN;
-use crate::vlc::Vlc;
+use v2v_kernel::vlc::Vlc;
 
 // ---- 空间补偿用的暂存区（`intrax8dsp.c` 顶上那张图）：
 //

@@ -9,7 +9,8 @@
 //! - **B 邻居的 `off` 逐块不同**（1MV 与 4MV 两套），而且 `!res_rtm_flag` 时
 //!   首列还有一个特例偏移。
 
-use v2v_msmpeg4::{mid_pred, Result};
+use v2v_kernel::Result;
+use v2v_msmpeg4::mid_pred;
 
 use crate::decoder::Ctx;
 use crate::header::MvMode;

@@ -14,11 +14,11 @@
 //! MS-MPEG-4 v3 的第三 escape 是 1+6+8 位。**`run_diff` 是帧内/帧间的唯一差别**：
 //! 帧内 0、帧间 1，只作用在第二 escape 的 run 上。
 
-use crate::bitreader::BitReader;
-use crate::error::{Error, Result};
+use v2v_kernel::bitreader::BitReader;
+use v2v_kernel::error::{Error, Result};
 use crate::tables;
 use crate::version::Version;
-use crate::vlc::Vlc;
+use v2v_kernel::vlc::Vlc;
 
 /// 一张 RL 表：前缀码 + 每个符号的 (run, level) + `last` 分界，外加两张派生表。
 pub struct RlTable {

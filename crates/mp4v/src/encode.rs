@@ -71,10 +71,8 @@
 //! 但一帧里每个帧内格子都是「先写后读」、每个帧间格子都被清成 1024 / 0，
 //! 所以每帧重建与跨帧复用**结果相同** —— 重建更省心，也就没有跨帧脏状态可错。
 
-use v2v_msmpeg4::{
-    fdct, fdct_i, idct_add, idct_put, mc_chroma8, mc_luma16, mc_mb, mc_params, mid_pred,
-    sad_luma16, BitWriter, Error, Frame, Planes, Result, RlTable, ZIGZAG,
-};
+use v2v_kernel::{fdct, fdct_i, idct_add, idct_put, BitWriter, Error, Result};
+use v2v_msmpeg4::{mc_chroma8, mc_luma16, mc_mb, mc_params, mid_pred, sad_luma16, Frame, Planes, RlTable, ZIGZAG};
 
 use crate::header::{
     time_increment_bits, write_user_data, write_visual_object_header, write_vol, write_vop_header,

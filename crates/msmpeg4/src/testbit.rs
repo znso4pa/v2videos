@@ -2,4 +2,4 @@
 //!
 //! 实现就在 `crate::bitwriter`（编码器也用同一个），这里只是给测试一个短名字。
 
-pub use crate::bitwriter::BitWriter;
+pub use v2v_kernel::bitwriter::BitWriter;
