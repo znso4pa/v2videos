@@ -36,11 +36,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 用最新的 stable，不钉版本：本仓用了 `Option::is_none_or`（1.82 起）这类
-      # 比较新的 std API，而 runner 镜像自带的 Rust 版本不一定跟得上。
-      - uses: dtolnay/rust-toolchain@stable
-      - name: 工具链版本
-        run: rustc --version && cargo --version
+      # 工具链由 `rust-toolchain.toml` 钉死，**不在这里另写版本** ——
+      # 写两处就有两个真相。`rustup show` 会读到那个文件并把缺的装上。
+      #
+      # 为什么必须钉：AGENTS.md 的「零警告是硬要求」只有在版本固定时才是可满足的。
+      # 用 @stable 的话，新版本多一条 lint 就红，而红的原因与本次改动无关 ——
+      # 于是有人加 `#[allow]` 了事，「硬要求」就变成了摆设。
+      - name: 工具链（按 rust-toolchain.toml）
+        run: |
+          rustup show
+          rustc --version && cargo --version && cargo clippy --version
 
       - name: 装 ffmpeg（只 Linux）
         if: matrix.ffmpeg
@@ -52,13 +57,35 @@ jobs:
 
       # ⚠️ `-j 4`：与本地一致（AGENTS.md 的「构建资源纪律」）。
       # runner 核少，但限并发不会有害，而且能让本地与 CI 的构建条件尽量一致。
-      - name: 构建（零警告是本仓的硬要求）
-        run: cargo build -j 4
+      #
+      # ⚠️ `RUSTFLAGS=-D warnings` + `--all-targets`：这就是把「零警告」从人的
+      # 习惯变成机器约束的那一步。`--all-targets` 是必须的 —— 裸 `cargo build`
+      # 不编 test / example，而警告最常出现在那里。依赖（`cc` 之类）不受影响：
+      # cargo 对 registry 依赖自动加 `--cap-lints allow`，它们的警告封顶为 allow。
+      - name: 构建（零警告是硬要求，这里由机器守）
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo build --workspace --all-targets -j 4
+
+      # clippy 只把 **correctness / suspicious** 两组设为错误：那两组报的是
+      # 「这段代码大概不是你想要的」，也就是真的可能出错的地方。
+      # style / perf 现在还有两百多条，一次性清掉会掺进太多与行为无关的改动，
+      # 而其中「浮点精度过剩」「运算无效果」那几条**可能改变数值** ——
+      # 那种改动必须逐条验字节一致，不能批量做。见 TODO.md 的欠账一节。
+      - name: clippy（correctness / suspicious 不许有）
+        env:
+          RUSTFLAGS: -D warnings
+        run: |
+          cargo clippy --workspace --all-targets -j 4 -- \
+            -D clippy::correctness -D clippy::suspicious \
+            -A clippy::style -A clippy::perf -A clippy::complexity
 
       # ⚠️ `--no-fail-fast`：默认一个测试目标挂了就**不再跑后面的**，
       # 于是「修一个、推一次、又发现下一个」要来回好几轮。实测过一次：
       # 默认跑法只暴露了 7 条失败，加了这个参数才看到还有另外 3 条。
       - name: 测试
+        env:
+          RUSTFLAGS: -D warnings
         run: cargo test --workspace -j 4 --no-fail-fast
 
 # 不加 `cargo fmt`：仓里没有 `rustfmt.toml`，3 万行按默认风格重排会炸出一片

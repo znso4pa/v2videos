@@ -1,0 +1,17 @@
+# 钉死工具链。
+#
+# AGENTS.md 写着「零警告是硬要求」。这条要求只有在**版本固定**时才是可满足的 ——
+# 每次 stable 升级都可能带进新 lint，于是「昨天还全绿」变成「今天一片红」，
+# 然后有人加一个 `#[allow]` 了事。钉住之后，「零警告」才是机器能守的约束，
+# 而不是人的记性。
+#
+# 升级流程（一次只动一个变量）：
+#   1. 改这里的 channel；
+#   2. `cargo build --workspace --all-targets`（CI 带 `-D warnings`，本地也照做）；
+#   3. 把新 lint 修掉 —— 一次升级一个提交，别和新功能混在一起。
+#
+# 不钉 `rustfmt`：仓里没有 `rustfmt.toml`，全仓按默认风格重排会炸出一片与改动
+# 无关的 diff（见 .github/workflows/ci.yml 末尾）。
+[toolchain]
+channel = "1.98.0"
+components = ["clippy"]
