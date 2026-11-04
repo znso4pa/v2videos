@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""用**第二个独立来源**核对 `crates/msmpeg4/src/tables.rs` 里的码表。
+"""用**第二个独立来源**核对 `crates/tables/src/msmpeg4.rs` 里的码表。
 
 ## 为什么要有这个
 
@@ -22,7 +22,7 @@ python3 tools/check_tables.py --fetch
 python3 tools/check_tables.py
 
 # 指定缓存目录 / 表文件
-python3 tools/check_tables.py --dir /tmp/oxtab --tables crates/msmpeg4/src/tables.rs
+python3 tools/check_tables.py --dir /tmp/oxtab --tables crates/tables/src/msmpeg4.rs
 ```
 
 退出码：全部一致 0；有差异 1；抓取失败 2。
@@ -103,7 +103,7 @@ def parse_static(name: str, path: Path):
 def main() -> int:
     ap = argparse.ArgumentParser(description="用 OxideAV（MIT）的表核对我们的 tables.rs")
     ap.add_argument("--dir", default="/tmp/v2v_ox_tables", help="CSV 缓存目录")
-    ap.add_argument("--tables", default="crates/msmpeg4/src/tables.rs", help="我们的表文件")
+    ap.add_argument("--tables", default="crates/tables/src/msmpeg4.rs", help="我们的表文件")
     ap.add_argument("--fetch", action="store_true", help="先抓 CSV")
     args = ap.parse_args()
 
