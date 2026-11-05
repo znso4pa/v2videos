@@ -152,13 +152,15 @@ impl Decoder {
     }
 
     fn parse_cpe(&self, r: &mut BitReader) -> Result<Element> {
-        // M1 只做到单声道：双声道在 ch0 的 scalefactor 之后与 ch1 起点差了若干位，
-        // 根因未定位（不是「随便错一点」—— 差一位整条流就废）。明确报错，不猜。
+        // **结构上做不到**（不是 bug）：CPE 的第二个声道紧跟在第一个声道的**谱数据**
+        // 之后，而谱数据的位长只有解完 Huffman 才知道（M2）。所以 M1 解析到第一个
+        // 声道的 `spectral_bit_pos` 就到头了 —— 想继续必须先把谱解出来。
         let _ = r;
         return Err(Error::Unsupported(
-            "CPE（双声道）解析未完成：ch0 的 scalefactor 之后与 ch1 起点错位".into(),
+            "CPE（双声道）需要先解谱数据（M2）才能定位第二个声道".into(),
         ));
         #[allow(unreachable_code)]
+
         let tag = r.u(4)? as u8;
         let common_window = r.u(1)? != 0;
         let mut channels = Vec::new();
@@ -200,11 +202,26 @@ impl Decoder {
         })
     }
 
-    /// `individual_channel_stream`（**不带** `common_window` 时）：`ics_info` 在前，
-    /// `global_gain` 在后 —— 顺序与 common_window 那条不同，写反了从 section 起错位。
+    /// `individual_channel_stream`（**不带** `common_window` 时）：
+    /// **`global_gain` 在前、`ics_info` 在后**（与 common_window 那条相反 ——
+    /// 那条是元素头先写 `ics_info`，每个声道只剩 `global_gain`）。
+    /// 顺序写反了：解码端会先读 11 位的 ics_info 当增益，整条流从第一个元素就错位。
     fn parse_ics(&self, r: &mut BitReader, _write_ics: bool) -> Result<IcsInfo> {
-        let ics = self.parse_ics_info(r)?;
-        self.parse_ics_body(r, &ics)
+        let global_gain = r.u(8)? as u8;
+        let mut ics = self.parse_ics_info(r)?;
+        ics.global_gain = global_gain;
+        self.parse_sections(r, &mut ics)?;
+        self.parse_scalefactors(r, &mut ics)?;
+        if r.u(1)? != 0 {
+            return Err(Error::Unsupported("pulse_data 暂不支持".into()));
+        }
+        if r.u(1)? != 0 {
+            return Err(Error::Unsupported("TNS 暂不支持（M3）".into()));
+        }
+        if r.u(1)? != 0 {
+            return Err(Error::Unsupported("gain_control 暂不支持".into()));
+        }
+        Ok(ics)
     }
 
     /// `common_window` 的第二个通道：不重读 ics_info，其余照常。

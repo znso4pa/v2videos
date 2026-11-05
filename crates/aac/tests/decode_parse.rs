@@ -6,7 +6,6 @@
 use v2v_aac::{Decoder, Encoder, EncoderConfig, Frame};
 
 #[test]
-#[ignore = "M1 未完成：section 长度累加越过 max_sfb，根因未定位（见 decode.rs 顶部）"]
 fn parses_own_mono_frame() {
     let cfg = EncoderConfig {
         channels: 1,
@@ -41,10 +40,10 @@ fn parses_own_mono_frame() {
     assert!(e.spectral_bit_pos < bytes.len() * 8);
 }
 
-/// M1 的**已知边界**：双声道（CPE）在 ch0 的 scalefactor 之后与 ch1 起点错位，
-/// 根因未定位。这里钉住「明确报错」——**不能**静默解出半截数据。
+/// M1 的**结构性边界**：CPE 的第二个声道在第一个声道的**谱数据**之后，
+/// 而谱数据的位长要解完 Huffman 才知道（M2）。所以这里钉住「明确报错」——
+/// **不能**静默解出半截数据。
 #[test]
-#[ignore = "M1 未完成：CPE 在 ch0 的 scalefactor 之后与 ch1 起点错位"]
 fn cpe_is_explicitly_unsupported() {
     let cfg = EncoderConfig {
         channels: 2,
@@ -62,7 +61,11 @@ fn cpe_is_explicitly_unsupported() {
         ],
     };
     let bytes = enc.encode_frame(&frame).unwrap();
-    assert!(dec.parse_frame(&bytes).is_err(), "CPE 必须明确报错");
+    let e = dec.parse_frame(&bytes).unwrap_err();
+    assert!(
+        format!("{e}").contains("M2"),
+        "CPE 的错误信息要点明「需要 M2」：{e}"
+    );
 }
 
 #[test]
