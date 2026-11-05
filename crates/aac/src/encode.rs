@@ -106,7 +106,7 @@ pub const CB_MAXVAL: [u8; 12] = [0, 1, 1, 2, 2, 4, 4, 7, 7, 12, 12, 16];
 pub const CB_RANGE: [u8; 12] = [0, 3, 3, 3, 3, 9, 9, 8, 8, 13, 13, 17];
 
 /// 只有第 11 本是 escape 码本（`ESC_BT`）。
-const CB_ESC: usize = 11;
+pub(crate) const CB_ESC: usize = 11;
 
 /// λ 的指数搜索上界，**单位是 1/8**：`λ = 2^(k/8)`，`k ∈ [0, 208]`。
 const MAX_LAMBDA_K8: i32 = 280;

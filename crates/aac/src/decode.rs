@@ -22,6 +22,7 @@
 //!
 //! 遇到还没做的部分**明确报 `Unsupported`**，不猜、不静默跳过。
 
+use crate::encode::{CB_DIM, CB_ESC, CB_UNSIGNED};
 use crate::{Error, Result};
 use v2v_tables::aac as t;
 
@@ -56,12 +57,17 @@ pub struct Element {
     pub channels: Vec<IcsInfo>,
     /// 谱数据开始的位偏移（M2 从这里接着解）。
     pub spectral_bit_pos: usize,
+    /// 每个通道的量化谱系数（`frame_len` 个；M2 解出来的，尚未反量化）。
+    pub spectra: Vec<Vec<i32>>,
 }
 
 /// 解出来的帧结构。
 #[derive(Debug, Clone)]
 pub struct FrameInfo {
     pub elements: Vec<Element>,
+    /// 解析结束时用掉的位数。`len * 8 - bits_used < 8` 说明位流被**恰好**读完
+    /// （只剩字节对齐的补零）—— 这是「语法没读偏」最强的间接判据。
+    pub bits_used: usize,
 }
 
 /// AAC-LC 解码器。
@@ -135,36 +141,37 @@ impl Decoder {
                 }
             }
         }
-        Ok(FrameInfo { elements })
+        Ok(FrameInfo {
+            elements,
+            bits_used: r.pos(),
+        })
     }
 
     fn parse_sce(&self, r: &mut BitReader) -> Result<Element> {
         let tag = r.u(4)? as u8;
         let ch = self.parse_ics(r, false)?;
+        let sp = r.pos();
+        let spec = self.parse_spectral(r, &ch)?;
         Ok(Element {
             kind: 0,
             tag,
             common_window: false,
             ms_mask_present: 0,
             channels: vec![ch],
-            spectral_bit_pos: r.pos(),
+            spectral_bit_pos: sp,
+            spectra: vec![spec],
         })
     }
 
     fn parse_cpe(&self, r: &mut BitReader) -> Result<Element> {
-        // **结构上做不到**（不是 bug）：CPE 的第二个声道紧跟在第一个声道的**谱数据**
-        // 之后，而谱数据的位长只有解完 Huffman 才知道（M2）。所以 M1 解析到第一个
-        // 声道的 `spectral_bit_pos` 就到头了 —— 想继续必须先把谱解出来。
-        let _ = r;
-        return Err(Error::Unsupported(
-            "CPE（双声道）需要先解谱数据（M2）才能定位第二个声道".into(),
-        ));
-        #[allow(unreachable_code)]
+
 
         let tag = r.u(4)? as u8;
         let common_window = r.u(1)? != 0;
         let mut channels = Vec::new();
+        let mut spectra = Vec::new();
         let mut ms_mask_present = 0;
+        let sp;
         if common_window {
             // ⚠️ 顺序：`ics_info` → `ms_mask_present` → 两个通道各自的 `global_gain`。
             let shared = self.parse_ics_info(r)?;
@@ -183,14 +190,24 @@ impl Decoder {
                 _ => return Err(Error::Bad("ms_mask_present = 3 是保留值")),
             }
             let ch0 = self.parse_ics_body(r, &shared)?;
+            sp = r.pos();
+            let spec0 = self.parse_spectral(r, &ch0)?;
             let ch1 = self.parse_ics_body(r, &shared)?;
+            let spec1 = self.parse_spectral(r, &ch1)?;
             channels.push(ch0);
             channels.push(ch1);
+            spectra.push(spec0);
+            spectra.push(spec1);
         } else {
             let ch0 = self.parse_ics(r, false)?;
+            sp = r.pos();
+            let spec0 = self.parse_spectral(r, &ch0)?;
             let ch1 = self.parse_ics(r, false)?;
+            let spec1 = self.parse_spectral(r, &ch1)?;
             channels.push(ch0);
             channels.push(ch1);
+            spectra.push(spec0);
+            spectra.push(spec1);
         }
         Ok(Element {
             kind: 1,
@@ -198,7 +215,8 @@ impl Decoder {
             common_window,
             ms_mask_present,
             channels,
-            spectral_bit_pos: r.pos(),
+            spectral_bit_pos: sp,
+            spectra,
         })
     }
 
@@ -272,6 +290,74 @@ impl Decoder {
         })
     }
 
+    /// 谱数据：按 `section_cb` 与 `swb` 逐带解（**长窗**；短窗留到 M3）。
+    fn parse_spectral(&self, r: &mut BitReader, ics: &IcsInfo) -> Result<Vec<i32>> {
+        if ics.window_sequence == 2 {
+            return Err(Error::Unsupported("短窗谱数据暂不支持（M3）".into()));
+        }
+        let sr = self.sample_rate_index as usize;
+        let len = t::SWB_OFFSET_1024_LEN[sr] as usize;
+        let swb = &t::SWB_OFFSET_1024[sr][..len];
+        let mut out = vec![0i32; self.frame_len];
+        for sfb in 0..ics.max_sfb as usize {
+            let cb = ics.section_cb[sfb];
+            let a = swb[sfb] as usize;
+            let b = swb[sfb + 1] as usize;
+            if b > self.frame_len || a >= b {
+                break;
+            }
+            self.decode_band(r, cb, &mut out[a..b])?;
+        }
+        Ok(out)
+    }
+
+    /// 一个频带的谱系数（Huffman + 符号位 + escape）。
+    fn decode_band(&self, r: &mut BitReader, cb: u8, out: &mut [i32]) -> Result<()> {
+        if cb == 0 {
+            out.fill(0);
+            return Ok(());
+        }
+        let cb = cb as usize;
+        let dim = CB_DIM[cb];
+        let unsigned = CB_UNSIGNED[cb];
+        let codes = &t::SPECTRAL_CODE[cb - 1];
+        let lens = &t::SPECTRAL_BITS[cb - 1];
+        let size = t::SPECTRAL_SIZE[cb - 1] as usize;
+        let vecs = t::CODEBOOK_VECTORS[cb - 1];
+        let mut pos = 0usize;
+        while pos < out.len() {
+            let idx = decode_spectral(r, codes, lens, size)?;
+            let mut vals = [0i32; 4];
+            for j in 0..dim {
+                vals[j] = i32::from(vecs[idx * dim + j]);
+            }
+            // 无符号码本：非零维逐个跟一个符号位。
+            if unsigned {
+                for v in vals.iter_mut().take(dim) {
+                    if *v != 0 && r.u(1)? != 0 {
+                        *v = -*v;
+                    }
+                }
+            }
+            // escape 码本：|值| == 64 的那一维后面跟变长整数。
+            if cb == CB_ESC {
+                for v in vals.iter_mut().take(dim) {
+                    if v.abs() == 64 {
+                        let mag = read_escape(r)?;
+                        *v = if *v < 0 { -mag } else { mag };
+                    }
+                }
+            }
+            for j in 0..dim {
+                if pos + j < out.len() {
+                    out[pos + j] = vals[j];
+                }
+            }
+            pos += dim;
+        }
+        Ok(())
+    }
+
     /// `section_data`：`sect_cb`（4 位）+ `sect_len_incr`（长窗 5 位 / 短窗 3 位），
     /// 反复直到覆盖 `max_sfb`。
     ///
@@ -339,6 +425,36 @@ impl Decoder {
         }
         Ok(())
     }
+}
+
+/// 谱数据的 Huffman：在 `size` 个码字里找匹配的 `(code, len)`。
+fn decode_spectral(r: &mut BitReader, codes: &[u16], lens: &[u8], size: usize) -> Result<usize> {
+    let mut code = 0u32;
+    for len in 1..=19u32 {
+        code = (code << 1) | r.u(1)?;
+        for i in 0..size {
+            if u32::from(lens[i]) == len && u32::from(codes[i]) == code {
+                return Ok(i);
+            }
+        }
+    }
+    Err(Error::Bad("谱数据的 Huffman 码无效"))
+}
+
+/// escape：`nbits-1` 个 1 再一个 0（`nbits = 前缀里 1 的个数 + 1`），
+/// 然后 `len = nbits + 3` 位的有符号值。
+fn read_escape(r: &mut BitReader) -> Result<i32> {
+    let mut ones = 0u32;
+    while r.u(1)? != 0 {
+        ones += 1;
+        if ones > 9 {
+            return Err(Error::Bad("escape 前缀过长"));
+        }
+    }
+    let len = ones + 4;
+    let v = r.u(len)? as i32;
+    let sign = 1i32 << (len - 1);
+    Ok(if v & sign != 0 { v - (1 << len) } else { v })
 }
 
 /// 短窗的分组数：`scale_factor_grouping` 的 7 位里，1 = 「与上一个窗同组」。
