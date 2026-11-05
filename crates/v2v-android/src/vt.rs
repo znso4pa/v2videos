@@ -31,6 +31,29 @@ extern "C" {
     fn vt_free(c: *mut VtCtx);
 }
 
+#[repr(C)]
+pub struct VtDecCtx {
+    _private: [u8; 0],
+}
+
+extern "C" {
+    fn vt_dec_open(avcc: *const u8, avcc_len: i32) -> *mut VtDecCtx;
+    fn vt_dec_feed(c: *mut VtDecCtx, data: *const u8, len: i32, pts_us: i64) -> i32;
+    fn vt_dec_next(
+        c: *mut VtDecCtx,
+        y: *mut *const u8,
+        u: *mut *const u8,
+        v: *mut *const u8,
+        w: *mut i32,
+        h: *mut i32,
+        pts_us: *mut i64,
+    ) -> i32;
+    fn vt_dec_flush(c: *mut VtDecCtx) -> i32;
+    fn vt_dec_is_hardware(c: *mut VtDecCtx) -> i32;
+    fn vt_dec_last_error(c: *mut VtDecCtx) -> *const std::os::raw::c_char;
+    fn vt_dec_free(c: *mut VtDecCtx);
+}
+
 /// 一个编码出来的 H.264 样本（长度前缀 NALU，非 Annex-B）。
 pub struct VtSample {
     pub data: Vec<u8>,
@@ -165,5 +188,126 @@ unsafe impl Send for VideoToolboxEncoder {}
 impl Drop for VideoToolboxEncoder {
     fn drop(&mut self) {
         unsafe { vt_free(self.ctx) };
+    }
+}
+
+/// 一帧解出来的画面：YUV420P 三平面、紧排、行距 = `width`。
+pub struct DecodedFrame {
+    pub y: Vec<u8>,
+    pub u: Vec<u8>,
+    pub v: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    pub pts_us: i64,
+}
+
+/// macOS 硬件 H.264 解码器（VideoToolbox）。
+///
+/// 输入口径与 `VideoToolboxEncoder` 的产物、以及 `v2v_mp4` 解封装吐出的样本
+/// 完全一致：**avcC + 长度前缀 NALU**（不是 Annex-B），所以这条路径不需要
+/// 任何格式转换。
+///
+/// `!Send`：解码会话的回调跑在 VT 自己的线程上，本类型刻意不声明 `Send`
+/// —— 调用点都是单线程「喂一个样本、取一批帧」，没有跨线程移动的需要。
+pub struct VideoToolboxDecoder {
+    ctx: *mut VtDecCtx,
+}
+
+impl VideoToolboxDecoder {
+    /// 用 avcC（AVCDecoderConfigurationRecord，含 SPS/PPS）打开解码会话。
+    pub fn open(avcc: &[u8]) -> Result<Self> {
+        unsafe {
+            let ctx = vt_dec_open(avcc.as_ptr(), avcc.len() as i32);
+            if ctx.is_null() {
+                // 打开失败时 ctx 已被 C 侧释放，错误串取不到了 —— 只能给个兜底。
+                return Err(Error::Bad("VideoToolbox 解码会话打开失败".into()));
+            }
+            Ok(Self { ctx })
+        }
+    }
+
+    /// 喂一个样本，并收走此刻已就绪的帧。
+    ///
+    /// ⚠️ 输出**不保证**与输入一一对应：解码器会缓冲（B 帧重排、延迟帧），
+    /// 所以 `feed` 可能返回 0 帧，也可能返回多于 1 帧。收尾必须调 `flush`。
+    pub fn feed(&mut self, sample: &[u8], pts_us: i64) -> Result<Vec<DecodedFrame>> {
+        unsafe {
+            if vt_dec_feed(self.ctx, sample.as_ptr(), sample.len() as i32, pts_us) != 0 {
+                return Err(Error::Bad(Self::last_err(self.ctx)));
+            }
+        }
+        self.drain()
+    }
+
+    /// 发 EOS 并把在途帧全部取出来（带 B 帧的流最后几帧只在这里出）。
+    pub fn flush(&mut self) -> Result<Vec<DecodedFrame>> {
+        unsafe {
+            if vt_dec_flush(self.ctx) != 0 {
+                return Err(Error::Bad(Self::last_err(self.ctx)));
+            }
+        }
+        self.drain()
+    }
+
+    /// 这个会话实际用的是硬件还是软件解码器。
+    ///
+    /// `None` = 查不到（设备/系统版本没提供该属性）—— 别把它当成「软解」，
+    /// 否则判据会在一台查不到属性的机器上莫名其妙地红。
+    pub fn is_hardware(&self) -> Option<bool> {
+        match unsafe { vt_dec_is_hardware(self.ctx) } {
+            1 => Some(true),
+            0 => Some(false),
+            _ => None,
+        }
+    }
+
+    fn drain(&mut self) -> Result<Vec<DecodedFrame>> {
+        let mut out = Vec::new();
+        loop {
+            let (mut y, mut u, mut v) = (
+                std::ptr::null::<u8>(),
+                std::ptr::null::<u8>(),
+                std::ptr::null::<u8>(),
+            );
+            let (mut w, mut h, mut pts_us) = (0i32, 0i32, 0i64);
+            let r = unsafe {
+                vt_dec_next(self.ctx, &mut y, &mut u, &mut v, &mut w, &mut h, &mut pts_us)
+            };
+            if r == 1 {
+                break; // 暂无更多
+            }
+            if r != 0 {
+                return Err(Error::Bad(Self::last_err(self.ctx)));
+            }
+            let (wu, hu) = (w as usize, h as usize);
+            let clen = (wu / 2) * (hu / 2);
+            // 三个平面各自从 C 侧给的指针拷 —— 不假设它们在内存里紧挨着，
+            // 那样 C 侧一改布局这边就静默错位。
+            out.push(DecodedFrame {
+                y: unsafe { std::slice::from_raw_parts(y, wu * hu) }.to_vec(),
+                u: unsafe { std::slice::from_raw_parts(u, clen) }.to_vec(),
+                v: unsafe { std::slice::from_raw_parts(v, clen) }.to_vec(),
+                width: w as u32,
+                height: h as u32,
+                pts_us,
+            });
+        }
+        Ok(out)
+    }
+
+    fn last_err(ctx: *mut VtDecCtx) -> String {
+        unsafe {
+            let p = vt_dec_last_error(ctx);
+            if p.is_null() {
+                return "未知错误".into();
+            }
+            std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+        }
+    }
+}
+
+impl Drop for VideoToolboxDecoder {
+    fn drop(&mut self) {
+        unsafe { vt_dec_free(self.ctx) };
     }
 }

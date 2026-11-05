@@ -42,17 +42,20 @@ fn main() {
             println!("cargo:rerun-if-changed=c/media_encoder.h");
         }
         "macos" => {
-            // VideoToolbox：系统框架，设备上的硬件编码器。
+            // VideoToolbox：系统框架，设备上的硬件编解码器。
             println!("cargo:rustc-link-lib=framework=VideoToolbox");
             println!("cargo:rustc-link-lib=framework=CoreMedia");
             println!("cargo:rustc-link-lib=framework=CoreVideo");
             println!("cargo:rustc-link-lib=framework=CoreFoundation");
             cc::Build::new()
                 .file("c/vt_encoder.c")
+                .file("c/vt_decoder.c")
                 .flag_if_supported("-std=c11")
                 .compile("vt_shim");
             println!("cargo:rerun-if-changed=c/vt_encoder.c");
             println!("cargo:rerun-if-changed=c/vt_encoder.h");
+            println!("cargo:rerun-if-changed=c/vt_decoder.c");
+            println!("cargo:rerun-if-changed=c/vt_decoder.h");
         }
         _ => {
             println!("cargo:rerun-if-changed=build.rs");
