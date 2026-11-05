@@ -240,7 +240,7 @@ cc -std=c11 -Wall -Wextra -Werror -I crates/v2v-capi/include \
 | **解码**   | MPEG-4 Part 2（`v2v-mp4v` 的 `decode`）：I / P、H.263 量化、16×16 半像素 —— 修了七个「能跑但不对」的 bug（`^` 优先级、亮度用错色度 DC 表、escape 步进、符号扩展、伪中值、resync 误拒、**escape 内层 level 没反量化**） | 两条判据同一把尺（`ffmpeg -idct 2 -fps_mode passthrough`）：自己编的 I P P P I P P P **逐像素 0 差**；**ffmpeg 自己编的流**（独立来源）10 帧全解、也 0 差 |
 | **播放**   | `v2v-player`：顺时取帧（视频逐帧、音频逐样本）、两轨独立、`seek(ms)`（Simple Index + 关键帧回退 + **前向解码到目标**） | black 首帧 PTS=0（preroll 真扣掉）、EOS 稳定返回 `None`；sample 全片两轨到 EOS、PTS 单调（修过一个不报错的坑：superframe 多帧只交第一帧 → 音频只剩 1/4）；seek(69.2 s) 实际落位 **69.2 s** |
 | **硬件编码** | `v2v-android`（进站 FFI，见「FFI」一节）：MediaCodec H.264 + MediaMuxer MP4，音频走我们的 AAC | C shim 用真 NDK 28.2（API 26）0 警告编译、双端 `cargo check` 0 错 0 警；真机实测**待补**（无设备连接，不写没量过的数） |
-| **硬件解码** | `v2v-android`（macOS VideoToolbox，`c/vt_decoder.c` + `vt.rs`）：avcC + 长度前缀 NALU → YUV420P 三平面。输入口径与 `Mp4Demuxer` 吐的样本一致，中间不需要 Annex-B 转换 | 对 `ffmpeg` **软件**解码（`-c:v h264`）逐帧比：720p / 1080p × 合成画面 / 真内容 × 各 60–90 帧，**PSNR = ∞，一帧不差**。这不是运气 —— H.264 的反变换 / 环路滤波是标准规定的精确整数运算，符合标准的解码器必须逐字节一致（所以「硬件解码有舍入」那个说法是错的）。断言仍写 **≥ 45 dB**：别的驱动上 ±1 LSB 属允许的实现差异，而真错会掉到 30 dB 那一档（实测把 Y 取址错开一行 = **31.69 dB**）。会话确认落在硬件上（`is_hardware`）。**还剩**：`v2v-capi` 的 `v2v_vdec_open` + `V2V_CODEC_H264_HW`、Android 的 MediaCodec 解码 |
+| **硬件解码** | `v2v-android`（macOS VideoToolbox，`c/vt_decoder.c` + `vt.rs`）：avcC + 长度前缀 NALU → YUV420P 三平面。输入口径与 `Mp4Demuxer` 吐的样本一致，中间不需要 Annex-B 转换。C ABI 侧是 `V2V_CODEC_H264_HW`（新编号）+ `v2v_vdec_decode_pts` / `next` / `flush` —— 硬件解码是**异步**的（喂一包可能不出帧，也可能一次出好几帧），语义与 0–5 号软件解码器不同，所以单独编号、单独入口 | 对 `ffmpeg` **软件**解码（`-c:v h264`）逐帧比：720p / 1080p × 合成画面 / 真内容 × 各 60–90 帧，**PSNR = ∞，一帧不差**；穿过 C ABI 之后同样逐字节一致，45 帧一个不少、带回来的 pts 集合与喂进去的完全相同。这不是运气 —— H.264 的反变换 / 环路滤波是标准规定的精确整数运算，符合标准的解码器必须逐字节一致（所以「硬件解码有舍入」那个说法是错的）。断言仍写 **≥ 45 dB**：别的驱动上 ±1 LSB 属允许的实现差异，而真错会掉到 30 dB 那一档（实测把 Y 取址错开一行 = **31.69 dB**）。**还剩**：Android 的 MediaCodec 解码、CLI 的 `.mp4` 输入 |
 | **音频直通** | 转换时原样搬音频轨（ASF 多流复用）                                                                                         | 真样本整条音轨：输出音频与源**逐样本 0 差异**（整轨字节完全一致）                                           |
 | **音频解码** | WMA v1/v2（`v2v-wma`）→ PCM                                                                                   | 真样本整轨与 ffmpeg 的 PCM **最大差 2**（s16 满量程 32768）；转进 MP4 后**对齐偏移 0 采样点**                             |
 | **音频编码** | AAC-LC（`v2v-aac`）：MDCT + 量化 + Huffman 码本 + **短窗**（瞬态）+ 窗口分组 + **TNS**（长窗）+ **M/S 立体声**（逐帧决策）；预算**按声道需要分**、**逐带率-失真分配**（每带按 `失真 + λ·位数` 选，λ 从上一帧的答案出发搜）够目标码率；双声道可选**声道并行**（输出逐字节不变） | ffmpeg 解得开；码率命中目标；真素材上与 ffmpeg 的 AAC 同目标码率比：**128k +2.1 dB、192k +3.1 dB、256k +3.1 dB**（另一段素材 +7 ～ +8 dB；口径见 §4，`tools/snr.py` 搜对齐后再算）；瞬态素材上**短窗 vs 长窗 12.02 vs 10.49 dB、体积小 29%** |
@@ -289,9 +289,9 @@ MP4 的分片 / `co64`、其他容器与编解码器。
 都**明确报 `Unsupported`**，不静默跳过。PNS 与 IS 规范不要求 bit-exact，所以也不进
 「对 `ffmpeg` ±1 LSB」那条判据（测 ffmpeg 位流时用 `-aac_pns 0 -aac_is 0` 关掉）。
 
-H.264 那边：**macOS 硬解已通**（见状态表），但**还没接进 C ABI** —— `v2v-capi` 里目前
-没有 `v2v_vdec_open` 的 H.264 分支，所以 `v2v convert` 还读不了 `.mp4` 输入；
-Android 的 MediaCodec 解码也还没写。软件 H.264 解码器（纯 Rust）**没有计划**。
+H.264 那边：**macOS 硬解已通**（C shim + C ABI 都有了，见状态表），但**还没接进 CLI** ——
+`v2v convert` 仍只认 WMV/ASF/AVI 输入，读不了 `.mp4`；Android 的 MediaCodec 解码也还没写。
+软件 H.264 解码器（纯 Rust）**没有计划**。
 
 ## 与 `ffmpeg` 的全面对表（2026-10-16 实测）
 
