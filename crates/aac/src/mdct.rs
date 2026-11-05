@@ -222,16 +222,21 @@ fn bessel_i0(x: f64) -> f64 {
 ///
 /// ## ⚠️ 那个 **`2.0`** 不是凑出来的
 ///
-/// 规范里的 IMDCT 带一个 `2/N`（`rusty_aac/src/dsp.rs::imdct` 的
-/// `out[i] = (2/N)·Σ...`）。前向要和它互逆、且在 Princen-Bradley 窗下
-/// 50% 重叠相加等于恒等，前向就得**乘 2**：
+/// 规范里的 IMDCT 带一个 `2/N`，**这里的 `N` 是窗长 `2·n`（2048）**，也就是
+/// 本文件的 `1/n`（`n` = 系数个数 1024）。前向要和它互逆、且在 Princen-Bradley
+/// 窗下 50% 重叠相加等于恒等，前向就得**乘 2**：
 ///
 /// ```text
-///   mdct(·) = 2 · Σ x[n]·cos(...)         （本函数）
-///   imdct(·) = (2/N) · Σ X[k]·cos(...)
+///   mdct(·)   = 2 · Σ x[n]·cos(...)            （本函数）
+///   imdct(·)  = (2/N_win) · Σ X[k]·cos(...)    = (1/n) · Σ ...
 /// ```
 ///
-/// 漏掉这个 2 的后果：谱系数整体小一半 → 量化时最优 `sf` 偏大 4 档
+/// ⚠️ **别把两个 `N` 弄混**：`imdct` 的定标曾是 `2/n`（`n` = 系数个数），
+/// 那等于规范的 `4/N_win`，重建出来**整整大 2 倍** —— 编码器侧看不出来
+/// （前向是标准的，ffmpeg 解出来的电平是对的），只有解码端会整体偏大。
+/// `synthesis` 的往返测试与 `tests/decode_pcm.rs` 的 ±1 LSB 对账各钉一头。
+///
+/// 漏掉前向那个 2 的后果：谱系数整体小一半 → 量化时最优 `sf` 偏大 4 档
 /// → **解码输出电平固定偏小**（实测比值 0.532，四档幅度都一样）。
 /// 这种「形状全对、只差一个常数倍」的错误最容易被当成「调参问题」去试，
 /// 而它其实是**定标契约**没对上。
@@ -321,15 +326,16 @@ pub fn mdct(input: &[f32], out: &mut [f32]) {
     }
 }
 
-/// 直接法的 IMDCT：`N → 2N`，**无归一化**。
+/// 直接法的 IMDCT：`N → 2N`，定标 `1/n`（= 规范的 `2/窗长`，见 `mdct` 的推导）。
 ///
-/// 与 `mdct` 互为逆（差一个整体常数因子，由 50% 重叠相加的窗处理）。
-/// 这里只用来做往返自测 —— 解码端的 IMDCT 不需要我们实现。
+/// 与 `mdct` 互为逆（开窗 + 50% 重叠相加后增益 1.0）。
+/// **只当 oracle**：解码端走 `imdct_fast`，这里 O(N²)，`n = 1024` 时一帧
+/// 每声道 210 万次内层迭代 —— 拿它跑整首歌会慢到没法用。
 pub fn imdct(input: &[f32], out: &mut [f32]) {
     let n = input.len();
     debug_assert_eq!(out.len(), 2 * n);
-    // 与 MDCT 的差：相位里的 `n/2` 从「输入侧」挪到「输出侧」，系数是 2/N。
-    let scale = 2.0 / n as f64;
+    // 与 MDCT 的差：相位里的 `n/2` 从「输入侧」挪到「输出侧」，系数是 1/n。
+    let scale = 1.0 / n as f64;
     for (i, o) in out.iter_mut().enumerate() {
         let mut s = 0f64;
         for (k, &x) in input.iter().enumerate() {
@@ -337,6 +343,80 @@ pub fn imdct(input: &[f32], out: &mut [f32]) {
                 * (PI / n as f64 * (i as f64 + 0.5 + n as f64 / 2.0) * (k as f64 + 0.5)).cos();
         }
         *o = (s * scale) as f32;
+    }
+}
+
+/// FFT 版 IMDCT：`N → 2N`，**与 `imdct` 同一个定标**（`1/n`，即规范的 `2/窗长`）。
+///
+/// 解码端用这一条。推导与 `mdct` 对称，只把相位挪到输出侧：
+///
+/// ```text
+///   y[n] = (2/N)·Σ_k X[k]·cos(π/N·(n+n0)(k+0.5))
+///        = (2/N)·Re{ e^{iθ_n} · Σ_k X[k]·e^{i2πnk/(2N)} }
+///   其中 θ_n = π(n+n0)/(2N)，Z[k] = X[k]·e^{iπ·n0·k/N}
+/// ```
+///
+/// 括号里那个和是 **2N 点逆 DFT** 的第 `n` 个 bin。FFT 只做正向，所以用
+/// 「输入取共轭 → 正变换 → 输出取共轭」拿（`v2v-kernel` 的 FFT 文档里写的就是这条）。
+///
+/// ⚠️ 两条相位都是**线性**的，所以旋转因子用切比雪夫递推生成，一次变换只调
+/// 4 次 `sin`/`cos`。与 `mdct` 一样，递推的状态**每次调用重新起**，不跨调用。
+pub fn imdct_fast(input: &[f32], out: &mut [f32]) {
+    let n = input.len();
+    debug_assert_eq!(out.len(), 2 * n);
+    debug_assert!(n.is_power_of_two());
+    let m = 2 * n;
+    let n0 = 0.5 + n as f64 / 2.0;
+    let step = PI / m as f64; // π/(2N)
+
+    let mut re = vec![0f64; m];
+    let mut im = vec![0f64; m];
+
+    // 预旋转：Z[k] = X[k]·e^{i·π·n0·k/N}，相位步长 = 2·step·n0（对 k 线性）
+    {
+        let s = 2.0 * step * n0;
+        let two_cos = 2.0 * s.cos();
+        let mut prev = (-s).cos();
+        let mut cur = 1.0f64; // cos(0)
+        let mut prev_i = (-s).sin();
+        let mut cur_i = 0.0f64; // sin(0)
+        for k in 0..n {
+            let x = f64::from(input[k]);
+            re[k] = x * cur;
+            im[k] = x * cur_i;
+            let next = two_cos * cur - prev;
+            prev = cur;
+            cur = next;
+            let next_i = two_cos * cur_i - prev_i;
+            prev_i = cur_i;
+            cur_i = next_i;
+        }
+    }
+
+    // 逆变换 = 共轭 → 正变换 → 共轭；输入那一次共轭折进下面这一行。
+    for v in im.iter_mut() {
+        *v = -*v;
+    }
+    fft_in_place(&mut re, &mut im);
+
+    // 后旋转：y[n] = (2/N)·Re{ e^{iθ_n}·conj(F[n]) } = (2/N)(re·cosθ + im·sinθ)
+    {
+        let base = step * n0;
+        let two_cos = 2.0 * step.cos();
+        let mut prev = (base - step).cos();
+        let mut cur = base.cos();
+        let mut prev_i = (base - step).sin();
+        let mut cur_i = base.sin();
+        let scale = 1.0 / n as f64;
+        for (i, o) in out.iter_mut().enumerate() {
+            *o = (scale * (re[i] * cur + im[i] * cur_i)) as f32;
+            let next = two_cos * cur - prev;
+            prev = cur;
+            cur = next;
+            let next_i = two_cos * cur_i - prev_i;
+            prev_i = cur_i;
+            cur_i = next_i;
+        }
     }
 }
 
@@ -376,6 +456,35 @@ mod tests {
             }
             let rel = worst / peak;
             assert!(rel < 1e-6, "n={n}：与定义的最大相对偏差 {rel:.3e}");
+        }
+    }
+
+    /// **FFT 版 IMDCT 必须与直接法逐点一致** —— 直接法是 oracle。
+    ///
+    /// 与上面那条 MDCT 的测试同一个套路：换算法时只有它能抓住「相位/定标写错」。
+    /// 两个长度都测（长窗 1024、短窗 128）。
+    #[test]
+    fn fast_imdct_matches_the_direct_formula() {
+        for &n in &[128usize, 1024] {
+            let mut state = 987654321u32;
+            let input: Vec<f32> = (0..n)
+                .map(|_| {
+                    state = state.wrapping_mul(1103515245).wrapping_add(12345);
+                    ((state >> 16) as f32 / 32768.0 - 1.0) * 1000.0
+                })
+                .collect();
+            let mut fast = vec![0f32; 2 * n];
+            let mut slow = vec![0f32; 2 * n];
+            imdct_fast(&input, &mut fast);
+            imdct(&input, &mut slow);
+
+            let (mut worst, mut peak) = (0f64, 0f64);
+            for (a, b) in fast.iter().zip(&slow) {
+                worst = worst.max((f64::from(*a) - f64::from(*b)).abs());
+                peak = peak.max(f64::from(*b).abs());
+            }
+            let rel = worst / peak;
+            assert!(rel < 1e-5, "n={n}：与直接法的最大相对偏差 {rel:.3e}");
         }
     }
 
@@ -541,11 +650,10 @@ mod tests {
 
         // 中间部分（两端各差一个块）应当还原。
         //
-        // ⚠️ **增益是 1.0**，不是 `N/2` ——
-        // `mdct()` 不带归一化、`imdct()` 带 `2/N`，两者相乘恰好抵消。
-        // 这与「展开成显式的余弦和」时的直觉相反（那时会看到 `N/2` 的因子），
-        // 因为 `imdct` 里的 `2/N` 与 50% 重叠的两次覆盖各出一半，合起来正好归一。
-        // 这一条正是在确认定标没写反 —— 写反了这里会是 `N/2` 或 `2/N`。
+        // ⚠️ **增益是 1.0**：前向是 `2·Σ`（标准），反向是 `(1/n)·Σ`（= 标准的
+        // `2/窗长`），开窗 + 50% 重叠相加正好抵消。这条测的就是**定标契约** ——
+        // 反向写成 `2/n`（把 `N` 当成系数个数）这里会量到 2.0，整条解码链的电平
+        // 就整体大一倍，而波形形状、频谱、帧数**全对**。
         let lo = 2 * n;
         let hi = total - 2 * n;
         let ratio: f64 = (lo..hi)
@@ -560,8 +668,8 @@ mod tests {
             .sum::<f64>()
             / (lo..hi).filter(|&i| src[i].abs() > 1e-3).count() as f64;
         assert!(
-            (ratio - 2.0).abs() < 1e-3,
-            "重叠相加的增益应当是 2.0（见上面的推导），量到 {ratio}"
+            (ratio - 1.0).abs() < 1e-3,
+            "重叠相加的增益应当是 1.0（见上面的推导），量到 {ratio}"
         );
     }
 
