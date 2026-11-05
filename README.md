@@ -50,6 +50,10 @@ crates/
   v2v-player        顺时播放层：逐帧取视频、逐样本取音频、两轨独立、`seek(ms)`（Simple Index +
                     关键帧回退 + 前向解码到目标）—— 对应 Android 播放服务需求的 Rust 侧。
                     另有 `mpeg12` feature 下的 `MpgPlayer`（MPEG-1/2，**只有视频**，默认不编）
+  v2v-filter        像素域算子：缩放（bilinear / bicubic，**缩小时核按 `src/dst` 拉伸抗混叠**）、
+                    CSC（YUV420P ↔ RGB24 / 4:4:4 / NV12，BT.601 limited range）、
+                    去隔行（bob / weave）。**全整数、无浮点**，同输入字节相同；
+                    **不进 C ABI**（CSC 与缩放是留给宿主的边界）
   v2v-android       **Android 硬件编码路径**：MediaCodec H.264 + MediaMuxer MP4。
                     unsafe 全部收在 `c/media_encoder.c` + `src/ffi.rs`（详见下面「FFI」一节）
   v2v-capi          **全仓唯一的 C ABI**（`libv2v_capi`）：一层一组 `v2v_*` 符号 +

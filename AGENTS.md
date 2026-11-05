@@ -31,6 +31,9 @@ mp4v       MPEG-4 Part 2 编码（I / P + 码率控制）**+ 解码**（I / P）
 aac        AAC-LC 编码（MDCT / 短窗 / TNS / Huffman / 码率控制）**+ 解码**（结构 / 谱 /
            反量化 / M-S / TNS / IMDCT + 重叠相加，对 ffmpeg ±1 LSB）
 v2v-mp4    MP4 / ISOBMFF 封装（mp4v + mp4a(AAC) 或 sowt PCM）
+v2v-filter 像素域算子：缩放（bilinear / bicubic，**缩小时核按 src/dst 拉伸抗混叠**）/
+           CSC（YUV420P ↔ RGB24 / 4:4:4 / NV12，BT.601 limited range）/
+           去隔行（bob / weave）—— **不进 C ABI**（CSC 与缩放是留给宿主的边界）
 v2v-player 顺时播放层：逐帧 / 逐样本、两轨独立、`seek(ms)`
 v2v-android  平台硬编：硬件 H.264（VideoToolbox / MediaCodec）+ WMA→WAV 抽轨（**只有 rlib**）
 v2v-capi   **全仓唯一的 C ABI**：`v2v_*` 一族符号 + 唯一头文件 `crates/v2v-capi/include/v2v.h`
