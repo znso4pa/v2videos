@@ -297,17 +297,31 @@ def gen():
     o.ints("CB_RANGE", "u8", nums(body(et, "aac_cb_range")))
 
     # ── TNS（时域噪声整形）─────────────────────────────────────────────────
-    # `tns_tmp2_map_0_4`：4 位系数量化表（16 项）。编码端量化与解码端重建**用同一张**，
-    # 所以必须一致 —— 它也是「为什么不能开系数压缩」的原因：开了压缩，解码端会改用
-    # `tns_tmp2_map_1_4`（另一张表），两端的值就对不上了。
-    tns_map = [float(x) for x in re.findall(r"-?\d+\.\d+", body(at, "tns_tmp2_map_0_4"))]
-    assert len(tns_map) == 16, f"tns_tmp2_map_0_4 项数 {len(tns_map)}"
-    o.w("/// `tns_tmp2_map_0_4`：TNS 的 4 位系数量化表（编码端量化 / 解码端重建共用）。\n")
-    o.w("pub static TNS_COEF_4BIT: [f32; 16] = [\n")
-    for v in tns_map:
-        o.w(f"    {v},\n")
-    o.w("];\n\n")
+    # 系数表是 **四张**，不是一个 `coef_res` 加一个 `coef_compress` 的简单组合：
+    # `tns_tmp2_map_<coef_compress>_<coef_res>`。位流里读的位数是
+    # `coef_res + 3 − coef_compress`（4/3/3/2），**查的表也跟着换**。
+    #
+    # 这四张表**不是**彼此的前缀：`_1_4` 的第 4~7 项是 `0.6737, 0.5264, 0.3612,
+    # 0.1837`，而 `_0_4` 同位置是 `-0.7431, -0.8660, -0.9511, -0.9945`。所以
+    # 「压缩 = 少读一位、仍查 4 位表」会得到一条**合法但错误**的滤波器 ——
+    # 不报错、不位移，只是 TNS 逆滤波用了错的系数。
+    tns_tables = [
+        ("TNS_COEF_4BIT", "0_4", 16, "4 位系数、未压缩（编码端量化 / 解码端重建共用）"),
+        ("TNS_COEF_4BIT_COMPRESSED", "1_4", 8, "4 位分辨率 + 系数压缩（位流里只读 3 位）"),
+        ("TNS_COEF_3BIT", "0_3", 8, "3 位系数、未压缩"),
+        ("TNS_COEF_3BIT_COMPRESSED", "1_3", 4, "3 位分辨率 + 系数压缩（位流里只读 2 位）"),
+    ]
+    for name, suffix, n, doc in tns_tables:
+        src = f"tns_tmp2_map_{suffix}"
+        vals = [float(x) for x in re.findall(r"-?\d+\.\d+", body(at, src))]
+        assert len(vals) == n, f"{src} 项数 {len(vals)}，应为 {n}"
+        o.w(f"/// `{src}`：TNS 的 {doc}。\n")
+        o.w(f"pub static {name}: [f32; {n}] = [\n")
+        for v in vals:
+            o.w(f"    {v},\n")
+        o.w("];\n\n")
     o.ints("TNS_MAX_BANDS_1024", "u8", nums(body(at, "ff_tns_max_bands_1024")))
+    o.ints("TNS_MAX_BANDS_128", "u8", nums(body(at, "ff_tns_max_bands_128")))
     o.ints("TNS_MIN_SFB_LONG", "u8", nums(body(et, "tns_min_sfb_long"))[:13])
 
     # 采样率索引 → 采样率（用于 AudioSpecificConfig 的 4 位字段）。
