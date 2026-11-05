@@ -133,7 +133,8 @@ pub struct EncoderConfig {
     /// 双声道时允不允许用 **M/S 立体声**（默认开）。
     ///
     /// 逐帧决策：两个声道相关时才用（判据见 `use_midside`）。开了它，位流里会写
-    /// `common_window = 1` + `ms_mask_present = 1`。
+    /// `common_window = 1` + `ms_mask_present = 2`（**2 = 所有带都用**；`1` 是
+    /// 「后面跟逐带掩码」，别记反 —— 见 `write_ics_info` 旁边那条）。
     pub ms_stereo: bool,
     /// **编码时用几个线程**（默认 **1** = 不并行）。
     ///
@@ -406,7 +407,7 @@ fn push_history(hist: &mut [f32], samples: &[f32]) {
     }
 }
 
-/// 用不用 M/S 立体声（`ms_mask_present = 1`：**所有**频带都用）。
+/// 用不用 M/S 立体声（`ms_mask_present = 2`：**所有**频带都用）。
 ///
 /// ## 判据：比两套表示的 **L1 范数**
 ///
@@ -419,7 +420,7 @@ fn push_history(hist: &mut [f32], samples: &[f32]) {
 ///
 /// ## ⚠️ 为什么是「逐帧」而不是「逐带」
 ///
-/// 逐带掩码（`ms_mask_present = 2`）要求**先把两个声道的谱都算出来**再决定，
+/// 逐带掩码（`ms_mask_present = 1`）要求**先把两个声道的谱都算出来**再决定，
 /// 而现在每个声道是「算谱 → 搜索 → 写」一条路走到底（还能两个声道并行）。
 /// 逐帧决策可以在**时域**先变换 —— MDCT 是线性的，`MDCT((L+R)/2) = (MDCT(L)+MDCT(R))/2`
 /// —— 于是完全不用动结构。先做逐帧，把「有没有 M/S」这件事跑通；逐带留到下一步。
@@ -2428,8 +2429,38 @@ fn write_scalefactors(w: &mut BitWriter, band_sf: &[i32], band_zero: &[bool], pr
     }
 }
 
+/// 一个频带量化之后的系数 —— 也就是 `write_band` 实际写进位流的那一组。
+///
+/// 抽出来是给解码端的往返测试当 oracle：否则「期望值」得在测试里再推一遍
+/// `quant_one` 的封顶与符号规则，两处一旦分叉，测试就变成自说自话。
+/// `write_band` 自己仍走内联的那一份（避免每带一次分配），两者的等价性由
+/// `decode::tests::band_codec_round_trips` 钉住。
+///
+/// 只有测试用得上，所以挂在 `cfg(test)` 下 —— 否则非测试构建会报 `dead_code`。
+#[cfg(test)]
+pub(crate) fn quantize_band(band: &[f32], sf: u8, cb: u8) -> Vec<i32> {
+    let cb = cb as usize;
+    let maxval = i32::from(CB_MAXVAL[cb]);
+    let q34v = q34(sf);
+    let unsigned = CB_UNSIGNED[cb];
+    band.iter()
+        .map(|&c| {
+            let m = quant_one(c.abs(), q34v, maxval);
+            if unsigned || c >= 0.0 {
+                m
+            } else {
+                -m
+            }
+        })
+        .collect()
+}
+
 /// 一个频带的谱系数（Huffman + 符号位 + escape）。
-fn write_band(w: &mut BitWriter, band: &[f32], sf: u8, cb: u8) -> crate::Result<()> {
+///
+/// `pub(crate)` 是为了让解码端能拿它当**写**的 oracle：`decode` 的
+/// `band_codec_round_trips` 用它写出一个频带、再用 `decode_band` 读回来 ——
+/// Huffman / 符号位 / escape 三层里任何一层错，往返都会当场对不上。
+pub(crate) fn write_band(w: &mut BitWriter, band: &[f32], sf: u8, cb: u8) -> crate::Result<()> {
     if cb == 0 {
         return Ok(());
     }

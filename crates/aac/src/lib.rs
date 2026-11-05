@@ -1,6 +1,6 @@
-//! 纯 Rust 的 **AAC-LC 音频编码**。
+//! 纯 Rust 的 **AAC-LC 音频编码 / 解码**。
 //!
-//! 存在的理由很直接：`.wmv → .mp4` 那条路上音频只能塞未压缩 PCM（`sowt`），
+//! 编码那边的动机很直接：`.wmv → .mp4` 那条路上音频只能塞未压缩 PCM（`sowt`），
 //! 而真样本整段里**音频载荷比视频载荷还大** —— 音频成了体积的大头。
 //! 补上 AAC 编码器才有可能把 `.mp4` 压到合理大小。
 //!
@@ -23,6 +23,8 @@
 //! - ✅ 短窗（`EIGHT_SHORT_SEQUENCE`，瞬态）+ 窗口分组（3GPP TS26.403 5.4.1）
 //!   + `LONG_START` / `LONG_STOP` 过渡窗（状态机见 `plan_seq`、开窗表见 `mdct`）
 //! - ✅ 逐带率-失真分配（每带按 `失真 + λ·位数` 选 sf / 码本，λ 从上一帧的答案出发搜）
+//! - ✅ **解码器**（`decode` + `synthesis`）：结构解析 → 谱 Huffman → 反量化 →
+//!   M/S → TNS 逆滤波 → IMDCT + 窗 + 重叠相加。判据是对 ffmpeg 解同一文件 **±1 LSB**
 //! - ⏳ PNS / IS / LTP
 //! - ⏳ 心理声学模型（`masking_thresholds` 算好了但**没接线** —— 两套接法
 //!   （线性加权 / 阈值饱和）实测都是净亏、已撤，见 `encode.rs` 与 `TODO.md`）
@@ -54,9 +56,10 @@ mod decode;
 mod encode;
 pub mod mdct;
 pub use v2v_tables::aac as tables;
+mod synthesis;
 mod tns;
 
-pub use decode::{Decoder, Element, FrameInfo, IcsInfo};
+pub use decode::{Decoder, Element, FrameInfo, IcsInfo, TnsFilter};
 pub use encode::{AudioSpecificConfig, Encoder, EncoderConfig, Frame, AOT_AAC_LC};
 // 错误类型复用共享内核的（`mp4v` / `vc1` / `mpeg12` 也是这么做的）—— 它本来就是
 // 「编解码器的通用错误」。
