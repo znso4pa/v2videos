@@ -903,8 +903,16 @@ fn convert_to_asf(
     // 所以 `flipflop_rounding` 恒 0），所以这条也逐字节不变（有测试钉）。
     //
     // 解码（参考链，天然串行）留在主线程当生产者，编码交给 worker 池；结果带 GOP 序号回来。
-    // ASF 是「攒载荷、按写入顺序打包」，所以并行这条路最后要按 pts 合并视频与音频再写 ——
-    // 实测合并出来的顺序与串行读到的**完全一致**（带音频直通也是 md5 相同）。
+    // ASF 是「攒载荷、按写入顺序打包」，所以并行这条路最后要按**源样本的写入顺序**
+    // 归并视频与音频再写 —— **不是按 pts**。
+    //
+    // ⚠️ 这里踩过坑（2026-11-06）：早先按 pts 归并，注释还写着「实测与串行完全一致」。
+    // 那是**错的**，而且只在「没有音频」的合成样本上验过 —— 一上真样本，
+    // `--threads 2` 的 `.wmv` 与串行连**文件大小**都不同（74159 vs 70959 字节）。
+    // 原因是 pts 排不出源的顺序：视频包常含多帧、音频包更细，先写进去的样本
+    // 其 pts 反而可能更大；`V(33)` 与 `A(33)` 谁先谁后由「相等时取视频」那条
+    // 硬规则定，与源无关。现在主线程给每个写入单元编一个全局序号（`seq`），
+    // 归并按它排 —— 那就是串行路径的写顺序，一条不差。
     //
     // 并行度**上限就是 GOP 数**：`-g 12` 时 300 帧 = 25 个 GOP，8 线程够用；
     // `-g 250` 时 300 帧只有 2 个 GOP，再多的线程也白搭（这是格式约束，不是实现问题）。
@@ -932,19 +940,24 @@ fn convert_to_asf(
         let gop_bytes = gop_len * w as usize * h as usize * 3 / 2;
         let queued = (INFLIGHT_BUDGET_BYTES / gop_bytes.max(1))
             .clamp(2, 2 * nthreads);
-        let (jtx, jrx) = std::sync::mpsc::sync_channel::<(usize, Vec<(u32, Frame)>)>(queued);
+        let (jtx, jrx) = std::sync::mpsc::sync_channel::<(usize, Vec<(u32, Frame, usize)>)>(queued);
         let jrx = std::sync::Arc::new(std::sync::Mutex::new(jrx));
-        let (rtx, rrx) = std::sync::mpsc::channel::<(usize, Vec<(u32, Vec<u8>, bool)>, f64, u64)>();
+        let (rtx, rrx) = std::sync::mpsc::channel::<(
+            usize,
+            Vec<(u32, Vec<u8>, bool, usize)>,
+            f64,
+            u64,
+        )>();
 
         // 一个 worker 的活：不停从队列领 GOP、编完把结果发回去。
         // 抽成闭包是为了**主线程也能跑它** —— 8 核上开 8 个 worker 再加一个解码线程
         // 会超订，所以 worker 数 = `threads - 1`，主线程喂完最后一个 GOP 就下场补上。
         let work = move |jrx: &std::sync::Arc<
-            std::sync::Mutex<std::sync::mpsc::Receiver<(usize, Vec<(u32, Frame)>)>>,
+            std::sync::Mutex<std::sync::mpsc::Receiver<(usize, Vec<(u32, Frame, usize)>)>>,
         >,
                          rtx: &std::sync::mpsc::Sender<(
             usize,
-            Vec<(u32, Vec<u8>, bool)>,
+            Vec<(u32, Vec<u8>, bool, usize)>,
             f64,
             u64,
         )>|
@@ -961,7 +974,7 @@ fn convert_to_asf(
                 let mut out = Vec::with_capacity(gop.len());
                 let (mut se, mut np) = (0f64, 0u64);
                 let mut vd = if verify { Some(Decoder::new()) } else { None };
-                for (pts, f) in &gop {
+                for (pts, f, seq) in &gop {
                     let st = e.encode_frame(f)?;
                     if let Some(v) = vd.as_mut() {
                         let back = v.decode(&st, w, h)?;
@@ -973,7 +986,7 @@ fn convert_to_asf(
                             np += a.len() as u64;
                         }
                     }
-                    out.push((*pts, st, e.last_key_frame));
+                    out.push((*pts, st, e.last_key_frame, *seq));
                 }
                 if rtx.send((idx, out, se, np)).is_err() {
                     break;
@@ -993,14 +1006,22 @@ fn convert_to_asf(
         }
 
         // 主线程：解封装 + 解码 → 攒够一个 GOP 就发出去；音频载荷先按序收着。
-        let mut audio_buf: Vec<(u32, Vec<u8>)> = Vec::new();
-        let mut gop: Vec<(u32, Frame)> = Vec::new();
+        //
+        // ⚠️ `seq` 是**写入顺序的全局序号**，不是 pts。并行这条路最后要按它归并，
+        // 因为串行那条路写的是**源样本展开顺序**：一个视频包可能含好几帧，音频样本
+        // 又夹在包与包之间 —— 这个顺序**不是按 pts 排的**（实测源里 `V(0), A(0),
+        // V(139), A(33)…`，视频包的 pts 跳得比音频粗）。曾经按 pts 归并，
+        // 结果 `--threads 2` 的 `.wmv` 与串行**大小都不同**（包结构变了）。
+        let mut audio_buf: Vec<(u32, Vec<u8>, usize)> = Vec::new();
+        let mut gop: Vec<(u32, Frame, usize)> = Vec::new();
         let mut n_gop = 0usize;
+        let mut seq = 0usize;
         while let Some(s) = demux.next()? {
             if Some(s.stream) == audio_num {
                 if opts.copy_audio {
                     let pts = u32::try_from(s.timestamp_ms.max(0)).unwrap_or(0);
-                    audio_buf.push((pts, s.data));
+                    audio_buf.push((pts, s.data, seq));
+                    seq += 1;
                     audio_payloads += 1;
                 } else {
                     skipped_audio += 1;
@@ -1016,7 +1037,8 @@ fn convert_to_asf(
                 let pts = u32::try_from(fpts.max(0)).map_err(|_| {
                     Error::Unsupported(format!("时间戳 {fpts} ms 超出 u32"))
                 })?;
-                gop.push((pts, frame));
+                gop.push((pts, frame, seq));
+                seq += 1;
                 frames += 1;
                 if gop.len() >= gop_len {
                     jtx.send((n_gop, std::mem::take(&mut gop)))
@@ -1040,7 +1062,8 @@ fn convert_to_asf(
             }
             let pts = u32::try_from(fpts.max(0))
                 .map_err(|_| Error::Unsupported(format!("时间戳 {fpts} ms 超出 u32")))?;
-            gop.push((pts, frame));
+            gop.push((pts, frame, seq));
+            seq += 1;
             frames += 1;
             if gop.len() >= gop_len {
                 jtx.send((n_gop, std::mem::take(&mut gop)))
@@ -1067,8 +1090,13 @@ fn convert_to_asf(
         }
         main_res.map_err(Error::Codec)?;
 
-        // 结果乱序回来 → 按 GOP 序号归位，再按 pts 合并视频与音频。
-        let mut gops: Vec<Vec<(u32, Vec<u8>, bool)>> = vec![Vec::new(); n_gop];
+        // 结果乱序回来 → 按 GOP 序号归位，再**按写入序号**归并视频与音频。
+        //
+        // 用 `seq` 而不是 pts：串行那条路写的是源样本的展开顺序，而 pts 排不出那个
+        // 顺序（一个视频包含多帧、音频样本夹在包之间）。按 pts 归并时，`V(33)` 与
+        // `A(33)` 谁先谁后是由「相等时取视频」这条硬规则定的，与源无关 —— 于是
+        // `--threads 2` 的产物连**文件大小**都和串行不同（ASF 按写入顺序攒包）。
+        let mut gops: Vec<Vec<(u32, Vec<u8>, bool, usize)>> = vec![Vec::new(); n_gop];
         for (idx, out, se, np) in rrx {
             if idx < gops.len() {
                 gops[idx] = out;
@@ -1076,26 +1104,27 @@ fn convert_to_asf(
                 n_px += np;
             }
         }
-        let mut vid: Vec<(u32, &Vec<u8>, bool)> = Vec::with_capacity(frames);
+        let mut vid: Vec<(usize, u32, &Vec<u8>, bool)> = Vec::with_capacity(frames);
         for g in &gops {
-            for (pts, st, key) in g {
-                vid.push((*pts, st, *key));
+            for (pts, st, key, s) in g {
+                vid.push((*s, *pts, st, *key));
             }
         }
-        vid.sort_by_key(|(p, _, _)| *p);
-        let mut aud: Vec<(u32, &Vec<u8>)> = audio_buf.iter().map(|(p, d)| (*p, d)).collect();
-        aud.sort_by_key(|(p, _)| *p);
+        vid.sort_by_key(|(s, _, _, _)| *s);
+        let mut aud: Vec<(usize, u32, &Vec<u8>)> = audio_buf.iter().map(|(p, d, s)| (*s, *p, d)).collect();
+        aud.sort_by_key(|(s, _, _)| *s);
+        // `seq` 全局唯一（视频帧与音频样本共用同一个计数器），所以不会有并列。
         let (mut i, mut j) = (0usize, 0usize);
         while i < vid.len() || j < aud.len() {
-            let take_video = j >= aud.len() || (i < vid.len() && vid[i].0 <= aud[j].0);
+            let take_video = j >= aud.len() || (i < vid.len() && vid[i].0 < aud[j].0);
             if take_video {
-                mux.write_video(vid[i].1, vid[i].2, vid[i].0)?;
-                if vid[i].2 {
+                mux.write_video(vid[i].2, vid[i].3, vid[i].1)?;
+                if vid[i].3 {
                     key_frames += 1;
                 }
                 i += 1;
             } else {
-                mux.write_audio(aud[j].1, aud[j].0)?;
+                mux.write_audio(aud[j].2, aud[j].1)?;
                 j += 1;
             }
         }
