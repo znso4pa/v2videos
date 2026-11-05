@@ -119,8 +119,17 @@ FFI 有两个方向，**每个方向都只有一个 crate**，别在别处加：
 `v2v_planes_copy_to`：拷进你自己的缓冲，可以带 padding，不用自己按 stride 逐行搬 ——
 「色度是 `ceil(width/2)` 宽、`ceil(height/2)` 高」这种细节写错**只会花屏，不会报错**。
 
-两个产物：`crates/v2v-capi/build-products.sh` 出 `min`（默认 feature）与 `full`（加
-`hw` / `mpeg12`）。同主版本就同 ABI —— full 只是多出 MPEG-1/2 与硬件转码那两族符号。
+产物：`crates/v2v-capi/build-products.sh` 默认出 `min`（默认 feature）与 `full`（加
+`hw` / `mpeg12`）。**按格式裁剪**用 `--formats`：
+
+```bash
+crates/v2v-capi/build-products.sh --formats "asf,wmv3,wma" --name decode_only
+```
+
+它走 `--no-default-features`，没开的容器 / 编解码器**连码表都不编进去**（`v2v-tables`
+的 feature 跟着缩），符号集也只剩开的那几族 —— 没开的那族 `dlsym` 会拿到 NULL。
+实测（macOS / release）：`min` 1.2 MB、`full` 1.5 MB，只开 `asf,wmv3,wma` 的产物 **688 KB**。
+同主版本就同 ABI —— 区别只是「有没有」，不是「布局不一样」。
 
 （**别把符号个数写进文档**：加一个函数它就变，而它是「数出来的」不是契约。
 要知道当下几个，`nm -gU dist/libv2v_capi_min.so | grep -c ' _v2v_'`。）

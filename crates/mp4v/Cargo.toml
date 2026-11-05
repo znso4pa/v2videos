@@ -7,7 +7,7 @@ license.workspace = true
 
 [dependencies]
 # 码表（LGPL 派生数据）单独一个 crate —— 见 crates/tables/src/lib.rs
-v2v-tables = { path = "../tables" }
+v2v-tables = { path = "../tables", default-features = false, features = ["mp4v"] }
 # DCT / 位写入器 / 前缀码 / RL 表 / IDCT / 帧缓冲 / 运动补偿 / AC 预测 / DC 反量化，
 # 全在共享内核里 —— 直接复用，不复刻一遍（复刻出来的第二份才是真会跑偏的那份）。
 #

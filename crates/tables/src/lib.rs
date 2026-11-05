@@ -11,10 +11,20 @@
 //! 这些表是 H.263 / MPEG-4 Part 2 / MPEG-4 Audio / WMA / VC-1 / MPEG-1/2 / IntraX8
 //! 的**格式定义**（编解码器规格的一部分），不是某个实现的私有数据。
 
+//! 每个模块一个 feature（见 `Cargo.toml`）：编解码器 crate 只开自己那一份，
+//! 「只编 WMV3 的 `.so`」就不会把 WMA / AAC 的表链进去。
+
+#[cfg(feature = "aac")]
 pub mod aac;
+#[cfg(feature = "intrax8")]
 pub mod intrax8;
+#[cfg(feature = "mpeg12")]
 pub mod mpeg12;
+#[cfg(feature = "mp4v")]
 pub mod mp4v;
+#[cfg(feature = "msmpeg4")]
 pub mod msmpeg4;
+#[cfg(feature = "vc1")]
 pub mod vc1;
+#[cfg(feature = "wma")]
 pub mod wma;

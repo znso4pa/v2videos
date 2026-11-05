@@ -12,7 +12,32 @@ publish = false
 crate-type = ["rlib", "cdylib", "staticlib"]
 
 [features]
-default = []
+# 默认 = 「WMV 全家桶」：ASF / AVI 解封装、MP4 封装、VC-1 + MS-MPEG-4 + MPEG-4 Part 2
+# 解码、WMA 解码、MP43 + MPEG-4 Part 2 编码、AAC 编码、播放层。
+#
+# **按格式裁剪**：`--no-default-features --features "asf,wmv3,wma"` 出的 `.so`
+# 只有 ASF 解封装 + VC-1/WMA 解码 —— 不链 MPEG-4 / AAC / MPEG-1/2 的代码，也不链
+# 它们的表（`v2v-tables` 的 feature 会跟着缩）。符号集也随之变小：头文件里没开的
+# 那一族根本不存在，调用方 `dlsym` 会拿到空指针（这比「符号在但一调就报
+# unsupported」更容易在集成期发现）。
+default = ["asf", "avi", "mp4", "wmv3", "mp43", "mp4v", "wma", "aac", "player"]
+
+# ── 容器 ──
+asf = ["dep:v2v-asf"]
+avi = ["dep:v2v-avi"]
+mp4 = ["dep:v2v-mp4"]
+
+# ── 编解码器 ──
+wmv3 = ["dep:v2v-vc1"]
+mp43 = ["dep:v2v-msmpeg4"]
+mp4v = ["dep:v2v-mp4v"]
+wma = ["dep:v2v-wma"]
+aac = ["dep:v2v-aac"]
+
+# 播放层（`v2v_player_*`）。它内部就要全部解码器，所以把这些一起打开 ——
+# 想要「最小产物」就别开它，直接用 `v2v_vdec_*` / `v2v_adec_*`。
+player = ["dep:v2v-player", "asf", "wmv3", "mp43", "mp4v", "wma"]
+
 # 硬件编码 + 转码入口（`v2v_transcode` / `v2v_hw_supported`）。
 # **默认关**：它带平台相关的 C shim（Android MediaCodec / macOS VideoToolbox），
 # 只想要解码的产物不该背上它，也不该因为它在这个平台上编不过而卡住。
@@ -20,21 +45,22 @@ hw = ["dep:v2v-android"]
 # MPEG-1/2（`v2v_mpeg_*` 播放 / `v2v_ps_*` 拆包）。
 # **默认关**：MPEG 的码表不小，只吃 WMV 的产物不该背上它。
 # 它同时打开 `v2v-player` 的同名 feature —— `v2v_player::mpeg` 在那里也是非默认的。
-mpeg12 = ["dep:v2v-mpeg12", "dep:v2v-mpegps", "v2v-player/mpeg12"]
+mpeg12 = ["dep:v2v-mpeg12", "dep:v2v-mpegps", "v2v-player/mpeg12", "player"]
 
 [dependencies]
 # 只用它的 `Error`（全仓编解码器共用那一个），做错误码映射。
 v2v-kernel = { path = "../v2v-kernel" }
 v2v-container = { path = "../v2v-container" }
-v2v-asf = { path = "../v2v-asf" }
-v2v-avi = { path = "../v2v-avi" }
-v2v-vc1 = { path = "../vc1" }
-v2v-msmpeg4 = { path = "../msmpeg4" }
-v2v-mp4v = { path = "../mp4v" }
-v2v-wma = { path = "../wma" }
-v2v-aac = { path = "../aac" }
-v2v-mp4 = { path = "../v2v-mp4" }
-v2v-player = { path = "../v2v-player" }
+# 下面这些全部 optional：开哪个 feature 才链哪个 —— 这就是「按格式裁剪」的实现方式。
+v2v-asf = { path = "../v2v-asf", optional = true }
+v2v-avi = { path = "../v2v-avi", optional = true }
+v2v-vc1 = { path = "../vc1", optional = true }
+v2v-msmpeg4 = { path = "../msmpeg4", optional = true }
+v2v-mp4v = { path = "../mp4v", optional = true }
+v2v-wma = { path = "../wma", optional = true }
+v2v-aac = { path = "../aac", optional = true }
+v2v-mp4 = { path = "../v2v-mp4", optional = true }
+v2v-player = { path = "../v2v-player", optional = true }
 v2v-android = { path = "../v2v-android", optional = true }
 v2v-mpeg12 = { path = "../mpeg12", optional = true }
 v2v-mpegps = { path = "../v2v-mpegps", optional = true }

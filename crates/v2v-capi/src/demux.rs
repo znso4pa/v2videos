@@ -17,7 +17,9 @@ use std::io::{BufReader, Read};
 use std::os::raw::c_int;
 use std::path::Path;
 
+#[cfg(feature = "asf")]
 use v2v_asf::{AsfDemuxer, SimpleIndex};
+#[cfg(feature = "avi")]
 use v2v_avi::AviDemuxer;
 use v2v_container::{AudioFormat, Sample, Stream, StreamKind, VideoFormat};
 
@@ -111,16 +113,20 @@ pub struct V2vIndex {
 /// 「种类 + 消息」，免得每处 `match` 都要写两条错误分支。
 type DemuxResult<T> = Result<T, (c_int, String)>;
 
+#[cfg(feature = "asf")]
 fn asf_r<T>(r: Result<T, v2v_asf::Error>) -> DemuxResult<T> {
     r.map_err(|e| (e.kind(), e.message()))
 }
 
+#[cfg(feature = "avi")]
 fn avi_r<T>(r: Result<T, v2v_avi::Error>) -> DemuxResult<T> {
     r.map_err(|e| (e.kind(), e.message()))
 }
 
 enum Backend {
+    #[cfg(feature = "asf")]
     Asf(AsfDemuxer<BufReader<File>>),
+    #[cfg(feature = "avi")]
     Avi(AviDemuxer<BufReader<File>>),
 }
 
@@ -194,11 +200,15 @@ pub unsafe extern "C" fn v2v_probe(head: *const u8, len: u32) -> c_int {
                 return CONTAINER_UNKNOWN;
             }
         };
+        #[cfg(feature = "asf")]
         if v2v_asf::is_asf(b) {
-            CONTAINER_ASF
-        } else if v2v_avi::is_avi(b) {
-            CONTAINER_AVI
-        } else if b.len() >= 4 && b[..4] == [0x00, 0x00, 0x01, 0xBA] {
+            return CONTAINER_ASF;
+        }
+        #[cfg(feature = "avi")]
+        if v2v_avi::is_avi(b) {
+            return CONTAINER_AVI;
+        }
+        if b.len() >= 4 && b[..4] == [0x00, 0x00, 0x01, 0xBA] {
             CONTAINER_MPEG_PS
         } else {
             CONTAINER_UNKNOWN
@@ -239,6 +249,7 @@ pub unsafe extern "C" fn v2v_demux_open(path: *const std::ffi::c_char) -> *mut V
         };
         let reader = BufReader::new(file);
         let backend = match kind {
+            #[cfg(feature = "asf")]
             CONTAINER_ASF => match AsfDemuxer::new(reader) {
                 Ok(d) => Backend::Asf(d),
                 Err(e) => {
@@ -246,6 +257,7 @@ pub unsafe extern "C" fn v2v_demux_open(path: *const std::ffi::c_char) -> *mut V
                     return std::ptr::null_mut();
                 }
             },
+            #[cfg(feature = "avi")]
             CONTAINER_AVI => match AviDemuxer::new(reader) {
                 Ok(d) => Backend::Avi(d),
                 Err(e) => {
@@ -278,13 +290,16 @@ fn sniff(path: &Path) -> Result<c_int, (c_int, String)> {
         .read(&mut head)
         .map_err(|e| (KIND_IO, format!("读 {} 失败: {e}", path.display())))?;
     let b = &head[..n];
-    let k = if v2v_asf::is_asf(b) {
-        CONTAINER_ASF
-    } else if v2v_avi::is_avi(b) {
-        CONTAINER_AVI
-    } else {
-        CONTAINER_UNKNOWN
-    };
+    #[allow(unused_mut)]
+    let mut k = CONTAINER_UNKNOWN;
+    #[cfg(feature = "asf")]
+    if v2v_asf::is_asf(b) {
+        k = CONTAINER_ASF;
+    }
+    #[cfg(feature = "avi")]
+    if v2v_avi::is_avi(b) {
+        k = CONTAINER_AVI;
+    }
     if k == CONTAINER_UNKNOWN {
         return Err((KIND_UNSUPPORTED, "认不出这个容器".into()));
     }
@@ -314,7 +329,9 @@ pub unsafe extern "C" fn v2v_demux_stream_count(h: *const V2vDemux) -> u32 {
     }
     let hp = unsafe { &*h };
     match &hp.backend {
+        #[cfg(feature = "asf")]
         Backend::Asf(d) => d.streams().len() as u32,
+        #[cfg(feature = "avi")]
         Backend::Avi(d) => d.streams().len() as u32,
     }
 }
@@ -337,7 +354,9 @@ pub unsafe extern "C" fn v2v_demux_stream(
         }
         let hp = unsafe { &mut *h };
         let streams: &[Stream] = match &hp.backend {
+            #[cfg(feature = "asf")]
             Backend::Asf(d) => d.streams(),
+            #[cfg(feature = "avi")]
             Backend::Avi(d) => d.streams(),
         };
         let Some(s) = streams.get(i as usize) else {
@@ -363,7 +382,9 @@ pub unsafe extern "C" fn v2v_demux_next(h: *mut V2vDemux, out: *mut V2vSample) -
         }
         let hp = unsafe { &mut *h };
         let next = match &mut hp.backend {
+            #[cfg(feature = "asf")]
             Backend::Asf(d) => asf_r(d.next_sample()),
+            #[cfg(feature = "avi")]
             Backend::Avi(d) => avi_r(d.next_sample()),
         };
         match next {
@@ -404,6 +425,7 @@ pub unsafe extern "C" fn v2v_demux_seek_packet(h: *mut V2vDemux, packet: u64) ->
                 Ok(()) => OK,
                 Err(e) => rc(&e),
             },
+            #[cfg(feature = "avi")]
             Backend::Avi(_) => {
                 set_err(KIND_UNSUPPORTED, "AVI 没有包级索引，不支持按包 seek");
                 ERR_UNSUPPORTED
@@ -426,8 +448,11 @@ pub unsafe extern "C" fn v2v_demux_index(h: *mut V2vDemux, out: *mut V2vIndex) -
         }
         let hp = unsafe { &mut *h };
         if hp.index.is_none() {
+            #[allow(unreachable_patterns)]
             let got = match &mut hp.backend {
+                #[cfg(feature = "asf")]
                 Backend::Asf(d) => d.simple_index(),
+                #[cfg(feature = "avi")]
                 Backend::Avi(_) => Ok(None),
             };
             match got {

@@ -7,7 +7,7 @@ license.workspace = true
 
 [dependencies]
 # 码表（LGPL 派生数据）单独一个 crate —— 见 crates/tables/src/lib.rs
-v2v-tables = { path = "../tables" }
+v2v-tables = { path = "../tables", default-features = false, features = ["vc1"] }
 # 位读取器 / 前缀码（VLC）/ 错误类型 / 帧缓冲（`Planes`）/ 中值预测 / ABT 的 4:8 8:4
 # 落位，都走共享内核 —— 不复刻一遍（复刻出来的第二份才是真会跑偏的那份）。
 v2v-kernel = { path = "../v2v-kernel" }

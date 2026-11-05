@@ -7,7 +7,7 @@ license.workspace = true
 
 [dependencies]
 # 码表（LGPL 派生数据）单独一个 crate —— 见 crates/tables/src/lib.rs
-v2v-tables = { path = "../tables" }
+v2v-tables = { path = "../tables", default-features = false, features = ["wma"] }
 # IMDCT 的 FFT 与 Huffman 用的前缀码解码，都走共享内核（AGENTS.md 不变量 3：
 # 谁都要用的东西不许复刻第二份）—— 与 aac 的 MDCT 是同一个函数。
 v2v-kernel = { path = "../v2v-kernel" }

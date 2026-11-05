@@ -19,6 +19,7 @@
 
 use std::os::raw::c_int;
 
+#[cfg(feature = "mp43")]
 use v2v_msmpeg4::Version;
 
 use crate::common::*;
@@ -62,13 +63,16 @@ impl From<v2v_vc1::Frame> for Owned {
 }
 
 enum Vdec {
+    #[cfg(feature = "wmv3")]
     Vc1(v2v_vc1::Decoder),
     /// MS-MPEG-4 的 `decode` 每帧都要宽高 —— 存下来，调用方不用每帧传。
+    #[cfg(feature = "mp43")]
     Ms {
         d: v2v_msmpeg4::Decoder,
         w: u32,
         h: u32,
     },
+    #[cfg(feature = "mp4v")]
     Mp4v(v2v_mp4v::Decoder),
 }
 
@@ -114,9 +118,11 @@ pub unsafe extern "C" fn v2v_vdec_open(
             return std::ptr::null_mut();
         }
         let built: Result<Vdec, v2v_kernel::Error> = match codec {
+            #[cfg(feature = "wmv3")]
             CODEC_WMV3 => v2v_vc1::SeqHeader::parse(extra)
                 .and_then(|seq| v2v_vc1::Decoder::new(seq, width, height))
                 .map(Vdec::Vc1),
+            #[cfg(feature = "mp43")]
             CODEC_MP43 | CODEC_MP42 | CODEC_WMV1 | CODEC_WMV2 => {
                 let version = match codec {
                     CODEC_MP43 => Version::V3,
@@ -135,6 +141,7 @@ pub unsafe extern "C" fn v2v_vdec_open(
                     h: height,
                 })
             }
+            #[cfg(feature = "mp4v")]
             CODEC_MP4V => {
                 if extra.is_empty() {
                     // AVI 的 `strf` 里常常没有 VOL —— 那就按「VOL 在码流里」来。
@@ -144,6 +151,21 @@ pub unsafe extern "C" fn v2v_vdec_open(
                         .and_then(v2v_mp4v::Decoder::new)
                         .map(Vdec::Mp4v)
                 }
+            }
+            #[cfg(not(feature = "wmv3"))]
+            CODEC_WMV3 => {
+                set_err(KIND_UNSUPPORTED, "这个产物没编进 VC-1（构建时缺 wmv3 feature）");
+                return std::ptr::null_mut();
+            }
+            #[cfg(not(feature = "mp43"))]
+            CODEC_MP43 | CODEC_MP42 | CODEC_WMV1 | CODEC_WMV2 => {
+                set_err(KIND_UNSUPPORTED, "这个产物没编进 MS-MPEG-4（构建时缺 mp43 feature）");
+                return std::ptr::null_mut();
+            }
+            #[cfg(not(feature = "mp4v"))]
+            CODEC_MP4V => {
+                set_err(KIND_UNSUPPORTED, "这个产物没编进 MPEG-4 Part 2（构建时缺 mp4v feature）");
+                return std::ptr::null_mut();
             }
             other => {
                 set_err(KIND_BAD, &format!("未知的编解码器编号 {other}"));
@@ -192,9 +214,13 @@ pub unsafe extern "C" fn v2v_vdec_decode(
             Err(e) => return arg_err(&e),
         };
         let hp = unsafe { &mut *h };
+        #[allow(unreachable_patterns)]
         let got: Result<Owned, v2v_kernel::Error> = match &mut hp.dec {
+            #[cfg(feature = "wmv3")]
             Vdec::Vc1(d) => d.decode_frame(bytes).map(|_| Owned::from(d.frame())),
+            #[cfg(feature = "mp43")]
             Vdec::Ms { d, w, h } => d.decode(bytes, *w, *h).map(Owned::from),
+            #[cfg(feature = "mp4v")]
             Vdec::Mp4v(d) => d.decode(bytes).map(Owned::from),
         };
         match got {

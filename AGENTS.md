@@ -48,8 +48,10 @@ v2v-bench  性能测量的**格式与寿命管理**：TSV 读写 / 机器指纹 
 变量 —— 那种错不会报错，只会查不出来。`v2v-android` 原来那层 `capi.rs` 就是这么
 搬走的（符号名与签名都没变，只是换了个 `.so` 导出）。
 
-`capi` 的产物是**两个**：`build-products.sh` 出 `min`（默认 feature，宿主用）与
+`v2v-capi` 的产物默认是**两个**：`build-products.sh` 出 `min`（默认 feature，宿主用）与
 `full`（加 `hw` / `mpeg12`，诊断用）。同主版本就同 ABI。
+**按格式裁剪**用 `--formats "asf,wmv3,wma" --name xxx`（走 `--no-default-features`）——
+没开的容器 / 编解码器连**码表**都不编进去，符号集也只剩开的那几族。
 
 **输入编码认这些**（`crates/v2v-cli/src/lib.rs::open_video_decoder` 是唯一真源）：
 `MP42` / `MP43` / `WMV1` / `WMV2` / **`WMV3`（VC-1）** / `mp4v`（`FMP4`·`DIVX`·`XVID`）。

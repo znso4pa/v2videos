@@ -7,7 +7,7 @@ license.workspace = true
 
 [dependencies]
 # 码表（LGPL 派生数据）单独一个 crate —— 见 crates/tables/src/lib.rs
-v2v-tables = { path = "../tables" }
+v2v-tables = { path = "../tables", default-features = false, features = ["msmpeg4", "intrax8"] }
 # 编解码器共用的那一层（位读写 / VLC / RL / DCT / IDCT / FFT / 帧缓冲 / 运动补偿 / SAD）。
 # 本 crate 是它最大的用户：`simd` 那套 NEON 目前唯一的调用方就是这边的运动估计，
 # 所以**只有这里**打开 `unsafe-kernels`（别的 crate 拿到的仍是纯标量实现）。

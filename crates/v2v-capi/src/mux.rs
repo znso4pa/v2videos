@@ -83,7 +83,9 @@ pub struct V2vMuxAudio {
 }
 
 enum Mux {
+    #[cfg(feature = "asf")]
     Asf(v2v_asf::AsfMuxer),
+    #[cfg(feature = "mp4")]
     Mp4(v2v_mp4::Mp4Muxer),
 }
 
@@ -162,6 +164,7 @@ pub unsafe extern "C" fn v2v_mux_open(
                 };
                 Ok(Mux::Asf(v2v_asf::AsfMuxer::with_audio(info, af)))
             }
+            #[cfg(feature = "mp4")]
             MUX_MP4 => {
                 if v.codec != MUX_VCODEC_MP4V {
                     set_err(KIND_UNSUPPORTED, "MP4 只做 MPEG-4 Part 2 的视频轨");
@@ -249,6 +252,7 @@ pub unsafe extern "C" fn v2v_mux_close(h: *mut V2vMux) {
 /// # Safety
 /// `data` 必须指向 `len` 字节可读内存。
 #[no_mangle]
+#[cfg_attr(not(feature = "mp4"), allow(unused_variables))]
 pub unsafe extern "C" fn v2v_mux_write_video(
     h: *mut V2vMux,
     data: *const u8,
@@ -270,6 +274,7 @@ pub unsafe extern "C" fn v2v_mux_write_video(
             return arg_err("已经 finish 过了，这个句柄不能再用");
         };
         match m {
+            #[cfg(feature = "asf")]
             Mux::Asf(x) => {
                 if !(0..=u32::MAX as i64).contains(&pts_ms) {
                     return arg_err("ASF 的时间戳必须落在 0..=u32::MAX 毫秒");
@@ -279,6 +284,7 @@ pub unsafe extern "C" fn v2v_mux_write_video(
                     Err(e) => rc(&e),
                 }
             }
+            #[cfg(feature = "mp4")]
             Mux::Mp4(x) => match x.write_video(bytes, key_frame != 0, duration_ticks) {
                 Ok(()) => OK,
                 Err(e) => rc(&e),
@@ -294,6 +300,7 @@ pub unsafe extern "C" fn v2v_mux_write_video(
 /// # Safety
 /// `data` 必须指向 `len` 字节可读内存。
 #[no_mangle]
+#[cfg_attr(not(feature = "mp4"), allow(unused_variables))]
 pub unsafe extern "C" fn v2v_mux_write_audio(
     h: *mut V2vMux,
     data: *const u8,
@@ -314,6 +321,7 @@ pub unsafe extern "C" fn v2v_mux_write_audio(
             return arg_err("已经 finish 过了，这个句柄不能再用");
         };
         match m {
+            #[cfg(feature = "asf")]
             Mux::Asf(x) => {
                 if !(0..=u32::MAX as i64).contains(&pts_ms) {
                     return arg_err("ASF 的时间戳必须落在 0..=u32::MAX 毫秒");
@@ -323,6 +331,7 @@ pub unsafe extern "C" fn v2v_mux_write_audio(
                     Err(e) => rc(&e),
                 }
             }
+            #[cfg(feature = "mp4")]
             Mux::Mp4(x) => match x.write_audio(bytes, duration_ticks) {
                 Ok(()) => OK,
                 Err(e) => rc(&e),
@@ -346,7 +355,9 @@ pub unsafe extern "C" fn v2v_mux_finish(h: *mut V2vMux) -> c_int {
             return arg_err("已经 finish 过了");
         };
         let bytes = match m {
+            #[cfg(feature = "asf")]
             Mux::Asf(x) => x.finish(),
+            #[cfg(feature = "mp4")]
             Mux::Mp4(x) => x.finish(),
         };
         match std::fs::write(&hp.path, &bytes) {

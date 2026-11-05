@@ -32,14 +32,21 @@
 //! `f32`，`stride` 语义写死在头文件里 —— 转换是调用方渲染层的事，
 //! 在 ABI 里做一层只会多一次全帧拷贝，还多一份要维护的语义。
 
-pub mod adec;
-pub mod aenc;
 pub mod common;
+#[cfg(any(feature = "asf", feature = "avi"))]
 pub mod demux;
+#[cfg(any(feature = "asf", feature = "mp4"))]
 pub mod mux;
+#[cfg(feature = "player")]
 pub mod player;
+#[cfg(any(feature = "wmv3", feature = "mp43", feature = "mp4v"))]
 pub mod vdec;
+#[cfg(any(feature = "mp43", feature = "mp4v"))]
 pub mod venc;
+#[cfg(feature = "wma")]
+pub mod adec;
+#[cfg(feature = "aac")]
+pub mod aenc;
 
 /// MPEG-1/2 播放（`mpeg12` feature）。
 #[cfg(feature = "mpeg12")]

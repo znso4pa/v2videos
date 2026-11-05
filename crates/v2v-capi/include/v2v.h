@@ -4,9 +4,26 @@
  * 一份头文件，一层一组符号：容器 / 解码 / 编码 / 封装 / 播放 / MPEG-1/2 / 转码。
  * 只用 C11 标准头，不需要 Rust 工具链就能编过。
  *
- * MPEG-1/2 与硬件转码那两节是**可选的**：库编译时没开对应的 feature，
- * 那几个符号就不存在。声明照留（头文件不知道你怎么编的库），
- * 于是「有没有」由链接器回答 —— 静态链接报未定义符号，dlopen 的 dlsym 返回 NULL。
+ * 声明是**全集**，实际导出哪些取决于库是怎么编的 —— 每个格式一个 feature：
+ *
+ *      feature   提供的符号
+ *      --------  ------------------------------------------------------------
+ *      asf       v2v_probe / v2v_demux_*（ASF）/ v2v_mux_*（ASF）
+ *      avi       v2v_probe / v2v_demux_*（AVI）
+ *      mp4       v2v_mux_*（MP4）
+ *      wmv3      v2v_vdec_*（VC-1 / WMV3）
+ *      mp43      v2v_vdec_* / v2v_venc_*（MS-MPEG-4 家族：MP42 / MP43 / WMV1 / WMV2）
+ *      mp4v      v2v_vdec_* / v2v_venc_*（MPEG-4 Part 2）
+ *      wma       v2v_adec_*（WMA v1 / v2）
+ *      aac       v2v_aenc_*（AAC-LC）
+ *      player    v2v_player_*（顺时播放；会连带打开 asf / wmv3 / mp43 / mp4v / wma）
+ *      mpeg12    v2v_mpeg_* / v2v_ps_*（MPEG-1/2；连带打开 player）
+ *      hw        v2v_transcode / v2v_hw_supported（硬件编码，平台相关）
+ *
+ * 没编进来的那一族**符号不存在**：静态链接报未定义符号，dlopen 的 dlsym 返回 NULL。
+ * 集成期请逐个 dlsym 检查，别假设全都在 —— 按需裁剪的产物只有你开的那些。
+ * 默认 feature 是「WMV 全家桶」，不含 mpeg12 / hw。
+ *
  * 想按需决定调不调，就在配置期判断，别在运行期猜。
  *
  * ============================ 全局约定 ============================

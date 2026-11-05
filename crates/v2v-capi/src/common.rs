@@ -282,6 +282,7 @@ pub struct V2vPacket {
 // 各 crate 的错误 → 三分类
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "player")]
 impl IntoAbi for v2v_player::Error {
     fn kind(&self) -> c_int {
         match self {
@@ -295,6 +296,7 @@ impl IntoAbi for v2v_player::Error {
     }
 }
 
+#[cfg(feature = "asf")]
 impl IntoAbi for v2v_asf::Error {
     fn kind(&self) -> c_int {
         match self {
@@ -308,6 +310,7 @@ impl IntoAbi for v2v_asf::Error {
     }
 }
 
+#[cfg(feature = "avi")]
 impl IntoAbi for v2v_avi::Error {
     fn kind(&self) -> c_int {
         match self {
@@ -333,6 +336,7 @@ impl IntoAbi for v2v_kernel::Error {
     }
 }
 
+#[cfg(feature = "wma")]
 impl IntoAbi for v2v_wma::Error {
     fn kind(&self) -> c_int {
         match self {
@@ -346,6 +350,7 @@ impl IntoAbi for v2v_wma::Error {
     }
 }
 
+#[cfg(feature = "mp4")]
 impl IntoAbi for v2v_mp4::Error {
     fn kind(&self) -> c_int {
         KIND_BAD

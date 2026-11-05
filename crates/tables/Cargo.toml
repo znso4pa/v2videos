@@ -12,4 +12,16 @@ description = "从 FFmpeg 数据文件生成的码表 —— 本仓唯一的 LGP
 # 换成从规范（或别的宽松来源）生成的同名模块，其余 crate 一行都不用改。
 # 迁移判据：新表必须与这里的表**逐值相同**（表就是格式定义，等价即正确）。
 
+# 每个格式一个 feature：编解码器 crate 只开自己那一份（`default-features = false`），
+# 这样「只编 WMV3 的 .so」不会把 WMA / AAC 的表也链进去 —— 体积和许可面都跟着缩。
+[features]
+default = ["aac", "intrax8", "mpeg12", "mp4v", "msmpeg4", "vc1", "wma"]
+aac = []
+intrax8 = []
+mpeg12 = []
+mp4v = []
+msmpeg4 = []
+vc1 = []
+wma = []
+
 [dependencies]
