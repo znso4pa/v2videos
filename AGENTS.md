@@ -35,6 +35,7 @@ v2v-player 顺时播放层：逐帧 / 逐样本、两轨独立、`seek(ms)`
 v2v-android  平台硬编：硬件 H.264（VideoToolbox / MediaCodec）+ WMA→WAV 抽轨（**只有 rlib**）
 v2v-capi   **全仓唯一的 C ABI**：`v2v_*` 一族符号 + 唯一头文件 `crates/v2v-capi/include/v2v.h`
 v2v-cli    `v2v convert`：ASF / AVI / MP4 → `.wmv`（MP43 + 音频直通）或 `.mp4`（mp4v + AAC）
+           **+ `v2v trim` / `v2v concat`**：按关键帧的无损剪切 / 拼接（只搬样本，不解码）
            **+ `v2v bench`**：测量写成 TSV、可选对着基线卡回归
 v2v-bench  性能测量的**格式与寿命管理**：TSV 读写 / 机器指纹 / 回归比较 —— **零依赖**，
            不测量任何东西（测量在各 crate 自己的 bench 里）
@@ -126,6 +127,10 @@ cargo build -j 2                # 并发**限 2** —— 见下一节「构建�
 
 cargo run -p v2v-cli -- convert in.wmv -o out/              # .wmv：MP43 + 音频直通
 cargo run -p v2v-cli -- convert --mp4 -g 12 in.wmv -o out/  # .mp4：mp4v + AAC
+
+# 无损剪切 / 拼接（不重编码；只能切在关键帧上，起点向后对齐并报出实际值）
+cargo run -p v2v-cli -- trim --start 10 --end 15 -o cut.wmv in.wmv
+cargo run -p v2v-cli -- concat -o ab.wmv a.wmv b.wmv
 
 # VC-1 逐帧逐像素对账（最吃时间的一条；V2V_MAX_FRAMES 可先限量跑）
 V2V_ASF_SAMPLE=/path/x.wmv cargo test -p v2v-vc1 --release --test frames -- --nocapture
