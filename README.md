@@ -37,7 +37,9 @@ crates/
   vc1               VC-1（**WMV3**）解码：Simple/Main profile、渐进、I/P —— 序列头 → 帧头 → 位平面 →
                     宏块层 → 逆变换（8×8 + ABT）→ 运动补偿（¼ 像素）→ 环路滤波 → YUV420P
   mp4v              MPEG-4 Part 2（mp4v）编码：I / P + 码率控制；**解码**：I / P 对 ffmpeg 逐像素 0 差
-  aac               **AAC-LC 编码**：MDCT（长/短窗）+ TNS + Huffman 码本 + 码率控制
+  aac               **AAC-LC 编码**：MDCT（长/短窗）+ TNS + Huffman 码本 + 码率控制；
+                    **解码**：结构 → 谱 Huffman → 反量化 → M/S → TNS 逆滤波 → IMDCT + 重叠相加，
+                    对 `ffmpeg` 解同一文件**逐样本 ±1 LSB**
   v2v-mp4           MP4 / ISOBMFF **封装**（ftyp / mdat / moov；音频 AAC 或 PCM）
   v2v-mpegps        MPEG-1/2 **program stream** 解封装（`.mpg` / `.dat` / `.vob` 那类 PS 容器）
   mpeg12            MPEG-1/2 **解码**（本 crate 自身零 unsafe，**且依赖闭包里也没有 unsafe**
@@ -281,6 +283,10 @@ GOP 并行解码也开着；「解码顺序 ≠ 显示顺序」按 PTS 出帧处
 **还没做（编码侧）**：MPEG-4 Part 2 的 **B 帧**与 8×8 运动补偿、AAC 的 **PNS** 与**逐带** M/S
 掩码（现在只做逐帧 —— 全部带一起选；TNS 只覆盖长窗）、WMA **编码器**（现在只能解）、
 MP4 的分片 / `co64`、其他容器与编解码器。
+
+**还没做（解码侧）**：AAC 的 **PNS**、**强度立体声**、`pulse_data`、`gain_control`、SBR / PS ——
+都**明确报 `Unsupported`**，不静默跳过。PNS 与 IS 规范不要求 bit-exact，所以也不进
+「对 `ffmpeg` ±1 LSB」那条判据（测 ffmpeg 位流时用 `-aac_pns 0 -aac_is 0` 关掉）。
 
 ## 与 `ffmpeg` 的全面对表（2026-10-16 实测）
 
@@ -635,7 +641,7 @@ SSIM 0.969486）对合并前 q=8（1709 kbps / 37.14 dB / 0.963555）—— **�
 | 编码                  | 解码      | 编码      | 边界与原因                                                          |
 | ------------------- | ------- | ------- | -------------------------------------------------------------- |
 | **WMA v1 / v2**     | ✅       | ❌       | 不写编码器 —— 往 `.wma` 走时音频是**直通**，重编码没有用例                            |
-| **AAC-LC**          | ❌       | ✅       | 不写解码器（`ffmpeg` 解得开就够了）。编码缺 **PNS**（噪声替换）、**IS**（强度立体声）、LTP |
+| **AAC-LC**          | ✅（对 `ffmpeg` ±1 LSB） | ✅       | 解码缺 **PNS**、**IS**、`pulse_data`、`gain_control`、SBR/PS（都明确报 `Unsupported`）；编码缺 **PNS**、**IS**、LTP |
 | **PCM**（`sowt`）     | ✅（直通）  | ✅（直通）  | 未压缩，进出都是原字节                                                    |
 
 ### 已知与 `ffmpeg` 的差异
