@@ -55,7 +55,8 @@ crates/
   v2v-capi          **全仓唯一的 C ABI**（`libv2v_capi`）：一层一组 `v2v_*` 符号 +
                     一份手写头文件 `include/v2v.h`。容器 / 解码 / 编码 / 封装 / 播放 /
                     MPEG-1/2 / 硬件转码，全在一个 `.so` 里（详见下面「C ABI」一节）
-  v2v-cli           `v2v` 命令行：**批量转码**（解封装 → 解码 → 编码 → 封装）+ `v2v bench`
+  v2v-cli           `v2v` 命令行：**批量转码**（解封装 → 解码 → 编码 → 封装）+
+                    无损剪切 / 拼接 + **扫描器**（只读头部，报能转的）+ `v2v bench`
                     （测量写成 TSV、可选对着基线卡回归）
   v2v-bench         性能测量的**格式与寿命管理**：TSV 读写 / 机器指纹 / 回归比较 —— **零依赖**，
                     自己不测量任何东西（见 `bench/README.md`）
@@ -248,6 +249,7 @@ cc -std=c11 -Wall -Wextra -Werror -I crates/v2v-capi/include \
 | **封装**   | ASF 写（`.wmv`，单视频流）：**多载荷打包** + **Simple Index**（每 1 秒一个 seek 槽） | `ffprobe` 认；自己解封装字节一致；ffmpeg 解出来的像素与我们的解码器**逐位一致**；真样本载荷占文件 **89%**（改前 24%）、体积小 3.8 倍；`ffmpeg -ss` 能读出我们写的索引 |
 | **封装**   | MP4 / ISOBMFF 写（`v2v-mp4`，视频 `mp4v`；音频 `mp4a`+`esds`（AAC）或 `sowt` PCM）                                     | 真样本 mp4v 轨的 `stsz`/`stts`/`stss`/`stco` 与 ffmpeg **逐项相同**、逐帧 MD5 一致；PCM 轨原样往返；AAC 轨 ffmpeg 解得开 |
 | **无损剪切 / 拼接** | `v2v trim` / `v2v concat`（`crates/v2v-cli/src/lossless.rs`）：按**关键帧**切、多段首尾相接，**只搬样本**，不解码、不重编码。`v2v-asf` 的封装器为此补了「搬运编解码器私有数据」（`set_video_extra`，VC-1 的序列头就在里面） | 判据是**逐字节**而不是 PSNR：剪切出来的载荷与源对应区间完全相同、时间戳从 0 重定；真 VC-1 1280x720 样本剪 5 秒，交 ffmpeg 解码后 **150/150 帧与源同一区间完全相同**；两段拼接 **273/273 帧等于两段首尾相接**。合成样本另有 11 条测试钉住「起点向后对齐到关键帧」「私有数据原样带走」「格式不一致时明确报错」 |
+| **扫描器** | `v2v scan`（`crates/v2v-cli/src/scan.rs`）：递归展开目录 → 按魔数认容器 → 取流 → 对照**输入编码表**判可转性，给出「能转成什么」（`wmv` / `mp4`）与前提（例如音频不认识只能 `--no-audio`）。TSV 与人类可读两种输出 | **只读头部**（容器头 / MP4 的 `moov` / AVI 的 `hdrl`+`idx1`），一个样本都不读：`testing/` 三个真样本的容器 / FourCC / 分辨率 / 时长与 `ffprobe` 逐项一致（时长精确到毫秒：124557 / 1000 / 138400 ms）。坏文件（空 / 乱字节 / 5 种截断 / 8 处改字节）一律报 `unknown` 或 `unsupported` 并给出原因，**不 panic**。1000 个文件实测 **0.02–0.13 s**（debug 构建；门限 2 s） |
 | **C ABI** | `v2v-capi`（出站 FFI）：容器 / 解码 / 编码 / 封装 / 播放 / MPEG-1/2 / 硬件转码，一层一组 `v2v_*` 符号 + 手写 `v2v.h`；`min` / `full` 两个产物 | 纯 C 程序 `dlopen` 打开自己产的 `.so`，按头文件的声明走完 `probe → open → info → 读帧（stride == width、pts 不倒退）→ seek → demux`；头文件在 `-Werror` 下编得过；`min` 与 `full` 两个产物都过 |
 
 **两条输出路**（`v2v convert`，默认 `.wmv`）：
@@ -266,11 +268,17 @@ v2v convert --mp4 in.mp4 -o out/
 # 无损剪切 / 拼接：只搬样本，不解码、不重编码（只能切在关键帧上）
 v2v trim --start 10 --end 15 -o cut.wmv in.wmv
 v2v concat -o ab.wmv a.wmv b.wmv
+
+# 扫描：递归找「我们能转的」，只读头部（一个样本都不读）
+v2v scan /path/to/game/data
+v2v scan --tsv --all . | awk -F'\t' '$11 ~ /mp4/ {print $1}'
 ```
 
-**输入按扩展名认**（`.wmv` / `.avi` / `.mp4`），`--mp4` 说的是**输出**格式 —— 所以
-`v2v convert --mp4 in.mp4` 是「`.mp4` 进、`.mp4` 出」。`.mp4` 输入的视频走 **VT 硬件解码**
-（macOS；别处明确报不支持），音频若是 AAC 且输出也是 AAC 就**原样搬帧**、不解码。
+**输入按魔数认容器**（ASF / AVI / MP4 的字节特征），**不看扩展名** —— 扩展名会骗人
+（游戏资源里 `.wmv` 其实是 MP4、`.bin` 其实是 ASF 的情况都见过）。`--mp4` 说的是
+**输出**格式，所以 `v2v convert --mp4 in.mp4` 是「`.mp4` 进、`.mp4` 出」。`.mp4` 输入
+的视频走 **VT 硬件解码**（macOS；别处明确报不支持），音频若是 AAC 且输出也是 AAC
+就**原样搬帧**、不解码。
 
 **为什么 `.mp4` 必须重编码**：MP4 / 3GP 容器**不收 MP43**（`mp4`/`3gp`/`3g2` 三个 muxer 都报  
 `codec not currently supported in container`），`mov` 收但是单向街 —— 写出来的东西 ffmpeg  

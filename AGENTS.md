@@ -36,6 +36,7 @@ v2v-android  平台硬编：硬件 H.264（VideoToolbox / MediaCodec）+ WMA→W
 v2v-capi   **全仓唯一的 C ABI**：`v2v_*` 一族符号 + 唯一头文件 `crates/v2v-capi/include/v2v.h`
 v2v-cli    `v2v convert`：ASF / AVI / MP4 → `.wmv`（MP43 + 音频直通）或 `.mp4`（mp4v + AAC）
            **+ `v2v trim` / `v2v concat`**：按关键帧的无损剪切 / 拼接（只搬样本，不解码）
+           **+ `v2v scan`**：递归扫目录，**只读头部**，报哪些能转、能转成什么
            **+ `v2v bench`**：测量写成 TSV、可选对着基线卡回归
 v2v-bench  性能测量的**格式与寿命管理**：TSV 读写 / 机器指纹 / 回归比较 —— **零依赖**，
            不测量任何东西（测量在各 crate 自己的 bench 里）
@@ -55,9 +56,14 @@ v2v-bench  性能测量的**格式与寿命管理**：TSV 读写 / 机器指纹 
 **按格式裁剪**用 `--formats "asf,wmv3,wma" --name xxx`（走 `--no-default-features`）——
 没开的容器 / 编解码器连**码表**都不编进去，符号集也只剩开的那几族。
 
-**输入编码认这些**（`crates/v2v-cli/src/lib.rs::open_video_decoder` 是唯一真源）：
+**输入编码认这些**（`crates/v2v-cli/src/lib.rs::classify_video` 是唯一真源 ——
+`open_video_decoder` 建解码器、`scan` 判「能不能转」都查它这一张表）：
 `MP42` / `MP43` / `WMV1` / `WMV2` / **`WMV3`（VC-1）** / `mp4v`（`FMP4`·`DIVX`·`XVID`）/
 **`avc1`（H.264）**。其余明确报 `Unsupported`（MP41 没有可对账的样本，拒绝而不是猜）。
+
+⚠️ **这张表只能有一份。** 加一个输入编码 = 改 `classify_video` 一个地方；
+分头改 `open_video_decoder` 与扫描器，就会出现「扫描说能转、转的时候报不支持」——
+那种不一致**不报错**，只是白等。
 
 ⚠️ **`avc1` 只有硬件解码**（macOS VideoToolbox，`VideoDecoder::H264Hw`）。别处编得动、
 运行时明确报不支持 —— 纯 Rust 的 H.264 解码器没有计划。它的形状与软件解码器不同：
@@ -65,7 +71,8 @@ v2v-bench  性能测量的**格式与寿命管理**：TSV 读写 / 机器指纹 
 显示顺序由 `H264HwDecoder` 的 16 帧有界重排缓冲保证，**样本喂完必须 `flush()`**
 （实测不排空会少一整批尾帧，且不报错）。
 
-⚠️ **VC-1 已经接进 CLI**（`open_video_decoder` 的 `WMV3` 分支 + `VideoDecoder::Vc1`），
+⚠️ **VC-1 已经接进 CLI**（`classify_video` 认 `WMV3` → `open_video_decoder` 的 `Vc1` 分支
++ `VideoDecoder::Vc1`），
 GOP 并行解码也开了 —— 「解码顺序 ≠ 显示顺序」由「按 PTS 出帧」处理，
 前提「从任意 I 帧起解 == 整链解到那里」由 `crates/vc1/tests/gop_start.rs` 钉着。
 CLI 级还有一条 `crates/v2v-cli/tests/convert.rs::converts_wmv3_input`。
@@ -131,6 +138,9 @@ cargo run -p v2v-cli -- convert --mp4 -g 12 in.wmv -o out/  # .mp4：mp4v + AAC
 # 无损剪切 / 拼接（不重编码；只能切在关键帧上，起点向后对齐并报出实际值）
 cargo run -p v2v-cli -- trim --start 10 --end 15 -o cut.wmv in.wmv
 cargo run -p v2v-cli -- concat -o ab.wmv a.wmv b.wmv
+
+# 扫描（只读头部，一个样本都不读；--all 连不支持的也列，--tsv 可管道）
+cargo run -p v2v-cli -- scan --all testing/
 
 # VC-1 逐帧逐像素对账（最吃时间的一条；V2V_MAX_FRAMES 可先限量跑）
 V2V_ASF_SAMPLE=/path/x.wmv cargo test -p v2v-vc1 --release --test frames -- --nocapture
