@@ -18,7 +18,8 @@
  *      aac       v2v_aenc_*（AAC-LC）
  *      player    v2v_player_*（顺时播放；会连带打开 asf / wmv3 / mp43 / mp4v / wma）
  *      mpeg12    v2v_mpeg_* / v2v_ps_*（MPEG-1/2；连带打开 player）
- *      hw        v2v_transcode / v2v_hw_supported（硬件编码，平台相关）
+ *      hw        v2v_transcode / v2v_hw_supported（硬件编码）、
+ *                V2V_CODEC_H264_HW（硬件解码，平台相关）
  *
  * 没编进来的那一族**符号不存在**：静态链接报未定义符号，dlopen 的 dlsym 返回 NULL。
  * 集成期请逐个 dlsym 检查，别假设全都在 —— 按需裁剪的产物只有你开的那些。
@@ -321,6 +322,19 @@ int32_t v2v_demux_index(v2v_demux *h, v2v_index *out);
  * 要「从某个关键帧重来」就关掉重开一个句柄 —— 内部的参考帧没法半途清零。
  *
  * 不做错误隐藏：解不出来就返回错误，不会给一帧「大概是这样」的画面。
+ *
+ * ── V2V_CODEC_H264_HW 是例外，语义不一样 ──
+ * 它跑在硬件的**异步**解码器上：喂一包可能一帧都不出，也可能一次出好几帧
+ * （B 帧重排），结尾还有几帧要靠 flush 才出来。所以：
+ *   1. 必须用 v2v_vdec_decode_pts 喂（pts 决定显示顺序；喂 0 会拿到**解码**
+ *      顺序 —— 画面看着有东西在动，很难发现）；
+ *   2. 每次喂完用 v2v_vdec_next 把多出来的帧取干（V2V_EOS = 暂时没有了，
+ *      不是流结束）；
+ *   3. 样本喂完调一次 v2v_vdec_flush，再用 v2v_vdec_next 取到 V2V_EOS。它是
+ *      「等异步解码收尾」的屏障，不是排空重排缓冲（实测不调也能拿到全部帧，
+ *      但按 VT 的协议销毁前必须等，见下面 v2v_vdec_flush 的注释）。
+ * 软件解码器（0–5）不需要这三步：一包一帧，decode 直接给帧，next 恒 V2V_EOS，
+ * flush 是空操作（返回 V2V_OK）。
  * ================================================================== */
 
 #define V2V_CODEC_WMV3 0 /* VC-1 */
@@ -329,12 +343,21 @@ int32_t v2v_demux_index(v2v_demux *h, v2v_index *out);
 #define V2V_CODEC_WMV1 3 /* WMV7 */
 #define V2V_CODEC_WMV2 4 /* WMV8，必须给 extradata */
 #define V2V_CODEC_MP4V 5 /* MPEG-4 Part 2；extra 为空则按「VOL 在码流里」 */
+/* H.264 硬件解码（macOS = VideoToolbox）。extra = avcC，必须给。
+ * 新编号、不复用 0–5：语义不同（见上面那段），混进同一段编号只会让调用方
+ * 少写一个分支。要 hw feature + macOS；其它平台 v2v_vdec_open 返回 NULL。 */
+#define V2V_CODEC_H264_HW 6
 
 typedef struct v2v_vdec v2v_vdec;
 
 typedef struct v2v_picture {
     uint32_t size;
     v2v_planes planes;
+    /* 这一帧的显示时间（微秒）。**追加在尾部**：把 size 设成旧的结构体大小
+     * 就只写旧的那部分，行为不变。软件解码器恒为 0（一包一帧，顺序 = 喂进来
+     * 的顺序）；V2V_CODEC_H264_HW 给真值（它会重排，不给这个就分不清拿到的是
+     * 哪一帧）。 */
+    int64_t pts_us;
 } v2v_picture;
 
 /* 建解码器。extra 用 v2v_stream_info.extra 原样传；width/height 用**显示尺寸**。
@@ -342,8 +365,23 @@ typedef struct v2v_picture {
 v2v_vdec *v2v_vdec_open(uint32_t codec, const uint8_t *extra, uint32_t extra_len,
                         uint32_t width, uint32_t height);
 
-/* 解一帧。data 是容器里的一个样本（裸帧数据，帧头在最前面）。 */
+/* 解一帧。data 是容器里的一个样本（裸帧数据，帧头在最前面）。
+ * V2V_CODEC_H264_HW 上**不能**调这个（返回 V2V_ERR_ARG）—— 用下面那个带 pts 的。 */
 int32_t v2v_vdec_decode(v2v_vdec *h, const uint8_t *data, uint32_t len, v2v_picture *out);
+
+/* 解一帧，带显示时间（微秒）。软件解码器忽略 pts_us。
+ * 返回 V2V_OK = 有画面；V2V_EOS = 收下了但暂时没有画面（不是流结束）。 */
+int32_t v2v_vdec_decode_pts(v2v_vdec *h, const uint8_t *data, uint32_t len, int64_t pts_us,
+                            v2v_picture *out);
+
+/* 取一帧已经解好的画面。V2V_EOS = 队列空了（喂下一个样本再来）。 */
+int32_t v2v_vdec_next(v2v_vdec *h, v2v_picture *out);
+
+/* 样本喂完了：等异步解码收尾，把在途帧排进队列，之后用 v2v_vdec_next 取到
+ * V2V_EOS。软件解码器上是空操作（返回 V2V_OK）。
+ * ⚠️ 实测不调它也能拿到全部帧（macOS 26，45 帧带 B 帧）—— 它是按 VT 的协议
+ * 留着（销毁会话前必须等异步帧），不是因为「不调会少帧」被验过。 */
+int32_t v2v_vdec_flush(v2v_vdec *h);
 
 void v2v_vdec_close(v2v_vdec *h);
 

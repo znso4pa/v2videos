@@ -99,6 +99,16 @@ jobs:
           RUSTFLAGS: -D warnings
         run: cargo test --workspace -j 4 --no-fail-fast
 
+      # `hw` feature **不在默认 feature 里**（它带平台相关的 C shim），所以上面那步
+      # 完全不碰它 —— VideoToolbox / MediaCodec 那条路可以一直编不过而 CI 全绿。
+      # 这里只**编译**（`--no-run`）：macOS runner 没装 ffmpeg，测试本身会 SKIP，
+      # 而这条要防的是「编不过」，不是「算错」。
+      - name: 硬件解码路径能编过（hw feature，只 macOS）
+        if: matrix.os == 'macos-latest'
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo test -p v2v-capi --features hw --no-run -j 4
+
       # `v2v bench` 的**接线**检查 —— 只确认子命令还挂在分派上、帮助打得出来。
       #
       # 这里**故意不量任何东西**：CI 没有真样本（版权 + 体积，不入库），而合成样本

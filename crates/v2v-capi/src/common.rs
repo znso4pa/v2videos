@@ -180,6 +180,10 @@ pub const CODEC_MP42: u32 = 2;
 pub const CODEC_WMV1: u32 = 3;
 pub const CODEC_WMV2: u32 = 4;
 pub const CODEC_MP4V: u32 = 5;
+/// H.264 走**硬件**解码器（macOS = VideoToolbox）。**新编号，不复用旧的**：
+/// 0–5 都是「纯 Rust、同步、一包一帧」的解码器，这一个的语义不一样
+/// （异步、要 pts、要 flush），混进同一段编号只会让调用方少写一个分支。
+pub const CODEC_H264_HW: u32 = 6;
 
 /// YUV420P 三平面。**stride 恒等于 width**（色度是 `ceil(width/2)`）——
 /// 本仓不产 padding，每行紧排。调用方可以据此逐行 `memcpy`。
