@@ -6,7 +6,8 @@ edition.workspace = true
 license = "MIT"
 
 [dependencies]
-# 无。纯 std。
+# 解封装要吐 `Stream` / `Sample` —— 那是全仓共用的数据模型。
+v2v-container = { path = "../v2v-container" }
 
 [dev-dependencies]
 # `tests/mux_bench.rs` 用它的 TSV 格式（`V2V_BENCH_TSV` 给了路径才写）。

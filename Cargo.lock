@@ -115,6 +115,7 @@ name = "v2v-mp4"
 version = "0.0.0"
 dependencies = [
  "v2v-bench",
+ "v2v-container",
 ]
 
 [[package]]

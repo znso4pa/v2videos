@@ -444,6 +444,29 @@ impl VideoSource for AsfSource {
     }
 }
 
+struct Mp4Source(v2v_mp4::Mp4Demuxer<BufReader<File>>);
+
+impl VideoSource for Mp4Source {
+    fn video_stream(&self) -> Option<VideoTrack> {
+        let v = self.0.streams().iter().find(|s| s.kind == StreamKind::Video)?;
+        let vf = v.video.as_ref()?;
+        Some(VideoTrack {
+            number: v.number,
+            width: vf.width,
+            height: vf.height,
+            fourcc: vf.fourcc,
+            extra: vf.extra.clone(),
+        })
+    }
+    fn audio_stream(&self) -> Option<(u8, AudioFormat)> {
+        let a = self.0.streams().iter().find(|s| s.kind == StreamKind::Audio)?;
+        Some((a.number, a.audio.clone()?))
+    }
+    fn next(&mut self) -> Result<Option<Sample>, Error> {
+        Ok(self.0.next_sample()?)
+    }
+}
+
 struct AviSource(v2v_avi::AviDemuxer<BufReader<File>>);
 
 impl VideoSource for AviSource {
@@ -491,8 +514,12 @@ fn open_source(path: &Path) -> Result<Box<dyn VideoSource>, Error> {
     if v2v_asf::is_asf(&head[..n]) {
         return Ok(Box::new(AsfSource(v2v_asf::AsfDemuxer::new(f)?)));
     }
+    // MP4 / ISOBMFF：`ftyp` 在偏移 4..8（前 4 字节是 box 尺寸）。
+    if n >= 8 && &head[4..8] == b"ftyp" {
+        return Ok(Box::new(Mp4Source(v2v_mp4::Mp4Demuxer::new(f)?)));
+    }
     Err(Error::Unsupported(
-        "认不出容器（目前支持 ASF/.wmv 与 AVI/.avi）".into(),
+        "认不出容器（目前支持 ASF/.wmv、AVI/.avi 与 MP4/.mp4）".into(),
     ))
 }
 

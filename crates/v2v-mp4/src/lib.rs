@@ -39,9 +39,11 @@
 //! 编辑列表（`edts` / `elst`，解码器延迟补偿）、分片 MP4、`co64`（> 4 GiB）、
 //! H.265 / AV1 之类的 sample entry、`pasp`、`udta` 标记。
 
+mod demux;
 mod mux;
 mod writer;
 
+pub use demux::Mp4Demuxer;
 pub use mux::{AudioCodec, AudioTrack, Mp4Muxer, VideoCodec, VideoTrack};
 
 /// MP4 封装里的错误。
@@ -49,16 +51,25 @@ pub use mux::{AudioCodec, AudioTrack, Mp4Muxer, VideoCodec, VideoTrack};
 pub enum Error {
     /// 参数或数据不合法。
     Bad(&'static str),
+    /// 读文件失败（解封装侧会 seek 到样本偏移）。
+    Io(std::io::Error),
 }
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::Bad(s) => write!(f, "MP4 数据不合法：{s}"),
+            Error::Io(e) => write!(f, "MP4 读文件失败：{e}"),
         }
     }
 }
 
 impl std::error::Error for Error {}
+
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
+        Error::Io(e)
+    }
+}
 
 pub type Result<T> = std::result::Result<T, Error>;
