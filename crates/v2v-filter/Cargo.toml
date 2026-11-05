@@ -1,0 +1,13 @@
+[package]
+name = "v2v-filter"
+version.workspace = true
+edition.workspace = true
+license = "MIT"
+repository.workspace = true
+publish = false
+description = "像素域算子：缩放 / 色彩空间转换 / 去隔行"
+
+# 依赖只有 `v2v-kernel`（借它的 `Frame` 与 `Error`）。**不引第三方**（全仓硬约束），
+# 也**不开** `unsafe-kernels` feature —— 于是本 crate 的依赖闭包里零 unsafe。
+[dependencies]
+v2v-kernel = { path = "../v2v-kernel" }

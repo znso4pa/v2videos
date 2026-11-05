@@ -38,6 +38,7 @@ MIT_CRATES = [
     "v2v-capi",
     "v2v-cli",
     "v2v-container",
+    "v2v-filter",
     "v2v-kernel",
     "v2v-mpeg12-simd",
     "v2v-mpegps",

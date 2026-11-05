@@ -108,6 +108,13 @@ name = "v2v-container"
 version = "0.0.0"
 
 [[package]]
+name = "v2v-filter"
+version = "0.0.0"
+dependencies = [
+ "v2v-kernel",
+]
+
+[[package]]
 name = "v2v-kernel"
 version = "0.0.0"
 

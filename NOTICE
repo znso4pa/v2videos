@@ -12,8 +12,9 @@ v2video —— 第三方代码与数据来源
   - **MIT**（全文见 [LICENSE-MIT](LICENSE-MIT)）：
     `crates/v2v-android`、`crates/v2v-asf`、`crates/v2v-avi`
     `crates/v2v-bench`、`crates/v2v-capi`、`crates/v2v-cli`
-    `crates/v2v-container`、`crates/v2v-kernel`、`crates/v2v-mpeg12-simd`
-    `crates/v2v-mpegps`、`crates/v2v-mp4`、`crates/v2v-player`
+    `crates/v2v-container`、`crates/v2v-filter`、`crates/v2v-kernel`
+    `crates/v2v-mpeg12-simd`、`crates/v2v-mpegps`、`crates/v2v-mp4`
+    `crates/v2v-player`
     —— 源码自研，不含任何派生数据。
 
 ⚠️ **链接了 LGPL 侧 crate 的产物（`.so` / 可执行文件）整体按 LGPL-2.1-or-later 分发。**
