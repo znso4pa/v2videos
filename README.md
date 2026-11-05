@@ -232,6 +232,16 @@ cc -std=c11 -Wall -Wextra -Werror -I crates/v2v-capi/include \
    crates/v2v-capi/tests/smoke.c -o /tmp/smoke && /tmp/smoke dist/libv2v_capi_full.so sample.wmv
 ```
 
+**确定性契约**：**同输入 + 同参数 → 字节相同**。这不是「编码器没有随机数」的推断，是钉住的
+契约（`crates/v2v-cli/tests/determinism.rs`）：`.wmv` / `.mp4` 各跑两次、`--threads 1` 对
+`--threads N`、跨进程、同进程连续重跑、无损剪切，全部逐字节比。另有一条**直接**判据 ——
+产物里的时间字段（MP4 的 `mvhd`/`tkhd`/`mdhd` 的 `creation_time`、ASF 的创建时间）必须是 0：
+只问「两次是否相同」抓不到「写当前秒」这类错，因为同一秒内跑两次本来就会相同。
+
+```bash
+cargo test -p v2v-cli --test determinism
+```
+
 ## 状态
 
 按「一段一段啃」推进。已经落到代码上的：
