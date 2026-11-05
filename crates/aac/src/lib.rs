@@ -50,11 +50,13 @@
 //!
 //! 这样出来的码流是**合法**的 AAC（ffmpeg 解得开）。
 
+mod decode;
 mod encode;
 pub mod mdct;
 pub use v2v_tables::aac as tables;
 mod tns;
 
+pub use decode::{Decoder, Element, FrameInfo, IcsInfo};
 pub use encode::{AudioSpecificConfig, Encoder, EncoderConfig, Frame, AOT_AAC_LC};
 // 错误类型复用共享内核的（`mp4v` / `vc1` / `mpeg12` 也是这么做的）—— 它本来就是
 // 「编解码器的通用错误」。
