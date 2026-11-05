@@ -60,6 +60,26 @@ impl Rate {
     }
 }
 
+/// `avih` 里算时长要用的两个数。
+#[derive(Debug, Clone, Copy, Default)]
+struct AviHeader {
+    us_per_frame: u32,
+    total_frames: u32,
+}
+
+impl AviHeader {
+    /// 时长（毫秒）—— 与 `ffprobe` 的 `format.duration` 同口径（`帧数 × 帧时长`）。
+    ///
+    /// 两个数任一为 0 就返回 `None`：`dwTotalFrames` 在 OpenDML 分块文件里只算第一块，
+    /// 而这种文件我们本来就明确拒绝（见 `AVIX` 那条），所以不存在「知道它不准还用它」。
+    fn duration_ms(&self) -> Option<u64> {
+        if self.us_per_frame == 0 || self.total_frames == 0 {
+            return None;
+        }
+        Some(u64::from(self.total_frames) * u64::from(self.us_per_frame) / 1000)
+    }
+}
+
 /// AVI 解封装器。
 pub struct AviDemuxer<R: Read + Seek> {
     reader: R,
@@ -70,6 +90,8 @@ pub struct AviDemuxer<R: Read + Seek> {
     /// 关键帧表：块在文件里的绝对偏移 → 是不是关键帧。
     key_at: HashMap<u64, bool>,
     has_index: bool,
+    /// `avih` 里的帧时长与总帧数（算时长用）。
+    header: AviHeader,
     /// `movi` 列表数据的结束偏移（绝对）。
     movi_end: u64,
     /// 当前读到哪，以及嵌套 `LIST` 的边界栈。
@@ -109,6 +131,7 @@ impl<R: Read + Seek> AviDemuxer<R> {
         let mut key_at = HashMap::new();
         let mut idx1_raw: Option<Vec<u8>> = None;
         let mut movi: Option<(u64, u64)> = None;
+        let mut header = AviHeader::default();
 
         // ---- 顶层块遍历 ----
         let mut pos = 12u64;
@@ -141,7 +164,7 @@ impl<R: Read + Seek> AviDemuxer<R> {
                                 return Err(Error::Bad("LIST 块的长度小于 kind 字段（4 字节）"));
                             }
                             let buf = read_vec(&mut reader, (sz - 4) as usize)?;
-                            parse_hdrl(&buf, &mut streams, &mut rates)?;
+                            parse_hdrl(&buf, &mut streams, &mut rates, &mut header)?;
                         }
                         b"movi" => movi = Some((body, data + sz)),
                         _ => {} // INFO / odml / JUNK…
@@ -176,6 +199,7 @@ impl<R: Read + Seek> AviDemuxer<R> {
             rates,
             key_at,
             has_index,
+            header,
             movi_end,
             pos: movi_start,
             limits: Vec::new(),
@@ -185,6 +209,14 @@ impl<R: Read + Seek> AviDemuxer<R> {
 
     pub fn streams(&self) -> &[Stream] {
         &self.streams
+    }
+
+    /// 容器时长（毫秒），来自 `avih` 的「帧数 × 帧时长」—— 与 `ffprobe` 同口径。
+    ///
+    /// `None` = `avih` 没写（两个数任一为 0）。**不拿 `movi` 的块数去补** ——
+    /// 那要遍历整个文件，扫描器不该为了一行「大概多长」去读几百 MB。
+    pub fn duration_ms(&self) -> Option<u64> {
+        self.header.duration_ms()
     }
 
     /// 有没有 `idx1` 索引（没有的话关键帧标志是「全标」的保守值）。
@@ -344,7 +376,12 @@ impl<'a> Cur<'a> {
 // ==================== hdrl ====================
 
 /// 解析 `LIST hdrl` 的**数据部分**（不含 `hdrl` 四字）：`avih` + 每条流的 `strl`。
-fn parse_hdrl(buf: &[u8], streams: &mut Vec<Stream>, rates: &mut Vec<Rate>) -> Result<()> {
+fn parse_hdrl(
+    buf: &[u8],
+    streams: &mut Vec<Stream>,
+    rates: &mut Vec<Rate>,
+    header: &mut AviHeader,
+) -> Result<()> {
     let mut c = Cur::new(buf);
     let mut n_streams: Option<usize> = None;
 
@@ -361,11 +398,11 @@ fn parse_hdrl(buf: &[u8], streams: &mut Vec<Stream>, rates: &mut Vec<Rate>) -> R
         match &id {
             b"avih" => {
                 let mut a = Cur::new(body);
-                let _us_per_frame = a.u32()?;
+                header.us_per_frame = a.u32()?;
                 let _max_bytes = a.u32()?;
                 let _pad = a.u32()?;
                 let _flags = a.u32()?;
-                let _total = a.u32()?;
+                header.total_frames = a.u32()?;
                 let _initial = a.u32()?;
                 n_streams = Some(a.u32()? as usize);
             }

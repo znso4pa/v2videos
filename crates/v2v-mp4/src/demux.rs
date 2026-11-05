@@ -45,6 +45,7 @@ pub struct Mp4Demuxer<R: Read + Seek> {
     r: R,
     streams: Vec<Stream>,
     tracks: Vec<Track>,
+    duration_ms: Option<u64>,
 }
 
 impl<R: Read + Seek> Mp4Demuxer<R> {
@@ -55,11 +56,25 @@ impl<R: Read + Seek> Mp4Demuxer<R> {
         if streams.is_empty() {
             return Err(Error::Bad("moov 里没有可用的轨道"));
         }
-        Ok(Self { r, streams, tracks })
+        let duration_ms = parse_mvhd_duration(&moov);
+        Ok(Self {
+            r,
+            streams,
+            tracks,
+            duration_ms,
+        })
     }
 
     pub fn streams(&self) -> &[Stream] {
         &self.streams
+    }
+
+    /// 容器时长（毫秒），来自 `mvhd` —— 与 `ffprobe` 报的 `format.duration` 同源。
+    ///
+    /// 拿不到（没有 `mvhd`、时基为 0、时长为 0 或 `0xFFFF…`「未知」）返回 `None`：
+    /// 这个数的用途是「扫描器报个大概时长」，**不值得为它去遍历样本表**。
+    pub fn duration_ms(&self) -> Option<u64> {
+        self.duration_ms
     }
 
     /// 取下一个样本。
@@ -231,6 +246,37 @@ fn find<'a>(d: &'a [u8], want: &[u8; 4]) -> Result<Option<&'a [u8]>> {
         }
     }
     Ok(None)
+}
+
+/// `mvhd` 里的时长（毫秒）。`None` = 文件没给 / 给的是「未知」。
+///
+/// 为什么用 `mvhd` 而不是各轨 `mdhd` 之和：`mvhd` 是**整个演示**的时长，正是
+/// `ffprobe` 的 `format.duration`；`mdhd` 是单轨的媒体时长，音视频不同步的文件
+/// 上两者能差出好几秒。扫描器要的是「这个文件大概多长」，取前者。
+fn parse_mvhd_duration(moov: &[u8]) -> Option<u64> {
+    let mvhd = find(moov, b"mvhd").ok().flatten()?;
+    let mut c = Cur::new(mvhd);
+    let version = c.u8().ok()?;
+    c.skip(3).ok()?;
+    // 两种版本的字段布局差在 32 位 / 64 位（见 ISO/IEC 14496-12 的 `mvhd`）。
+    let (timescale, duration) = if version == 1 {
+        c.skip(16).ok()?; // creation_time + modification_time（各 64 位）
+        (u64::from(c.u32().ok()?), c.u64().ok()?)
+    } else {
+        c.skip(8).ok()?; // creation_time + modification_time（各 32 位）
+        (u64::from(c.u32().ok()?), u64::from(c.u32().ok()?))
+    };
+    // 规范里全 1 是「未知时长」的标记（v0 是 32 位、v1 是 64 位）——
+    // 直接乘 1000 会得到一个天文数字，必须当没有。
+    let unknown = if version == 1 {
+        duration == u64::MAX
+    } else {
+        duration == u64::from(u32::MAX)
+    };
+    if timescale == 0 || duration == 0 || unknown {
+        return None;
+    }
+    Some(duration.saturating_mul(1000) / timescale)
 }
 
 fn parse_moov(moov: &[u8]) -> Result<(Vec<Stream>, Vec<Track>)> {
