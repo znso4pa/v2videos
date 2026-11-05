@@ -1,7 +1,9 @@
-//! `v2v` —— WMV/ASF 批量转码 + 基准测量命令行。
+//! `v2v` —— WMV/ASF 批量转码 + 无损剪切 / 拼接 + 基准测量命令行。
 //!
 //! ```text
 //! v2v convert [选项] <输入>...
+//! v2v trim    --start <秒> [--end <秒>] -o <输出> <输入>
+//! v2v concat  -o <输出> <输入>...
 //! v2v bench   [选项] <样本>...
 //!
 //! convert 的选项：
@@ -17,6 +19,7 @@
 //!       --no-verify       不校验输出（默认会解码回来比 PSNR；只对 WMV 有效）
 //!   -h, --help            帮助
 //!
+//! trim / concat **不重编码**（只搬样本，画质与源逐字节相同），所以只能切在关键帧上。
 //! bench 的选项见 `BENCH_USAGE`。
 //! ```
 //!
@@ -26,13 +29,15 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use v2v_cli::bench::{self, Options as BenchOptions};
-use v2v_cli::{convert_batch, ConvertOptions, Mp4Audio, OutputFormat};
+use v2v_cli::{concat, convert_batch, trim, ConvertOptions, Mp4Audio, OutputFormat};
 
 const USAGE: &str = "\
 v2v —— WMV/ASF 批量转码（纯 Rust：解封装 → 解码 → 编码 → 封装）
 
 用法：
   v2v convert [选项] <输入>...
+  v2v trim    --start <秒> [--end <秒>] -o <输出> <输入>
+  v2v concat  -o <输出> <输入>...
   v2v bench   [选项] <样本>...   （性能测量：打 TSV、可选对着基线卡回归）
 
 选项：
@@ -60,6 +65,15 @@ v2v —— WMV/ASF 批量转码（纯 Rust：解封装 → 解码 → 编码 →
       --no-audio        不搬/不转音频
       --no-verify       跳过输出校验（默认解码回来与源比 PSNR）—— 只对 .wmv 有效
   -h, --help            显示本帮助
+
+trim / concat（**不重编码**，只搬样本 —— 画质与源逐字节相同）：
+  v2v trim --start <秒> [--end <秒>] -o <输出> <输入>
+      只能切在**关键帧**上。起点会**向后**对齐到第一个时间戳 >= --start 的关键帧，
+      实际起点会报出来（向前对齐会把你要删掉的内容留在文件里）。
+      --end 是开区间（不含）；不给就剪到结尾。
+  v2v concat -o <输出> <输入>...
+      各段的视频四要素（FourCC / 宽高 / 私有数据）与音频格式必须**完全一致**，
+      且每段的第一个视频样本必须是关键帧 —— 不满足就明确报错，不产出坏文件。
 
 输入支持：ASF（.wmv）/ AVI 里的 MP42 / MP43 / WMV1 / WMV2 / mp4v（FMP4·DIVX·XVID）视频轨 + WMA 音频轨。
 
@@ -144,16 +158,142 @@ fn main() -> ExitCode {
 /// `Ok(true)` = 全部成功（或没有超过门限的回归）；`Ok(false)` = 有文件失败 / 有回归。
 fn run(args: &[String]) -> Result<bool, String> {
     let mut it = args.iter();
-    let cmd = it.next().ok_or("缺少子命令（convert / bench）")?;
+    let cmd = it.next().ok_or("缺少子命令（convert / trim / concat / bench）")?;
     match cmd.as_str() {
         "-h" | "--help" => {
             print!("{USAGE}");
             Ok(true)
         }
         "convert" => run_convert(&mut it),
+        "trim" => run_trim(&mut it),
+        "concat" => run_concat(&mut it),
         "bench" => run_bench(&mut it),
-        other => Err(format!("未知子命令 `{other}`（有 convert / bench）")),
+        other => Err(format!(
+            "未知子命令 `{other}`（有 convert / trim / concat / bench）"
+        )),
     }
+}
+
+/// `v2v trim`：无损剪切（只搬样本，不解码、不重编码）。
+fn run_trim(it: &mut std::slice::Iter<'_, String>) -> Result<bool, String> {
+    let mut start: Option<f64> = None;
+    let mut end: Option<f64> = None;
+    let mut output: Option<PathBuf> = None;
+    let mut input: Option<PathBuf> = None;
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "-o" | "--out" => {
+                output = Some(PathBuf::from(it.next().ok_or("-o 后面要跟输出文件")?));
+            }
+            "--start" => start = Some(parse_secs(it.next(), "--start")?),
+            "--end" => end = Some(parse_secs(it.next(), "--end")?),
+            "-h" | "--help" => {
+                print!("{USAGE}");
+                return Ok(true);
+            }
+            other if other.starts_with('-') => return Err(format!("trim 不认 `{other}`")),
+            other => {
+                if input.is_some() {
+                    return Err("trim 只接一个输入文件（多段用 concat）".into());
+                }
+                input = Some(PathBuf::from(other));
+            }
+        }
+    }
+    let input = input.ok_or("trim 要给一个输入文件")?;
+    let output = output.ok_or("trim 要给 -o <输出文件>")?;
+    let start = start.ok_or("trim 要给 --start <秒>")?;
+    if start < 0.0 {
+        return Err("--start 不能是负数".into());
+    }
+    let start_ms = (start * 1000.0).round() as u64;
+    let end_ms = match end {
+        Some(e) if e < 0.0 => return Err("--end 不能是负数".into()),
+        Some(e) => Some((e * 1000.0).round() as u64),
+        None => None,
+    };
+
+    match trim(&input, &output, start_ms, end_ms) {
+        Ok(r) => {
+            eprintln!(
+                "  ✓ {} → {}：{} 帧（{} 关键帧）+ {} 个音频样本，{} → {} 字节",
+                input.display(),
+                output.display(),
+                r.video_samples,
+                r.key_frames,
+                r.audio_samples,
+                r.bytes_in,
+                r.bytes_out
+            );
+            eprintln!(
+                "      实际区间 {} ms ~ {} ms（请求起点 {start_ms} ms，已向后对齐到关键帧）",
+                r.actual_start_ms, r.end_ms
+            );
+            Ok(true)
+        }
+        Err(e) => {
+            eprintln!("  ✗ {}：{e}", input.display());
+            Ok(false)
+        }
+    }
+}
+
+/// `v2v concat`：无损拼接（各段格式必须完全一致）。
+fn run_concat(it: &mut std::slice::Iter<'_, String>) -> Result<bool, String> {
+    let mut output: Option<PathBuf> = None;
+    let mut inputs: Vec<PathBuf> = Vec::new();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "-o" | "--out" => {
+                output = Some(PathBuf::from(it.next().ok_or("-o 后面要跟输出文件")?));
+            }
+            "-h" | "--help" => {
+                print!("{USAGE}");
+                return Ok(true);
+            }
+            other if other.starts_with('-') => return Err(format!("concat 不认 `{other}`")),
+            other => inputs.push(PathBuf::from(other)),
+        }
+    }
+    let output = output.ok_or("concat 要给 -o <输出文件>")?;
+    if inputs.len() < 2 {
+        return Err("concat 至少要两个输入文件".into());
+    }
+
+    match concat(&inputs, &output) {
+        Ok(r) => {
+            eprintln!(
+                "  ✓ {} 段 → {}：{} 帧 + {} 个音频样本，{} ms，{} 字节",
+                r.segments,
+                output.display(),
+                r.video_samples,
+                r.audio_samples,
+                r.duration_ms,
+                r.bytes_out
+            );
+            Ok(true)
+        }
+        Err(e) => {
+            eprintln!("  ✗ {}：{e}", output.display());
+            Ok(false)
+        }
+    }
+}
+
+/// 把「秒」（可带小数）解析成 f64。
+///
+/// 为什么不用 `parse::<u64>()`：`--start 12.5` 是最自然的写法，而按整秒取会静默把
+/// 12.5 变成 12 —— 剪出来的东西比要的早半秒，还不报错。
+fn parse_secs(raw: Option<&String>, flag: &str) -> Result<f64, String> {
+    let raw = raw.ok_or(format!("{flag} 后面要跟秒数"))?;
+    let n: f64 = raw
+        .trim()
+        .parse()
+        .map_err(|_| format!("{flag} 要一个秒数（可带小数，如 12.5），读到 `{raw}`"))?;
+    if !n.is_finite() {
+        return Err(format!("{flag} 要一个有限数，读到 `{raw}`"));
+    }
+    Ok(n)
 }
 
 /// `v2v bench`：解析参数后交给 `v2v_cli::bench`。

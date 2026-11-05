@@ -52,6 +52,10 @@ use v2v_kernel::mc::Frame;
 /// 它们只需要 `v2v-bench` 那个格式库，不需要把整个转码器拖进来。
 pub mod bench;
 
+/// 无损剪切 / 拼接：只搬样本，不解码、不重编码。
+pub mod lossless;
+pub use lossless::{concat, trim, ConcatReport, TrimReport};
+
 /// 认 FourCC → 版本，**只放逐像素对账过的版本进来**。
 ///
 /// ⚠️ 解码器内部已经认五种版本，但经过**逐帧对 ffmpeg 逐像素 0 差**验证的只有：
