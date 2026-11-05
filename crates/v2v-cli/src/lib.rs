@@ -103,6 +103,9 @@ const XVID: u32 = u32::from_le_bytes(*b"XVID");
 /// 不是因为不想：ffmpeg 里根本没有 VC-1 编码器，本仓也没有可对账的 oracle。
 pub const WMV3: u32 = u32::from_le_bytes(*b"WMV3");
 
+/// H.264 的 sample entry FourCC（MP4 的 `avc1`）。`extra` 是 avcC。
+const AVC1: u32 = u32::from_le_bytes(*b"avc1");
+
 /// 输入视频解码器。
 ///
 /// 存在的理由：VC-1 与 MS-MPEG-4 **不是同一套骨架**（帧头、宏块层、变换、MC 全不同），
@@ -119,26 +122,170 @@ pub enum VideoDecoder {
     Vc1(v2v_vc1::Decoder),
     /// MPEG-4 Part 2（`mp4v`）—— I / P、H.263 量化。
     Mp4v(v2v_mp4v::Decoder),
+    /// H.264 —— 只有 macOS 的**硬件**解码器（VideoToolbox）。
+    ///
+    /// 它与上面三个的形状不一样：**异步 + 重排**，见 [`H264HwDecoder`]。
+    #[cfg(target_os = "macos")]
+    H264Hw(H264HwDecoder),
+}
+
+/// H.264 硬件解码器 + **重排缓冲**。
+///
+/// ## 为什么必须重排
+///
+/// VT 交出来的是**解码顺序**，不是显示顺序（实测：一段 60 帧、`-bf 3` 的流，
+/// 出帧的 pts 序列不是升序）。拿它直接往编码器里灌，得到的文件「能放、
+/// 帧数也对」，只是画面顺序错 —— 最难发现的那种错。
+///
+/// ## 缓冲多深
+///
+/// **16 帧** = H.264 允许的最大重排深度（VUI 的 `max_num_reorder_frames` 上限，
+/// 也是 DPB 尺寸的上限）。攒到 17 帧才吐最小的那个，就保证了「不会有更小的
+/// 在后面」。
+///
+/// 万一真有比 16 还深的重排（不合规的流），吐出来的 pts 会倒退 —— 那种情况
+/// **明确报错**，不产出一个顺序错的文件。
+#[cfg(target_os = "macos")]
+pub struct H264HwDecoder {
+    d: v2v_android::vt::VideoToolboxDecoder,
+    /// 已解出、还没定序的帧（按 pts 取最小）。
+    buf: Vec<(i64, Frame)>,
+    /// 上一个**交出去**的 pts（毫秒）—— 用来抓「重排深度超限」。
+    last_out: Option<i64>,
+}
+
+/// H.264 重排深度上限（见 [`H264HwDecoder`]）。
+#[cfg(target_os = "macos")]
+const REORDER_MAX: usize = 16;
+
+#[cfg(target_os = "macos")]
+impl H264HwDecoder {
+    fn new(avcc: &[u8]) -> Result<Self, Error> {
+        let d = v2v_android::vt::VideoToolboxDecoder::open(avcc)
+            .map_err(|e| Error::Unsupported(format!("H.264 硬件解码会话建不起来：{e}")))?;
+        Ok(Self {
+            d,
+            buf: Vec::with_capacity(REORDER_MAX + 1),
+            last_out: None,
+        })
+    }
+
+    /// 把缓冲里「已经能定序」的帧按 pts 升序交出去。
+    fn drain(&mut self, force: bool) -> Result<Vec<(Frame, i64)>, Error> {
+        let mut out = Vec::new();
+        while !self.buf.is_empty() && (force || self.buf.len() > REORDER_MAX) {
+            // 缓冲最多 17 项，每次线性取最小就够（排序反而更慢）。
+            let mut best = 0;
+            for i in 1..self.buf.len() {
+                if self.buf[i].0 < self.buf[best].0 {
+                    best = i;
+                }
+            }
+            let (pts_ms, f) = self.buf.swap_remove(best);
+            if let Some(prev) = self.last_out {
+                if pts_ms <= prev {
+                    return Err(Error::Unsupported(format!(
+                        "H.264 的出帧顺序在 {} ms 处倒退（上一个 {} ms）—— 这段流的重排深度超过 \
+                         {REORDER_MAX} 帧，本工具的重排缓冲不够，宁可报错也不产出顺序错的文件",
+                        pts_ms, prev
+                    )));
+                }
+            }
+            self.last_out = Some(pts_ms);
+            out.push((f, pts_ms));
+        }
+        Ok(out)
+    }
 }
 
 impl VideoDecoder {
-    /// 解一帧。`w` / `h` 是**显示**尺寸（只有 MS-MPEG-4 那一侧用得上 ——
-    /// VC-1 的解码器在构造时就把尺寸记下来了）。
-    pub fn decode(&mut self, data: &[u8], w: u32, h: u32) -> Result<Frame, Error> {
+    /// 解一个样本，返回**显示顺序**的帧（可能 0 帧，也可能多帧）与各自的 pts（毫秒）。
+    ///
+    /// 为什么不是「一帧进一帧出」：H.264 的硬件解码器是异步的、还会重排 ——
+    /// 喂进去的这一包可能一帧都出不来（要等后面的参考帧），也可能一次吐出好几帧。
+    /// 软件解码器（MP43 / VC-1 / mp4v）没有这个问题，恒返回一帧。
+    ///
+    /// `pts_ms` 只有 H.264 那条路用得上（VT 靠它定显示顺序）；别的一包一帧，
+    /// 原样把它带回去。
+    pub fn decode(
+        &mut self,
+        data: &[u8],
+        w: u32,
+        h: u32,
+        pts_ms: i64,
+    ) -> Result<Vec<(Frame, i64)>, Error> {
         match self {
-            Self::Msmpeg4(d) => Ok(d.decode(data, w, h)?),
+            Self::Msmpeg4(d) => Ok(vec![(d.decode(data, w, h)?, pts_ms)]),
             Self::Vc1(d) => {
                 d.decode_frame(data)?;
                 let f = d.frame();
-                Ok(Frame {
-                    width: f.width,
-                    height: f.height,
-                    y: f.y,
-                    u: f.u,
-                    v: f.v,
-                })
+                Ok(vec![(
+                    Frame {
+                        width: f.width,
+                        height: f.height,
+                        y: f.y,
+                        u: f.u,
+                        v: f.v,
+                    },
+                    pts_ms,
+                )])
             }
-            Self::Mp4v(d) => Ok(d.decode(data)?),
+            Self::Mp4v(d) => Ok(vec![(d.decode(data)?, pts_ms)]),
+            #[cfg(target_os = "macos")]
+            Self::H264Hw(hw) => {
+                let got = hw
+                    .d
+                    .feed(data, pts_ms * 1000)
+                    .map_err(|e| Error::Hw(e.to_string()))?;
+                for f in got {
+                    hw.buf.push((
+                        f.pts_us.div_euclid(1000),
+                        Frame {
+                            width: f.width,
+                            height: f.height,
+                            y: f.y,
+                            u: f.u,
+                            v: f.v,
+                        },
+                    ));
+                }
+                hw.drain(false)
+            }
+        }
+    }
+
+    /// 样本喂完了：把解码器里剩下的帧全部取出来（按显示顺序）。
+    ///
+    /// 软件解码器上恒为空 —— 它们没有延迟帧。H.264 那条路**必须**调：
+    /// 重排缓冲在 EOF 时还压着最多 [`REORDER_MAX`] 帧，不排空就整块丢。
+    /// 实测（90 帧的样本）**少了 16 帧**，90 → 74，而且不报任何错。
+    ///
+    /// ⚠️ 这里面有两件事，别混为一谈：① 排空**我们自己的**重排缓冲 —— 上面那个
+    /// 90→74 就是它；② 调 VT 的 `VTDecompressionSessionCompleteFrames` ——
+    /// **这一条的必要性没验过**（实测不调也能拿到全部帧，见 `crates/v2v-android`
+    /// 的 `vt.rs`）。留着是按 VT 协议（销毁会话前要等异步帧回来）。
+    pub fn flush(&mut self) -> Result<Vec<(Frame, i64)>, Error> {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::H264Hw(hw) => {
+                let got = hw.d
+                    .flush()
+                    .map_err(|e| Error::Hw(e.to_string()))?;
+                for f in got {
+                    hw.buf.push((
+                        f.pts_us.div_euclid(1000),
+                        Frame {
+                            width: f.width,
+                            height: f.height,
+                            y: f.y,
+                            u: f.u,
+                            v: f.v,
+                        },
+                    ));
+                }
+                hw.drain(true)
+            }
+            _ => Ok(Vec::new()),
         }
     }
 }
@@ -178,6 +325,24 @@ fn open_video_decoder(
         let dec = v2v_vc1::Decoder::new(seq, w, h)
             .map_err(|e| Error::Unsupported(format!("VC-1 解码器建不起来：{e}")))?;
         return Ok(VideoDecoder::Vc1(dec));
+    }
+    if fourcc == AVC1 {
+        // H.264 **只有硬件解码器**（macOS VideoToolbox）。别处明确报不支持 ——
+        // 纯 Rust 的 H.264 解码器没有计划（README「还没做（解码侧）」）。
+        #[cfg(target_os = "macos")]
+        {
+            if extra.is_empty() {
+                return Err(Error::Unsupported(
+                    "H.264 输入缺 avcC（MP4 的 `avcC` box 没解出来？）".into(),
+                ));
+            }
+            return Ok(VideoDecoder::H264Hw(H264HwDecoder::new(extra)?));
+        }
+        #[cfg(not(target_os = "macos"))]
+        return Err(Error::Unsupported(
+            "H.264 解码目前只有 macOS 的硬件路径（VideoToolbox）；这个平台上没有可用的解码器"
+                .into(),
+        ));
     }
     let version = verified_version(fourcc)?;
     Ok(VideoDecoder::Msmpeg4(make_decoder(version, extra)?))
@@ -339,6 +504,9 @@ pub enum Error {
     Avi(v2v_avi::Error),
     Mp4(v2v_mp4::Error),
     Wma(v2v_wma::Error),
+    /// 硬件解码器（VideoToolbox）报的错。它有自己的 `Error` 类型（带 `Io`），
+    /// 与 `v2v_kernel::Error` 不通用 —— 这里只留消息，反正 CLI 不做分类重试。
+    Hw(String),
     Unsupported(String),
 }
 
@@ -351,6 +519,7 @@ impl std::fmt::Display for Error {
             Error::Avi(e) => write!(f, "AVI 错误：{e}"),
             Error::Mp4(e) => write!(f, "MP4 封装错误：{e}"),
             Error::Wma(e) => write!(f, "WMA 解码错误：{e}"),
+            Error::Hw(s) => write!(f, "硬件解码错误：{s}"),
             Error::Unsupported(s) => write!(f, "不支持：{s}"),
         }
     }
@@ -551,6 +720,36 @@ pub fn convert_file(
 /// 否则 worker 会饿死）。
 const INFLIGHT_BUDGET_BYTES: usize = 128 << 20;
 
+/// 编一帧 MP43、写进 ASF、可选地解回来算 PSNR。
+///
+/// 抽出来是因为调用点有**两处**（正常路径 + `flush` 的尾巴），而「编 → 写 → 解回来比」
+/// 这三步必须两边一模一样 —— 两处各写一遍，迟早只改一边。
+///
+/// 返回 `(是不是关键帧, 平方误差, 像素数)`；没开 `verify` 时后两个是 0。
+fn encode_and_verify(
+    enc: &mut Encoder,
+    mux: &mut AsfMuxer,
+    vdec: &mut Option<Decoder>,
+    frame: &Frame,
+    pts: u32,
+) -> Result<(bool, f64, u64), Error> {
+    let stream = enc.encode_frame(frame)?;
+    let key = enc.last_key_frame;
+    mux.write_video(&stream, key, pts)?;
+    let (mut se, mut np) = (0f64, 0u64);
+    if let Some(vd) = vdec.as_mut() {
+        let back = vd.decode(&stream, frame.width, frame.height)?;
+        for (a, b) in [(&frame.y, &back.y), (&frame.u, &back.u), (&frame.v, &back.v)] {
+            for (&x, &y) in a.iter().zip(b.iter()) {
+                let d = x as f64 - y as f64;
+                se += d * d;
+            }
+            np += a.len() as u64;
+        }
+    }
+    Ok((key, se, np))
+}
+
 /// `.wmv`（MP43 in ASF）那条路。
 fn convert_to_asf(
     input: &Path,
@@ -579,7 +778,8 @@ fn convert_to_asf(
             Some((_, af)) if af.format_tag == 0x0160 || af.format_tag == 0x0161 => Some(af),
             Some((_, af)) => {
                 return Err(Error::Unsupported(format!(
-                    "音频是 0x{:04X}，直通只支持 WMA（0x0160/0x0161）",
+                    "音频是 0x{:04X}，`.wmv` 的音频是**直通**（只支持 WMA 0x0160/0x0161）\
+                     —— 换成 `--mp4`（输出 MP4 时才重编码音频），或者 `--no-audio` 只转视频",
                     af.format_tag
                 )))
             }
@@ -725,20 +925,42 @@ fn convert_to_asf(
             if s.stream != vnum {
                 continue;
             }
-            let pts = u32::try_from(s.timestamp_ms.max(0))
-                .map_err(|_| Error::Unsupported(format!("时间戳 {} ms 超出 u32", s.timestamp_ms)))?;
-            let frame = dec.decode(&s.data, w, h)?;
+            // 一包可能出 0 帧（H.264 在等参考帧）也可能出多帧 —— 逐帧派活。
+            // pts 用**帧自己的**，不是这一包的：重排之后两者常常不是同一个值。
+            for (frame, fpts) in dec.decode(&s.data, w, h, s.timestamp_ms)? {
+                let pts = u32::try_from(fpts.max(0)).map_err(|_| {
+                    Error::Unsupported(format!("时间戳 {fpts} ms 超出 u32"))
+                })?;
+                gop.push((pts, frame));
+                frames += 1;
+                if gop.len() >= gop_len {
+                    jtx.send((n_gop, std::mem::take(&mut gop)))
+                        .map_err(|_| Error::Unsupported("视频 worker 池提前退出".into()))?;
+                    n_gop += 1;
+                }
+            }
+            if let Some(max) = opts.max_frames {
+                if frames >= max {
+                    break;
+                }
+            }
+        }
+        // 解码器的尾巴（H.264 的重排缓冲）也要派出去 —— 不 flush 会整块丢。
+        // ⚠️ 但 `--max-frames` 仍然有效：缓冲里那十几帧不能全灌出去。
+        for (frame, fpts) in dec.flush()? {
+            if let Some(max) = opts.max_frames {
+                if frames >= max {
+                    break;
+                }
+            }
+            let pts = u32::try_from(fpts.max(0))
+                .map_err(|_| Error::Unsupported(format!("时间戳 {fpts} ms 超出 u32")))?;
             gop.push((pts, frame));
             frames += 1;
             if gop.len() >= gop_len {
                 jtx.send((n_gop, std::mem::take(&mut gop)))
                     .map_err(|_| Error::Unsupported("视频 worker 池提前退出".into()))?;
                 n_gop += 1;
-            }
-            if let Some(max) = opts.max_frames {
-                if frames >= max {
-                    break;
-                }
             }
         }
         if !gop.is_empty() {
@@ -826,36 +1048,42 @@ fn convert_to_asf(
         if s.stream != vnum {
             continue;
         }
-        let pts = u32::try_from(s.timestamp_ms.max(0))
-            .map_err(|_| Error::Unsupported(format!("时间戳 {} ms 超出 u32", s.timestamp_ms)))?;
-
-        let frame = dec.decode(&s.data, w, h)?;
-        let stream = enc.encode_frame(&frame)?;
-        mux.write_video(&stream, enc.last_key_frame, pts)?;
-
-        if enc.last_key_frame {
-            key_frames += 1;
-        }
-        if let Some(vd) = vdec.as_mut() {
-            let back = vd.decode(&stream, w, h)?;
-            for (a, b) in [
-                (&frame.y, &back.y),
-                (&frame.u, &back.u),
-                (&frame.v, &back.v),
-            ] {
-                for (&x, &y) in a.iter().zip(b.iter()) {
-                    let d = x as f64 - y as f64;
-                    sq_err += d * d;
+        // 一包可能出 0 帧也可能出多帧（H.264）；软件解码器恒一帧。
+        let outs = dec.decode(&s.data, w, h, s.timestamp_ms)?;
+        for (frame, fpts) in outs {
+            let pts = u32::try_from(fpts.max(0))
+                .map_err(|_| Error::Unsupported(format!("时间戳 {fpts} ms 超出 u32")))?;
+            let (key, se, np) = encode_and_verify(&mut enc, &mut mux, &mut vdec, &frame, pts)?;
+            key_frames += usize::from(key);
+            sq_err += se;
+            n_px += np;
+            frames += 1;
+            if let Some(max) = opts.max_frames {
+                if frames >= max {
+                    break;
                 }
-                n_px += a.len() as u64;
             }
         }
-        frames += 1;
         if let Some(max) = opts.max_frames {
             if frames >= max {
                 break;
             }
         }
+    }
+    // 解码器的尾巴（H.264 的重排缓冲）—— 不 flush 会整块丢。
+    for (frame, fpts) in dec.flush()? {
+        if let Some(max) = opts.max_frames {
+            if frames >= max {
+                break;
+            }
+        }
+        let pts = u32::try_from(fpts.max(0))
+            .map_err(|_| Error::Unsupported(format!("时间戳 {fpts} ms 超出 u32")))?;
+        let (key, se, np) = encode_and_verify(&mut enc, &mut mux, &mut vdec, &frame, pts)?;
+        key_frames += usize::from(key);
+        sq_err += se;
+        n_px += np;
+        frames += 1;
     }
 
     let wmv = mux.finish();
@@ -895,14 +1123,64 @@ struct AudioPlan {
     /// `default_sample_size` 压缩，`stts` 是一条 `(N, 1)`），所以写的时候要一个点一次。
     /// 见 `crates/v2v-mp4` 的模块文档。
     point: usize,
-    /// 开头要丢掉的样本数（WMA 的编码器延迟）。
+    /// 开头要丢掉的样本数（编码器延迟：WMA 两帧 / AAC 一帧）。直通时不用。
     skip: usize,
-    /// `None` = 源本来就是 PCM，直接搬；`Some` = 要过 WMA 解码器。
-    decoder: Option<v2v_wma::WmaDecoder>,
+    /// 走哪条路（见 [`AudioSource`]）。
+    kind: AudioSource,
+}
+
+/// 音频解码器 —— 源里那几种压缩音频。
+///
+/// 两种都吐同一种东西：**交织的小端 16 位 PCM**，值域 ±32768（不是 ±1）。
+/// 下游（AAC 编码 / PCM 直通）只认这一个口径，所以差异收在这里。
+pub enum AudioDecoder {
+    /// WMA v1 / v2。一个 ASF 载荷里常装好几帧（superframe）。
+    Wma(v2v_wma::WmaDecoder),
+    /// AAC-LC（MP4 的 `mp4a`）。一个样本就是**一帧**，1024 个采样点。
+    Aac(v2v_aac::Decoder),
+}
+
+impl AudioDecoder {
+    /// 解一个容器样本，返回交织 PCM。
+    fn decode_to_pcm(&mut self, data: &[u8]) -> Result<Vec<u8>, String> {
+        match self {
+            Self::Wma(d) => {
+                let frames = d.decode_superframe(data).map_err(|e| e.to_string())?;
+                Ok(wma_frame_to_pcm(frames))
+            }
+            // AAC 的 `decode_frame` 返回「每声道一串 f32」—— 与 WMA 的一帧同形，
+            // 包一层就能复用同一个交织函数。
+            Self::Aac(d) => {
+                let planes = d.decode_frame(data).map_err(|e| e.to_string())?;
+                Ok(wma_frame_to_pcm(vec![planes]))
+            }
+        }
+    }
+}
+
+/// 音频轨走哪条路。
+pub enum AudioSource {
+    /// 源本来就是 16 位 PCM：按采样点切块直接搬。
+    Pcm,
+    /// 源是 **AAC 且输出也是 AAC**：**原样搬帧**，完全不解码。
+    ///
+    /// 为什么要有这条：我们的 AAC 解码器还缺 PNS / 强度立体声（明确报
+    /// `Unsupported`），而 ffmpeg 默认就会用 PNS —— 拿它解码再编码，等于
+    /// 把「本来能无损搬过去」的音频卡在一个不支持的语法上。顺带还省掉
+    /// 一次有损重编码。
+    AacCopy,
+    /// 要解成 PCM（WMA 源，或者 AAC 源但要输出 PCM）。
+    Decode(AudioDecoder),
 }
 
 /// 决定音频轨怎么走。返回 `None` = 输出不带音频。
-fn plan_audio(demux: &dyn VideoSource, enabled: bool) -> Result<Option<AudioPlan>, Error> {
+///
+/// `aac_copy_ok`：输出也是 AAC 时能不能直通（由 `copy_audio` + 输出音频编码决定）。
+fn plan_audio(
+    demux: &dyn VideoSource,
+    enabled: bool,
+    aac_copy_ok: bool,
+) -> Result<Option<AudioPlan>, Error> {
     if !enabled {
         return Ok(None);
     }
@@ -910,6 +1188,12 @@ fn plan_audio(demux: &dyn VideoSource, enabled: bool) -> Result<Option<AudioPlan
         return Ok(None);
     };
     let point = af.channels as usize * 2;
+    let plan = |kind, skip| AudioPlan {
+        stream: num,
+        point,
+        skip,
+        kind,
+    };
     match af.format_tag {
         // WMA v1 / v2：解成 16 位 PCM。
         0x0160 | 0x0161 => {
@@ -926,23 +1210,31 @@ fn plan_audio(demux: &dyn VideoSource, enabled: bool) -> Result<Option<AudioPlan
             // ⚠️ **编码器延迟**：WMA 编码器开头灌了两帧的静音，ffmpeg 的解码器
             // `skip_samples = frame_len * 2` 把它丢掉。不跟着丢，音频会整体晚
             // 两帧（44.1 kHz、帧长 2048 → 约 93 ms），与视频明显对不上。
-            Ok(Some(AudioPlan {
-                stream: num,
-                point,
-                skip: params.frame_len * 2,
-                decoder: Some(decoder),
-            }))
+            Ok(Some(plan(
+                AudioSource::Decode(AudioDecoder::Wma(decoder)),
+                params.frame_len * 2,
+            )))
+        }
+        // AAC-LC（MP4 的 `mp4a`，`esds` 里的 AudioSpecificConfig 在 `extra`）。
+        0x00FF => {
+            if aac_copy_ok {
+                return Ok(Some(plan(AudioSource::AacCopy, 0)));
+            }
+            let decoder = v2v_aac::Decoder::new(&af.extra)?;
+            // ⚠️ **AAC 也有编码器延迟**，而且和 WMA 一样必须丢：
+            // 第一帧交出的 1024 个样本是上一帧（全零）的重叠尾巴，不是原始波形
+            // 的起点（`v2v_aac::Decoder::decode_frame` 的文档写死了这点）。
+            // ffmpeg 靠 MP4 的 `edts`/`elst` 声明这个延迟，我们的解封装器不读 edts，
+            // 所以按 AAC-LC 的定值 **1024** 丢。丢错了的表现是「音画差 23 ms」——
+            // 画质、帧数、能不能解这些判据全都不会报警。
+            let skip = decoder.frame_len;
+            Ok(Some(plan(AudioSource::Decode(AudioDecoder::Aac(decoder)), skip)))
         }
         // 本来就是 16 位 PCM：不用解，直接搬。
-        0x0001 if af.bits_per_sample == 16 => Ok(Some(AudioPlan {
-            stream: num,
-            point,
-            skip: 0,
-            decoder: None,
-        })),
+        0x0001 if af.bits_per_sample == 16 => Ok(Some(plan(AudioSource::Pcm, 0))),
         other => Err(Error::Unsupported(format!(
-            "音频是 0x{other:04X}，`.mp4` 这条路只支持 WMA（0x0160/0x0161）与 16 位 PCM（0x0001）\
-             —— 用 --no-audio 只转视频"
+            "音频是 0x{other:04X}，`.mp4` 这条路只支持 WMA（0x0160/0x0161）、\
+             AAC-LC（0x00FF）与 16 位 PCM（0x0001）—— 用 --no-audio 只转视频"
         ))),
     }
 }
@@ -1059,10 +1351,13 @@ fn convert_to_mp4(
 
     // 源里那条音频轨的格式（有没有音频、采样率多少）—— 封装器的 `stsd` 要用。
     let src_audio = demux.audio_stream().map(|(_, af)| af);
-    let mut audio = plan_audio(demux.as_ref(), opts.copy_audio)?;
+    // 「输出也是 AAC」才谈得上直通：源是 AAC、输出要 PCM 的话还是得解码。
+    let aac_copy_ok = opts.copy_audio && opts.audio == Mp4Audio::Aac;
+    let mut audio = plan_audio(demux.as_ref(), opts.copy_audio, aac_copy_ok)?;
     if src_audio.is_none() {
         audio = None; // 没有音频轨就别留下一个「以为有」的 plan
     }
+    let aac_copy = matches!(audio.as_ref().map(|a| &a.kind), Some(AudioSource::AacCopy));
     let audio_num = audio.as_ref().map(|a| a.stream);
     // `--no-audio` 时源里的音频样本要计数，报告里说清楚跳过了多少。
     let skipped_num = if audio_num.is_none() {
@@ -1124,13 +1419,13 @@ fn convert_to_mp4(
         },
         avg_bitrate: 0,
     };
-    // ---- 音频编码器（只在 `.mp4` + `Mp4Audio::Aac` 时建）----
+    // ---- 音频编码器（只在 `.mp4` + `Mp4Audio::Aac` + **不直通**时建）----
     //
     // ⚠️ AAC 的**每一帧必须是 1024 个采样点**（长窗），而 WMA 解码器吐出来的
     // 是一段一段不等长的 PCM。所以中间要有个「攒够 1024 再编」的缓冲 ——
     // 见下面的 `aac_pending`。
     let mut aac = match (&audio, &src_audio, opts.audio) {
-        (Some(_), Some(af), Mp4Audio::Aac) => {
+        (Some(_), Some(af), Mp4Audio::Aac) if !aac_copy => {
             Some(v2v_aac::Encoder::new(v2v_aac::EncoderConfig {
                 channels: af.channels as u8,
                 sample_rate: af.sample_rate,
@@ -1144,6 +1439,27 @@ fn convert_to_mp4(
     };
 
     let mut mux = match (src_audio.as_ref(), aac.as_ref()) {
+        // AAC 直通：编码方式与参数全部沿用**源**的，只搬帧。
+        (Some(af), None) if aac_copy => v2v_mp4::Mp4Muxer::with_audio(
+            vtrack,
+            v2v_mp4::AudioTrack {
+                channels: af.channels,
+                sample_rate: af.sample_rate,
+                timescale: af.sample_rate,
+                avg_bitrate: af.avg_bytes_per_sec * 8,
+                codec: v2v_mp4::AudioCodec::Es {
+                    object_type: 0x40, // MPEG-4 Audio
+                    // 直通时 DSI 必须用**源**的 AudioSpecificConfig —— 自己另写一份
+                    // 就等于声明了一个和码流不符的配置。
+                    decoder_specific_info: af.extra.clone(),
+                },
+                // 源流的 priming 还在帧里（我们不解码，也就没法「丢掉」它），
+                // 所以输出照样要声明。AAC-LC 的编码器延迟固定是一个帧。
+                // ⚠️ 我们的解封装器还不读源的 `edts`/`elst`，拿不到它声明的真实值；
+                // 1024 是 AAC-LC 的定值，也是 ffmpeg 自己的写法。
+                priming: 1024,
+            },
+        ),
         (Some(af), Some(a)) => {
             v2v_mp4::Mp4Muxer::with_audio(
                 vtrack,
@@ -1220,16 +1536,29 @@ fn convert_to_mp4(
     // 所以第二级必须是**单线程顺序**的 —— 这里正是，不要把它也拆开。
     let (tx_audio, rx_audio) = std::sync::mpsc::channel::<(usize, Vec<u8>)>();
     let (tx_pcm, rx_pcm) = std::sync::mpsc::channel::<(usize, Vec<u8>)>();
-    let mut wma_dec = match audio.as_mut() {
-        Some(a) => a.decoder.take(),
-        None => None,
-    };
     let mut skip_left = audio.as_ref().map_or(0, |a| a.skip);
-    // 第一级：WMA 解码（无编码器时就是 PCM 直通）+ 跳过编码器延迟。
+    // 把解码器从 plan 里拿出来（worker 需要 `'static` 的所有权）。
+    // `AacCopy` / `Pcm` 没有解码器 —— 前者原样搬帧，后者原样搬采样点。
+    let mut audio_dec = match audio.take() {
+        Some(AudioPlan {
+            kind: AudioSource::Decode(d),
+            ..
+        }) => Some(d),
+        _ => None,
+    };
+    // 第一级：音频解码（WMA / AAC；直通时不解）+ 跳过编码器延迟。
     let decode_worker = std::thread::spawn(move || -> std::result::Result<(), String> {
         while let Ok((idx, data)) = rx_audio.recv() {
-            let mut pcm = match wma_dec.as_mut() {
-                Some(d) => wma_frame_to_pcm(d.decode_superframe(&data).map_err(|e| e.to_string())?),
+            if aac_copy {
+                // AAC 直通：帧原样往后传。**不丢 priming** —— 它已经在帧里了，
+                // 丢掉等于把源的时间轴改短。
+                if tx_pcm.send((idx, data)).is_err() {
+                    break;
+                }
+                continue;
+            }
+            let mut pcm = match audio_dec.as_mut() {
+                Some(d) => d.decode_to_pcm(&data)?,
                 None => data,
             };
             if skip_left > 0 {
@@ -1243,7 +1572,7 @@ fn convert_to_mp4(
         }
         Ok(())
     });
-    // 第二级：AAC 编码（或 PCM 直通时按采样点切块）。
+    // 第二级：AAC 编码（或 PCM / AAC 帧直通）。
     let mut aac_enc = aac.take();
     let audio_worker = std::thread::spawn(move || -> std::result::Result<(Vec<Pending>, usize), String> {
         let mut out: Vec<Pending> = Vec::new();
@@ -1252,6 +1581,18 @@ fn convert_to_mp4(
         let mut marks: Vec<usize> = Vec::new();
         let mut audio_points = 0usize;
         while let Ok((idx, pcm)) = rx_pcm.recv() {
+            if aac_copy {
+                // AAC 直通：一个样本就是一帧（1024 个采样点 = 1024 个 tick）。
+                out.push(Pending {
+                    key: (idx, 0),
+                    kind: PendingKind::Audio {
+                        data: pcm,
+                        duration: 1024,
+                    },
+                });
+                audio_points += 1024;
+                continue;
+            }
             if let Some(enc) = aac_enc.as_mut() {
                 // ---- AAC：攒够 1024 个采样点再编一帧 ----
                 //
@@ -1401,7 +1742,12 @@ fn convert_to_mp4(
 
     // 上一帧的视频时间戳（毫秒）—— `stts` 写的是**真实间隔**。
     let mut prev_vts: Option<i64> = None;
-    let mut last_dur = (VTS as f64 / fps as f64).round().max(1.0) as u32;
+    // 名义帧时长：`stts` 里第一帧没有前驱可比，用它兜底。
+    //
+    // ⚠️ 不能用「样本时间戳的差」兜底 —— MP4 的样本是**解码顺序**、时间戳是 PTS，
+    // 带 B 帧时第一帧的差值可能是 167 ms（实测），那一帧的时长就被写坏了。
+    let nominal_dur = (VTS as f64 / f64::from(fps)).round().max(1.0) as u32;
+    let mut last_dur = nominal_dur;
     // 帧间隔的分布 —— 用来判「源是不是变帧率」。
     //
     // ⚠️ **为什么必须判**：`.mp4` 这条路的 VOP 头里 `time_mod` 是按**帧号**记的
@@ -1409,12 +1755,20 @@ fn convert_to_mp4(
     // 源是变帧率时这两件事对不上 —— 实测 ffmpeg 读回来会把 300 帧展开成 435 帧
     // （见 TODO 的「MP43/WMV1 封装时间戳」）。所以：**没显式给 `--fps` 就不许静默
     // 产出这种自相矛盾的文件**；给了 `--fps` 就按它重定时，让两边一致。
+    //
+    // ⚠️ **量的是「会写进 `stts` 的那个数」**，不是样本时间戳的差。两者只在
+    // 「解码顺序 == 显示顺序」时一致；H.264 有重排，样本的差是脏的（见 `fps_from_timestamps`
+    // 的注释）。所以这条路在下面按**出帧 pts** 记，只有并行解码那条路（没有重排的
+    // VC-1 / MP43）才用样本的差。
     let explicit_fps = opts.fps.is_some();
     let (mut dur_min, mut dur_max) = (u32::MAX, 0u32);
     let mut stop = false;
     let mut sample_idx = 0usize;
     // 攒够一个 GOP 就派给 worker。
     let mut gop_buf: Vec<(usize, Frame, u32)> = Vec::with_capacity(gop_len);
+    // 上一个**交出去**的帧的 pts（毫秒）。时长按它算 —— H.264 重排之后
+    // 「样本的时间戳」和「帧的显示时间」不是一回事。
+    let mut prev_out_pts: Option<i64> = None;
 
     // ---- 视频**解码池**：按 GOP 独立解 ----
     //
@@ -1585,19 +1939,24 @@ fn convert_to_mp4(
         }
 
         // ---- 视频 ----
+        //
+        // 样本时间戳的差 —— **只对没有重排的解码器成立**（解码顺序 == 显示顺序）。
+        // 并行解码那条路（VC-1 / MP43）走这里；带 B 帧的 H.264 由下面按出帧 pts 算。
         if let Some(p) = prev_vts {
             let d = s.timestamp_ms - p;
             if d > 0 {
                 last_dur = d.min(u32::MAX as i64) as u32;
-                dur_min = dur_min.min(last_dur);
-                dur_max = dur_max.max(last_dur);
+                if par_decode {
+                    dur_min = dur_min.min(last_dur);
+                    dur_max = dur_max.max(last_dur);
+                }
             }
         }
         prev_vts = Some(s.timestamp_ms);
         // 显式给了 `--fps`：按它**重定时**（`stts` 与 VOL 的 `time_mod` 才对得上）。
         // 不给就保留源的真实间隔 —— 这是本仓「不改写源时间轴」的立场。
         if explicit_fps {
-            last_dur = (VTS as f64 / f64::from(fps)).round().max(1.0) as u32;
+            last_dur = nominal_dur;
         }
 
         if par_decode {
@@ -1614,17 +1973,37 @@ fn convert_to_mp4(
             sample_gop.push((idx, s.data, last_dur));
             frames += 1;
         } else {
-            let frame = dec.decode(&s.data, w, h)?;
+            // 一包可能出 0 帧也可能出多帧（H.264）；软件解码器恒一帧。
+            let outs = dec.decode(&s.data, w, h, s.timestamp_ms)?;
             // ⚠️ **`-g 0` 在 `.mp4` 这条路上就是「全 I 帧」** ——
             // 这条路的默认值是 0（每个 I 帧都独立可解，见 `ConvertOptions` 的说明），
             // 所以 worker 那边不能直接调 `encode_frame`（在 `mp4v` 里 `0` 的含义是
             // 「无 GOP」，会编 P 帧、而且第一个 P 帧会因为没有参考帧而报错）——
             // `all_i` 就是为这个传进去的。
-            gop_buf.push((idx, frame, last_dur));
-            frames += 1;
-            if gop_buf.len() >= gop_len {
-                vtx.send(std::mem::take(&mut gop_buf))
-                    .map_err(|_| Error::Io(std::io::Error::other("视频线程提前退出")))?;
+            for (frame, fpts) in outs {
+                // 时长按**帧自己的 pts** 算（`stts` 写真实间隔）：H.264 重排之后
+                // 「这一包的时间戳」和「这一帧的显示时间」不是一回事，用样本的会错位。
+                let measured = if explicit_fps {
+                    None
+                } else {
+                    frame_dur(&mut prev_out_pts, fpts)
+                };
+                let dur = if explicit_fps {
+                    last_dur
+                } else {
+                    measured.unwrap_or(nominal_dur)
+                };
+                // 变帧率只看**量到的**间隔 —— 第一帧的时长是兜底值，计进去会污染极差。
+                if let Some(d) = measured {
+                    dur_min = dur_min.min(d);
+                    dur_max = dur_max.max(d);
+                }
+                gop_buf.push((idx, frame, dur));
+                frames += 1;
+                if gop_buf.len() >= gop_len {
+                    vtx.send(std::mem::take(&mut gop_buf))
+                        .map_err(|_| Error::Io(std::io::Error::other("视频线程提前退出")))?;
+                }
             }
         }
         if let Some(max) = opts.max_frames {
@@ -1656,8 +2035,45 @@ fn convert_to_mp4(
                 Err(_) => return Err(Error::Io(std::io::Error::other("视频解码线程 panic"))),
             }
         }
-    } else if !gop_buf.is_empty() {
-        vtx.send(gop_buf).map_err(|_| Error::Io(std::io::Error::other("视频线程提前退出")))?;
+    } else {
+        // 解码器的尾巴（H.264 的重排缓冲）—— 不排空会整块丢，而且丢的正是结尾。
+        //
+        // ⚠️ key 要给**递增**的：`mdat` 是按 key 的交错顺序铺的，所有尾帧共用一个
+        // `sample_idx` 会让它们挤在同一个位置上（顺序靠稳定排序兜住，但交错就散了）。
+        // 尾帧的显示时间本来就是最后，放在最后是对的。
+        let mut tail_key = sample_idx;
+        for (frame, fpts) in dec.flush()? {
+            if let Some(max) = opts.max_frames {
+                if frames >= max {
+                    break;
+                }
+            }
+            let measured = if explicit_fps {
+                None
+            } else {
+                frame_dur(&mut prev_out_pts, fpts)
+            };
+            let dur = if explicit_fps {
+                last_dur
+            } else {
+                measured.unwrap_or(nominal_dur)
+            };
+            if let Some(d) = measured {
+                dur_min = dur_min.min(d);
+                dur_max = dur_max.max(d);
+            }
+            gop_buf.push((tail_key, frame, dur));
+            tail_key += 1;
+            frames += 1;
+            if gop_buf.len() >= gop_len {
+                vtx.send(std::mem::take(&mut gop_buf))
+                    .map_err(|_| Error::Io(std::io::Error::other("视频线程提前退出")))?;
+            }
+        }
+        if !gop_buf.is_empty() {
+            vtx.send(std::mem::take(&mut gop_buf))
+                .map_err(|_| Error::Io(std::io::Error::other("视频线程提前退出")))?;
+        }
     }
     drop(vtx);
 
@@ -1675,7 +2091,8 @@ fn convert_to_mp4(
         Ok(Err(e)) => return Err(Error::Io(std::io::Error::other(format!("音频解码线程：{e}")))),
         Err(_) => return Err(Error::Io(std::io::Error::other("音频解码线程 panic"))),
     }
-    let (mut audio_events, audio_points) = match audio_worker.join() {
+    // worker 报的累计值只用来交叉检查，报告里的数在裁剪之后重新数（见下面）。
+    let (mut audio_events, worker_points) = match audio_worker.join() {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => return Err(Error::Io(std::io::Error::other(format!("音频编码线程：{e}")))),
         Err(_) => return Err(Error::Io(std::io::Error::other("音频编码线程 panic"))),
@@ -1727,6 +2144,20 @@ fn convert_to_mp4(
             PendingKind::Video { .. } => true,
         });
     }
+
+    // 报告里的「音频样本数」取**真正写进文件**的数目。
+    //
+    // ⚠️ 不能直接用 worker 的累计值：它在裁剪**之前**统计，报的是「编出来多少」而不是
+    // 「文件里有多少」。实测 `-n 6` 报 31744 个采样点，而产物只有 9216 个 —— 差 3.4 倍，
+    // 拿去当判据会得出「音频整条没被裁」的错结论。
+    let audio_points: usize = audio_events
+        .iter()
+        .map(|p| match &p.kind {
+            PendingKind::Audio { duration, .. } => *duration as usize,
+            PendingKind::Video { .. } => 0,
+        })
+        .sum();
+    debug_assert!(audio_points <= worker_points, "裁完之后不该比编出来的还多");
 
     // ---- 按**原交错顺序**回放：`mdat` 的排布必须与串行版逐字节相同 ----
     let mut all: Vec<Pending> = Vec::with_capacity(video_events.len() + audio_events.len());
@@ -1919,10 +2350,31 @@ const DEFAULT_FPS: u32 = 25;
 /// 首两个样本的间隔可能落在两条轨的边界上，或者干脆是 0。
 const FPS_PROBE_SAMPLES: usize = 8;
 
+/// 一帧的时长（毫秒）—— 按**相邻两帧的 pts 差**算。`None` = 还没有上一帧可比，
+/// 兜底值由调用方给（这里不猜，猜了就会写进 `stts`）。
+///
+/// 为什么不能直接用「这一包的样本间隔」：H.264 的硬件解码器会**重排**，交出来的
+/// 这一帧常常不是刚喂进去的那一包，用样本的间隔会让 `stts` 整体错位
+/// （症状是「能放、但播放节奏轻微发飘」，不报任何错）。
+fn frame_dur(prev: &mut Option<i64>, pts: i64) -> Option<u32> {
+    let d = match *prev {
+        Some(p) if pts > p => Some((pts - p).min(i64::from(u32::MAX)) as u32),
+        _ => None,
+    };
+    *prev = Some(pts);
+    d
+}
+
 /// 从视频样本的时间戳推帧率。
 ///
 /// 取**间隔的中位数**而不是第一个间隔 —— 时间戳偶尔会有一个不规整的
 /// （ASF 的分组边界、重复帧），只看第一个会被带跑。
+///
+/// ⚠️ **必须先排序再算差**：MP4 的样本按**解码顺序**出，时间戳却是 **PTS**，
+/// 带 B 帧时这个序列是跳的（实测某 30 fps 文件的头 8 个：66/200/133/100/166/333/
+/// 266/233）。直接取相邻差会得到 134/167 这种数，帧率被推成 **7 fps**
+/// —— 而且不报错，只是编码器按 7 fps 去声明 VOL。排序之后 34/33/33/34/33/33/67
+/// 才对（末尾那个 67 是预读窗口截断造成的，中位数能吃掉它）。
 ///
 /// ⚠️ 这里推的是**整数**帧率（要写进 VOL 的 `vop_time_increment_resolution`，
 /// 那个字段是整数）。12.5 fps 这种会被推成 12 或 13 —— 但**播放节奏不受影响**：
@@ -1930,6 +2382,9 @@ const FPS_PROBE_SAMPLES: usize = 8;
 /// `ffprobe` 报的 `r_frame_rate` 那个数。非整数帧率想声明准，得改成
 /// 「时间基 = 1001 × 帧率」那一套，目前没做。
 fn fps_from_timestamps(ts: &[i64]) -> Option<u32> {
+    let mut ts: Vec<i64> = ts.to_vec();
+    ts.sort_unstable();
+    ts.dedup();
     let mut ds: Vec<i64> = ts
         .windows(2)
         .map(|w| w[1] - w[0])
@@ -1988,5 +2443,55 @@ pub fn output_path_for(input: &Path, out_dir: &Path, format: OutputFormat) -> Pa
         out_dir.join(format!("{stem}.conv.{ext}"))
     } else {
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 实测过的「MP4 视频样本时间戳」序列（30 fps、带 B 帧，**解码顺序**）。
+    ///
+    /// 这串数就是踩坑的现场：解封装按解码顺序出样本，时间戳却是 **PTS**，
+    /// 于是相邻差里混进 134 / 167 这种值 —— 帧率被推成 **7 fps**，而且**不报错**，
+    /// 只是 VOL 里声明错了（`ffprobe` 报 `7/1`）。排序之后才是
+    /// 34/33/33/34/33/33/67（末尾的 67 是预读窗口截断造成的，中位数能吃掉）。
+    #[test]
+    fn fps_probe_sorts_before_diffing() {
+        let ts = [66, 200, 133, 100, 166, 333, 266, 233];
+        assert_eq!(
+            fps_from_timestamps(&ts),
+            Some(30),
+            "带 B 帧的 30 fps 流被推成了别的帧率（排序漏了？）"
+        );
+    }
+
+    /// 单调序列（ASF、或没有 B 帧的 MP4）行为不变。
+    #[test]
+    fn fps_probe_keeps_working_on_monotonic_timestamps() {
+        let ts: Vec<i64> = (0..8).map(|i| i * 40).collect();
+        assert_eq!(fps_from_timestamps(&ts), Some(25));
+    }
+
+    /// 重复时间戳（ASF 分组边界上会出现）不能把间隔算成 0。
+    #[test]
+    fn fps_probe_ignores_duplicate_timestamps() {
+        let ts = [0, 33, 33, 67, 100, 100, 133, 167];
+        assert_eq!(fps_from_timestamps(&ts), Some(30));
+    }
+
+    /// `frame_dur` 第一帧没有前驱时给 `None` —— 兜底值必须由调用方给。
+    ///
+    /// ⚠️ 这条不是形式主义：早先的版本在这里返回 `fallback`，而 `fallback` 来自
+    /// **样本时间戳的差**；带 B 帧时那个数可能是 167 ms，于是第一帧的 `stts`
+    /// 时长被写坏，症状是「能放、但开头节奏不对」，不报任何错。
+    #[test]
+    fn frame_dur_refuses_to_guess_the_first_frame() {
+        let mut prev = None;
+        assert_eq!(frame_dur(&mut prev, 66), None, "第一帧不该猜时长");
+        assert_eq!(frame_dur(&mut prev, 100), Some(34));
+        assert_eq!(frame_dur(&mut prev, 133), Some(33));
+        // pts 倒退（B 帧重排没排干净）也不能当成一个负的时长。
+        assert_eq!(frame_dur(&mut prev, 120), None);
     }
 }

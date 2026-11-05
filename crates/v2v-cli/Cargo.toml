@@ -28,5 +28,8 @@ v2v-wma = { path = "../wma" }
 #     自己再写一遍就等于同一件事有两个说法；
 #   - `mpeg12` feature 让 `.mpg` 也能进同一个入口（`convert` 不处理 MPEG-PS）。
 v2v-player = { path = "../v2v-player", features = ["mpeg12"] }
+# `.mp4` 输入的 H.264 走**硬件解码**（只有 macOS 有）。别处编得动、运行时明确报不支持 ——
+# 纯 Rust 的 H.264 解码器没有计划（见 README「还没做（解码侧）」）。
+v2v-android = { path = "../v2v-android" }
 # 测量结果的格式 / 机器指纹 / 回归比较。**零依赖**，不拖任何编解码器。
 v2v-bench = { path = "../v2v-bench" }

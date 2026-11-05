@@ -1204,6 +1204,115 @@ fn mp4_output_decodes_with_ffmpeg() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `.mp4` 输入（H.264 + B 帧）→ `.mp4` 输出：帧率与时间轴都要跟源对得上。
+///
+/// 钉的是「**别拿解码顺序的样本时间戳去取差**」。踩坑现场：带 B 帧的 MP4 里，
+/// 解封装按解码顺序出样本、时间戳却是 PTS（实测头 8 个：66/200/133/100/166/333/
+/// 266/233）。直接取相邻差会得到 134/167 这种值，后果有两个，而且**都不报错**：
+///
+/// 1. 帧率被推成 **7 fps** —— 编码器照它声明 VOL 的 `vop_time_increment_resolution`，
+///    `ffprobe` 读回来就是 `7/1`；
+/// 2. 变帧率判据拿到「帧间隔 33~167 ms」，把一个**正常**文件当成变帧率拒掉。
+///
+/// 判据取「产物自己声明的帧率」：它是上面两个后果的公共出口 —— 帧率错它错，
+/// 被拒掉就没有产物。再补一条逐帧 PSNR，确保不是「帧率对了、帧错位了」。
+#[cfg(target_os = "macos")]
+#[test]
+fn mp4_input_with_b_frames_keeps_its_frame_rate() {
+    if !has_ffmpeg() {
+        eprintln!("SKIP: PATH 上没有 ffmpeg");
+        return;
+    }
+    let dir = temp_dir("mp4_bframes");
+    let (w, h, n) = (320u32, 240u32, 30usize);
+    let input = dir.join("in.mp4");
+    let output = dir.join("out.mp4");
+
+    // `-bf 3` 是这条测试的**全部意义**：没有 B 帧就没有重排，解码顺序 == 显示顺序，
+    // 上面那两个坑一个也踩不到（第一版就是这么漏过去的）。
+    let made = Command::new("ffmpeg")
+        .args([
+            "-y", "-v", "error", "-f", "lavfi",
+            "-i", "testsrc2=320x240:rate=30:duration=1",
+            "-c:v", "libx264", "-preset", "veryfast", "-bf", "3", "-g", "15",
+            "-pix_fmt", "yuv420p", "-an",
+        ])
+        .arg(&input)
+        .output()
+        .expect("跑 ffmpeg");
+    if !made.status.success() {
+        eprintln!("SKIP: 造不出 H.264 样本：{}", String::from_utf8_lossy(&made.stderr));
+        return;
+    }
+
+    let opts = ConvertOptions {
+        qscale: 6,
+        format: v2v_cli::OutputFormat::Mp4,
+        verify: false,
+        ..Default::default()
+    };
+    let rep = convert_file(&input, &output, &opts)
+        .expect("带 B 帧的恒定帧率 `.mp4` 不该被拒（变帧率判据拿脏数据了？）");
+    assert_eq!(rep.frames, n, "帧数不对");
+
+    // ---- 判据 1：产物**位流里声明**的帧率必须是 30 ----
+    //
+    // ⚠️ 不能用 `ffprobe` 读产物的 `r_frame_rate`：MP4 里那个数是 libavformat 从
+    // **`stts`** 推出来的，与 VOL 无关 —— 实测帧率探测坏掉时它照样报 `30/1`，
+    // 这条判据就永远绿了。VOL 是**编码器按 `fps_num` 写进去的**，所以直接比
+    // `esds` 里的 DSI（VOS + 视觉对象 + VOL + 用户数据）：拿「30 fps 的编码器
+    // 会产出的 DSI」当标准答案，一个字节都不许差。
+    let dsi = {
+        let d = v2v_mp4::Mp4Demuxer::new(std::fs::File::open(&output).expect("开产物"))
+            .expect("解产物");
+        d.streams()
+            .iter()
+            .find(|s| s.kind == v2v_container::StreamKind::Video)
+            .and_then(|s| s.video.as_ref())
+            .map(|v| v.extra.clone())
+            .expect("产物里没有视频轨")
+    };
+    let want_dsi = v2v_mp4v::Encoder::new(v2v_mp4v::EncoderConfig {
+        width: w,
+        height: h,
+        fps_num: 30,
+        qscale: opts.qscale,
+        ..Default::default()
+    })
+    .expect("建参照编码器")
+    .decoder_specific_info();
+    assert_eq!(
+        hex(&dsi),
+        hex(&want_dsi),
+        "产物 VOL 里声明的不是 30 fps —— 帧率探测拿到脏时间戳了"
+    );
+
+    // ---- 判据 2：帧数 ----
+    let probe = Command::new("ffprobe")
+        .args([
+            "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=nb_frames",
+            "-of", "csv=p=0",
+        ])
+        .arg(&output)
+        .output()
+        .expect("跑 ffprobe");
+    assert!(probe.status.success(), "ffprobe 读不了产物");
+    let frames = String::from_utf8_lossy(&probe.stdout).trim().to_string();
+    assert_eq!(frames, n.to_string(), "产物里的帧数不是 {n}（实际 {frames}）");
+
+    // ---- 判据 3：逐帧比 PSNR（帧率对了但帧错位也会在这里露出来）----
+    let (a, b) = (
+        ffmpeg_yuv(&input, n, w, h).expect("解源"),
+        ffmpeg_yuv(&output, n, w, h).expect("解产物"),
+    );
+    let p = psnr(&a, &b);
+    eprintln!("`.mp4` → `.mp4`（带 B 帧）端到端 PSNR = {p:.2} dB");
+    assert!(p > 30.0, "画质太差（{p:.2} dB）—— 帧率对了但帧可能错位");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// **真样本端到端**（默认 `#[ignore]`）：真 `.wmv` 转 `.mp4`，
 /// 交 ffmpeg 解，视频比 PSNR、**音频查对齐偏移**。
 ///

@@ -89,6 +89,7 @@ name = "v2v-cli"
 version = "0.0.0"
 dependencies = [
  "v2v-aac",
+ "v2v-android",
  "v2v-asf",
  "v2v-avi",
  "v2v-bench",
