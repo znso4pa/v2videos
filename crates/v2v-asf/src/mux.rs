@@ -114,6 +114,8 @@ pub struct AsfMuxer {
     end_sec: i32,
     /// 单帧占用的最大包数，写进索引头的 `Max Packet Count`。
     maximum_packet: u16,
+    /// 编解码器私有数据，原样写进 `BITMAPINFOHEADER` 的尾部（见 `set_video_extra`）。
+    video_extra: Vec<u8>,
 }
 
 impl AsfMuxer {
@@ -145,7 +147,26 @@ impl AsfMuxer {
             next_start_sec: 0,
             end_sec: 0,
             maximum_packet: 0,
+            video_extra: Vec::new(),
         }
+    }
+
+    /// 把编解码器私有数据写进视频流属性的 `BITMAPINFOHEADER` 尾部。
+    ///
+    /// 为什么需要：`VideoStreamInfo` 只有宽高和 FourCC，那是**重编码**够用的全部
+    /// 信息（编码器自己产出的码流不需要额外的配置）。但**无损搬运**不一样 ——
+    /// WMV2 的能力位、VC-1 的 `STRUCT_C`（序列头）都在源的 extradata 里，
+    /// 不一起搬过去，产物就是「结构能读、画面解不出来」。
+    ///
+    /// 写法与解封装端对称：`biSize = 40 + extra.len()`，数据紧跟在 40 字节头后面
+    /// （`crates/v2v-asf/src/header.rs::parse_video_format` 就是这么读的）。
+    /// 不给（空）时产出的字节与以前**完全一样**。
+    ///
+    /// ⚠️ `extra` 是几十字节量级（`STRUCT_C` 一个序列头、WMV2 一组能力位）。超过
+    /// 64 KB 会让头里的 u16 长度字段回绕 —— 那种输入本仓的容器层根本不会产出。
+    pub fn set_video_extra(&mut self, extra: Vec<u8>) {
+        debug_assert!(extra.len() < u16::MAX as usize - 40, "extradata 大得不像话");
+        self.video_extra = extra;
     }
 
     /// 写一个音频载荷（**直通**：调用方给的就是源的载荷字节）。
@@ -460,20 +481,22 @@ impl AsfMuxer {
 
         // ---- Stream Properties（视频）----
         let sp_body = {
-            let mut b = Vec::with_capacity(78 + 51);
+            // 11 字节前缀 + BITMAPINFOHEADER(40) + 私有数据。
+            let extra = &self.video_extra;
+            let mut b = Vec::with_capacity(78 + 51 + extra.len());
             b.extend_from_slice(&guid::VIDEO_MEDIA);
             b.extend_from_slice(&video_conceal_none());
             b.extend_from_slice(&0u64.to_le_bytes()); // 时间偏移
-            b.extend_from_slice(&51u32.to_le_bytes()); // type-specific 长度
+            b.extend_from_slice(&((51 + extra.len()) as u32).to_le_bytes()); // type-specific 长度
             b.extend_from_slice(&0u32.to_le_bytes()); // 纠错数据长度
             b.extend_from_slice(&1u16.to_le_bytes()); // 流号
             b.extend_from_slice(&0u32.to_le_bytes()); // 保留
-            // type-specific：宽/高/标志/格式长度 + BITMAPINFOHEADER(40)
+            // type-specific：宽/高/标志/格式长度 + BITMAPINFOHEADER(40) + 私有数据
             b.extend_from_slice(&self.video.width.to_le_bytes());
             b.extend_from_slice(&self.video.height.to_le_bytes());
             b.push(2); // 标志（与 ffmpeg muxer 同值）
-            b.extend_from_slice(&40u16.to_le_bytes());
-            b.extend_from_slice(&40u32.to_le_bytes()); // biSize
+            b.extend_from_slice(&((40 + extra.len()) as u16).to_le_bytes());
+            b.extend_from_slice(&((40 + extra.len()) as u32).to_le_bytes()); // biSize
             b.extend_from_slice(&(self.video.width as i32).to_le_bytes());
             b.extend_from_slice(&(self.video.height as i32).to_le_bytes());
             b.extend_from_slice(&1u16.to_le_bytes()); // planes
@@ -484,6 +507,7 @@ impl AsfMuxer {
             b.extend_from_slice(&0u32.to_le_bytes()); // yppm
             b.extend_from_slice(&0u32.to_le_bytes()); // clr used
             b.extend_from_slice(&0u32.to_le_bytes()); // clr important
+            b.extend_from_slice(extra);
             b
         };
 

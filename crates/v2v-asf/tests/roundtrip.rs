@@ -387,3 +387,57 @@ fn audio_passthrough_roundtrips() {
     assert_eq!(kinds[0], (1, StreamKind::Video), "第 1 条该是流 1 / 视频");
     assert_eq!(kinds[1].1, StreamKind::Audio, "第 2 条该被认成音频");
 }
+
+/// **编解码器私有数据要原样往返**（`set_video_extra`）。
+///
+/// 为什么单独钉这一条：无损剪切 / 拼接靠它把源的 extradata 搬过去。VC-1 的
+/// `STRUCT_C`（序列头）就装在里面 —— 丢了它，产物「结构能读、画面解不出来」，
+/// 而帧数、时长、文件大小**全都正常**，是最难发现的一类坏。
+///
+/// 判据分三层，缺一层都可能漏：① 字节完全相同；② 长度不是 0（否则「两边都空」也过）；
+/// ③ **不写时行为不变**（`biSize` 仍是 40）—— 否则每个现有产物的头都会变。
+#[test]
+fn codec_private_data_round_trips() {
+    use std::io::Cursor;
+
+    let video = VideoStreamInfo {
+        width: 64,
+        height: 48,
+        fourcc: u32::from_le_bytes(*b"WMV3"),
+    };
+    // 长度取奇数、内容不是全零：全零 + 偶数长度会掩盖「少读一个字节」这种错。
+    let extra: Vec<u8> = (0..37u8).map(|b| b.wrapping_mul(11).wrapping_add(3)).collect();
+
+    let build = |with_extra: bool| {
+        let mut m = AsfMuxer::new(video.clone());
+        if with_extra {
+            m.set_video_extra(extra.clone());
+        }
+        for i in 0..4u32 {
+            m.write_video(&vec![i as u8; 64], i == 0, i * 40).expect("写");
+        }
+        m.finish()
+    };
+
+    let with = build(true);
+    let without = build(false);
+
+    let read = |bytes: &[u8]| -> Vec<u8> {
+        let d = AsfDemuxer::new(Cursor::new(bytes)).expect("解封装");
+        let v = d
+            .streams()
+            .iter()
+            .find(|s| s.kind == StreamKind::Video)
+            .expect("视频轨");
+        v.video.as_ref().expect("视频格式").extra.clone()
+    };
+
+    assert_eq!(read(&with), extra, "私有数据没能原样往返");
+    assert!(read(&without).is_empty(), "没给私有数据时不该凭空多出字节");
+    // ③ 长度差必须正好是私有数据的长度 —— 说明变的只有 `biSize` 那一处。
+    assert_eq!(
+        with.len() - without.len(),
+        extra.len(),
+        "文件只该长出私有数据那么多字节（头部长度字段是原地改的）"
+    );
+}
