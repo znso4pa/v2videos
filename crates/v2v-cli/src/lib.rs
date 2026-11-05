@@ -41,7 +41,7 @@ use std::path::{Path, PathBuf};
 
 pub use v2v_asf::{AsfDemuxer, AsfMuxer, StreamKind, VideoStreamInfo};
 pub use v2v_avi::AviDemuxer;
-pub use v2v_container::{AudioFormat, Sample};
+pub use v2v_container::{fourcc_string, AudioFormat, Sample};
 pub use v2v_msmpeg4::{Decoder, Encoder, EncoderConfig, Version};
 use v2v_kernel::mc::Frame;
 
@@ -55,6 +55,10 @@ pub mod bench;
 /// 无损剪切 / 拼接：只搬样本，不解码、不重编码。
 pub mod lossless;
 pub use lossless::{concat, trim, ConcatReport, TrimReport};
+
+/// 扫描器：递归扫目录，**只读头部**，说出哪些能转、能转成什么。
+pub mod scan;
+pub use scan::{format_table, format_tsv, scan, ScanEntry, Verdict};
 
 /// 认 FourCC → 版本，**只放逐像素对账过的版本进来**。
 ///
@@ -294,62 +298,117 @@ impl VideoDecoder {
     }
 }
 
+/// 「这个 FourCC 走哪个解码器」—— 全仓**唯一**一张输入编码表。
+///
+/// 存在的理由：扫描器（[`scan`]）要在**不解码**的前提下说「这个文件我们能转」，
+/// 而 [`open_video_decoder`] 要真的把解码器建起来。两处各写一份白名单，迟早会漂，
+/// 而「扫描说能转、转的时候报不支持」是最难查的一类不一致 —— 它不报错，只是白等。
+/// 所以两边都查这一张：**能进这里 = 真能建**。
+enum InputCodec {
+    /// MPEG-4 Part 2（`mp4v` / `FMP4` / `DIVX` / `XVID` 四个别名同一条语法）。
+    Mp4v,
+    /// VC-1（`WMV3`）。
+    Vc1,
+    /// H.264（`avc1`）—— 只有 macOS 的硬件路径。
+    ///
+    /// 非 macOS 上这个变体**永远不会被构造**（[`classify_video`] 直接报不支持），
+    /// 但 [`input_codec_name`] 的 `match` 还得列出它 —— 于是 `dead_code` 会认为它
+    /// 没人用过。这不是死代码，是「这个平台上没这条腿」。
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    H264,
+    /// MS-MPEG-4（MP42 / MP43 / WMV1 / WMV2）。
+    Msmpeg4(Version),
+}
+
+/// 非 macOS 上 `avc1` 的拒绝理由 —— [`classify_video`] 与 [`open_video_decoder`]
+/// 共用这一份，免得两处文案漂成两种说法。
+#[cfg(not(target_os = "macos"))]
+const NO_H264: &str =
+    "H.264 解码目前只有 macOS 的硬件路径（VideoToolbox）；这个平台上没有可用的解码器";
+
+/// FourCC → 解码器类别。认不出（或这个平台上没有解码器）就明确报错。
+fn classify_video(fourcc: u32) -> Result<InputCodec, Error> {
+    // MPEG-4 Part 2 的 FourCC 有一堆别名：AVI 里 ffmpeg 写 `FMP4`，MP4 里是 `mp4v`，
+    // DivX / Xvid 编码器写 `DIVX` / `XVID` —— 都是同一条语法，交给同一个解码器。
+    if matches!(fourcc, FMP4 | MP4V | DIVX | XVID) {
+        return Ok(InputCodec::Mp4v);
+    }
+    if fourcc == WMV3 {
+        return Ok(InputCodec::Vc1);
+    }
+    if fourcc == AVC1 {
+        // H.264 **只有硬件解码器**（macOS VideoToolbox）。别处明确报不支持 ——
+        // 纯 Rust 的 H.264 解码器没有计划（README「还没做（解码侧）」）。
+        #[cfg(target_os = "macos")]
+        return Ok(InputCodec::H264);
+        #[cfg(not(target_os = "macos"))]
+        return Err(Error::Unsupported(NO_H264.into()));
+    }
+    Ok(InputCodec::Msmpeg4(verified_version(fourcc)?))
+}
+
+/// 输入编码的显示名；`None` = 我们解不了。
+///
+/// 给扫描器用 —— 与 [`classify_video`] 查同一张表，所以不会出现
+/// 「扫描器说有名字、建解码器时说不支持」。
+pub fn input_codec_name(fourcc: u32) -> Option<&'static str> {
+    match classify_video(fourcc) {
+        Ok(InputCodec::Mp4v) => Some("mp4v"),
+        Ok(InputCodec::Vc1) => Some("WMV3"),
+        Ok(InputCodec::H264) => Some("H.264"),
+        Ok(InputCodec::Msmpeg4(v)) => Some(v.name()),
+        Err(_) => None,
+    }
+}
+
 /// 按 FourCC 建解码器。`extra` 是容器的编解码器私有数据，`w` / `h` 是显示尺寸。
 ///
-/// | FourCC | 走哪条 |
-/// |---|---|
-/// | `MP43` / `WMV1` / `WMV2` | `v2v-msmpeg4`（`WMV2` 还要 `extra` 里的能力位） |
-/// | `WMV3` | `v2v-vc1`（`extra` 是 `STRUCT_C` 序列头） |
-///
-/// 别的一律明确报 `Unsupported`。
+/// 认哪个 FourCC 由 [`classify_video`] 决定（扫描器查的是同一张表）；这里只负责
+/// 「照类别把解码器建起来」。
 fn open_video_decoder(
     fourcc: u32,
     extra: &[u8],
     w: u32,
     h: u32,
 ) -> Result<VideoDecoder, Error> {
-    // MPEG-4 Part 2 的 FourCC 有一堆别名：AVI 里 ffmpeg 写 `FMP4`，MP4 里是 `mp4v`，
-    // DivX / Xvid 编码器写 `DIVX` / `XVID` —— 都是同一条语法，交给同一个解码器。
-    if matches!(fourcc, FMP4 | MP4V | DIVX | XVID) {
-        // ⚠️ **extradata 可能是空的**：AVI 的 `strf` 常只有 40 字节，ffmpeg 把 VOL
-        // 写在第一个样本的 VOP 前面。所以拿不到 VOL 时不报错，改成「等流里的 VOL」
-        // —— 第一个样本到了自然就配上尺寸了（`Decoder::new_from_stream`）。
-        return match v2v_mp4v::Vol::parse(extra) {
-            Ok(vol) => {
-                let dec = v2v_mp4v::Decoder::new(vol)
-                    .map_err(|e| Error::Unsupported(format!("mp4v 解码器建不起来：{e}")))?;
-                Ok(VideoDecoder::Mp4v(dec))
+    match classify_video(fourcc)? {
+        InputCodec::Mp4v => {
+            // ⚠️ **extradata 可能是空的**：AVI 的 `strf` 常只有 40 字节，ffmpeg 把 VOL
+            // 写在第一个样本的 VOP 前面。所以拿不到 VOL 时不报错，改成「等流里的 VOL」
+            // —— 第一个样本到了自然就配上尺寸了（`Decoder::new_from_stream`）。
+            match v2v_mp4v::Vol::parse(extra) {
+                Ok(vol) => {
+                    let dec = v2v_mp4v::Decoder::new(vol)
+                        .map_err(|e| Error::Unsupported(format!("mp4v 解码器建不起来：{e}")))?;
+                    Ok(VideoDecoder::Mp4v(dec))
+                }
+                Err(_) => Ok(VideoDecoder::Mp4v(v2v_mp4v::Decoder::new_from_stream())),
             }
-            Err(_) => Ok(VideoDecoder::Mp4v(v2v_mp4v::Decoder::new_from_stream())),
-        };
-    }
-    if fourcc == WMV3 {
-        let seq = v2v_vc1::SeqHeader::parse(extra)
-            .map_err(|e| Error::Unsupported(format!("VC-1 序列头解析失败：{e}")))?;
-        let dec = v2v_vc1::Decoder::new(seq, w, h)
-            .map_err(|e| Error::Unsupported(format!("VC-1 解码器建不起来：{e}")))?;
-        return Ok(VideoDecoder::Vc1(dec));
-    }
-    if fourcc == AVC1 {
-        // H.264 **只有硬件解码器**（macOS VideoToolbox）。别处明确报不支持 ——
-        // 纯 Rust 的 H.264 解码器没有计划（README「还没做（解码侧）」）。
-        #[cfg(target_os = "macos")]
-        {
-            if extra.is_empty() {
-                return Err(Error::Unsupported(
-                    "H.264 输入缺 avcC（MP4 的 `avcC` box 没解出来？）".into(),
-                ));
-            }
-            return Ok(VideoDecoder::H264Hw(H264HwDecoder::new(extra)?));
         }
-        #[cfg(not(target_os = "macos"))]
-        return Err(Error::Unsupported(
-            "H.264 解码目前只有 macOS 的硬件路径（VideoToolbox）；这个平台上没有可用的解码器"
-                .into(),
-        ));
+        InputCodec::Vc1 => {
+            let seq = v2v_vc1::SeqHeader::parse(extra)
+                .map_err(|e| Error::Unsupported(format!("VC-1 序列头解析失败：{e}")))?;
+            let dec = v2v_vc1::Decoder::new(seq, w, h)
+                .map_err(|e| Error::Unsupported(format!("VC-1 解码器建不起来：{e}")))?;
+            Ok(VideoDecoder::Vc1(dec))
+        }
+        // 非 macOS 上 [`classify_video`] 根本不会给出 `H264`（它直接报不支持），
+        // 但 `match` 仍要穷尽所有变体 —— 那边这个分支只是把同一句拒绝理由再说一遍。
+        InputCodec::H264 => {
+            #[cfg(target_os = "macos")]
+            {
+                if extra.is_empty() {
+                    return Err(Error::Unsupported(
+                        "H.264 输入缺 avcC（MP4 的 `avcC` box 没解出来？）".into(),
+                    ));
+                }
+                Ok(VideoDecoder::H264Hw(H264HwDecoder::new(extra)?))
+            }
+            #[cfg(not(target_os = "macos"))]
+            Err(Error::Unsupported(NO_H264.into()))
+        }
+        InputCodec::Msmpeg4(version) => Ok(VideoDecoder::Msmpeg4(make_decoder(version, extra)?)),
     }
-    let version = verified_version(fourcc)?;
-    Ok(VideoDecoder::Msmpeg4(make_decoder(version, extra)?))
 }
 
 /// 输出容器。
@@ -579,6 +638,10 @@ struct VideoTrack {
 /// 存在的理由：转码管线只关心「视频流是谁、多大、什么 codec」和「下一个样本」，
 /// 不该为每种容器写一份管线。加容器 = 加一个实现，管线不动。
 trait VideoSource {
+    /// 容器名（`"ASF"` / `"AVI"` / `"MP4"`）—— 扫描器报告用。
+    fn container_name(&self) -> &'static str;
+    /// 容器声明的时长（毫秒）；`None` = 文件没写，**不猜**。
+    fn duration_ms(&self) -> Option<u64>;
     /// 视频轨；没有视频轨就 `None`。
     fn video_stream(&self) -> Option<VideoTrack>;
     /// `(流号, WAVEFORMATEX)`；没有音频轨就 `None`。
@@ -589,6 +652,12 @@ trait VideoSource {
 struct AsfSource(v2v_asf::AsfDemuxer<BufReader<File>>);
 
 impl VideoSource for AsfSource {
+    fn container_name(&self) -> &'static str {
+        "ASF"
+    }
+    fn duration_ms(&self) -> Option<u64> {
+        Some(self.0.info().duration_ms())
+    }
     fn video_stream(&self) -> Option<VideoTrack> {
         let v = self
             .0
@@ -620,6 +689,12 @@ impl VideoSource for AsfSource {
 struct Mp4Source(v2v_mp4::Mp4Demuxer<BufReader<File>>);
 
 impl VideoSource for Mp4Source {
+    fn container_name(&self) -> &'static str {
+        "MP4"
+    }
+    fn duration_ms(&self) -> Option<u64> {
+        self.0.duration_ms()
+    }
     fn video_stream(&self) -> Option<VideoTrack> {
         let v = self.0.streams().iter().find(|s| s.kind == StreamKind::Video)?;
         let vf = v.video.as_ref()?;
@@ -643,6 +718,12 @@ impl VideoSource for Mp4Source {
 struct AviSource(v2v_avi::AviDemuxer<BufReader<File>>);
 
 impl VideoSource for AviSource {
+    fn container_name(&self) -> &'static str {
+        "AVI"
+    }
+    fn duration_ms(&self) -> Option<u64> {
+        self.0.duration_ms()
+    }
     fn video_stream(&self) -> Option<VideoTrack> {
         let v = self
             .0

@@ -1,9 +1,10 @@
-//! `v2v` —— WMV/ASF 批量转码 + 无损剪切 / 拼接 + 基准测量命令行。
+//! `v2v` —— WMV/ASF 批量转码 + 无损剪切 / 拼接 + 扫描 + 基准测量命令行。
 //!
 //! ```text
 //! v2v convert [选项] <输入>...
 //! v2v trim    --start <秒> [--end <秒>] -o <输出> <输入>
 //! v2v concat  -o <输出> <输入>...
+//! v2v scan    [--all] [--tsv] <路径>...
 //! v2v bench   [选项] <样本>...
 //!
 //! convert 的选项：
@@ -20,6 +21,7 @@
 //!   -h, --help            帮助
 //!
 //! trim / concat **不重编码**（只搬样本，画质与源逐字节相同），所以只能切在关键帧上。
+//! scan 只读头部，不读样本（见 `SCAN_USAGE`）。
 //! bench 的选项见 `BENCH_USAGE`。
 //! ```
 //!
@@ -29,7 +31,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use v2v_cli::bench::{self, Options as BenchOptions};
-use v2v_cli::{concat, convert_batch, trim, ConvertOptions, Mp4Audio, OutputFormat};
+use v2v_cli::{
+    concat, convert_batch, format_table, format_tsv, scan, trim, ConvertOptions, Mp4Audio,
+    OutputFormat,
+};
 
 const USAGE: &str = "\
 v2v —— WMV/ASF 批量转码（纯 Rust：解封装 → 解码 → 编码 → 封装）
@@ -38,6 +43,7 @@ v2v —— WMV/ASF 批量转码（纯 Rust：解封装 → 解码 → 编码 →
   v2v convert [选项] <输入>...
   v2v trim    --start <秒> [--end <秒>] -o <输出> <输入>
   v2v concat  -o <输出> <输入>...
+  v2v scan    [--all] [--tsv] <路径>...   （递归找能转的视频，只读头部）
   v2v bench   [选项] <样本>...   （性能测量：打 TSV、可选对着基线卡回归）
 
 选项：
@@ -75,7 +81,12 @@ trim / concat（**不重编码**，只搬样本 —— 画质与源逐字节相�
       各段的视频四要素（FourCC / 宽高 / 私有数据）与音频格式必须**完全一致**，
       且每段的第一个视频样本必须是关键帧 —— 不满足就明确报错，不产出坏文件。
 
-输入支持：ASF（.wmv）/ AVI 里的 MP42 / MP43 / WMV1 / WMV2 / mp4v（FMP4·DIVX·XVID）视频轨 + WMA 音频轨。
+输入支持（按**魔数**认容器，不看扩展名）：
+  ASF（.wmv）  MP42 / MP43 / WMV1 / WMV2 / WMV3（VC-1）视频 + WMA 音频
+  AVI（.avi）  同上（ffmpeg 写 mp4v 时 FourCC 是 FMP4 / DIVX / XVID）
+  MP4（.mp4）  mp4v（MPEG-4 Part 2）或 avc1（H.264，**仅 macOS** 硬解）+ AAC / PCM
+  纯 Rust 能解的视频：MP42 / MP43 / WMV1 / WMV2 / WMV3 / mp4v；
+  H.264 只有 macOS 的 VideoToolbox 一条路（别的平台上明确报不支持）。
 
 两条输出路：
   .wmv  视频重编码成 MP43，音频**直通**（零损失）。会做 PSNR 校验。
@@ -125,6 +136,34 @@ v2v bench —— 性能测量：把结果写成 TSV，可选对着基线卡回�
   v2v bench --check bench/baseline/$(...).tsv testing/sample.wmv
 ";
 
+/// `v2v scan` 的帮助。与 convert 的选项**一个都不重叠**，单独一份。
+const SCAN_USAGE: &str = "\
+v2v scan —— 递归找「我们能转的」视频，并说出能转成什么
+
+用法：
+  v2v scan [选项] <路径>...
+
+选项：
+      --all    连不能转的也列出来（默认只列能转的）
+      --tsv    输出 TSV（第一行是表头，可管道给 awk / cut）
+  -h, --help   显示本帮助
+
+列：
+  CONT      容器（ASF / AVI / MP4）—— 按**魔数**认，不看扩展名
+  VIDEO     视频 FourCC；SIZE 是显示宽高
+  AUDIO     音频编解码器 + 声道数 / 采样率（kHz）
+  DURATION  容器声明的时长；`-` = 文件没写
+  TARGET    能去的输出容器：wmv（MP43 in ASF）/ mp4（mp4v in MP4）
+  `└` 开头的缩进行是**前提**（例如「音频不认识，只能 --no-audio」）
+
+⚠️ 只读头部（容器头 / MP4 的 moov / AVI 的 hdrl+idx1），**一个样本都不读**。
+   所以 TARGET 的意思是「容器声称的编解码器我们有解码器」，不是「真的解得开」——
+   头部完好但帧数据烂掉的文件这里照样报能转。要确认得真跑一遍 convert。
+
+目录会递归展开，**跳过符号链接**（防环、防同一个文件被数两遍）；命令行上直接
+点名的符号链接照扫。读不动的子目录跳过不报。
+";
+
 /// 解析码率：纯数字按 bit/s 算，也接受 `k` / `M` 后缀（`500k`、`1.5M`）。
 fn parse_bitrate(s: &str) -> Result<u32, String> {
     let t = s.trim();
@@ -158,7 +197,7 @@ fn main() -> ExitCode {
 /// `Ok(true)` = 全部成功（或没有超过门限的回归）；`Ok(false)` = 有文件失败 / 有回归。
 fn run(args: &[String]) -> Result<bool, String> {
     let mut it = args.iter();
-    let cmd = it.next().ok_or("缺少子命令（convert / trim / concat / bench）")?;
+    let cmd = it.next().ok_or("缺少子命令（convert / trim / concat / scan / bench）")?;
     match cmd.as_str() {
         "-h" | "--help" => {
             print!("{USAGE}");
@@ -167,11 +206,56 @@ fn run(args: &[String]) -> Result<bool, String> {
         "convert" => run_convert(&mut it),
         "trim" => run_trim(&mut it),
         "concat" => run_concat(&mut it),
+        "scan" => run_scan(&mut it),
         "bench" => run_bench(&mut it),
         other => Err(format!(
-            "未知子命令 `{other}`（有 convert / trim / concat / bench）"
+            "未知子命令 `{other}`（有 convert / trim / concat / scan / bench）"
         )),
     }
+}
+
+/// `v2v scan`：递归扫路径，只读头部，报出能转的（以及能转成什么）。
+///
+/// 结果走 **stdout**（它是一份报告，要能重定向 / 管道），统计走 stderr。
+fn run_scan(it: &mut std::slice::Iter<'_, String>) -> Result<bool, String> {
+    let mut all = false;
+    let mut tsv = false;
+    let mut paths: Vec<PathBuf> = Vec::new();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--all" => all = true,
+            "--tsv" => tsv = true,
+            "-h" | "--help" => {
+                print!("{SCAN_USAGE}");
+                return Ok(true);
+            }
+            other if other.starts_with('-') => return Err(format!("scan 不认 `{other}`")),
+            other => paths.push(PathBuf::from(other)),
+        }
+    }
+    if paths.is_empty() {
+        return Err("scan 至少要给一个路径".into());
+    }
+
+    // 路径不存在是**运行期**错误（不是用法错误）：报一行、退出码 1，别糊一脸帮助。
+    let entries = match scan(&paths) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("  ✗ {e}");
+            return Ok(false);
+        }
+    };
+    let out = if tsv {
+        format_tsv(&entries, all)
+    } else {
+        format_table(&entries, all)
+    };
+    print!("{out}");
+
+    let convertible = entries.iter().filter(|e| e.verdict.is_convertible()).count();
+    eprintln!("  {convertible} / {} 个文件能转", entries.len());
+    // 扫描本身成功就是 0 —— 「有些文件不能转」是**扫描的结论**，不是失败。
+    Ok(true)
 }
 
 /// `v2v trim`：无损剪切（只搬样本，不解码、不重编码）。
