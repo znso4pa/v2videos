@@ -240,7 +240,8 @@ cc -std=c11 -Wall -Wextra -Werror -I crates/v2v-capi/include \
 | **解码**   | MPEG-4 Part 2（`v2v-mp4v` 的 `decode`）：I / P、H.263 量化、16×16 半像素 —— 修了七个「能跑但不对」的 bug（`^` 优先级、亮度用错色度 DC 表、escape 步进、符号扩展、伪中值、resync 误拒、**escape 内层 level 没反量化**） | 两条判据同一把尺（`ffmpeg -idct 2 -fps_mode passthrough`）：自己编的 I P P P I P P P **逐像素 0 差**；**ffmpeg 自己编的流**（独立来源）10 帧全解、也 0 差 |
 | **播放**   | `v2v-player`：顺时取帧（视频逐帧、音频逐样本）、两轨独立、`seek(ms)`（Simple Index + 关键帧回退 + **前向解码到目标**） | black 首帧 PTS=0（preroll 真扣掉）、EOS 稳定返回 `None`；sample 全片两轨到 EOS、PTS 单调（修过一个不报错的坑：superframe 多帧只交第一帧 → 音频只剩 1/4）；seek(69.2 s) 实际落位 **69.2 s** |
 | **硬件编码** | `v2v-android`（进站 FFI，见「FFI」一节）：MediaCodec H.264 + MediaMuxer MP4，音频走我们的 AAC | C shim 用真 NDK 28.2（API 26）0 警告编译、双端 `cargo check` 0 错 0 警；真机实测**待补**（无设备连接，不写没量过的数） |
-| **硬件解码** | `v2v-android`（macOS VideoToolbox，`c/vt_decoder.c` + `vt.rs`）：avcC + 长度前缀 NALU → YUV420P 三平面。输入口径与 `Mp4Demuxer` 吐的样本一致，中间不需要 Annex-B 转换。C ABI 侧是 `V2V_CODEC_H264_HW`（新编号）+ `v2v_vdec_decode_pts` / `next` / `flush` —— 硬件解码是**异步**的（喂一包可能不出帧，也可能一次出好几帧），语义与 0–5 号软件解码器不同，所以单独编号、单独入口 | 对 `ffmpeg` **软件**解码（`-c:v h264`）逐帧比：720p / 1080p × 合成画面 / 真内容 × 各 60–90 帧，**PSNR = ∞，一帧不差**；穿过 C ABI 之后同样逐字节一致，45 帧一个不少、带回来的 pts 集合与喂进去的完全相同。这不是运气 —— H.264 的反变换 / 环路滤波是标准规定的精确整数运算，符合标准的解码器必须逐字节一致（所以「硬件解码有舍入」那个说法是错的）。断言仍写 **≥ 45 dB**：别的驱动上 ±1 LSB 属允许的实现差异，而真错会掉到 30 dB 那一档（实测把 Y 取址错开一行 = **31.69 dB**）。**还剩**：Android 的 MediaCodec 解码、CLI 的 `.mp4` 输入 |
+| **硬件解码** | `v2v-android`（macOS VideoToolbox，`c/vt_decoder.c` + `vt.rs`）：avcC + 长度前缀 NALU → YUV420P 三平面。输入口径与 `Mp4Demuxer` 吐的样本一致，中间不需要 Annex-B 转换。C ABI 侧是 `V2V_CODEC_H264_HW`（新编号）+ `v2v_vdec_decode_pts` / `next` / `flush` —— 硬件解码是**异步**的（喂一包可能不出帧，也可能一次出好几帧），语义与 0–5 号软件解码器不同，所以单独编号、单独入口 | 对 `ffmpeg` **软件**解码（`-c:v h264`）逐帧比：720p / 1080p × 合成画面 / 真内容 × 各 60–90 帧，**PSNR = ∞，一帧不差**；穿过 C ABI 之后同样逐字节一致，45 帧一个不少、带回来的 pts 集合与喂进去的完全相同。这不是运气 —— H.264 的反变换 / 环路滤波是标准规定的精确整数运算，符合标准的解码器必须逐字节一致（所以「硬件解码有舍入」那个说法是错的）。断言仍写 **≥ 45 dB**：别的驱动上 ±1 LSB 属允许的实现差异，而真错会掉到 30 dB 那一档（实测把 Y 取址错开一行 = **31.69 dB**）。**还剩**：Android 的 MediaCodec 解码（按用户要求跳过） |
+| **`.mp4` 输入** | `v2v convert --mp4 in.mp4`：视频走 VT 硬解 + **16 帧有界重排缓冲**（VT 出的是解码顺序，不是显示顺序；pts 倒退时明确报错，不产出顺序错的文件）；音频走 **AAC 直通**（不解码、无损、更快，`esds` 沿用源自己的 AudioSpecificConfig + `priming = 1024`） | 90 帧 / 3 s 的 H.264+AAC 样本：帧数 90→90、时长 3.000 s、逐帧对源 **35.3 dB**（尺子自检：源序列错 1 帧只有 **19.2 dB**，说明帧错位会被抓到）；音频**逐样本 0 差**（132080 个采样点全等）。25 / 29.97 / 60 fps 与 `-bf 5` 深重排都验过；真正的变帧率源仍然**报错拒绝**（`--fps` 可强制重定时） |
 | **音频直通** | 转换时原样搬音频轨（ASF 多流复用）                                                                                         | 真样本整条音轨：输出音频与源**逐样本 0 差异**（整轨字节完全一致）                                           |
 | **音频解码** | WMA v1/v2（`v2v-wma`）→ PCM                                                                                   | 真样本整轨与 ffmpeg 的 PCM **最大差 2**（s16 满量程 32768）；转进 MP4 后**对齐偏移 0 采样点**                             |
 | **音频编码** | AAC-LC（`v2v-aac`）：MDCT + 量化 + Huffman 码本 + **短窗**（瞬态）+ 窗口分组 + **TNS**（长窗）+ **M/S 立体声**（逐帧决策）；预算**按声道需要分**、**逐带率-失真分配**（每带按 `失真 + λ·位数` 选，λ 从上一帧的答案出发搜）够目标码率；双声道可选**声道并行**（输出逐字节不变） | ffmpeg 解得开；码率命中目标；真素材上与 ffmpeg 的 AAC 同目标码率比：**128k +2.1 dB、192k +3.1 dB、256k +3.1 dB**（另一段素材 +7 ～ +8 dB；口径见 §4，`tools/snr.py` 搜对齐后再算）；瞬态素材上**短窗 vs 长窗 12.02 vs 10.49 dB、体积小 29%** |
@@ -257,7 +258,14 @@ v2v convert in.wmv -o out/
 # .mp4：视频重编码成 MPEG-4 Part 2（-g 给 GOP，默认 250 帧 ≈ 10 秒；0 = 全 I 帧），
 #       音频 WMA → PCM → **AAC-LC**（--pcm 可退回未压缩 PCM）
 v2v convert --mp4 -g 12 in.wmv -o out/
+
+# .mp4 输入（H.264 硬解 + AAC 直通）→ 再出 .mp4
+v2v convert --mp4 in.mp4 -o out/
 ```
+
+**输入按扩展名认**（`.wmv` / `.avi` / `.mp4`），`--mp4` 说的是**输出**格式 —— 所以
+`v2v convert --mp4 in.mp4` 是「`.mp4` 进、`.mp4` 出」。`.mp4` 输入的视频走 **VT 硬件解码**
+（macOS；别处明确报不支持），音频若是 AAC 且输出也是 AAC 就**原样搬帧**、不解码。
 
 **为什么 `.mp4` 必须重编码**：MP4 / 3GP 容器**不收 MP43**（`mp4`/`3gp`/`3g2` 三个 muxer 都报  
 `codec not currently supported in container`），`mov` 收但是单向街 —— 写出来的东西 ffmpeg  
@@ -268,6 +276,11 @@ v2v convert --mp4 -g 12 in.wmv -o out/
 多分辨率、`rangered`、重同步标记（见下一段）。**MP41** 的 MB 层分支写好了，但 ffmpeg
 只有 `msmpeg4v2` / `msmpeg4v3` 两个编码器 —— **造不出 v1 的流**，也就拿不到对账样本，
 所以输入被明确拒绝。（MP42 已经对上了，见能力矩阵。）
+
+**H.264 只有硬件解码这条路**：macOS 上是 VideoToolbox，别处没有。纯 Rust 的 H.264
+解码器**没有计划** —— 它不是「再写一个模块」，而是一整套 CABAC / 去块滤波 / 帧内预测
+的整数管线，投入与收益不成比例。所以 `.mp4` 输入在非 macOS 上是明确报不支持，而不是
+悄悄降级。另外 `avc1` 的 **High 10 / 4:2:2 / MVC** 也没验过（VT 支持与否取决于机器）。
 
 **VC-1 走到哪一步**：`v2v-vc1` 已经**整条链路通了** —— 序列头（容器 extradata 里的
 `STRUCT_C`）、帧头（I/P）、帧头里的**位平面**（逐宏块跳过标志那类整帧位图，7 种编码 +

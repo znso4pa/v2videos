@@ -34,7 +34,7 @@ v2v-mp4    MP4 / ISOBMFF 封装（mp4v + mp4a(AAC) 或 sowt PCM）
 v2v-player 顺时播放层：逐帧 / 逐样本、两轨独立、`seek(ms)`
 v2v-android  平台硬编：硬件 H.264（VideoToolbox / MediaCodec）+ WMA→WAV 抽轨（**只有 rlib**）
 v2v-capi   **全仓唯一的 C ABI**：`v2v_*` 一族符号 + 唯一头文件 `crates/v2v-capi/include/v2v.h`
-v2v-cli    `v2v convert`：ASF / AVI → `.wmv`（MP43 + 音频直通）或 `.mp4`（mp4v + AAC）
+v2v-cli    `v2v convert`：ASF / AVI / MP4 → `.wmv`（MP43 + 音频直通）或 `.mp4`（mp4v + AAC）
            **+ `v2v bench`**：测量写成 TSV、可选对着基线卡回归
 v2v-bench  性能测量的**格式与寿命管理**：TSV 读写 / 机器指纹 / 回归比较 —— **零依赖**，
            不测量任何东西（测量在各 crate 自己的 bench 里）
@@ -55,8 +55,14 @@ v2v-bench  性能测量的**格式与寿命管理**：TSV 读写 / 机器指纹 
 没开的容器 / 编解码器连**码表**都不编进去，符号集也只剩开的那几族。
 
 **输入编码认这些**（`crates/v2v-cli/src/lib.rs::open_video_decoder` 是唯一真源）：
-`MP42` / `MP43` / `WMV1` / `WMV2` / **`WMV3`（VC-1）** / `mp4v`（`FMP4`·`DIVX`·`XVID`）。
-其余明确报 `Unsupported`（MP41 没有可对账的样本，拒绝而不是猜）。
+`MP42` / `MP43` / `WMV1` / `WMV2` / **`WMV3`（VC-1）** / `mp4v`（`FMP4`·`DIVX`·`XVID`）/
+**`avc1`（H.264）**。其余明确报 `Unsupported`（MP41 没有可对账的样本，拒绝而不是猜）。
+
+⚠️ **`avc1` 只有硬件解码**（macOS VideoToolbox，`VideoDecoder::H264Hw`）。别处编得动、
+运行时明确报不支持 —— 纯 Rust 的 H.264 解码器没有计划。它的形状与软件解码器不同：
+**异步 + 重排**，所以 `VideoDecoder::decode` 返回 `Vec<(Frame, pts)>`（0～N 帧），
+显示顺序由 `H264HwDecoder` 的 16 帧有界重排缓冲保证，**样本喂完必须 `flush()`**
+（实测不排空会少一整批尾帧，且不报错）。
 
 ⚠️ **VC-1 已经接进 CLI**（`open_video_decoder` 的 `WMV3` 分支 + `VideoDecoder::Vc1`），
 GOP 并行解码也开了 —— 「解码顺序 ≠ 显示顺序」由「按 PTS 出帧」处理，
