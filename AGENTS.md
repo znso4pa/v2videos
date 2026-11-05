@@ -30,7 +30,8 @@ v2v-mpeg12-simd  同一内核的 unsafe / FFI 变体，可单独编 .so / .a
 mp4v       MPEG-4 Part 2 编码（I / P + 码率控制）**+ 解码**（I / P）
 aac        AAC-LC 编码（MDCT / 短窗 / TNS / Huffman / 码率控制）**+ 解码**（结构 / 谱 /
            反量化 / M-S / TNS / IMDCT + 重叠相加，对 ffmpeg ±1 LSB）
-v2v-mp4    MP4 / ISOBMFF 封装（mp4v + mp4a(AAC) 或 sowt PCM）
+v2v-mp4    MP4 / ISOBMFF 封装（mp4v + mp4a(AAC) 或 sowt PCM）**+ 解封装**
+           （`Mp4Demuxer`：非分片、`stco`/`co64`、`ctts` 算进 PTS；**尚未进 C ABI**）
 v2v-filter 像素域算子：缩放（bilinear / bicubic，**缩小时核按 src/dst 拉伸抗混叠**）/
            CSC（YUV420P ↔ RGB24 / 4:4:4 / NV12，BT.601 limited range）/
            去隔行（bob / weave）—— **不进 C ABI**（CSC 与缩放是留给宿主的边界）

@@ -41,6 +41,7 @@ crates/
                     **解码**：结构 → 谱 Huffman → 反量化 → M/S → TNS 逆滤波 → IMDCT + 重叠相加，
                     对 `ffmpeg` 解同一文件**逐样本 ±1 LSB**
   v2v-mp4           MP4 / ISOBMFF **封装**（ftyp / mdat / moov；音频 AAC 或 PCM）
+                    **+ 解封装**（`Mp4Demuxer`：非分片、`stco`/`co64`、`ctts` 算进 PTS）
   v2v-mpegps        MPEG-1/2 **program stream** 解封装（`.mpg` / `.dat` / `.vob` 那类 PS 容器）
   mpeg12            MPEG-1/2 **解码**（本 crate 自身零 unsafe，**且依赖闭包里也没有 unsafe**
                     —— kernel 的 NEON 是 opt-in feature，这里不开；当参考实现/oracle）：MPEG-1 的 I/P/B；
@@ -237,7 +238,7 @@ cc -std=c11 -Wall -Wextra -Werror -I crates/v2v-capi/include \
 
 | 链路分段     | 做到了什么                                                                                                       | 怎么算验证过                                                                                          |
 | -------- | ----------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
-| **解封装**  | ASF / WMV（`v2v-asf`）、AVI（`v2v-avi`）                                                                         | 与 `ffprobe` 逐字段对：轨道、尺寸、包数、关键帧数                                                                  |
+| **解封装**  | ASF / WMV（`v2v-asf`）、AVI（`v2v-avi`）、MPEG-1/2 PS（`v2v-mpegps`）、MP4 / ISOBMFF（`v2v-mp4::Mp4Demuxer`，**尚未进 C ABI**）                    | 与 `ffprobe` 逐字段对：轨道、尺寸、包数、关键帧数；MP4 逐包对 `stts`/`stsz`/`stss`/`stco` 与 `ffprobe` 相同 |
 | **解码**   | MS-MPEG-4 v3（**MP43**）、**WMV1**（WMV7）与 **WMV2**（WMV8）：I 帧 + P 帧（skip、MV 预测、半像素运动补偿、帧间残差）。三版共用骨架，**分叉在帧头与几处版本常量**上：`pict_type` 位宽、ext header 的位置、变长/定长的第三 escape、`ff_wmv1_scantable` 那套扫描表、DC 预测的平手方向与缩放（`scale != 8` 时走 `FASTDIV`，对负数**向下取整**）。**WMV2 另有一整套**：逐宏块 skip 表（4 种粒度）、按 qscale 挑的 CBP 表、`mspel` 四抽头半像素 + 逐宏块 `hshift`、**ABT**（4×8 / 8×4，含自己的扫描表与第二个半块）、**环路滤波**（逐宏块就地滤，skip 宏块也要滤）、以及 **IntraX8**（`j_type` —— 一个按 8×8 块走的内帧子解码器：12 种空间预测 + 自己的环路滤波 + 自己的熵编码，`extradata` 的能力位置位时**每个 I 帧**都归它） | 与 `ffmpeg` **逐像素**对：MP43 / WMV1 / WMV2 各自的真样本**每一帧最大差 0**（WMV2 **六份样本共 24321 帧**，其中 **126 帧走 IntraX8**；含 `mspel`、ABT、环路滤波、边缘复制那些分支） |
 | **解码**   | **VC-1 / WMV3**（`v2v-vc1`）：**整条链路**——序列头（容器 extradata 的 `STRUCT_C`）→ 帧头（含位平面）→ 宏块层（I / P：DC/AC 预测、系数解码）→ 逆变换（8×8 与 **ABT** 三种 8×4 / 4×8 / 4×4）→ 运动补偿（**四分之一 / 半像素**插值、亮度补偿 IC）→ 环路滤波 → YUV420P。范围限定 **Main profile / 渐进 / I-P**；Advanced profile、B 帧、隔行明确报错 | 两条**外部**判据：① 位游标 —— I 帧宏块层解完落在帧尾（差一位就跑偏几十位），把「语法解对」与「像素重建对不对」分开；② `ffmpeg` 吐 `yuv420p` 裸帧边解边比，**整片 3719 帧逐帧逐像素 0 差**（`crates/vc1/tests/frames.rs`）。帧头那层另对 `ffmpeg -debug pict`：真样本 1920×1080 **3719 帧的 `pict_type` 与两张位平面 `(imode, invert)` 全同** |
 | **编码**   | MP43 **I 帧 + P 帧**：正向 DCT + 量化 + DC / RL 熵编码、运动估计（整像素粗搜 + 半像素细化）、skip 宏块                                    | 编出来的 I+P 序列交给 `ffmpeg` 解，与自己的解码器**逐像素一致**                                                       |
@@ -313,7 +314,7 @@ GOP 并行解码也开着；「解码顺序 ≠ 显示顺序」按 PTS 出帧处
 
 **还没做（编码侧）**：MPEG-4 Part 2 的 **B 帧**与 8×8 运动补偿、AAC 的 **PNS** 与**逐带** M/S
 掩码（现在只做逐帧 —— 全部带一起选；TNS 只覆盖长窗）、WMA **编码器**（现在只能解）、
-MP4 的分片 / `co64`、其他容器与编解码器。
+MP4 的**分片**（`moof`）与**编辑列表**（`edts`/`elst`）、其他容器与编解码器。
 
 **还没做（解码侧）**：AAC 的 **PNS**、**强度立体声**、`pulse_data`、`gain_control`、SBR / PS ——
 都**明确报 `Unsupported`**，不静默跳过。PNS 与 IS 规范不要求 bit-exact，所以也不进
@@ -654,7 +655,7 @@ SSIM 0.969486）对合并前 q=8（1709 kbps / 37.14 dB / 0.963555）—— **�
 | ----------------------- | --- | --- | --------------------------------------------------------------------------------------- |
 | **ASF**（`.wmv` / `.wma`） | ✅   | ✅   | 只做单视频流 + 单音频流（音频**直通**，不重编码）；不做加密、多视频轨、非标准的纠错标志                                        |
 | **AVI**（RIFF）           | ✅   | ❌   | 只读 —— `.wmv → .avi` 没人要，写它没有用例。不认 OpenDML（`AVIX` 分块 / `indx`），遇到明确报 `Unsupported` 而不是假装支持 |
-| **MP4** / ISOBMFF        | ❌   | ✅   | 只写 —— 仓里的 ISOBMFF **读取器**都在测试里（手搓的），不进产物。不做编辑列表（`edts`/`elst`）、分片 MP4、`co64`（> 4 GiB）、H.265/AV1 的 sample entry |
+| **MP4** / ISOBMFF        | ✅   | ✅   | 解封装（`Mp4Demuxer`）：非分片、`moov` 在头或尾都行、`stco` 与 `co64` 都认、`ctts` 算进 PTS 并按 **PTS** 出样本。**但还没接进 C ABI** —— `v2v_demux_*` 目前只认 ASF / AVI（`mp4` feature 只给了 `v2v_mux_*`）。不做分片 MP4（`moof`）、`edts`/`elst` 编辑列表、加密（`encv`/`enca`）、H.265/AV1 的 sample entry |
 
 ### 视频编码
 
