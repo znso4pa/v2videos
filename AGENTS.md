@@ -163,6 +163,10 @@ cargo run -p v2v-cli -- concat -o ab.wmv a.wmv b.wmv
 # 扫描（只读头部，一个样本都不读；--all 连不支持的也列，--tsv 可管道）
 cargo run -p v2v-cli -- scan --all testing/
 
+# 对 ffmpeg 的 A/B：速度 + 产物质量（两侧单线程、同 qscale/GOP、无音频、PSNR 按帧号配对）
+cargo build --release -p v2v-cli
+tools/ab_ffmpeg.py --reps 3 --out /tmp/ab.tsv /tmp/corpus/*.wmv
+
 # VC-1 逐帧逐像素对账（最吃时间的一条；V2V_MAX_FRAMES 可先限量跑）
 V2V_ASF_SAMPLE=/path/x.wmv cargo test -p v2v-vc1 --release --test frames -- --nocapture
 ```
@@ -356,6 +360,11 @@ df -h /System/Volumes/Data  # 磁盘 <10% 可用会让 macOS 整体变卡（换�
   跟着变。正解是给每个写入单元编一个全局序号。**合成样本缺一条流，就等于少覆盖一半。**
 - **Android 侧**：`MediaCodec` 没有 WMV/VC-1 编码器、`MediaMuxer` 不认 ASF ——
   所以「往 wmv 走」只能全程 ffmpeg。
+- **比速度时两侧都要钉线程数**：`ffmpeg` 的解码默认开帧级多线程，不钉 `-threads 1`
+  就会把「它用了 4 个核」算进「我们慢几倍」—— 实测 720p 上差 13%（4.99× vs 4.34×）。
+- **trellis 只作用于帧间块**：纯噪声语料上两侧其实都是**全帧内**（`ffmpeg -g 12` 也产出
+  90/90 关键帧），于是 `--trellis` 在那种内容上「画质不变、慢 8.8×」—— 是**适用范围**
+  问题，不是参数没调好。判据要先问「这条路径我的输入走得到吗」。
 
 ## 完成任务前
 
