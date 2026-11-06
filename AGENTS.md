@@ -8,8 +8,8 @@
 
 ## 现状
 
-**链路已经打通到 `.wmv → .mp4`**：**19 个 crate、约 7.6 万行 Rust**，**零第三方运行时依赖**
-（`Cargo.lock` 里只有本仓的包，外加 `cc` 那条**构建**链 —— 只服务 `android-encode` 的 C shim）。
+**链路已经打通到 `.wmv → .mp4`**：**20 个 crate、约 8.5 万行 Rust（含测试）**，**零第三方运行时依赖**
+（`Cargo.lock` 里只有本仓的包，外加 `cc` 那条**构建**链 —— 只服务 `v2v-android` 的 C shim）。
 
 ```text
 v2v-container  解封装共用的数据模型（Stream / Sample / AudioFormat / VideoFormat）—— 零依赖
