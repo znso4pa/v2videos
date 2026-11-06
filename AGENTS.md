@@ -155,6 +155,7 @@ cargo build -j 2                # 并发**限 2** —— 见下一节「构建�
 
 cargo run -p v2v-cli -- convert in.wmv -o out/              # .wmv：MP43 + 音频直通
 cargo run -p v2v-cli -- convert --mp4 -g 12 in.wmv -o out/  # .mp4：mp4v + AAC
+cargo run -p v2v-cli -- convert --mp4 --trellis in.wmv -o out/  # 帧间系数级 RD（慢 5–9×，默认关）
 
 # 无损剪切 / 拼接（不重编码；只能切在关键帧上，起点向后对齐并报出实际值）
 cargo run -p v2v-cli -- trim --start 10 --end 15 -o cut.wmv in.wmv

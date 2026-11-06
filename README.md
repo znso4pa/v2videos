@@ -339,6 +339,11 @@ H.264 那边：**macOS 硬解已通**（C shim + C ABI 都有了，见状态表�
 
 ## 与 `ffmpeg` 的全面对表（2026-10-16 实测）
 
+> **更新、可复跑的一版在 [`bench/ab-ffmpeg-20261106.md`](bench/ab-ffmpeg-20261106.md)**：
+> 6 段语料（真内容 / 合成 / 近静止 / 噪声）+ `tools/ab_ffmpeg.py`，带**速度、PSNR/SSIM、
+> R-D 曲线与同体积对比**。下面这张是 2026-10-16 的手工对表，口径一致但样本不同 ——
+> 两张表**不要混着读**，尤其是「同 qscale 的体积差」。
+
 **口径**（这几条不一起看就会读出错误结论）：
 
 - 真样本、**同一台机器、背靠背 A/B**；机器空闲时量（有负载时绝对值明显变慢，所以只看比值）
@@ -758,6 +763,7 @@ SSIM 0.969486）对合并前 q=8（1709 kbps / 37.14 dB / 0.963555）—— **�
 cargo run --release -p v2v-cli -- convert <输入.wmv>... -o <输出目录> [-q 6] [-g 250] [-n 100]
 cargo run --release -p v2v-cli -- convert --mp4 <输入.wmv>... -o <输出目录> [-q 6] [-g 12] [--fps 25]
 cargo run --release -p v2v-cli -- convert --mp4 --video-bitrate 500k <输入.wmv>... -o <输出目录>
+cargo run --release -p v2v-cli -- convert --mp4 --trellis <输入.wmv>... -o <输出目录>
 
 # 性能：打 TSV、存基线、对着基线卡回归（只卡比值，见 bench/README.md）
 cargo run --release -p v2v-cli -- bench <样本.wmv>...
@@ -767,6 +773,9 @@ cargo run --release -p v2v-cli -- bench --check bench/baseline/<机器指纹>.ts
 
 `.mp4` 的音频默认 AAC：`--aac-bitrate 128000` 给目标码率，`--pcm` 退回未压缩 `sowt`，
 `--no-ms` 关掉 M/S 立体声（只为对比测量）。
+`--trellis` 打开帧间的**系数级 RD**（默认关）：逐系数在 `{L, L∓1}` 里挑「失真 + λ·位数」
+最小的那个。**它只作用于帧间块**，而且实测现值偏保守（见 `bench/ab-ffmpeg-20261106.md`
+的「追查」一节）—— 慢 5–9×，收益还没兑现。
 `--threads N` 给并行度（默认 1）：视频按 **GOP** 并行，音频按**帧**并行（批内连续分块）与
 **声道**并行；线程数都封顶到可用并行度。
 **并行度上限就是 GOP 数** —— `-g 250` 配 `--threads 8` 是白给（300 帧只有 2 个 GOP）。
@@ -789,7 +798,7 @@ cargo run --release -p v2v-cli -- bench --check bench/baseline/<机器指纹>.ts
 `--mp4` 不做这个校验 —— 那条路的正确性由 `crates/mp4v/tests/ffmpeg_roundtrip.rs`  
 （`mp4v` 编 → `ffmpeg` 解，逐像素 0 差）钉着。
 
-输入容器按**魔数**自动认（`ASF` / `AVI`，不看扩展名）；  
+输入容器按**魔数**自动认（`ASF` / `AVI` / **`MP4`**，不看扩展名）；  
 别的容器 / codec 会明确报「不支持」，不静默跳过。
 
 ## 路线与分支策略
