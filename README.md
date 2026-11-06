@@ -679,7 +679,7 @@ SSIM 0.969486）对合并前 q=8（1709 kbps / 37.14 dB / 0.963555）—— **�
 | **WMV9 / VC-1**          | ✅ I / P   | ❌         | **ffmpeg 里根本没有 VC-1/wmv3 编码器**（只有解码器），想要 WMV9 得另找路子。解码侧 `v2v-vc1` 已走完整条链路（Main profile / 渐进 / I/P，真 1080p 样本逐帧逐像素 0 差）；缺 **B 帧 / 隔行 / Advanced profile**、overlap smoothing、多分辨率、重同步标记 —— 遇到明确报 `Unsupported`，不静默出错 |
 | **MPEG-1**（`.mpg`） | ✅ I / P / B | ❌ | 走 `mpegps`（PS 容器）+ `mpeg12`。对 ffmpeg 逐帧比，容差 2（参考件是浮点 IDCT、我们是整数 IDCT）；真样本 50 帧全对 |
 | **MPEG-2** | ✅ I / P / B（progressive + 隔行帧图） | ❌ | 含场 DCT、场运动、4:2:2 / 4:4:4 色度。**隔行流的 B 帧场预测还没收敛**（PSNR 47 dB，个别像素差 165）—— 测试里只报数不卡断言，见 TODO |
-| **MPEG-4 Part 2**（`mp4v`） | ✅ I / P（H.263 量化） | ✅ I / P   | 解码：AVI 里的 `FMP4` / `mp4v` / `DIVX` / `XVID` 都认，I / P 对 ffmpeg **逐像素 0 差**（`crates/mp4v/tests/ffmpeg_roundtrip.rs`，含独立来源的流）。**不支持**：`quant_type = 1`（MPEG 矩阵量化 —— 我们自己编的 `.mp4` 就是这一档，所以「读回自己写的」还没通）、B / S 帧、4MV、`dquant`、隔行、GMC、数据分割、resync marker。编码默认走 **MPEG 型**（同体积下 SSIM 更高）+ 可选的**系数级 RD（trellis，默认关）** |
+| **MPEG-4 Part 2**（`mp4v`） | ✅ I / P（H.263 与 **MPEG 矩阵**两种量化） | ✅ I / P   | 解码：AVI 里的 `FMP4` / `mp4v` / `DIVX` / `XVID` 都认，I / P 对 ffmpeg **逐像素 0 差**（`crates/mp4v/tests/ffmpeg_roundtrip.rs`，含独立来源的流）。`quant_type = 1`（MPEG 矩阵量化，含帧间**失配控制**）也已对齐 —— 所以「读回自己编的 `.mp4`」是通的。**不支持**：**自定义**量化矩阵（只做规范默认那对）、B / S 帧、4MV、`dquant`、隔行、GMC、数据分割、resync marker。编码默认走 **MPEG 型**（同体积下 SSIM 更高）+ 可选的**系数级 RD（trellis，默认关）** |
 | **H.264 / AVC**          | ❌         | ⭕ 硬件（FFI）：macOS VideoToolbox / Android MediaCodec | 软件侧不在范围内（LGPL 侧链不了 x264，见「许可证」）；硬件侧走 `crates/v2v-android`（见「FFI」一节）—— 真实样本实测 PSNR 42.45 dB（同码率反超 ffmpeg 的 mpeg4 1.7 dB） |
 
 ### 音频编码

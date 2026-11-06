@@ -1032,6 +1032,53 @@ fn decoder_p_frames_match_ffmpeg_bit_exactly() {
     assert_eq!(worst, 0, "与 ffmpeg 逐像素不一致，最大差 {worst}");
 }
 
+/// **MPEG 矩阵量化（`quant_type = 1`）对 ffmpeg 逐像素 0 差。**
+///
+/// 这条是「自家产物自己解不了」的回归：编码器默认就写 `quant_type = 1`
+/// （同码率下感知指标更高，见 `encode.rs` 的 `Quant`），而解码器曾经明确拒绝它 ——
+/// 于是 `v2v convert --mp4` 的产物**转不回去**，而且报错发生在解码的第一步，
+/// 看起来像「这个文件坏了」。
+///
+/// 反量化的契约在 `encode.rs` 的 `Quant` 上写着（编码端与解码端必须同一个式子）：
+/// 帧内 `(|level|·2q·W) >> 4`、帧间 `((2|level|+1)·2q·W) >> 5`，
+/// 帧间还要做**失配控制**（64 个值求和、奇数就翻 `block[63]` 的最低位）。
+/// 少做失配控制的表现是「每块差一位、P 帧逐帧漂移」—— 所以这条测试必须带 P 帧，
+/// 全 I 帧根本走不到那段代码。
+#[test]
+fn decoder_mpeg_quant_matches_ffmpeg_bit_exactly() {
+    if !has_ffmpeg() {
+        eprintln!("SKIP: PATH 上没有 ffmpeg");
+        return;
+    }
+    let frames: Vec<Frame> = (0..8).map(test_frame).collect();
+    let cfg = EncoderConfig {
+        width: W,
+        height: H,
+        mpeg_quant: true,     // ← 与 CLI 默认一致
+        keyframe_interval: 4, // I P P P I P P P：帧间那条路必须被走到
+        ..EncoderConfig::default()
+    };
+    let (es, _) = encode_raw_es(cfg, &frames);
+
+    let path = std::env::temp_dir().join(format!("v2v_mp4v_mq_{}.m4v", std::process::id()));
+    std::fs::write(&path, &es).expect("写 m4v");
+    let (ref_yuv, log) = decode_to_yuv(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+
+    let vol = Vol::parse(&es).expect("解 VOL");
+    assert!(vol.mpeg_quant, "这条测试的流必须是 MPEG 矩阵量化");
+    let mut d = Decoder::new(vol).expect("建解码器");
+    let mut ours = Vec::new();
+    for (i, s) in split_vops(&es).iter().enumerate() {
+        let f = d.decode(s).unwrap_or_else(|e| panic!("第 {i} 帧解不开：{e}"));
+        ours.extend(frame_bytes(&f));
+    }
+    eprintln!("ffmpeg 日志：{log}");
+    assert_eq!(ours.len(), ref_yuv.len(), "解出来的字节数不一致");
+    let worst = max_abs_diff(&ours, &ref_yuv);
+    assert_eq!(worst, 0, "MPEG 量化下与 ffmpeg 逐像素不一致，最大差 {worst}");
+}
+
 /// **独立来源的流**：ffmpeg 自己编的 mp4v，我们的解码器也要解对。
 ///
 /// 上一条用的是我们自己编的流 —— 编码器与解码器可能**共享同一个错误假设**

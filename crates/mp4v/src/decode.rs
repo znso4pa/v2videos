@@ -8,7 +8,7 @@
 //! | `quant_type = 0`（H.263 量化，ffmpeg 的默认） | ✅ |
 //! | 16×16 运动矢量、半像素（`quarter_sample = 0`） | ✅ |
 //! | `resync_marker_disable = 0`（**允许** marker 但实际不出现） | ✅ 本仓与 ffmpeg 的编码器都不插 |
-//! | `mpeg_quant`（MPEG 矩阵量化） | ❌ 明确报 `Unsupported` |
+//! | `mpeg_quant`（MPEG 矩阵量化） | ✅ 规范默认矩阵；**自定义矩阵明确报 `Unsupported`** |
 //! | 4MV（`cbpc & 16`）、`dquant`、B / S 帧、隔行、GMC / sprite、数据分割 | ❌ 同上 |
 //! | 流里**真的出现** resync marker | ❌ 不处理（宏块层会错位）—— ffmpeg **多线程**编码会按 slice 插，测试里用 `-threads 1` 避开 |
 //!
@@ -73,8 +73,12 @@ pub struct Vol {
     pub height: u32,
     /// `av_log2(fps_num - 1) + 1` —— VOP 头里 `vop_time_increment` 的位宽。
     pub time_increment_bits: u32,
-    /// `quant_type`：`true` = MPEG 矩阵量化（**暂不支持**）。
+    /// `quant_type`：`true` = MPEG 矩阵量化（逐系数乘规范默认矩阵）。
     pub mpeg_quant: bool,
+    /// VOL 里带了**自定义**量化矩阵。我们只实现规范默认的那一对
+    /// （`DEFAULT_INTRA_MATRIX` / `DEFAULT_INTER_MATRIX`），带了自定义矩阵就明确拒绝 ——
+    /// 跳过矩阵位却按默认矩阵反量化，画面会「大致对、细节全错」，比拒绝坏得多。
+    pub custom_quant_matrix: bool,
     /// `quarter_sample`：`true` = 四分之一像素（**暂不支持**）。
     pub quarter_sample: bool,
     /// `progressive_sequence`。
@@ -113,9 +117,9 @@ pub struct Decoder {
 
 impl Decoder {
     pub fn new(vol: Vol) -> Result<Self> {
-        if vol.mpeg_quant {
+        if vol.mpeg_quant && vol.custom_quant_matrix {
             return Err(Error::Unsupported(
-                "MPEG 矩阵量化（quant_type = 1）暂不支持".into(),
+                "自定义量化矩阵暂不支持（只做规范默认矩阵）".into(),
             ));
         }
         if vol.quarter_sample {
@@ -154,6 +158,7 @@ impl Decoder {
                 height: 0,
                 time_increment_bits: 1,
                 mpeg_quant: false,
+                custom_quant_matrix: false,
                 quarter_sample: false,
                 progressive: true,
                 sprite: 0,
@@ -274,6 +279,13 @@ impl Decoder {
         let c_dc_scale = tables::C_DC_SCALE[q] as i32;
         let qmul = (qscale as i32) << 1;
         let qadd = ((qscale as i32) - 1) | 1;
+        // `quant_type = 1`：反量化不是平坦步长，逐系数乘规范默认矩阵。
+        // 契约在 `encode.rs` 的 `Quant` 上写着（编码端与这里是同一个式子）：
+        // 帧内 `(|level|·2q·W) >> 4`、帧间 `((2|level|+1)·2q·W) >> 5`，
+        // 都是「先取绝对值、算术右移、最后补符号」—— 与 ffmpeg 的
+        // `dct_unquantize_mpeg2_{intra,inter}_c` 逐位一致。
+        let mpeg = self.vol.mpeg_quant;
+        let step_q = (qscale as i32) << 1;
         let use_intra_dc_vlc = qscale < intra_dc_threshold;
 
         // DC / AC 预测网格：带 1 格边框，DC 的初值是 **1024**（不是 0）。
@@ -411,7 +423,10 @@ impl Decoder {
                         &ZIGZAG
                     };
                     if coded || !use_intra_dc_vlc {
-                        let (qm, qa) = if mb_intra { (1, 0) } else { (qmul, qadd) };
+                        // MPEG 量化时帧间也要拿**原始电平**（矩阵是逐位置的，不能
+                        // 在 VLC 解码里一次乘完）—— 与 ffmpeg 把 `qmul/qadd` 置 1/0
+                        // 是同一个做法。
+                        let (qm, qa) = if mb_intra || mpeg { (1, 0) } else { (qmul, qadd) };
                         let start = if mb_intra && use_intra_dc_vlc { 0 } else { -1 };
                         let rl = if mb_intra { &t.rl_intra } else { &t.rl_inter };
                         decode_coeffs(r, rl, scan, qm, qa, start, &mut block)?;
@@ -427,10 +442,30 @@ impl Decoder {
                         // 帧内 AC 反量化（DC 已在上面乘过 scale）。
                         for i in 1..64usize {
                             let v = block[i] as i32;
-                            if v != 0 {
-                                block[i] = if v < 0 { v * qmul - qadd } else { v * qmul + qadd } as i16;
+                            if v == 0 {
+                                continue;
                             }
+                            block[i] = if mpeg {
+                                // 逐系数乘默认矩阵。**先取绝对值再补符号** ——
+                                // 算术右移对负数会向下取整，直接 `v*step >> 4`
+                                // 会比编码端少 1（编码端也是先取绝对值）。
+                                let a = (v.unsigned_abs() * step_q as u32
+                                    * u32::from(tables::DEFAULT_INTRA_MATRIX[i]))
+                                    >> 4;
+                                if v < 0 {
+                                    -(a as i32) as i16
+                                } else {
+                                    a as i16
+                                }
+                            } else if v < 0 {
+                                (v * qmul - qadd) as i16
+                            } else {
+                                (v * qmul + qadd) as i16
+                            };
                         }
+                    }
+                    if mpeg && !mb_intra && coded {
+                        dequant_inter_mpeg(&mut block, step_q);
                     }
                     // ---- 落像素 ----
                     let (plane, stride) = plane_of(&mut out, n);
@@ -449,6 +484,32 @@ impl Decoder {
         let _ = ph;
         self.prev = Some(out.clone());
         Ok(crop(out, self.vol.width as usize, self.vol.height as usize))
+    }
+}
+
+/// 帧间块的 MPEG 量化反量化 + **失配控制**。
+///
+/// `block` 里是原始电平（自然序）。反量化逐系数乘默认矩阵；随后按规范把 64 个值
+/// 求和（初值 −1），是奇数就把**下标 63** 的最低位翻一下。
+///
+/// 少了失配控制这一步，重建每块差一位 —— P 帧会一帧帧累积成漂移，
+/// 而症状是「PSNR 缓慢下降」，看不出是哪一步错的（`encode.rs` 那边也记着这条）。
+fn dequant_inter_mpeg(block: &mut [i16; 64], step_q: i32) {
+    let mut sum = -1i32;
+    for k in 0..64usize {
+        let l = block[k] as i32;
+        if l == 0 {
+            continue;
+        }
+        let a = ((2 * l.unsigned_abs() + 1) * step_q as u32
+            * u32::from(tables::DEFAULT_INTER_MATRIX[k]))
+            >> 5;
+        let v = if l < 0 { -(a as i32) } else { a as i32 };
+        block[k] = v as i16;
+        sum += v;
+    }
+    if sum & 1 != 0 {
+        block[63] ^= 1;
     }
 }
 
@@ -852,9 +913,11 @@ fn parse_vol(data: &[u8]) -> Result<Vol> {
         5
     };
     let mpeg_quant = r.bit()? != 0;
+    let mut custom_quant_matrix = false;
     if mpeg_quant {
-        // 自定义矩阵（ffmpeg 的编码器只置 quant_type，不传矩阵）。
+        // 自定义矩阵（ffmpeg 与本仓的编码器都只置 quant_type，不传矩阵）。
         if r.bit()? == 1 {
+            custom_quant_matrix = true;
             for _ in 0..64 {
                 if r.u(8)? == 0 {
                     break;
@@ -862,6 +925,7 @@ fn parse_vol(data: &[u8]) -> Result<Vol> {
             }
         }
         if r.bit()? == 1 {
+            custom_quant_matrix = true;
             for _ in 0..64 {
                 if r.u(8)? == 0 {
                     break;
@@ -885,6 +949,7 @@ fn parse_vol(data: &[u8]) -> Result<Vol> {
         height,
         time_increment_bits,
         mpeg_quant,
+        custom_quant_matrix,
         quarter_sample: false,
         progressive,
         sprite,
