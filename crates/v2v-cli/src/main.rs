@@ -61,6 +61,8 @@ v2v —— WMV/ASF 批量转码（纯 Rust：解封装 → 解码 → 编码 →
                         所以仍是串行（与编码 worker 重叠着跑）；WMV1/WMV2 有跨帧状态，不开。
                         并行度上限是 **GOP 数**——短视频或默认大 GOP 下 GOP 数 < 线程数时
                         加速封顶（要更多并行就把 `-g` 调小或喂长视频）。AAC 仍按声道并行。
+      --trellis         .mp4 的帧间系数级 RD（默认关）。慢，但平坦频谱内容（噪声 /
+                        高频细节）上画质更好 —— 它是「省一位 vs 多一份失真」的 DP 选择
       --video-bitrate N .mp4 的**视频**目标码率（bit/s；也可写 500k / 1.5M）。
                         开了就逐帧调 qscale 去够它，`-q` 退化成起步值。
                         不传 = 按固定的 -q 编（旧行为）。
@@ -496,6 +498,7 @@ fn run_convert(it: &mut std::slice::Iter<'_, String>) -> Result<bool, String> {
                     .map_err(|_| "--aac-bitrate 要正整数（bit/s）".to_string())?;
             }
             "--no-ms" => opts.ms_stereo = false,
+            "--trellis" => opts.trellis = true,
             "--threads" => {
                 let v: usize = it
                     .next()

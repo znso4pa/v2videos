@@ -126,6 +126,8 @@ def main():
     ap.add_argument("--gop", type=int, default=12, help="两侧同 GOP（默认 12）")
     ap.add_argument("--reps", type=int, default=3, help="速度取几次里最快（默认 3）")
     ap.add_argument("--out", help="把结果写成 TSV 到这个路径")
+    ap.add_argument("--trellis", action="store_true",
+                    help="给我们那一侧加 --trellis（帧间系数级 RD，默认关）")
     args = ap.parse_args()
 
     for tool in ("ffmpeg", "ffprobe"):
@@ -150,6 +152,8 @@ def main():
             # 我们的：--no-audio 去掉音频；--no-verify 去掉「解回来对源算 PSNR」那一步
             ours_cmd = [args.v2v, "convert", "--mp4", "--no-audio", "--no-verify",
                         "-q", str(args.qscale), "-g", str(args.gop), "-o", tmp, src]
+            if args.trellis:
+                ours_cmd.insert(3, "--trellis")
             # 产物名由 CLI 决定（<stem>.mp4），可能与我们想的同名 —— 先清掉再跑
             produced = os.path.join(tmp, f"{stem}.mp4")
             for f in (produced, ours):

@@ -492,6 +492,14 @@ pub struct ConvertOptions {
     /// 开着的时候 `qscale` 只当**起步值**，编码器逐帧调它去够目标码率。
     /// 只对 `.mp4` 有效 —— `.wmv` 那条路（MP43）还没有码率控制。
     pub video_bitrate: Option<u32>,
+    /// `.mp4` 的**帧间**系数级 RD（trellis）。默认关。
+    ///
+    /// 开了之后编码器在扫描序上做一遍 DP，逐系数在 `{L, L∓1}` 里挑「失真 + λ·位数」
+    /// 最小的那个 —— 也就是把「省一个 bit」和「多一份失真」放在同一个尺度上算。
+    /// 代价是**慢**（每个非零系数一次 DP），换的是平坦频谱内容（噪声、高频细节）上的
+    /// 画质。本仓的 A/B 实测：噪声语料上同体积差 ffmpeg 1.2 dB，trellis 是第一个该试的旋钮。
+    /// 只对 `.mp4` 有效。
+    pub trellis: bool,
 }
 
 /// `.mp4` 的音频轨编码方式。
@@ -526,6 +534,7 @@ impl Default for ConvertOptions {
             ms_stereo: true,
             threads: 1,
             video_bitrate: None,
+            trellis: false,
         }
     }
 }
@@ -1513,6 +1522,7 @@ fn convert_to_mp4(
         qscale: opts.qscale,
         bitrate: opts.video_bitrate,
         keyframe_interval: opts.keyframe_interval,
+        trellis: opts.trellis,
         ..Default::default()
     };
     // `esds` 要的 DSI（VOS + 视觉对象 + VOL + 用户数据）与编码器**状态**无关，
