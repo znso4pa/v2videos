@@ -221,8 +221,12 @@ int64_t v2v_player_position_ms(const v2v_player *h);
 /* ==================================================================
  * 容器（L0 嗅探 / L1 解封装）
  *
- * ASF 与 AVI 共用**同一套符号**：它们的动词本来就一样（开、列流、取下一个样本），
+ * ASF / AVI / MP4 共用**同一套符号**：它们的动词本来就一样（开、列流、取下一个样本），
  * 吐出来的也是同一个样本结构。加新容器 = 加一个后端，这套符号不动。
+ *
+ * **只有 seek 不齐**：ASF 有包级索引（v2v_demux_seek_packet 可用）；AVI 没有；
+ * MP4 有完整样本表但按**时间**定位，没有「包号」—— 后两者都返回 V2V_ERR_UNSUPPORTED。
+ * 给 MP4 加时间 seek 是 ABI 形状改动，会与进度 / 取消一起做，别先自己加符号。
  *
  * 样本的 data 是**借用**的：活到下一次 v2v_demux_next / close。
  * 典型用法是「拿到就解」，所以这里刻意不做「交所有权 + free」。
@@ -233,6 +237,8 @@ int64_t v2v_player_position_ms(const v2v_player *h);
 #define V2V_CONTAINER_AVI 2
 /* MPEG-1/2 program stream。认得出，但**不在这套符号里**（形状不同，见 v2v_mpeg_*）。 */
 #define V2V_CONTAINER_MPEG_PS 3
+/* MP4 / ISOBMFF（.mp4 / .m4v / .m4a）。在这套符号里；不支持按包 seek（见上）。 */
+#define V2V_CONTAINER_MP4 4
 
 #define V2V_STREAM_AUDIO 0
 #define V2V_STREAM_VIDEO 1

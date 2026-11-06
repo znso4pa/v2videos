@@ -50,7 +50,9 @@ pub struct V2vVencCfg {
 }
 
 enum Venc {
+    #[cfg(feature = "mp43")]
     Ms(v2v_msmpeg4::Encoder),
+    #[cfg(feature = "mp4v")]
     Mp4v(v2v_mp4v::Encoder),
 }
 
@@ -122,7 +124,9 @@ pub unsafe extern "C" fn v2v_venc_open(codec: u32, cfg: *const V2vVencCfg) -> *m
             return std::ptr::null_mut();
         };
 
+        #[allow(unreachable_patterns)]
         let built: Result<Venc, v2v_kernel::Error> = match codec {
+            #[cfg(feature = "mp43")]
             CODEC_MP43 => {
                 let mut ec = v2v_msmpeg4::EncoderConfig::default();
                 if let Some(q) = qscale {
@@ -132,6 +136,7 @@ pub unsafe extern "C" fn v2v_venc_open(codec: u32, cfg: *const V2vVencCfg) -> *m
                 ec.keyframe_interval = 0;
                 Ok(Venc::Ms(v2v_msmpeg4::Encoder::new(ec)))
             }
+            #[cfg(feature = "mp4v")]
             CODEC_MP4V => {
                 let mut ec = v2v_mp4v::EncoderConfig {
                     width: cfg.width,
@@ -161,7 +166,9 @@ pub unsafe extern "C" fn v2v_venc_open(codec: u32, cfg: *const V2vVencCfg) -> *m
             Ok(enc) => {
                 let header = match &enc {
                     // MP4 的 esds 要这个；ASF 不需要（它的流属性里没有 extradata）。
+                    #[cfg(feature = "mp4v")]
                     Venc::Mp4v(e) => e.decoder_specific_info(),
+                    #[cfg(feature = "mp43")]
                     Venc::Ms(_) => Vec::new(),
                 };
                 Box::into_raw(Box::new(V2vVenc {
@@ -223,6 +230,7 @@ pub unsafe extern "C" fn v2v_venc_encode(
         }
         let want_i = force_key != 0 || hp.frames == 0;
         let got: Result<Vec<u8>, v2v_kernel::Error> = match &mut hp.enc {
+            #[cfg(feature = "mp43")]
             Venc::Ms(e) => {
                 if want_i {
                     e.encode_i_frame(&frame)
@@ -230,6 +238,7 @@ pub unsafe extern "C" fn v2v_venc_encode(
                     e.encode_frame(&frame)
                 }
             }
+            #[cfg(feature = "mp4v")]
             Venc::Mp4v(e) => {
                 if want_i {
                     e.encode_i_frame(&frame)

@@ -1,10 +1,15 @@
 //! 容器层：嗅探 + 解封装（`v2v_probe` / `v2v_demux_*`）。
 //!
-//! ## 为什么 ASF 与 AVI 共用一套符号
+//! ## 为什么 ASF / AVI / MP4 共用一套符号
 //!
-//! 两个解封装器的动词本来就一样：`new(reader)` / `streams()` / `next_sample()`，
+//! 三个解封装器的动词本来就一样：`new(reader)` / `streams()` / `next_sample()`，
 //! 吐出来的也是同一个 `Sample`（`v2v-container` 的类型）。所以这一层不是
-//! 「把两种容器塞进一个抽象」，而是**把已经相同的形状照原样搬出去**。
+//! 「把三种容器塞进一个抽象」，而是**把已经相同的形状照原样搬出去**。
+//!
+//! **唯一不齐的是 seek**：ASF 有包级索引（Simple Index），AVI 没有，MP4 有**完整样本表**
+//! 但那是按时间定位的，不是「包号」。所以 `v2v_demux_seek_packet` 目前只有 ASF 能用，
+//! MP4 / AVI 都明确报 `UNSUPPORTED` —— **不假装支持**（假支持会让调用方读到错位置的
+//! 样本，而那种错不报错）。给 MP4 加时间 seek 属于 ABI 形状改动，与进度 / 取消一起做。
 //!
 //! ## 样本是借用的
 //!
@@ -18,9 +23,11 @@ use std::os::raw::c_int;
 use std::path::Path;
 
 #[cfg(feature = "asf")]
-use v2v_asf::{AsfDemuxer, SimpleIndex};
+use v2v_asf::AsfDemuxer;
 #[cfg(feature = "avi")]
 use v2v_avi::AviDemuxer;
+#[cfg(feature = "mp4")]
+use v2v_mp4::Mp4Demuxer;
 use v2v_container::{AudioFormat, Sample, Stream, StreamKind, VideoFormat};
 
 use crate::common::*;
@@ -36,6 +43,12 @@ pub const CONTAINER_AVI: c_int = 2;
 /// 本仓的解封装器是「整块内存 + `next_packet`」，与这里的流式接口形状不同，
 /// 所以**它不在这套符号里**（见 `v2v_mpeg_*`）。
 pub const CONTAINER_MPEG_PS: c_int = 3;
+/// MP4 / ISOBMFF（`.mp4` / `.m4v` / `.m4a`）。
+///
+/// 与 `CONTAINER_MPEG_PS` 不同，**它在这套符号里**：`Mp4Demuxer` 的动词
+/// （`new` / `streams` / `next_sample`）与 ASF / AVI 完全一样。
+/// 不支持的只有「按包 seek」—— MP4 的样本表是按时间的，不是包号。
+pub const CONTAINER_MP4: c_int = 4;
 
 /// 流的种类。
 pub const STREAM_AUDIO: u32 = 0;
@@ -123,11 +136,18 @@ fn avi_r<T>(r: Result<T, v2v_avi::Error>) -> DemuxResult<T> {
     r.map_err(|e| (e.kind(), e.message()))
 }
 
+#[cfg(feature = "mp4")]
+fn mp4_r<T>(r: Result<T, v2v_mp4::Error>) -> DemuxResult<T> {
+    r.map_err(|e| (e.kind(), e.message()))
+}
+
 enum Backend {
     #[cfg(feature = "asf")]
     Asf(AsfDemuxer<BufReader<File>>),
     #[cfg(feature = "avi")]
     Avi(AviDemuxer<BufReader<File>>),
+    #[cfg(feature = "mp4")]
+    Mp4(Mp4Demuxer<BufReader<File>>),
 }
 
 /// 解封装句柄（不透明）。
@@ -138,7 +158,11 @@ pub struct V2vDemux {
     /// 最近一次 `stream()` 的 extra 拷贝。
     extra: Vec<u8>,
     /// 懒加载的索引（外层 `None` = 还没读；内层 `None` = 文件里没有）。
-    index: Option<Option<SimpleIndex>>,
+    ///
+    /// 存成 `(interval_100ns, packets)` 而不是 ASF 的 `SimpleIndex`：`asf` feature
+    /// 关掉时（只编 MP4 的产物）这个结构体也得成立。之前直接写 `SimpleIndex`，
+    /// 裁剪成 `--formats mp4` 就编不过 —— 那条路一直没被走过，所以没人发现。
+    index: Option<Option<(u64, Vec<u32>)>>,
     /// 索引里的包号拷贝（`V2vIndex.packets` 指向这里）。
     packets: Vec<u32>,
 }
@@ -208,6 +232,11 @@ pub unsafe extern "C" fn v2v_probe(head: *const u8, len: u32) -> c_int {
         if v2v_avi::is_avi(b) {
             return CONTAINER_AVI;
         }
+        // MP4 / ISOBMFF：前 4 字节是 box 尺寸，`ftyp` 在偏移 4..8。
+        #[cfg(feature = "mp4")]
+        if b.len() >= 8 && &b[4..8] == b"ftyp" {
+            return CONTAINER_MP4;
+        }
         if b.len() >= 4 && b[..4] == [0x00, 0x00, 0x01, 0xBA] {
             CONTAINER_MPEG_PS
         } else {
@@ -265,6 +294,14 @@ pub unsafe extern "C" fn v2v_demux_open(path: *const std::ffi::c_char) -> *mut V
                     return std::ptr::null_mut();
                 }
             },
+            #[cfg(feature = "mp4")]
+            CONTAINER_MP4 => match Mp4Demuxer::new(reader) {
+                Ok(d) => Backend::Mp4(d),
+                Err(e) => {
+                    rc(&e);
+                    return std::ptr::null_mut();
+                }
+            },
             _ => {
                 set_err(
                     KIND_UNSUPPORTED,
@@ -300,6 +337,10 @@ fn sniff(path: &Path) -> Result<c_int, (c_int, String)> {
     if v2v_avi::is_avi(b) {
         k = CONTAINER_AVI;
     }
+    #[cfg(feature = "mp4")]
+    if b.len() >= 8 && &b[4..8] == b"ftyp" {
+        k = CONTAINER_MP4;
+    }
     if k == CONTAINER_UNKNOWN {
         return Err((KIND_UNSUPPORTED, "认不出这个容器".into()));
     }
@@ -333,6 +374,8 @@ pub unsafe extern "C" fn v2v_demux_stream_count(h: *const V2vDemux) -> u32 {
         Backend::Asf(d) => d.streams().len() as u32,
         #[cfg(feature = "avi")]
         Backend::Avi(d) => d.streams().len() as u32,
+        #[cfg(feature = "mp4")]
+        Backend::Mp4(d) => d.streams().len() as u32,
     }
 }
 
@@ -358,6 +401,8 @@ pub unsafe extern "C" fn v2v_demux_stream(
             Backend::Asf(d) => d.streams(),
             #[cfg(feature = "avi")]
             Backend::Avi(d) => d.streams(),
+            #[cfg(feature = "mp4")]
+            Backend::Mp4(d) => d.streams(),
         };
         let Some(s) = streams.get(i as usize) else {
             return arg_err(&format!("流下标 {i} 越界（共 {} 条）", streams.len()));
@@ -386,6 +431,8 @@ pub unsafe extern "C" fn v2v_demux_next(h: *mut V2vDemux, out: *mut V2vSample) -
             Backend::Asf(d) => asf_r(d.next_sample()),
             #[cfg(feature = "avi")]
             Backend::Avi(d) => avi_r(d.next_sample()),
+            #[cfg(feature = "mp4")]
+            Backend::Mp4(d) => mp4_r(d.next_sample()),
         };
         match next {
             Ok(None) => EOS,
@@ -409,11 +456,13 @@ pub unsafe extern "C" fn v2v_demux_next(h: *mut V2vDemux, out: *mut V2vSample) -
 
 /// 把读游标挪到第 `packet` 个包。之后用 `next` 往后读。
 ///
-/// 只有 ASF 有索引，AVI 返回 `V2V_ERR_UNSUPPORTED`。
+/// 只有 ASF 有包级索引；AVI 与 MP4 都返回 `V2V_ERR_UNSUPPORTED`（原因不同，见各自分支）。
 ///
 /// # Safety
 /// `h` 必须是有效句柄。
 #[no_mangle]
+// `packet` 只有 ASF 用；关掉 asf 时所有分支都不读它。
+#[cfg_attr(not(feature = "asf"), allow(unused_variables))]
 pub unsafe extern "C" fn v2v_demux_seek_packet(h: *mut V2vDemux, packet: u64) -> c_int {
     guard(|| {
         if h.is_null() {
@@ -421,6 +470,7 @@ pub unsafe extern "C" fn v2v_demux_seek_packet(h: *mut V2vDemux, packet: u64) ->
         }
         let hp = unsafe { &mut *h };
         match &mut hp.backend {
+            #[cfg(feature = "asf")]
             Backend::Asf(d) => match d.seek_to_packet(packet) {
                 Ok(()) => OK,
                 Err(e) => rc(&e),
@@ -428,6 +478,14 @@ pub unsafe extern "C" fn v2v_demux_seek_packet(h: *mut V2vDemux, packet: u64) ->
             #[cfg(feature = "avi")]
             Backend::Avi(_) => {
                 set_err(KIND_UNSUPPORTED, "AVI 没有包级索引，不支持按包 seek");
+                ERR_UNSUPPORTED
+            }
+            #[cfg(feature = "mp4")]
+            Backend::Mp4(_) => {
+                set_err(
+                    KIND_UNSUPPORTED,
+                    "MP4 的样本表按时间定位，没有「包号」这个概念；按包 seek 不支持",
+                );
                 ERR_UNSUPPORTED
             }
         }
@@ -448,26 +506,30 @@ pub unsafe extern "C" fn v2v_demux_index(h: *mut V2vDemux, out: *mut V2vIndex) -
         }
         let hp = unsafe { &mut *h };
         if hp.index.is_none() {
+            // 类型要写明：`asf` 关掉时所有分支都是 `Ok(None)`，推断不出 `(u64, Vec<u32>)`。
             #[allow(unreachable_patterns)]
-            let got = match &mut hp.backend {
+            let got: DemuxResult<Option<(u64, Vec<u32>)>> = match &mut hp.backend {
                 #[cfg(feature = "asf")]
-                Backend::Asf(d) => d.simple_index(),
+                Backend::Asf(d) => asf_r(d.simple_index())
+                    .map(|o| o.map(|i| (i.interval_100ns, i.packet_numbers))),
                 #[cfg(feature = "avi")]
                 Backend::Avi(_) => Ok(None),
+                #[cfg(feature = "mp4")]
+                Backend::Mp4(_) => Ok(None),
             };
             match got {
                 Ok(i) => hp.index = Some(i),
-                Err(e) => return rc(&e),
+                Err((k, m)) => return rc_kind(k, &m),
             }
         }
-        let Some(Some(idx)) = &hp.index else {
+        let Some(Some((interval_100ns, nums))) = &hp.index else {
             return EOS;
         };
         hp.packets.clear();
-        hp.packets.extend_from_slice(&idx.packet_numbers);
+        hp.packets.extend_from_slice(nums);
         let v = V2vIndex {
             size: std::mem::size_of::<V2vIndex>() as u32,
-            interval_ms: (idx.interval_100ns / 10_000).max(1) as u32,
+            interval_ms: (interval_100ns / 10_000).max(1) as u32,
             count: hp.packets.len() as u32,
             packets: hp.packets.as_ptr(),
         };

@@ -55,6 +55,7 @@ impl From<v2v_kernel::mc::Frame> for Owned {
     }
 }
 
+#[cfg(feature = "wmv3")]
 impl From<v2v_vc1::Frame> for Owned {
     fn from(f: v2v_vc1::Frame) -> Self {
         Self {

@@ -31,7 +31,9 @@ mp4v       MPEG-4 Part 2 编码（I / P + 码率控制）**+ 解码**（I / P）
 aac        AAC-LC 编码（MDCT / 短窗 / TNS / Huffman / 码率控制）**+ 解码**（结构 / 谱 /
            反量化 / M-S / TNS / IMDCT + 重叠相加，对 ffmpeg ±1 LSB）
 v2v-mp4    MP4 / ISOBMFF 封装（mp4v + mp4a(AAC) 或 sowt PCM）**+ 解封装**
-           （`Mp4Demuxer`：非分片、`stco`/`co64`、`ctts` 算进 PTS；**尚未进 C ABI**）
+           （`Mp4Demuxer`：非分片、`stco`/`co64`、`ctts` 算进 PTS）
+           —— **已进 C ABI**：`v2v_probe` 返回 `V2V_CONTAINER_MP4`，`v2v_demux_*` 与 ASF / AVI
+           同一套符号；**只有按包 seek 不支持**（MP4 的样本表按时间定位，没有包号）
 v2v-filter 像素域算子：缩放（bilinear / bicubic，**缩小时核按 src/dst 拉伸抗混叠**）/
            CSC（YUV420P ↔ RGB24 / 4:4:4 / NV12，BT.601 limited range）/
            去隔行（bob / weave）—— **不进 C ABI**（CSC 与缩放是留给宿主的边界）
@@ -59,6 +61,21 @@ v2v-bench  性能测量的**格式与寿命管理**：TSV 读写 / 机器指纹 
 `full`（加 `hw` / `mpeg12`，诊断用）。同主版本就同 ABI。
 **按格式裁剪**用 `--formats "asf,wmv3,wma" --name xxx`（走 `--no-default-features`）——
 没开的容器 / 编解码器连**码表**都不编进去，符号集也只剩开的那几族。
+
+⚠️ **任何 feature 组合都要能编**，而且**只在一种组合上验 = 没验**。实测过的坑：裁剪最初
+只跑过 `asf,wmv3,wma`，那组恰好带着 `wmv3` → 连带把 `v2v-msmpeg4` 拉进依赖图，
+于是 `mux` / `venc` / `vdec` 里几条**没 cfg 的臂**一直是绿的；换成 `mp4,mp4v,aac` 立刻
+五处编不过。动过任何 `cfg(feature)` 之后至少跑这六组（`RUSTFLAGS="-D warnings"`）：
+
+```bash
+cargo check -p v2v-capi -j 2                                              # 默认全集
+for f in "mp4" "mp4,mp4v,aac" "avi,mp4v" "asf,wmv3,wma" "asf,mp43" "avi"; do
+  cargo check -p v2v-capi --no-default-features --features "$f" -j 2
+done
+```
+
+没编进来的格式一律报「这个产物没编进 X（构建时缺 yyy feature）」，**不是**「未知编号」——
+后者会让集成方去怀疑自己的参数，而真正的原因是构建时裁掉了 feature。
 
 **输入编码认这些**（`crates/v2v-cli/src/lib.rs::classify_video` 是唯一真源 ——
 `open_video_decoder` 建解码器、`scan` 判「能不能转」都查它这一张表）：

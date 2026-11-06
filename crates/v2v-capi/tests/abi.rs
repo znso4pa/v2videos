@@ -747,9 +747,16 @@ fn muxes_asf_and_reads_it_back() {
     let _ = std::fs::remove_file(&out);
 }
 
-/// MP4 封装：只验产物是个像样的 MP4（没有 MP4 解封装器，读不回来）。
+/// MP4 **封装 → 解封装**走完整 ABI 往返。
+///
+/// 判据是**逐字节**：写进去的每个样本，从 `v2v_demux_next` 读回来必须一字不差。
+/// 这条同时验了三件事：`v2v_probe` 认得 `ftyp`、`v2v_demux_open` 按容器分派到 MP4、
+/// 样本表（`stco`/`stsz`/`stsc`/`stts`）展开的偏移与长度都对。
+///
+/// 只用自己写自己读是不够的 —— 解封装的独立 oracle 在 `crates/v2v-mp4/tests/demux_real.rs`
+/// （对 `ffprobe` 的包列表逐包比大小与 PTS 增量），这里管的是 **ABI 那一层没把东西传丢**。
 #[test]
-fn muxes_mp4_with_a_valid_header() {
+fn muxes_mp4_then_reads_it_back_through_the_abi() {
     use v2v_capi::mux::*;
     use v2v_capi::venc::*;
 
@@ -824,6 +831,57 @@ fn muxes_mp4_with_a_valid_header() {
     // 后面必须能找到 `mdat`（真有码流写进去了）。
     assert!(bytes.windows(4).any(|w| w == b"mdat"), "没找到 mdat");
 
+    // ---- 解封装：走 ABI 读回来 ----
+    use v2v_capi::demux::*;
+
+    assert_eq!(
+        unsafe { v2v_probe(bytes.as_ptr(), bytes.len().min(64) as u32) },
+        CONTAINER_MP4,
+        "probe 没认出 ftyp"
+    );
+
+    let d = unsafe { v2v_demux_open(path.as_ptr()) };
+    assert!(!d.is_null(), "打开 MP4 解封装失败：{}", unsafe {
+        std::ffi::CStr::from_ptr(v2v_last_error()).to_string_lossy()
+    });
+
+    assert_eq!(unsafe { v2v_demux_stream_count(d) }, 1, "只写了一条视频轨");
+    let si = find_stream(d, STREAM_VIDEO);
+    assert_eq!(si.width, w);
+    assert_eq!(si.height, h);
+    assert_eq!(si.fourcc, u32::from_le_bytes(*b"mp4v"), "fourcc 按小端约定");
+
+    let mut got: Vec<(Vec<u8>, i32, i64)> = Vec::new();
+    loop {
+        let mut smp: V2vSample = unsafe { std::mem::zeroed() };
+        smp.size = size_of::<V2vSample>() as u32;
+        match unsafe { v2v_demux_next(d, &mut smp) } {
+            OK => got.push((
+                unsafe { std::slice::from_raw_parts(smp.data, smp.data_len as usize) }.to_vec(),
+                smp.key_frame,
+                smp.timestamp_ms,
+            )),
+            EOS => break,
+            other => panic!("next 返回 {other}：{}", unsafe {
+                std::ffi::CStr::from_ptr(v2v_last_error()).to_string_lossy()
+            }),
+        }
+    }
+    assert_eq!(got.len(), packets.len(), "样本数对不上");
+    for (i, (want, g)) in packets.iter().zip(got.iter()).enumerate() {
+        assert_eq!(&g.0, &want.0, "第 {i} 个样本的字节与写进去的不一致");
+        assert_eq!(g.1, want.1, "第 {i} 个样本的关键帧位不一致");
+        assert_eq!(g.2, i as i64 * 40, "第 {i} 个样本的 pts 不一致");
+    }
+
+    // MP4 有完整样本表，但那是按时间定位的 —— 按包 seek 明确不支持，**不假装成功**。
+    assert_eq!(unsafe { v2v_demux_seek_packet(d, 1) }, ERR_UNSUPPORTED);
+    // 没有 ASF 那种包级索引。
+    let mut idx: V2vIndex = unsafe { std::mem::zeroed() };
+    idx.size = size_of::<V2vIndex>() as u32;
+    assert_eq!(unsafe { v2v_demux_index(d, &mut idx) }, EOS);
+
+    unsafe { v2v_demux_close(d) };
     let _ = std::fs::remove_file(&out);
 }
 

@@ -25,6 +25,8 @@
 use std::os::raw::c_int;
 use std::path::PathBuf;
 
+// 只有 ASF 那条路用它；MP4 走自己的 `AudioTrack`。
+#[cfg(feature = "asf")]
 use v2v_container::AudioFormat;
 
 use crate::common::*;
@@ -138,6 +140,7 @@ pub unsafe extern "C" fn v2v_mux_open(
         };
 
         let built: Result<Mux, String> = match container {
+            #[cfg(feature = "asf")]
             MUX_ASF => {
                 let af = match a {
                     None => None,
@@ -209,6 +212,18 @@ pub unsafe extern "C" fn v2v_mux_open(
                     }
                 }
             }
+            // 没编进来的容器：明确说「这个产物没编进 X」，而不是「未知编号」——
+            // 后者会让集成方去怀疑参数，而真正的原因是构建时裁掉了 feature。
+            #[cfg(not(feature = "asf"))]
+            MUX_ASF => {
+                set_err(KIND_UNSUPPORTED, "这个产物没编进 ASF 封装（构建时缺 asf feature）");
+                return std::ptr::null_mut();
+            }
+            #[cfg(not(feature = "mp4"))]
+            MUX_MP4 => {
+                set_err(KIND_UNSUPPORTED, "这个产物没编进 MP4 封装（构建时缺 mp4 feature）");
+                return std::ptr::null_mut();
+            }
             other => {
                 set_err(KIND_BAD, &format!("未知的输出容器编号 {other}"));
                 return std::ptr::null_mut();
@@ -252,7 +267,8 @@ pub unsafe extern "C" fn v2v_mux_close(h: *mut V2vMux) {
 /// # Safety
 /// `data` 必须指向 `len` 字节可读内存。
 #[no_mangle]
-#[cfg_attr(not(feature = "mp4"), allow(unused_variables))]
+// `pts_ms` 只有 ASF 用、`duration_ticks` 只有 MP4 用 —— 少任何一边都算未使用。
+#[cfg_attr(not(all(feature = "asf", feature = "mp4")), allow(unused_variables))]
 pub unsafe extern "C" fn v2v_mux_write_video(
     h: *mut V2vMux,
     data: *const u8,
@@ -300,7 +316,8 @@ pub unsafe extern "C" fn v2v_mux_write_video(
 /// # Safety
 /// `data` 必须指向 `len` 字节可读内存。
 #[no_mangle]
-#[cfg_attr(not(feature = "mp4"), allow(unused_variables))]
+// `pts_ms` 只有 ASF 用、`duration_ticks` 只有 MP4 用 —— 少任何一边都算未使用。
+#[cfg_attr(not(all(feature = "asf", feature = "mp4")), allow(unused_variables))]
 pub unsafe extern "C" fn v2v_mux_write_audio(
     h: *mut V2vMux,
     data: *const u8,
