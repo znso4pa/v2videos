@@ -1,0 +1,21 @@
+# v2v-ab 1
+# cpu	Apple M3
+# arch	arm64
+# cores	8
+# profile	release
+# tool	tools/ab_ffmpeg.py
+# load	3.90 3.32 3.27
+# settings	qscale=6 gop=12 reps=3 threads=1 both, audio=off, psnr=frame-aligned
+# sample.0	noise_360p.wmv
+# sample.1	real_360p.wmv
+# sample.2	real_720p.wmv
+# sample.3	static_360p.wmv
+# sample.4	synth_360p.wmv
+# sample.5	synth_720p.wmv
+# sample	frames	ours_ms	ff_ms	ratio	ours_bytes	ff_bytes	size_ratio	ours_psnr_y	ours_psnr_avg	ours_ssim	ff_psnr_y	ff_psnr_avg	ff_ssim
+noise_360p	90	1268	411	3.083	12141683	15074462	0.805	34.590	36.351	0.99851	38.814	40.575	0.99944
+real_360p	90	397	153	2.596	864792	839184	1.031	41.027	41.774	0.98394	40.320	40.992	0.97783
+real_720p	132	2450	564	4.344	3276649	2933052	1.117	40.908	41.621	0.97611	40.071	40.750	0.96941
+static_360p	90	218	78	2.783	89899	61783	1.455	53.713	52.371	0.99564	51.549	50.497	0.99269
+synth_360p	90	225	114	1.977	483073	580198	0.833	42.926	41.881	0.98966	44.165	43.183	0.99216
+synth_720p	90	775	266	2.916	1398555	1765661	0.792	48.073	47.118	0.99632	47.638	46.729	0.99602
