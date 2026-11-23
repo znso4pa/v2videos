@@ -3,7 +3,7 @@
 
 检查四件事：
 
-1. `crates/*` 的 `license` 与约定一致：六个含 FFmpeg 派生码表的 crate 是
+1. `crates/*` 的 `license` 与约定一致：含 FFmpeg 派生码表或依赖它们的 crate 是
    `LGPL-2.1-or-later`，其余是 `MIT`（名单见下，与 `NOTICE` 由同一个生成器维护）。
 2. 每个 crate 都被这两张名单覆盖 —— 新增 crate 时忘了定许可证会在这里红。
 3. `LICENSE` 与 `LICENSE-MIT` 都存在。
@@ -29,10 +29,11 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # 与 tools/gen_notice.py 的 LGPL_CRATES / MIT_CRATES 必须一致。
 # 两边都列是**故意的**：这里读的是「期望值」，生成器读的是「写进 NOTICE 的值」，
 # 两边同时改错才会一起骗过人。
-LGPL_CRATES = ["aac", "mpeg12", "mp4v", "msmpeg4", "tables", "vc1", "wma"]
+LGPL_CRATES = ["aac", "mpeg12", "mp3", "mp4v", "msmpeg4", "tables", "vc1", "wma"]
 MIT_CRATES = [
     "v2v-android",
     "v2v-asf",
+    "v2v-audio-ffi",
     "v2v-avi",
     "v2v-bench",
     "v2v-capi",

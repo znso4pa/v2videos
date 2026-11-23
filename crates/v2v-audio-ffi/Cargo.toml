@@ -1,0 +1,13 @@
+[package]
+name = "v2v-audio-ffi"
+description = "可选的原生音频编解码库适配层"
+version.workspace = true
+edition.workspace = true
+license = "MIT"
+
+[features]
+default = []
+mpg123 = ["dep:v2v-mp3"]
+
+[dependencies]
+v2v-mp3 = { path = "../mp3", default-features = false, optional = true }

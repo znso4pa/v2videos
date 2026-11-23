@@ -9,6 +9,9 @@ license = "MIT"
 name = "v2v"
 path = "src/main.rs"
 
+[features]
+mp3-ffi = ["dep:v2v-audio-ffi"]
+
 [dependencies]
 # 只用它的 `Error`（全仓编解码器共用那一个），`Error::Codec` 收的就是它。
 v2v-kernel = { path = "../v2v-kernel" }
@@ -23,6 +26,8 @@ v2v-mp4 = { path = "../v2v-mp4" }
 v2v-mp4v = { path = "../mp4v" }
 v2v-aac = { path = "../aac" }
 v2v-wma = { path = "../wma" }
+v2v-mp3 = { path = "../mp3" }
+v2v-audio-ffi = { path = "../v2v-audio-ffi", optional = true, features = ["mpg123"] }
 # `v2v bench` 的测量对象。⚠️ 这两个**只服务 bench**，`convert` 那条路不用它们：
 #   - `v2v-player` 把「解封装 + 解码」接成一个能逐帧取数的循环，bench 量的就是它，
 #     自己再写一遍就等于同一件事有两个说法；

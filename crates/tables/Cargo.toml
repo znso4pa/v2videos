@@ -15,10 +15,11 @@ description = "从 FFmpeg 数据文件生成的码表 —— 本仓唯一的 LGP
 # 每个格式一个 feature：编解码器 crate 只开自己那一份（`default-features = false`），
 # 这样「只编 WMV3 的 .so」不会把 WMA / AAC 的表也链进去 —— 体积和许可面都跟着缩。
 [features]
-default = ["aac", "intrax8", "mpeg12", "mp4v", "msmpeg4", "vc1", "wma"]
+default = ["aac", "intrax8", "mpeg12", "mp3", "mp4v", "msmpeg4", "vc1", "wma"]
 aac = []
 intrax8 = []
 mpeg12 = []
+mp3 = []
 mp4v = []
 msmpeg4 = []
 vc1 = []

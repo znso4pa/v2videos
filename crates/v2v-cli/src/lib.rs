@@ -1252,15 +1252,40 @@ struct AudioPlan {
     kind: AudioSource,
 }
 
+#[cfg(feature = "mp3-ffi")]
+use v2v_audio_ffi::Mp3Decoder;
+#[cfg(not(feature = "mp3-ffi"))]
+use v2v_mp3::Decoder as Mp3Decoder;
+
+#[derive(Clone, Copy)]
+enum AudioKind {
+    Wma(u8),
+    Aac,
+    Mp3,
+    Pcm,
+}
+
+fn classify_audio(af: &AudioFormat) -> Option<AudioKind> {
+    match af.format_tag {
+        0x0160 => Some(AudioKind::Wma(1)),
+        0x0161 => Some(AudioKind::Wma(2)),
+        0x00FF => Some(AudioKind::Aac),
+        v2v_mp3::FORMAT_TAG => Some(AudioKind::Mp3),
+        0x0001 if af.bits_per_sample == 16 => Some(AudioKind::Pcm),
+        _ => None,
+    }
+}
+
 /// 音频解码器 —— 源里那几种压缩音频。
 ///
-/// 两种都吐同一种东西：**交织的小端 16 位 PCM**，值域 ±32768（不是 ±1）。
+/// 各解码器都吐同一种东西：**交织的小端 16 位 PCM**，值域 ±32768（不是 ±1）。
 /// 下游（AAC 编码 / PCM 直通）只认这一个口径，所以差异收在这里。
 pub enum AudioDecoder {
     /// WMA v1 / v2。一个 ASF 载荷里常装好几帧（superframe）。
     Wma(v2v_wma::WmaDecoder),
     /// AAC-LC（MP4 的 `mp4a`）。一个样本就是**一帧**，1024 个采样点。
     Aac(v2v_aac::Decoder),
+    Mp3(Box<Mp3Decoder>),
 }
 
 impl AudioDecoder {
@@ -1269,14 +1294,15 @@ impl AudioDecoder {
         match self {
             Self::Wma(d) => {
                 let frames = d.decode_superframe(data).map_err(|e| e.to_string())?;
-                Ok(wma_frame_to_pcm(frames))
+                Ok(audio_frames_to_pcm(frames))
             }
             // AAC 的 `decode_frame` 返回「每声道一串 f32」—— 与 WMA 的一帧同形，
             // 包一层就能复用同一个交织函数。
             Self::Aac(d) => {
                 let planes = d.decode_frame(data).map_err(|e| e.to_string())?;
-                Ok(wma_frame_to_pcm(vec![planes]))
+                Ok(audio_frames_to_pcm(vec![planes]))
             }
+            Self::Mp3(d) => d.feed(data).map(audio_frames_to_pcm).map_err(|e| e.to_string()),
         }
     }
 }
@@ -1317,10 +1343,8 @@ fn plan_audio(
         skip,
         kind,
     };
-    match af.format_tag {
-        // WMA v1 / v2：解成 16 位 PCM。
-        0x0160 | 0x0161 => {
-            let version = if af.format_tag == 0x0160 { 1 } else { 2 };
+    match classify_audio(&af) {
+        Some(AudioKind::Wma(version)) => {
             let params = v2v_wma::WmaParams::new(
                 version,
                 af.channels as usize,
@@ -1339,7 +1363,7 @@ fn plan_audio(
             )))
         }
         // AAC-LC（MP4 的 `mp4a`，`esds` 里的 AudioSpecificConfig 在 `extra`）。
-        0x00FF => {
+        Some(AudioKind::Aac) => {
             if aac_copy_ok {
                 return Ok(Some(plan(AudioSource::AacCopy, 0)));
             }
@@ -1354,20 +1378,24 @@ fn plan_audio(
             Ok(Some(plan(AudioSource::Decode(AudioDecoder::Aac(decoder)), skip)))
         }
         // 本来就是 16 位 PCM：不用解，直接搬。
-        0x0001 if af.bits_per_sample == 16 => Ok(Some(plan(AudioSource::Pcm, 0))),
-        other => Err(Error::Unsupported(format!(
-            "音频是 0x{other:04X}，`.mp4` 这条路只支持 WMA（0x0160/0x0161）、\
-             AAC-LC（0x00FF）与 16 位 PCM（0x0001）—— 用 --no-audio 只转视频"
+        Some(AudioKind::Pcm) => Ok(Some(plan(AudioSource::Pcm, 0))),
+        Some(AudioKind::Mp3) => {
+            let decoder = Mp3Decoder::new(af.channels.into(), af.sample_rate)?;
+            Ok(Some(plan(AudioSource::Decode(AudioDecoder::Mp3(Box::new(decoder))), 0)))
+        }
+        None => Err(Error::Unsupported(format!(
+            "音频是 0x{:04X}，`.mp4` 这条路支持 WMA、AAC-LC、MP3 与 16 位 PCM；\
+             用 --no-audio 只转视频", af.format_tag
         ))),
     }
 }
 
-/// 把 WMA 解出来的一帧（每声道一串 f32）交织成小端 16 位 PCM。
+/// 把解出的逐声道 f32 交织成小端 16 位 PCM。
 ///
 /// ⚠️ 解码器给的是**已经落在 `[-32768, 32767]` 的浮点**，不是 `[-1, 1)` ——
 /// 直接截断即可，**不要**再乘 32768（乘了会整体溢出成噪声）。
 /// 口径与 `crates/wma/tests/pcm.rs` 的对账测试一致。
-fn wma_frame_to_pcm(frames: Vec<Vec<Vec<f32>>>) -> Vec<u8> {
+fn audio_frames_to_pcm(frames: Vec<Vec<Vec<f32>>>) -> Vec<u8> {
     let mut out = Vec::new();
     for f in frames {
         let n = f.first().map_or(0, |p| p.len());
@@ -1670,7 +1698,8 @@ fn convert_to_mp4(
         }) => Some(d),
         _ => None,
     };
-    // 第一级：音频解码（WMA / AAC；直通时不解）+ 跳过编码器延迟。
+    // 第一级：音频解码（直通时不解）+ 跳过编码器延迟。
+    let check_audio_eof = opts.max_frames.is_none();
     let decode_worker = std::thread::spawn(move || -> std::result::Result<(), String> {
         while let Ok((idx, data)) = rx_audio.recv() {
             if aac_copy {
@@ -1692,6 +1721,11 @@ fn convert_to_mp4(
             }
             if tx_pcm.send((idx, pcm)).is_err() {
                 break; // 编码侧已退出（出错），由下面的 join 报出来
+            }
+        }
+        if check_audio_eof {
+            if let Some(AudioDecoder::Mp3(d)) = audio_dec.as_ref() {
+                d.finish().map_err(|e| e.to_string())?;
             }
         }
         Ok(())

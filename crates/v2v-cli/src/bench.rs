@@ -6,6 +6,7 @@
 //! |---|---|---|
 //! | `decode/video/<stem>/<w>x<h>` | `.wmv`（WMV3） | [`Player::next_video`] |
 //! | `decode/audio/<stem>/<rate>hz` | `.wmv`（有音频轨） | [`Player::next_audio`] |
+//! | `decode/mp3/<backend>/<stem>/<rate>hz` | `.avi`（有 MP3 音轨） | Layer III 解码 |
 //! | `transcode/mp4/<stem>` | `.wmv` | [`convert_file`]（`-g 12`、AAC 128k、不校验） |
 //! | `decode/mpeg12/<stem>/<w>x<h>` | `.mpg` / `.mpeg` / `.dat` / `.vob` | `MpgPlayer::next_video` |
 //!
@@ -201,7 +202,9 @@ fn describe(f: &v2v_bench::Finding, th: &Thresholds) -> String {
             th.abs_pct
         ),
         Kind::MissingInCurrent => format!("· {}：基线里有、这次没跑", f.case),
-        Kind::MissingInBaseline => format!("· {}：这次跑了、基线里没有（新用例，还没有基线）", f.case),
+        Kind::MissingInBaseline => {
+            format!("· {}：这次跑了、基线里没有（新用例，还没有基线）", f.case)
+        }
     }
 }
 
@@ -217,11 +220,120 @@ fn measure_sample(report: &mut Report, path: &Path, opts: &Options) -> Result<()
         .extension()
         .map(|e| e.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
-    if matches!(ext.as_str(), "mpg" | "mpeg" | "dat" | "vob") {
+    if ext == "avi" {
+        measure_mp3(report, path, opts)
+    } else if matches!(ext.as_str(), "mpg" | "mpeg" | "dat" | "vob") {
         measure_mpeg(report, path, opts)
     } else {
         measure_asf(report, path, opts)
     }
+}
+
+fn measure_mp3(report: &mut Report, path: &Path, opts: &Options) -> Result<(), String> {
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut avi = v2v_avi::AviDemuxer::new(file).map_err(|e| e.to_string())?;
+    let mut audio = avi
+        .streams()
+        .iter()
+        .filter_map(|s| s.audio.as_ref().map(|a| (s.number, a)));
+    let (stream, format) = audio
+        .next()
+        .filter(|(_, a)| a.format_tag == v2v_mp3::FORMAT_TAG)
+        .ok_or_else(|| format!("{} 的第一条音轨不是 MP3", path.display()))?;
+    let (channels, rate) = (usize::from(format.channels), format.sample_rate);
+    let single_audio = audio.next().is_none();
+
+    let suffix = format!("{}/{}hz", file_label(path), rate);
+    let rust_case = format!("decode/mp3/rust/{suffix}");
+    #[cfg(feature = "mp3-ffi")]
+    let ffi_case = format!("decode/mp3/mpg123/{suffix}");
+    #[cfg(feature = "mp3-ffi")]
+    let wants_ffi = opts.wants(&ffi_case);
+    #[cfg(not(feature = "mp3-ffi"))]
+    let wants_ffi = false;
+    if !opts.wants(&rust_case) && !wants_ffi {
+        return Ok(());
+    }
+
+    // 两个后端使用相同载荷，排除读盘和解封装的耗时。
+    let mut payloads = Vec::new();
+    while let Some(s) = avi.next_sample().map_err(|e| e.to_string())? {
+        if s.stream == stream {
+            payloads.push(s.data);
+        }
+    }
+    let mut rows = Vec::new();
+    if opts.wants(&rust_case) {
+        rows.push(mp3_row(&rust_case, &payloads, opts, || {
+            let mut d = v2v_mp3::Decoder::new(channels, rate)?;
+            Ok(move |bytes: &[u8]| d.feed(bytes))
+        })?);
+    }
+    #[cfg(feature = "mp3-ffi")]
+    if wants_ffi {
+        rows.push(mp3_row(&ffi_case, &payloads, opts, || {
+            let mut d = v2v_audio_ffi::Mp3Decoder::new(channels, rate)?;
+            Ok(move |bytes: &[u8]| d.feed(bytes))
+        })?);
+    }
+
+    // FFmpeg 的 -frames:a 以帧为单位；两边都跑整轨才取参考值。
+    let units = rows[0].n;
+    let reference = if opts.with_ref && single_audio && opts.frames.is_none() {
+        ffmpeg_per_unit(path, true, units, None, opts.reps)
+    } else {
+        None
+    };
+    for mut row in rows {
+        if row.n != units {
+            return Err("MP3 后端输出的样本数不一致".into());
+        }
+        if let Some(r) = reference {
+            row = row.with_ref(r);
+        }
+        eprintln!(
+            "· {}：{} 样本，{:.6} ms/样本",
+            row.case,
+            row.n,
+            row.per_unit()
+        );
+        report.push(row);
+    }
+    Ok(())
+}
+
+fn mp3_row<D>(
+    case: &str,
+    payloads: &[Vec<u8>],
+    opts: &Options,
+    mut create: impl FnMut() -> v2v_mp3::Result<D>,
+) -> Result<Row, String>
+where
+    D: FnMut(&[u8]) -> v2v_mp3::Result<Vec<v2v_mp3::Pcm>>,
+{
+    let mut best = f64::INFINITY;
+    let mut units = 0;
+    // 首轮预热一次，VLC 表和矩阵只在进程内初始化一次。
+    for pass in 0..=opts.reps {
+        let mut feed = create().map_err(|e| e.to_string())?;
+        let t = Instant::now();
+        units = 0;
+        for data in payloads {
+            for frame in feed(data).map_err(|e| e.to_string())? {
+                units += frame[0].len() as u64;
+            }
+            if opts.frames.is_some_and(|limit| units >= limit as u64) {
+                break;
+            }
+        }
+        if pass != 0 {
+            best = best.min(t.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+    if units == 0 {
+        return Err("MP3 音轨没有产出 PCM".into());
+    }
+    Ok(Row::new(case, units, best, "sample"))
 }
 
 fn measure_asf(report: &mut Report, path: &Path, opts: &Options) -> Result<(), String> {

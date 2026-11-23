@@ -195,31 +195,36 @@ fn probe(path: &Path) -> ScanEntry {
 ///
 /// 规则是从两条输出路径的**实际约束**抄下来的，不是猜的：
 /// - `.wmv`（ASF/MP43）的音频是**直通**，只收 WMA（`convert_to_asf` 里那条判断）；
-/// - `--mp4`（mp4v）的音频要重编码成 AAC，能解 WMA / AAC / 16 位 PCM。
+/// - `--mp4`（mp4v）的音频要重编码成 AAC，能解 WMA / AAC / MP3 / 16 位 PCM。
 ///
 /// 两条路都吃「没有音频」，所以没音频的文件两个目标都能去。
 fn output_targets(af: Option<&crate::AudioFormat>) -> (Vec<&'static str>, Option<String>) {
     let Some(af) = af else {
         return (vec!["wmv", "mp4"], None);
     };
-    match af.format_tag {
+    use crate::AudioKind;
+    match crate::classify_audio(af) {
         // WMA v1 / v2：`.wmv` 直通，`--mp4` 解成 PCM 再编 AAC。
-        0x0160 | 0x0161 => (vec!["wmv", "mp4"], None),
+        Some(AudioKind::Wma(_)) => (vec!["wmv", "mp4"], None),
         // AAC：`--mp4` 能**原样搬帧**（无损、也绕开我们 AAC 解码器缺的那几个语法）；
         // `.wmv` 没有 AAC 直通，只能 `--no-audio`。
-        0x00FF => (
+        Some(AudioKind::Aac) => (
             vec!["mp4"],
             Some("音频是 AAC：`.wmv` 那条路的音频只直通 WMA，要转它得加 `--no-audio`".into()),
         ),
         // 16 位 PCM：`--mp4` 按采样点直接搬；`.wmv` 同样只收 WMA。
-        0x0001 if af.bits_per_sample == 16 => (
+        Some(AudioKind::Pcm) => (
             vec!["mp4"],
             Some("音频是 PCM：`.wmv` 那条路的音频只直通 WMA，要转它得加 `--no-audio`".into()),
         ),
-        other => (
+        Some(AudioKind::Mp3) => (
+            vec!["mp4"],
+            Some("音频是 MP3：`.wmv` 那条路的音频只直通 WMA，要转它得加 `--no-audio`".into()),
+        ),
+        None => (
             vec!["wmv", "mp4"],
             Some(format!(
-                "音频是 0x{other:04X}，两条路都不认 —— 只能加 `--no-audio` 只转视频"
+                "音频是 0x{:04X}，两条路都不认 —— 只能加 `--no-audio` 只转视频", af.format_tag
             )),
         ),
     }
@@ -232,7 +237,7 @@ fn audio_codec_name(tag: u16) -> String {
         0x0161 => "WMA2".into(),
         0x0162 => "WMAPro".into(),
         0x0001 => "PCM".into(),
-        0x0055 => "MP3".into(),
+        v2v_mp3::FORMAT_TAG => "MP3".into(),
         0x00FF => "AAC-LC".into(),
         other => format!("0x{other:04X}"),
     }
@@ -474,11 +479,11 @@ mod tests {
     }
 
     /// 音频不认识时两条路都要靠 `--no-audio` —— 这条**必须**带上提示，
-    /// 否则用户照着 `TARGET` 去转，会撞上一句「音频是 0x0055」。
+    /// 否则用户照着 `TARGET` 去转，会撞上一句「音频是 0xFFFF」。
     #[test]
     fn unknown_audio_still_offers_targets_but_warns() {
         let af = crate::AudioFormat {
-            format_tag: 0x0055,
+            format_tag: 0xffff,
             channels: 2,
             ..Default::default()
         };
@@ -488,13 +493,15 @@ mod tests {
     }
 
     #[test]
-    fn aac_only_goes_to_mp4() {
-        let af = crate::AudioFormat {
-            format_tag: 0x00FF,
-            channels: 2,
-            ..Default::default()
-        };
-        let (targets, _) = output_targets(Some(&af));
-        assert_eq!(targets, vec!["mp4"]);
+    fn aac_and_mp3_only_go_to_mp4() {
+        for format_tag in [0x00ff, v2v_mp3::FORMAT_TAG] {
+            let af = crate::AudioFormat {
+                format_tag,
+                channels: 2,
+                ..Default::default()
+            };
+            let (targets, _) = output_targets(Some(&af));
+            assert_eq!(targets, vec!["mp4"]);
+        }
     }
 }

@@ -60,10 +60,10 @@ build() {
     shift
     if [ $# -gt 0 ]; then
         # shellcheck disable=SC2086
-        cargo build -p v2v-capi $profile_flag --features "$*"
+        cargo build -p v2v-capi -j 2 $profile_flag --features "$*"
     else
         # shellcheck disable=SC2086
-        cargo build -p v2v-capi $profile_flag
+        cargo build -p v2v-capi -j 2 $profile_flag
     fi
     src="$target_dir/$profile/$libname"
     if [ ! -f "$src" ]; then
@@ -78,7 +78,7 @@ build() {
 
 if [ -n "$formats" ]; then
     # shellcheck disable=SC2086
-    cargo build -p v2v-capi $profile_flag --no-default-features --features "$formats"
+    cargo build -p v2v-capi -j 2 $profile_flag --no-default-features --features "$formats"
     src="$target_dir/$profile/$libname"
     if [ ! -f "$src" ]; then
         echo "编完了却没找到 $src" >&2

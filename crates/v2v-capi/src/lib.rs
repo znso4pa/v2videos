@@ -43,7 +43,7 @@ pub mod player;
 pub mod vdec;
 #[cfg(any(feature = "mp43", feature = "mp4v"))]
 pub mod venc;
-#[cfg(feature = "wma")]
+#[cfg(any(feature = "wma", feature = "mp3", feature = "mp3-ffi"))]
 pub mod adec;
 #[cfg(feature = "aac")]
 pub mod aenc;

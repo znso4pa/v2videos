@@ -15,6 +15,8 @@
  *      mp43      v2v_vdec_* / v2v_venc_*（MS-MPEG-4 家族：MP42 / MP43 / WMV1 / WMV2）
  *      mp4v      v2v_vdec_* / v2v_venc_*（MPEG-4 Part 2）
  *      wma       v2v_adec_*（WMA v1 / v2）
+ *      mp3       v2v_adec_*（MP3，纯 Rust）
+ *      mp3-ffi   v2v_adec_*（MP3，libmpg123；与 mp3 同开时优先）
  *      aac       v2v_aenc_*（AAC-LC）
  *      player    v2v_player_*（顺时播放；会连带打开 asf / wmv3 / mp43 / mp4v / wma）
  *      mpeg12    v2v_mpeg_* / v2v_ps_*（MPEG-1/2；连带打开 player）
@@ -23,7 +25,7 @@
  *
  * 没编进来的那一族**符号不存在**：静态链接报未定义符号，dlopen 的 dlsym 返回 NULL。
  * 集成期请逐个 dlsym 检查，别假设全都在 —— 按需裁剪的产物只有你开的那些。
- * 默认 feature 是「WMV 全家桶」，不含 mpeg12 / hw。
+ * 默认 feature 是「WMV 全家桶」加 MP3，mpeg12 / hw / mp3-ffi 默认关闭。
  *
  * 想按需决定调不调，就在配置期判断，别在运行期猜。
  *
@@ -267,7 +269,7 @@ typedef struct v2v_stream_info {
     uint32_t bits_per_pixel;
 
     /* 音频 */
-    uint32_t format_tag; /* 0x0161 = WMA v2, 0x0160 = WMA v1, 0x0001 = PCM */
+    uint32_t format_tag; /* 0x0161 = WMA v2, 0x0160 = WMA v1, 0x0001 = PCM, 0x0055 = MP3 */
     uint32_t sample_rate;
     uint32_t avg_bytes_per_sec;
     uint32_t channels;
@@ -392,7 +394,7 @@ int32_t v2v_vdec_flush(v2v_vdec *h);
 void v2v_vdec_close(v2v_vdec *h);
 
 /* ==================================================================
- * 音频解码（L2）：WMA v1 / v2
+ * 音频解码（L2）：WMA / MP3 v1 / v2
  *
  * 为什么是「喂一个载荷 + 逐个取帧」两件事：ASF 的一个音频载荷里常装着
  * 好几个 WMA 帧（superframe），解码器一次吐一串。硬做成「一次调用 = 一帧」
@@ -406,15 +408,14 @@ typedef struct v2v_adec v2v_adec;
 
 typedef struct v2v_adec_cfg {
     uint32_t size;
-    uint32_t format_tag; /* 0x0160 = WMA v1, 0x0161 = WMA v2 */
+    uint32_t format_tag; /* 0x0160 = WMA v1, 0x0161 = WMA v2, 0x0055 = MP3 */
     uint32_t channels;
     uint32_t sample_rate;
     uint32_t avg_bytes_per_sec;
     uint32_t block_align;
     const uint8_t *extra;
     uint32_t extra_len;
-    /* 1 = 丢掉编码器开头的静音（frame_len * 2 个采样点），与 ffmpeg 一致；
-     * 不丢的话音频整体晚约 90 ms。建议开。 */
+    /* WMA: 1 = 跳过开头两帧。MP3 忽略此字段，输出原始解码样本。 */
     uint32_t drop_priming;
 } v2v_adec_cfg;
 
@@ -431,7 +432,8 @@ v2v_adec *v2v_adec_open(const v2v_adec_cfg *cfg);
 
 void v2v_adec_close(v2v_adec *h);
 
-/* 喂一个载荷（容器里的一个音频样本），解出来的帧进队列。 */
+/* 喂一个容器音频载荷，解出来的帧进队列。MP3 可在任意字节边界分块，
+ * 需要连续 MPEG 帧，从流起点喂入，文件级标签由调用方处理。 */
 int32_t v2v_adec_feed(v2v_adec *h, const uint8_t *data, uint32_t len);
 
 /* 取一帧。V2V_EOS = 队列空了（不是流结束）。 */

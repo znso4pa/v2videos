@@ -1,4 +1,4 @@
-//! 音频解码（`v2v_adec_*`）：WMA v1 / v2。
+//! 音频解码（`v2v_adec_*`）：WMA v1 / v2 和 MP3。
 //!
 //! ## 为什么是「喂一个载荷 + 逐个取帧」两件事
 //!
@@ -25,11 +25,34 @@ use std::os::raw::c_int;
 
 use crate::common::*;
 
+#[cfg(feature = "mp3-ffi")]
+use v2v_audio_ffi::Mp3Decoder;
+#[cfg(all(feature = "mp3", not(feature = "mp3-ffi")))]
+use v2v_mp3::Decoder as Mp3Decoder;
+
+enum Decoder {
+    #[cfg(feature = "wma")]
+    Wma(Box<v2v_wma::WmaDecoder>),
+    #[cfg(any(feature = "mp3", feature = "mp3-ffi"))]
+    Mp3(Box<Mp3Decoder>),
+}
+
+impl Decoder {
+    fn feed(&mut self, bytes: &[u8]) -> Result<Vec<Vec<Vec<f32>>>, c_int> {
+        match self {
+            #[cfg(feature = "wma")]
+            Self::Wma(decoder) => decoder.decode_superframe(bytes).map_err(|e| rc(&e)),
+            #[cfg(any(feature = "mp3", feature = "mp3-ffi"))]
+            Self::Mp3(decoder) => decoder.feed(bytes).map_err(|e| rc(&e)),
+        }
+    }
+}
+
 /// 建解码器要的参数（与 `v2v_stream_info` 的音频字段一一对应）。
 #[repr(C)]
 pub struct V2vAdecCfg {
     pub size: u32,
-    /// `wFormatTag`：`0x0160` = WMA v1，`0x0161` = WMA v2。其它值报不支持。
+    /// `wFormatTag`：`0x0160` = WMA v1，`0x0161` = WMA v2，`0x0055` = MP3。
     pub format_tag: u32,
     pub channels: u32,
     pub sample_rate: u32,
@@ -39,13 +62,13 @@ pub struct V2vAdecCfg {
     /// 编解码器私有数据（`v2v_stream_info.extra` 原样传）。
     pub extra: *const u8,
     pub extra_len: u32,
-    /// 1 = 丢掉编码器开头的静音（与 ffmpeg / 播放层一致）；0 = 原样交出。
+    /// WMA: 1 = 跳过开头两帧。MP3 忽略此字段，输出原始解码样本。
     pub drop_priming: u32,
 }
 
 /// 音频解码句柄（不透明）。
 pub struct V2vAdec {
-    decoder: v2v_wma::WmaDecoder,
+    decoder: Decoder,
     /// 解出来、还没交出去的帧。
     pending: VecDeque<Vec<Vec<f32>>>,
     /// 最近一次交出去的那帧（出参的指针指向这里）。
@@ -87,26 +110,16 @@ pub unsafe extern "C" fn v2v_adec_open(cfg: *const V2vAdecCfg) -> *mut V2vAdec {
             set_err(KIND_BAD, "参数是空指针");
             return std::ptr::null_mut();
         }
-        let cfg = unsafe { &*cfg };
-        if (cfg.size as usize) < std::mem::size_of::<V2vAdecCfg>() {
+        let size = unsafe { cfg.cast::<u32>().read() };
+        if (size as usize) < std::mem::size_of::<V2vAdecCfg>() {
             set_err(KIND_BAD, "cfg->size 太小，可能不是本版本的调用方");
             return std::ptr::null_mut();
         }
+        let cfg = unsafe { &*cfg };
         let extra = match unsafe { slice(cfg.extra, cfg.extra_len) } {
             Ok(b) => b,
             Err(e) => {
                 set_err(KIND_BAD, &e);
-                return std::ptr::null_mut();
-            }
-        };
-        let version = match cfg.format_tag {
-            0x0160 => 1u8,
-            0x0161 => 2u8,
-            other => {
-                set_err(
-                    KIND_UNSUPPORTED,
-                    &format!("音频 format_tag 0x{other:04X}，这里只做 WMA v1/v2"),
-                );
                 return std::ptr::null_mut();
             }
         };
@@ -117,31 +130,9 @@ pub unsafe extern "C" fn v2v_adec_open(cfg: *const V2vAdecCfg) -> *mut V2vAdec {
             );
             return std::ptr::null_mut();
         }
-        let params = match v2v_wma::WmaParams::new(
-            version,
-            cfg.channels as usize,
-            cfg.sample_rate,
-            cfg.avg_bytes_per_sec.saturating_mul(8),
-            cfg.block_align as usize,
-            extra,
-        ) {
-            Ok(p) => p,
-            Err(e) => {
-                rc(&e);
-                return std::ptr::null_mut();
-            }
-        };
-        let skip_left = if cfg.drop_priming != 0 {
-            params.frame_len * 2
-        } else {
-            0
-        };
-        let decoder = match v2v_wma::WmaDecoder::new(params) {
-            Ok(d) => d,
-            Err(e) => {
-                rc(&e);
-                return std::ptr::null_mut();
-            }
+        let (decoder, skip_left) = match open_decoder(cfg, extra) {
+            Ok(pair) => pair,
+            Err(_) => return std::ptr::null_mut(),
         };
         Box::into_raw(Box::new(V2vAdec {
             decoder,
@@ -154,6 +145,55 @@ pub unsafe extern "C" fn v2v_adec_open(cfg: *const V2vAdecCfg) -> *mut V2vAdec {
             skip_left,
         }))
     })
+}
+
+fn open_decoder(cfg: &V2vAdecCfg, _extra: &[u8]) -> Result<(Decoder, usize), c_int> {
+    match cfg.format_tag {
+        0x0160 | 0x0161 => {
+            #[cfg(feature = "wma")]
+            {
+                let version = if cfg.format_tag == 0x0160 { 1 } else { 2 };
+                let params = v2v_wma::WmaParams::new(
+                    version,
+                    cfg.channels as usize,
+                    cfg.sample_rate,
+                    cfg.avg_bytes_per_sec.saturating_mul(8),
+                    cfg.block_align as usize,
+                    _extra,
+                )
+                .map_err(|e| rc(&e))?;
+                let skip = if cfg.drop_priming != 0 {
+                    params.frame_len * 2
+                } else {
+                    0
+                };
+                let decoder = v2v_wma::WmaDecoder::new(params).map_err(|e| rc(&e))?;
+                Ok((Decoder::Wma(Box::new(decoder)), skip))
+            }
+            #[cfg(not(feature = "wma"))]
+            Err(rc_kind(
+                KIND_UNSUPPORTED,
+                "这个产物没编进 WMA（构建时缺 wma feature）",
+            ))
+        }
+        0x0055 => {
+            #[cfg(any(feature = "mp3", feature = "mp3-ffi"))]
+            {
+                let decoder =
+                    Mp3Decoder::new(cfg.channels as usize, cfg.sample_rate).map_err(|e| rc(&e))?;
+                Ok((Decoder::Mp3(Box::new(decoder)), 0))
+            }
+            #[cfg(not(any(feature = "mp3", feature = "mp3-ffi")))]
+            Err(rc_kind(
+                KIND_UNSUPPORTED,
+                "这个产物没编进 MP3（构建时缺 mp3 或 mp3-ffi feature）",
+            ))
+        }
+        other => Err(rc_kind(
+            KIND_UNSUPPORTED,
+            &format!("不支持音频 format_tag 0x{other:04X}"),
+        )),
+    }
 }
 
 /// 关掉并释放。传空指针是空操作。
@@ -183,14 +223,12 @@ pub unsafe extern "C" fn v2v_adec_feed(h: *mut V2vAdec, data: *const u8, len: u3
             Err(e) => return arg_err(&e),
         };
         let hp = unsafe { &mut *h };
-        match hp.decoder.decode_superframe(bytes) {
+        match hp.decoder.feed(bytes) {
             Ok(frames) => {
-                for f in frames {
-                    hp.pending.push_back(f);
-                }
+                hp.pending.extend(frames);
                 OK
             }
-            Err(e) => rc(&e),
+            Err(code) => code,
         }
     })
 }

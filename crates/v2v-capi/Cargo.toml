@@ -13,14 +13,14 @@ crate-type = ["rlib", "cdylib", "staticlib"]
 
 [features]
 # 默认 = 「WMV 全家桶」：ASF / AVI 解封装、MP4 封装、VC-1 + MS-MPEG-4 + MPEG-4 Part 2
-# 解码、WMA 解码、MP43 + MPEG-4 Part 2 编码、AAC 编码、播放层。
+# 解码、WMA 解码、MP43 + MPEG-4 Part 2 编码、AAC 编码、播放层，另加纯 Rust MP3 解码。
 #
 # **按格式裁剪**：`--no-default-features --features "asf,wmv3,wma"` 出的 `.so`
 # 只有 ASF 解封装 + VC-1/WMA 解码 —— 不链 MPEG-4 / AAC / MPEG-1/2 的代码，也不链
 # 它们的表（`v2v-tables` 的 feature 会跟着缩）。符号集也随之变小：头文件里没开的
 # 那一族根本不存在，调用方 `dlsym` 会拿到空指针（这比「符号在但一调就报
 # unsupported」更容易在集成期发现）。
-default = ["asf", "avi", "mp4", "wmv3", "mp43", "mp4v", "wma", "aac", "player"]
+default = ["asf", "avi", "mp4", "wmv3", "mp43", "mp4v", "wma", "aac", "mp3", "player"]
 
 # ── 容器 ──
 asf = ["dep:v2v-asf"]
@@ -33,6 +33,9 @@ mp43 = ["dep:v2v-msmpeg4"]
 mp4v = ["dep:v2v-mp4v"]
 wma = ["dep:v2v-wma"]
 aac = ["dep:v2v-aac"]
+mp3 = ["dep:v2v-mp3", "v2v-mp3/decode"]
+# 同时启用时，v2v_adec 的 MP3 路径选 mpg123。
+mp3-ffi = ["dep:v2v-mp3", "dep:v2v-audio-ffi"]
 
 # 播放层（`v2v_player_*`）。它内部就要全部解码器，所以把这些一起打开 ——
 # 想要「最小产物」就别开它，直接用 `v2v_vdec_*` / `v2v_adec_*`。
@@ -58,6 +61,8 @@ v2v-vc1 = { path = "../vc1", optional = true }
 v2v-msmpeg4 = { path = "../msmpeg4", optional = true }
 v2v-mp4v = { path = "../mp4v", optional = true }
 v2v-wma = { path = "../wma", optional = true }
+v2v-mp3 = { path = "../mp3", optional = true, default-features = false }
+v2v-audio-ffi = { path = "../v2v-audio-ffi", optional = true, features = ["mpg123"] }
 v2v-aac = { path = "../aac", optional = true }
 v2v-mp4 = { path = "../v2v-mp4", optional = true }
 v2v-player = { path = "../v2v-player", optional = true }

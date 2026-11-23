@@ -1,12 +1,12 @@
 [workspace]
-members = ["crates/tables", "crates/v2v-container", "crates/v2v-asf", "crates/v2v-avi", "crates/v2v-mpegps", "crates/mpeg12", "crates/v2v-mpeg12-simd", "crates/v2v-kernel", "crates/msmpeg4", "crates/wma", "crates/v2v-mp4", "crates/mp4v", "crates/aac", "crates/vc1", "crates/v2v-filter", "crates/v2v-player", "crates/v2v-bench", "crates/v2v-capi", "crates/v2v-android", "crates/v2v-cli"]
+members = ["crates/tables", "crates/v2v-container", "crates/v2v-asf", "crates/v2v-avi", "crates/v2v-mpegps", "crates/mpeg12", "crates/v2v-mpeg12-simd", "crates/v2v-kernel", "crates/msmpeg4", "crates/wma", "crates/v2v-mp4", "crates/mp4v", "crates/aac", "crates/mp3", "crates/v2v-audio-ffi", "crates/vc1", "crates/v2v-filter", "crates/v2v-player", "crates/v2v-bench", "crates/v2v-capi", "crates/v2v-android", "crates/v2v-cli"]
 resolver = "2"
 
 [workspace.package]
 version = "0.0.0"
 edition = "2021"
-# 默认许可证，只给**含 FFmpeg 派生码表的六个 crate** 继承（aac / mpeg12 / mp4v /
-# msmpeg4 / vc1 / wma）。其余 crate 在各自的 Cargo.toml 里显式写 `license = "MIT"`。
+# 默认许可证，只给**依赖 FFmpeg 派生码表的编解码器及码表 crate** 继承（aac / mpeg12 / mp3 / mp4v /
+# msmpeg4 / tables / vc1 / wma）。其余 crate 在各自的 Cargo.toml 里显式写 `license = "MIT"`。
 # 分界依据、产物的整体许可、以及机器约束见 NOTICE、README「许可证」、tools/check_license.py。
 license = "LGPL-2.1-or-later"
 repository = "https://github.com/znso4pa/v2videos"

@@ -34,6 +34,7 @@ FFMPEG_VERSION = "7.1"
 
 # (生成器, 产出, [上游文件...]) —— 与各生成器里自己的来源清单一致。
 OUTPUTS = [
+    ("tools/gen_mp3_tables.py", "crates/tables/src/mp3.rs", ["mpegaudiodec_common.c", "mpegaudiodsp_data.c"]),
     ("tools/gen_tables.py", "crates/tables/src/msmpeg4.rs", ["msmpeg4data.c", "msmpeg4_vc1_data.c"]),
     ("tools/gen_tables.py", "crates/tables/src/mp4v.rs", ["h263data.c", "mpeg4data.h", "mpegvideodata.c"]),
     ("tools/gen_aac_tables.py", "crates/tables/src/aac.rs", ["aactab.c", "aacenctab.h"]),
@@ -44,12 +45,13 @@ OUTPUTS = [
 ]
 
 # 含上面那些生成码表的 crate —— 它们是 LGPL 派生数据，必须按 LGPL-2.1-or-later 分发。
-LGPL_CRATES = ["aac", "mpeg12", "mp4v", "msmpeg4", "tables", "vc1", "wma"]
+LGPL_CRATES = ["aac", "mpeg12", "mp3", "mp4v", "msmpeg4", "tables", "vc1", "wma"]
 
 # 其余 crate：源码自研，按 MIT 分发（**不含**链接后产物，见下文）。
 MIT_CRATES = [
     "v2v-android",
     "v2v-asf",
+    "v2v-audio-ffi",
     "v2v-avi",
     "v2v-bench",
     "v2v-capi",
@@ -83,7 +85,7 @@ def main():
     for line in crate_lines(LGPL_CRATES):
         w(line)
     w("    —— 码表全在 `crates/tables`（从 FFmpeg 的数据文件读出，见下文一、），")
-    w("    另外六个编解码器 crate 依赖它。")
+    w("    另外七个编解码器 crate 依赖它。")
     w("  - **MIT**（全文见 [LICENSE-MIT](LICENSE-MIT)）：")
     for line in crate_lines(MIT_CRATES):
         w(line)
@@ -91,7 +93,7 @@ def main():
     w("")
     w("⚠️ **链接了 LGPL 侧 crate 的产物（`.so` / 可执行文件）整体按 LGPL-2.1-or-later 分发。**")
     w("MIT 只覆盖那些 crate 的**源码**：单独取用 MIT 侧的 crate（例如只拿 `container` /")
-    w("`kernel`）不受影响，但任何把它们与上面六个 crate 链在一起的产物仍是 LGPL。")
+    w("`kernel`）不受影响，但任何把它们与LGPL 侧 crate 链在一起的产物仍是 LGPL。")
     w("")
     w("本文件列出**不是本仓原创**的部分、它们的来源、以及上游的版权声明 ——")
     w("依 LGPL-2.1 §4(a)「保留版权声明与许可声明」的要求。")
@@ -148,11 +150,14 @@ def main():
     w("三、其余部分")
     w("-" * 34)
     w("")
-    w("除上面列出的生成码表之外，本仓的代码是自研的，没有链接任何第三方库")
+    w("除上面列出的生成码表之外，本仓的代码是自研的，默认不链接第三方运行时库")
     w("（`Cargo.lock` 里只有本仓自己的包）。编解码器的**算法**来自公开规范")
     w("（ITU-T H.263、ISO/IEC 14496-2、ISO/IEC 14496-3、ASF 规范），")
-    w("不是从任何实现逐行翻译的 —— 所以除码表所在的六个 crate 之外，")
-    w("其余 crate 的源码按 MIT 分发。")
+    w("以仓库内的许可证名单为准，MIT 侧 crate 的源码按 MIT 分发。")
+    w("")
+
+    w("可选 mpg123 feature 动态链接 libmpg123（LGPL-2.1，https://www.mpg123.org/）。")
+    w("项目源码与该原生运行时库按各自的许可证分发。")
     w("")
 
     text = "\n".join(out).rstrip() + "\n"

@@ -113,13 +113,13 @@ fn asf_reports_container_codec_size_and_duration() {
 }
 
 /// 视频能解、音频不能：**两条路都还得 `--no-audio`**，所以必须带上提示，
-/// 否则用户照着 TARGET 去转，会撞上一句「音频是 0x0055」。
+/// 否则用户照着 TARGET 去转，会撞上一句「音频是 0xffff」。
 #[test]
 fn unsupported_audio_keeps_targets_but_warns() {
     let d = temp_dir("mp3");
     let p = d.join("a.wmv");
     let mp3 = AudioFormat {
-        format_tag: 0x0055,
+        format_tag: 0xffff,
         ..wma_audio()
     };
     make_asf(&p, 320, 240, MP43, &frames_10(), Some(mp3));

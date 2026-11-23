@@ -31,9 +31,11 @@ crates/
   v2v-avi           AVI（RIFF）解封装
   v2v-kernel        **编解码器共用的信号处理内核**：位读写器 / VLC / RL 表容器 / FDCT / IDCT / FFT /
                     帧缓冲（`Frame` / `Planes`）/ 运动补偿 / SAD / 宏块层预测 / NEON
-                    —— 全仓唯一允许 `unsafe` 的地方，而且只有 `simd` 一个模块
+                    —— 内核只在 `simd` 模块使用 `unsafe`
   msmpeg4           MS-MPEG-4 v2/v3（MP42 / MP43）/ WMV1 / WMV2 解码（I / P + **IntraX8**）+ MP43 编码（I / P，含运动估计与帧内/帧间判决）
   wma               WMA v1/v2 音频解码（帧头 / LSP 指数 / 系数 / IMDCT）
+  mp3               MPEG-1 / 2 / 2.5 Layer III 顺序解码，处理跨载荷分帧与比特池
+  v2v-audio-ffi     可选的原生音频适配层，目前支持 libmpg123 解码
   vc1               VC-1（**WMV3**）解码：Simple/Main profile、渐进、I/P —— 序列头 → 帧头 → 位平面 →
                     宏块层 → 逆变换（8×8 + ABT）→ 运动补偿（¼ 像素）→ 环路滤波 → YUV420P
   mp4v              MPEG-4 Part 2（mp4v）编码：I / P + 码率控制；**解码**：I / P 对 ffmpeg 逐像素 0 差
@@ -69,6 +71,7 @@ tools/
   gen_tables.py     H.263 / MPEG-4 Part 2 的 VLC / 反量化表（附自检：前缀无关、Kraft 和、逐码往返）
   check_tables.py   用**第二个独立来源**核对 msmpeg4 的表
   gen_aac_tables.py AAC 的 Huffman 码表 / 频带表
+  gen_mp3_tables.py Layer III 的 Huffman 码表、频带和合成窗
   gen_wma_tables.py WMA 解码的码表 / 频率表
   gen_vc1_tables.py VC-1 的位平面 VLC / 量化表 / 枚举常量 / 宏块层的 AC 编码集与三张 tt 表 /
                     4×4 扫描 / DC 定标 / `dqscale`（`vc1data.c`、`vc1_vlc_data.h`）
@@ -90,9 +93,9 @@ tools/
 
 ## FFI：哪些 crate 碰了它，性能账怎么算
 
-FFI 有两个方向，**每个方向都只有一个 crate**，别在别处加：
+FFI 有两个方向：
 
-- **进站（我们调 C）**：`crates/v2v-android`。
+- **进站（我们调 C）**：`crates/v2v-android` 调用平台媒体框架，`crates/v2v-audio-ffi` 调用可选的原生音频库。
 - **出站（C 调我们）**：`crates/v2v-capi`。
 
 其余全部纯 Rust（`msmpeg4` / `mp4v` 的 NEON 走 `std::arch` intrinsics，不跨语言
@@ -105,6 +108,27 @@ FFI 有两个方向，**每个方向都只有一个 crate**，别在别处加：
 它的 API（`Mp4HwWriter`）是安全的：裸指针不外漏、`Drop` 兜底、`!Send`
 （MediaCodec 不是线程安全的）。非 Android 平台编译同名桩，运行时明确报 `Unsupported`。
 
+### MP3 解码
+
+CLI 默认使用纯 Rust 解码，用 `--mp4` 将 AVI / ASF 中的 MP3 音轨转为 AAC，或者加
+`--pcm` 写未压缩音频。C 调用方可用 `v2v_adec_open` 的 `format_tag = 0x0055`，
+采用 `feed` / `next` 读逐声道 PCM。Rust 的 `Framer` 接收连续的 MPEG 帧字节，
+允许拆包和合包。首版从流起点顺序解码，输出包含编码器延迟的原始 PCM。裸 `.mp3` 文件的标签、
+无缝裁剪、seek、free format 及纯 Rust 的 8 kHz mixed block 暂未覆盖。
+
+安装带开发文件的 libmpg123 与 pkg-config 后，可以选择 FFI 后端：
+
+```bash
+cargo run -p v2v-cli --features mp3-ffi -j 2 -- convert --mp4 -o out/ input.avi
+crates/v2v-capi/build-products.sh --formats "avi,mp3-ffi" --name avi_mp3_ffi
+```
+
+C ABI 单独开 `mp3` 使用纯 Rust。两项都开时优先 mpg123。交叉编译设置
+`V2V_MPG123_LIB_DIR` 指向目标平台的原生动态库目录。
+
+`v2v bench --cases decode/mp3 sample.avi` 在解封装后计时，启用 CLI 的
+`mp3-ffi` feature 时会分别报告两个后端。
+
 ### C ABI：`libv2v_capi`
 
 `crates/v2v-capi` 是**全仓唯一的出站 C 表面**。一个 `.so`、一个 `v2v_abi_version()`、
@@ -115,7 +139,7 @@ FFI 有两个方向，**每个方向都只有一个 crate**，别在别处加：
 | --- | --- | --- |
 | 公共 | `v2v_abi_version` / `v2v_last_error` / `v2v_last_error_kind` | 版本、错误通道 |
 | 容器 | `v2v_probe` / `v2v_demux_*` | ASF、AVI |
-| 解码 | `v2v_vdec_*` / `v2v_adec_*` | VC-1、MS-MPEG-4 家族、MPEG-4 Part 2、WMA |
+| 解码 | `v2v_vdec_*` / `v2v_adec_*` | VC-1、MS-MPEG-4 家族、MPEG-4 Part 2、WMA、MP3 |
 | 编码 | `v2v_venc_*` / `v2v_aenc_*` | MP43、MPEG-4 Part 2、AAC |
 | 封装 | `v2v_mux_*` | ASF、MP4 |
 | 播放 | `v2v_player_*` | 解封装 + 解码，逐帧 / 逐样本，`seek(ms)` |
@@ -139,7 +163,7 @@ crates/v2v-capi/build-products.sh --formats "asf,wmv3,wma" --name decode_only
 
 它走 `--no-default-features`，没开的容器 / 编解码器**连码表都不编进去**（`v2v-tables`
 的 feature 跟着缩），符号集也只剩开的那几族 —— 没开的那族 `dlsym` 会拿到 NULL。
-实测（macOS / release）：`min` 1.2 MB、`full` 1.5 MB，只开 `asf,wmv3,wma` 的产物 **688 KB**。
+MP3 接入前的快照（macOS / release）：`min` 1.2 MB、`full` 1.5 MB，只开 `asf,wmv3,wma` 的产物 **688 KB**。
 同主版本就同 ABI —— 区别只是「有没有」，不是「布局不一样」。
 
 （**别把符号个数写进文档**：加一个函数它就变，而它是「数出来的」不是契约。
@@ -277,7 +301,7 @@ cargo test -p v2v-cli --test determinism
 v2v convert in.wmv -o out/
 
 # .mp4：视频重编码成 MPEG-4 Part 2（-g 给 GOP，默认 250 帧 ≈ 10 秒；0 = 全 I 帧），
-#       音频 WMA → PCM → **AAC-LC**（--pcm 可退回未压缩 PCM）
+#       音频 WMA / MP3 → PCM → **AAC-LC**（--pcm 可退回未压缩 PCM）
 v2v convert --mp4 -g 12 in.wmv -o out/
 
 # .mp4 输入（H.264 硬解 + AAC 直通）→ 再出 .mp4
@@ -861,11 +885,11 @@ escape 码本无符号、符号位单独发）。负系数的误差于是被估�
 
 | 范围 | 许可证 |
 |---|---|
-| `crates/{tables, msmpeg4, vc1, aac, wma, mp4v, mpeg12}` | **LGPL-2.1-or-later**（[LICENSE](LICENSE)） |
-| 其余 12 个 crate：`v2v-kernel` / `v2v-container` / `v2v-asf` / `v2v-avi` / `v2v-mpegps` / `v2v-mp4` / `v2v-player` / `v2v-cli` / `v2v-bench` / `v2v-capi` / `v2v-android` / `v2v-mpeg12-simd` | **MIT**（[LICENSE-MIT](LICENSE-MIT)） |
+| `crates/{tables, msmpeg4, vc1, aac, wma, mp4v, mpeg12, mp3}` | **LGPL-2.1-or-later**（[LICENSE](LICENSE)） |
+| 其余带 `v2v-` 前缀的 crate（含 `v2v-audio-ffi`） | **MIT**（[LICENSE-MIT](LICENSE-MIT)） |
 
 分界的**唯一依据是码表**：**全部码表都在 `crates/tables`**（从 FFmpeg 数据文件读出的
-VLC / 反量化 / Huffman 表，同为 LGPL-2.1-or-later），另外六个编解码器 crate 依赖它。
+VLC / 反量化 / Huffman 表，同为 LGPL-2.1-or-later），另外七个编解码器 crate 依赖它。
 表本身是 H.263 / MPEG-4 Part 2 / MPEG-4 Audio / WMA / VC-1 / MPEG-1/2 的**格式定义**、
 与实现无关，也可以换数据源重新生成（`tools/` 下的生成器就是为此留的）——
 **换源只改 `crates/tables` 一个 crate**，其余 crate 一行都不用动。
@@ -874,7 +898,7 @@ VLC / 反量化 / Huffman 表，同为 LGPL-2.1-or-later），另外六个编解
 边界落在 **crate** 上而不是单个文件上 —— 每个 crate 只有一种许可证，不存在「同一个
 crate 里两种许可」那种看错的情况。
 
-⚠️ **产物仍整体 LGPL**：任何链接了上面六个 crate 的 `.so` / 可执行文件
+⚠️ **产物仍整体 LGPL**：任何链接了上表 LGPL 侧 crate 的 `.so` / 可执行文件
 （`libv2v_capi`、`v2v` CLI……）按 LGPL-2.1-or-later 分发 —— MIT 只覆盖那些 crate 的**源码**。
 只取用 MIT 侧的 crate（例如只拿 `v2v-container` / `v2v-kernel`）不受影响。
 

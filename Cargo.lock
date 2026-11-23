@@ -53,6 +53,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "v2v-audio-ffi"
+version = "0.0.0"
+dependencies = [
+ "v2v-mp3",
+]
+
+[[package]]
 name = "v2v-avi"
 version = "0.0.0"
 dependencies = [
@@ -71,9 +78,11 @@ dependencies = [
  "v2v-aac",
  "v2v-android",
  "v2v-asf",
+ "v2v-audio-ffi",
  "v2v-avi",
  "v2v-container",
  "v2v-kernel",
+ "v2v-mp3",
  "v2v-mp4",
  "v2v-mp4v",
  "v2v-mpeg12",
@@ -91,10 +100,12 @@ dependencies = [
  "v2v-aac",
  "v2v-android",
  "v2v-asf",
+ "v2v-audio-ffi",
  "v2v-avi",
  "v2v-bench",
  "v2v-container",
  "v2v-kernel",
+ "v2v-mp3",
  "v2v-mp4",
  "v2v-mp4v",
  "v2v-msmpeg4",
@@ -117,6 +128,14 @@ dependencies = [
 [[package]]
 name = "v2v-kernel"
 version = "0.0.0"
+
+[[package]]
+name = "v2v-mp3"
+version = "0.0.0"
+dependencies = [
+ "v2v-kernel",
+ "v2v-tables",
+]
 
 [[package]]
 name = "v2v-mp4"
