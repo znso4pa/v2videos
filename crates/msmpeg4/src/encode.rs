@@ -330,37 +330,27 @@ impl Encoder {
     /// —— ME 与 qscale 无关，截断也罕见，实践里最多重编一两次。
     pub fn encode_p_frame(&mut self, frame: &Frame) -> Result<Vec<u8>> {
         let mut q = self.cfg.qscale;
-        // ⚠️ **重编之前必须把状态退回去。** `encode_p_frame_at` 会把 `ref_planes`
-        // 换成「这一次尝试重建出来的帧」，还会改 MV 网格与 DC 预测器 —— 不退回去的话，
-        // 第二次是拿**解码器根本没见过的参考帧**在编，误差逐帧累积。
-        // 低 q 最容易触发 level 截断、也就最容易重编，所以症状在低 q 上最重
-        // （实测：`-q 3` 会把一段「渐亮到白」整帧编成暗的，`-q 6` 正常）。
-        let saved = (
-            self.ref_planes.clone(),
-            self.mv_grid.clone(),
-            self.dc_luma.clone(),
-            self.dc_cb.clone(),
-            self.dc_cr.clone(),
-        );
+        // 每次尝试都读取同一份参考帧，并重新初始化 MV、DC 网格。
+        // 只有被接纳的重建才成为下一帧的参考。
         loop {
-            let (stream, clamped, max_coef) = self.encode_p_frame_at(frame, q)?;
+            let (stream, reconstructed, clamped, max_coef) = self.encode_p_frame_at(frame, q)?;
             if !clamped || q >= 31 {
+                self.ref_planes = Some(reconstructed);
                 self.last_qscale = q;
                 return Ok(stream);
             }
             let need = ((max_coef as f64) / (2.0 * MAX_ESCAPE_LEVEL as f64)).ceil() as i64;
             q = q.max(need.clamp(1, 31) as u8);
-            self.ref_planes = saved.0.clone();
-            self.mv_grid = saved.1.clone();
-            self.dc_luma = saved.2.clone();
-            self.dc_cb = saved.3.clone();
-            self.dc_cr = saved.4.clone();
         }
     }
 
     /// 在**指定 qscale** 下编一帧 P。
-    /// 返回 `(位流, 是否发生 level 截断, 走量化器的系数里的最大幅值)`。
-    fn encode_p_frame_at(&mut self, frame: &Frame, q_target: u8) -> Result<(Vec<u8>, bool, i32)> {
+    /// 返回位流、重建帧、是否发生 level 截断以及参与量化的最大系数幅值。
+    fn encode_p_frame_at(
+        &mut self,
+        frame: &Frame,
+        q_target: u8,
+    ) -> Result<(Vec<u8>, Planes, bool, i32)> {
         let w = frame.width as usize;
         let h = frame.height as usize;
         let mb_w = w.div_ceil(16);
@@ -611,12 +601,15 @@ impl Encoder {
                     // 帧间才写 MV 网格；帧内宏块留着 (0,0)（与解码端一致）。
                     let g = self.mv_grid.idx(mbx, mby);
                     self.mv_grid.data[g] = mv;
-                    // 重建：MC 上面已经铺进 `cur` 了，这里只叠反量化后的残差。
-                    for n in 0..6usize {
+                    // 只在 CBP 标出的块上叠残差，其余块保留 MC 预测。
+                    for (n, block) in qb.iter().enumerate() {
+                        if cbp & (1 << (5 - n)) == 0 {
+                            continue;
+                        }
                         let (plane, stride, _px, _py) = recon_at(&mut cur, n, mbx, mby);
                         let mut rb = [0i16; 64];
                         for k in 0..64usize {
-                            rb[k] = dequant(qb[n][k], qmul, qadd);
+                            rb[k] = dequant(block[k], qmul, qadd);
                         }
                         idct_add(&mut rb, plane, stride);
                     }
@@ -625,8 +618,7 @@ impl Encoder {
         }
 
         self.intra_mbs_last = intra_count;
-        self.ref_planes = Some(cur);
-        Ok((wtr.finish(), clamped, max_coef))
+        Ok((wtr.finish(), cur, clamped, max_coef))
     }
 }
 
