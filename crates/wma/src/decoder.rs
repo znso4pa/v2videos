@@ -758,18 +758,17 @@ impl WmaDecoder {
                     w += 1;
                 }
             } else {
-                for _i in 0..coefs_start {
-                    out[w] = 0.0;
-                    w += 1;
-                }
-                for i in 0..nb_coefs[ch] {
-                    out[w] = self.coefs1[ch][i] * self.exponents[ch][(i << bsize) >> esize] * mult;
-                    w += 1;
-                }
-                let n = self.block_len - coefs_end;
-                for _ in 0..n {
-                    out[w] = 0.0;
-                    w += 1;
+                let source = &self.coefs1[ch][..nb_coefs[ch]];
+                let out = &mut out[coefs_start..coefs_start + source.len()];
+                let exponents = &self.exponents[ch];
+                if bsize == esize {
+                    for ((dst, &coef), &exp) in out.iter_mut().zip(source).zip(exponents) {
+                        *dst = coef * exp * mult;
+                    }
+                } else {
+                    for (i, (dst, &coef)) in out.iter_mut().zip(source).enumerate() {
+                        *dst = coef * exponents[(i << bsize) >> esize] * mult;
+                    }
                 }
             }
         }
@@ -892,7 +891,7 @@ impl WmaDecoder {
         let mut max_scale = 0f32;
         let mut pos = 0usize;
         let mut band = 0usize;
-        let bands = self.exponent_bands[bsize].clone();
+        let bands = &self.exponent_bands[bsize];
         let block_len = self.block_len;
 
         if self.params.version == 1 {
@@ -901,9 +900,7 @@ impl WmaDecoder {
             max_scale = v;
             let n = bands[band];
             band += 1;
-            for i in 0..n {
-                self.exponents[ch][pos + i] = v;
-            }
+            self.exponents[ch][pos..pos + n].fill(v);
             pos += n;
         } else {
             last_exp = 36;
@@ -924,9 +921,7 @@ impl WmaDecoder {
             }
             let n = bands[band];
             band += 1;
-            for i in 0..n {
-                self.exponents[ch][pos + i] = v;
-            }
+            self.exponents[ch][pos..pos + n].fill(v);
             pos += n;
         }
         self.max_exponent[ch] = max_scale;
@@ -1032,7 +1027,9 @@ impl WmaDecoder {
 ///
 /// 用 f64 算完再收 f32，与 ffmpeg 的表生成方式一致。
 fn pow_tab(exp: i32) -> f32 {
-    10f64.powf(exp as f64 / 16.0) as f32
+    static POWERS: std::sync::OnceLock<[f32; 156]> = std::sync::OnceLock::new();
+    POWERS.get_or_init(|| std::array::from_fn(|i| 10f64.powf(i as f64 / 16.0) as f32))
+        [exp as usize]
 }
 
 /// `ff_wma_total_gain_to_bits`。

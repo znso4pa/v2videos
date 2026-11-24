@@ -386,6 +386,19 @@ fn audio_passthrough_roundtrips() {
     assert_eq!(kinds.len(), 2, "应当正好两条流，实际 {kinds:?}");
     assert_eq!(kinds[0], (1, StreamKind::Video), "第 1 条该是流 1 / 视频");
     assert_eq!(kinds[1].1, StreamKind::Audio, "第 2 条该被认成音频");
+
+    for &(stream, _) in &kinds {
+        let mut selected = AsfDemuxer::new(Cursor::new(&bytes)).unwrap().retain_stream(stream);
+        assert_eq!(selected.streams().len(), kinds.len());
+        for want in got.iter().filter(|sample| sample.stream == stream) {
+            let actual = selected.next_sample().unwrap().unwrap();
+            assert_eq!(actual.stream, want.stream);
+            assert_eq!(actual.timestamp_ms, want.timestamp_ms);
+            assert_eq!(actual.key_frame, want.key_frame);
+            assert_eq!(actual.data, want.data);
+        }
+        assert!(selected.next_sample().unwrap().is_none());
+    }
 }
 
 /// **编解码器私有数据要原样往返**（`set_video_extra`）。

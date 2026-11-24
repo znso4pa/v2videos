@@ -74,6 +74,7 @@ pub struct AsfDemuxer<R: Read> {
     /// 按流编号标记该流是否在 Stream Properties 里声明过。
     known: Vec<bool>,
     packet_size: usize,
+    packet_buf: Vec<u8>,
     min_packet_size: u32,
     preroll_ms: u32,
     total_packets: u64,
@@ -113,6 +114,7 @@ impl<R: Read> AsfDemuxer<R> {
         Ok(Self {
             reader,
             packet_size: h.info.max_packet_size.max(1) as usize,
+            packet_buf: Vec::new(),
             min_packet_size: h.info.min_packet_size,
             preroll_ms: h.info.preroll_ms,
             total_packets: h.total_packets,
@@ -134,6 +136,15 @@ impl<R: Read> AsfDemuxer<R> {
 
     pub fn streams(&self) -> &[Stream] {
         &self.streams
+    }
+
+    /// 只重组并返回这一轨的样本，保留所有轨的头部信息。
+    pub fn retain_stream(mut self, stream: u8) -> Self {
+        for (number, known) in self.known.iter_mut().enumerate() {
+            *known &= number == usize::from(stream);
+        }
+        self.queue.retain(|sample| sample.stream == stream);
+        self
     }
 
     /// 下一条完整样本；`None` = 到文件尾。
@@ -161,7 +172,8 @@ impl<R: Read> AsfDemuxer<R> {
             self.done = true;
             return Ok(());
         }
-        let mut buf = vec![0u8; self.packet_size];
+        let mut buf = std::mem::take(&mut self.packet_buf);
+        buf.resize(self.packet_size, 0);
         let filled = self.reader.read_full(&mut buf)?;
         // 尾部不完整的包：**按文件结束处理，不报错**。真实世界里截断/残缺的文件很常见，
         // ffmpeg 也是容忍的；把它当致命错误会让「文件差最后几字节」整个读不出来。
@@ -169,12 +181,13 @@ impl<R: Read> AsfDemuxer<R> {
         if truncated {
             self.done = true;
             if filled == 0 {
+                self.packet_buf = buf;
                 return Ok(());
             }
-            buf.truncate(filled);
         }
         self.packets_read += 1;
-        let r = self.process_packet(&buf);
+        let r = self.process_packet(&buf[..filled]);
+        self.packet_buf = buf;
         if truncated {
             // 残缺的尾巴解到一半失败是预期的：已经拿到的东西都留下了。
             return Ok(());

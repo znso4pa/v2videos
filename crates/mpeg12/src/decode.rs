@@ -1478,71 +1478,71 @@ fn predict_block(
         && sy >= 0
         && sy + 7 * row_step >= 0;
     if interior {
-        // ── 快路：行首地址一次算好，内层直接下标 ──
-        let row0 = (sy as usize) * stride + sx as usize;
-        let row1 = ((sy + row_step) as usize) * stride + sx as usize;
-        match (fx, fy) {
-            (0, 0) => {
-                for y in 0..8 {
-                    let base = row0 + y * row_step as usize * stride;
-                    for x in 0..8 {
-                        out[y * 8 + x] = reference[base + x];
-                    }
-                }
-            }
-            (1, 0) => {
-                for y in 0..8 {
-                    let base = row0 + y * row_step as usize * stride;
-                    for x in 0..8 {
-                        let a = reference[base + x] as u16;
-                        let b = reference[base + x + 1] as u16;
-                        out[y * 8 + x] = ((a + b + 1) >> 1) as u8;
-                    }
-                }
-            }
-            (0, 1) => {
-                for y in 0..8 {
-                    let a0 = row0 + y * row_step as usize * stride;
-                    let b0 = row1 + y * row_step as usize * stride;
-                    for x in 0..8 {
-                        let a = reference[a0 + x] as u16;
-                        let b = reference[b0 + x] as u16;
-                        out[y * 8 + x] = ((a + b + 1) >> 1) as u8;
-                    }
-                }
-            }
-            _ => {
-                for y in 0..8 {
-                    let a0 = row0 + y * row_step as usize * stride;
-                    let b0 = row1 + y * row_step as usize * stride;
-                    for x in 0..8 {
-                        let a = reference[a0 + x] as u16;
-                        let b = reference[a0 + x + 1] as u16;
-                        let c = reference[b0 + x] as u16;
-                        let d = reference[b0 + x + 1] as u16;
-                        out[y * 8 + x] = ((a + b + c + d + 2) >> 2) as u8;
-                    }
-                }
-            }
-        }
-        return out;
+        let row0 = sy as usize * stride + sx as usize;
+        let step = row_step as usize * stride;
+        return match (fx, fy) {
+            (0, 0) => interpolate_interior::<false, false>(reference, row0, step),
+            (1, 0) => interpolate_interior::<true, false>(reference, row0, step),
+            (0, 1) => interpolate_interior::<false, true>(reference, row0, step),
+            _ => interpolate_interior::<true, true>(reference, row0, step),
+        };
     }
-    // ── 慢路：贴着帧边界的块，逐像素 clamp（和原来逐位相同）──
-    for y in 0..8 {
-        for x in 0..8 {
-            let sx = origin_x as i32 + ix + x as i32;
-            let sy = origin_y as i32 + row_step * y as i32 + iy;
-            let at = |dx: i32, dy: i32| -> u16 {
-                let px = (sx + dx).clamp(0, width as i32 - 1) as usize;
-                let py = (sy + dy).clamp(0, height as i32 - 1) as usize;
-                reference[py * stride + px] as u16
-            };
-            let a = at(0, 0);
-            out[y * 8 + x] = match (fx, fy) {
+
+    // 边缘复制的列坐标在八行之间不变，两条参考行也只需每行裁一次。
+    let columns = std::array::from_fn::<_, 8, _>(|x| {
+        (sx + x as i32).clamp(0, width as i32 - 1) as usize
+    });
+    let right = std::array::from_fn::<_, 8, _>(|x| {
+        (sx + x as i32 + 1).clamp(0, width as i32 - 1) as usize
+    });
+    let row = |y: i32| {
+        let at = y.clamp(0, height as i32 - 1) as usize * stride;
+        &reference[at..at + width]
+    };
+    for (y, dst) in out.chunks_exact_mut(8).enumerate() {
+        let y = sy + row_step * y as i32;
+        let top = row(y);
+        let bottom = row(y + fy * row_step);
+        for (x, value) in dst.iter_mut().enumerate() {
+            let a = u16::from(top[columns[x]]);
+            *value = match (fx, fy) {
                 (0, 0) => a as u8,
-                (1, 0) => ((a + at(1, 0) + 1) >> 1) as u8,
-                (0, 1) => ((a + at(0, row_step) + 1) >> 1) as u8,
-                _ => ((a + at(1, 0) + at(0, row_step) + at(1, row_step) + 2) >> 2) as u8,
+                (1, 0) => ((a + u16::from(top[right[x]]) + 1) >> 1) as u8,
+                (0, 1) => ((a + u16::from(bottom[columns[x]]) + 1) >> 1) as u8,
+                _ => ((a + u16::from(top[right[x]]) + u16::from(bottom[columns[x]])
+                    + u16::from(bottom[right[x]]) + 2) >> 2) as u8,
+            };
+        }
+    }
+    out
+}
+
+/// 帧内预测按整行移动边界检查，让相邻半像素的计算可以向量化。
+fn interpolate_interior<const X: bool, const Y: bool>(
+    reference: &[u8],
+    base: usize,
+    step: usize,
+) -> [u8; 64] {
+    let mut out = [0; 64];
+    for (y, dst) in out.chunks_exact_mut(8).enumerate() {
+        let at = base + y * step;
+        let span = 8 + usize::from(X);
+        let top = &reference[at..at + span];
+        if !X && !Y {
+            dst.copy_from_slice(top);
+            continue;
+        }
+        let bottom_at = at + usize::from(Y) * step;
+        let bottom = &reference[bottom_at..bottom_at + span];
+        for (x, value) in dst.iter_mut().enumerate() {
+            let a = u16::from(top[x]);
+            *value = if X && Y {
+                ((a + u16::from(top[x + 1]) + u16::from(bottom[x])
+                    + u16::from(bottom[x + 1]) + 2) >> 2) as u8
+            } else if X {
+                ((a + u16::from(top[x + 1]) + 1) >> 1) as u8
+            } else {
+                ((a + u16::from(bottom[x]) + 1) >> 1) as u8
             };
         }
     }

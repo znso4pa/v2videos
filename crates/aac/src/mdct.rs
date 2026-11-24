@@ -28,17 +28,16 @@
 //! 「几十毫秒、可以接受」。**实测把这个判断推翻了**：把 `mdct` 短路掉，AAC 单编
 //! 20 秒从 13.85 s 掉到 3.0 s —— 它一个人占了整个编码的 **78%**。
 //!
-//! 现在走 `预旋转 → 2N 点 FFT → 后旋转 → 取实部 ×2`，一次变换只调 4 次
-//! `sin`/`cos`（两条相位都是线性的，旋转因子用切比雪夫递推生成，不建表）。
-//! 快 **4.9×**，而且**输出逐字节不变**（f64 的差异被 f32 舍入吸收）。
+//! AAC 长短窗把输入折叠为 DCT-IV，复用内核的 n/2 点复数 FFT。
+//! 其他块长沿用 `预旋转 → 2N 点 FFT → 后旋转`。
 //!
 //! 「难对账」这条担心的解法不是不换算法，而是**加一条直接按定义算的 oracle 测试**
 //! （`fast_mdct_matches_the_definition`）—— 换算法时只有它能把折叠/旋转/定标写错
 //! 当场抓住。FFT 本身搬去了共享内核 `v2v-kernel`（见那边的 `fft.rs`）。
 
-use std::f64::consts::PI;
+use std::{f64::consts::PI, sync::OnceLock};
 
-use v2v_kernel::fft_in_place;
+use v2v_kernel::{fft_in_place, MdctPlan};
 
 /// 长块的样本数（MDCT 输出点数）。
 pub const LONG_LEN: usize = 1024;
@@ -254,6 +253,21 @@ fn bessel_i0(x: f64) -> f64 {
 /// ≈ 1e-13），而输出最后只取 f32（精度 6e-8）—— `mdct_round_trips_with_overlap`
 /// 与 ffmpeg 的 SNR 对账都钉着这条。
 pub fn mdct(input: &[f32], out: &mut [f32]) {
+    static LONG: OnceLock<MdctPlan> = OnceLock::new();
+    static SHORT: OnceLock<MdctPlan> = OnceLock::new();
+    let n = out.len();
+    let plan = match n {
+        LONG_LEN => LONG.get_or_init(|| MdctPlan::new(LONG_LEN, 2.0)),
+        SHORT_LEN => SHORT.get_or_init(|| MdctPlan::new(SHORT_LEN, 2.0)),
+        _ => return mdct_wide(input, out),
+    };
+    let mut re = [0.0; LONG_LEN / 2];
+    let mut im = [0.0; LONG_LEN / 2];
+    debug_assert_eq!(input.len(), 2 * n);
+    plan.apply(&input[..2 * n], out, &mut re[..n / 2], &mut im[..n / 2]);
+}
+
+fn mdct_wide(input: &[f32], out: &mut [f32]) {
     let n = out.len();
     debug_assert_eq!(input.len(), 2 * n);
     // 长度必须是 2 的幂（N 与 2N 都是）—— 本仓只用 1024 / 128，构造时就固定了。

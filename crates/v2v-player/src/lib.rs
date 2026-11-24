@@ -282,13 +282,14 @@ impl Player {
         let seq = v2v_vc1::SeqHeader::parse(&vfmt.extra)?;
         info.flags = info_flags(seq.max_b_frames);
         let decoder = v2v_vc1::Decoder::new(seq, info.width, info.height)?;
+        let video_num = vstream.number;
         let video = VideoTrack {
-            stream_num: vstream.number,
+            stream_num: video_num,
             seq,
             width: info.width,
             height: info.height,
             decoder,
-            demux: video_demux,
+            demux: video_demux.retain_stream(video_num),
             done: false,
             position_ms: 0,
             pending_frame: None,
@@ -326,7 +327,7 @@ impl Player {
                 stream_num: num,
                 params: params.clone(),
                 decoder,
-                demux,
+                demux: demux.retain_stream(num),
                 channels: af.channels as usize,
                 sample_rate: af.sample_rate,
                 pts_base_ms: 0,

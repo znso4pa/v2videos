@@ -18,7 +18,8 @@ impl Decoder {
         Ok(Self {
             framer: Framer::new(channels, sample_rate)?,
             state: State {
-                reservoir: Vec::new(),
+                reservoir: Vec::with_capacity(1024),
+                main_data: Vec::new(),
                 synthesis: std::array::from_fn(|_| Synthesis::new()),
             },
         })
@@ -41,6 +42,7 @@ impl Decoder {
 
 struct State {
     reservoir: Vec<u8>,
+    main_data: Vec<u8>,
     synthesis: [Synthesis; 2],
 }
 
@@ -70,14 +72,15 @@ impl State {
             .len()
             .checked_sub(back)
             .ok_or(Error::Bad("MP3 reservoir underflow"))?;
-        let mut main = self.reservoir[from..].to_vec();
-        main.extend_from_slice(&frame[main_start..]);
+        self.main_data.clear();
+        self.main_data.extend_from_slice(&self.reservoir[from..]);
+        self.main_data.extend_from_slice(&frame[main_start..]);
         self.reservoir.extend_from_slice(&frame[main_start..]);
         let keep_from = self.reservoir.len().saturating_sub(511);
         self.reservoir.drain(..keep_from);
 
         let granules = h.samples / 576;
-        let mut main = BitReader::new(&main);
+        let mut main = BitReader::new(&self.main_data);
         let mut pcm: Pcm = (0..h.channels)
             .map(|_| Vec::with_capacity(h.samples))
             .collect();
@@ -160,11 +163,12 @@ impl Part<'_, '_> {
         Ok(symbol)
     }
 
+    #[inline]
     fn signed(&mut self, value: usize, linbits: u8) -> Result<i16> {
         if value == 0 {
             return Ok(0);
         }
-        let extra = if value == 15 {
+        let extra = if value == 15 && linbits != 0 {
             self.read(linbits.into())? as i16
         } else {
             0

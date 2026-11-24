@@ -37,7 +37,7 @@ use crate::grid::Grid;
 use crate::predict::dc_predict;
 use v2v_kernel::predict::coded_block_predict;
 use crate::tables;
-use v2v_kernel::vlc::Vlc;
+use std::sync::OnceLock;
 
 /// `DC_MAX`：DC VLC 的 escape 符号（超过它就用 8 位明文）。
 const DC_MAX: i32 = 119;
@@ -181,9 +181,9 @@ impl Encoder {
         // ---- 表 ----
         let rl_luma = rl_table_for_standard(self.cfg.rl_table_index as usize)?;
         let rl_chroma = rl_table_for_standard(3 + self.cfg.rl_chroma_table_index as usize)?;
-        let dc_vlc = Vlc::new(&tables::DC[self.cfg.dc_table_index as usize][0]);
-        let dc_vlc_c = Vlc::new(&tables::DC[self.cfg.dc_table_index as usize][1]);
-        let mb_intra_vlc = Vlc::new(&tables::MB_INTRA);
+        let dc_vlc = &tables::DC[self.cfg.dc_table_index as usize][0];
+        let dc_vlc_c = &tables::DC[self.cfg.dc_table_index as usize][1];
+        let mb_intra_vlc = &tables::MB_INTRA;
 
         self.dc_luma = Grid::with_init(2 * mb_w, 2 * mb_h, 1024);
         self.dc_cb = Grid::with_init(mb_w, mb_h, 1024);
@@ -241,8 +241,8 @@ impl Encoder {
                     self.coded.data[xy] = val as u8;
                     coded_cbp |= (val ^ pred as u32) << (5 - i);
                 }
-                let (code, len) = mb_intra_vlc
-                    .code_len(coded_cbp as usize)
+                let &[code, len] = mb_intra_vlc
+                    .get(coded_cbp as usize)
                     .ok_or(Error::Bad("CBP 超出帧内 MB 类型表"))?;
                 wtr.put(code, len);
                 wtr.put(0, 1); // ac_pred = 0（我们不做 AC 预测）
@@ -253,8 +253,8 @@ impl Encoder {
                     &mut self.dc_luma,
                     &mut self.dc_cb,
                     &mut self.dc_cr,
-                    &dc_vlc,
-                    &dc_vlc_c,
+                    dc_vlc,
+                    dc_vlc_c,
                     &rl_luma,
                     &rl_chroma,
                     &qb,
@@ -380,10 +380,10 @@ impl Encoder {
         // `3 + rl_table_index`（P 帧头只写一个下标，解码端 `rl_chroma_table_index`
         // 直接抄它 —— 见 `msmpeg4dec.c` 的 P 分支）。
         let rl_intra_luma = rl_table_for_standard(self.cfg.rl_table_index as usize)?;
-        let mb_non_intra_vlc = Vlc::new(&tables::MB_NON_INTRA);
-        let dc_vlc = Vlc::new(&tables::DC[self.cfg.dc_table_index as usize][0]);
-        let dc_vlc_c = Vlc::new(&tables::DC[self.cfg.dc_table_index as usize][1]);
-        let mv_tab = MvIndex::new(self.cfg.mv_table_index as usize);
+        let mb_non_intra_vlc = &tables::MB_NON_INTRA;
+        let dc_vlc = &tables::DC[self.cfg.dc_table_index as usize][0];
+        let dc_vlc_c = &tables::DC[self.cfg.dc_table_index as usize][1];
+        let mv_tab = MvIndex::get(self.cfg.mv_table_index as usize);
 
         // P 帧恒用带舍入的插值，理由见上面的函数注释。
         let no_rounding = false;
@@ -398,10 +398,8 @@ impl Encoder {
 
         // 帧内路径的**位数下限**：MB 类型（cbp=0 的码）+ 1 位 ac_pred + 6 个全 0 的
         // DC 码。帧间路径比这还便宜时，帧内不可能赢，直接跳过评估。
-        let (_, mb0_len) = mb_non_intra_vlc
-            .code_len(0)
-            .ok_or(Error::Bad("MB_NON_INTRA[0] 越界"))?;
-        let dc0_len = dc_vlc.code_len(0).map(|(_, l)| l).unwrap_or(0);
+        let mb0_len = mb_non_intra_vlc[0][1];
+        let dc0_len = dc_vlc[0][1];
         let intra_floor = mb0_len as usize + 1 + 6 * dc0_len as usize;
 
         let mut wtr = BitWriter::new();
@@ -493,8 +491,8 @@ impl Encoder {
 
                 // ---- 帧间路径的位流（临时写入器，赢了才接进正式位流）----
                 let mut w_p = BitWriter::new();
-                let (code, len) = mb_non_intra_vlc
-                    .code_len((cbp + 64) as usize)
+                let &[code, len] = mb_non_intra_vlc
+                    .get((cbp + 64) as usize)
                     .ok_or(Error::Bad("CBP 超出帧间 MB 类型表"))?;
                 w_p.put(code, len);
                 mv_tab.write(&mut w_p, mv.0 - pred.0, mv.1 - pred.1)?;
@@ -546,8 +544,8 @@ impl Encoder {
                         mbx,
                         mby,
                     );
-                    let (code, len) = mb_non_intra_vlc
-                        .code_len(cbp_intra as usize)
+                    let &[code, len] = mb_non_intra_vlc
+                        .get(cbp_intra as usize)
                         .ok_or(Error::Bad("CBP 超出 MB 类型表（帧内）"))?;
                     w_i.put(code, len);
                     w_i.put(0, 1); // ac_pred = 0（我们不做 AC 预测）
@@ -556,8 +554,8 @@ impl Encoder {
                         &mut self.dc_luma,
                         &mut self.dc_cb,
                         &mut self.dc_cr,
-                        &dc_vlc,
-                        &dc_vlc_c,
+                        dc_vlc,
+                        dc_vlc_c,
                         &rl_intra_luma,
                         &rl_inter,
                         &qb_intra,
@@ -672,8 +670,8 @@ fn write_intra_blocks(
     dc_luma: &mut Grid<i16>,
     dc_cb: &mut Grid<i16>,
     dc_cr: &mut Grid<i16>,
-    dc_vlc: &Vlc,
-    dc_vlc_c: &Vlc,
+    dc_vlc: &[[u32; 2]],
+    dc_vlc_c: &[[u32; 2]],
     rl_luma: &RlTable,
     rl_chroma: &RlTable,
     qb: &[[i32; 64]; 6],
@@ -758,10 +756,17 @@ fn dequant(level: i32, qmul: i32, qadd: i32) -> i16 {
 /// 铺进一张 64×64 的表，没铺到的格子就是 escape（差分用 6+6 位明文补）。
 struct MvIndex {
     table: Vec<u16>,
-    vlc: Vlc,
+    code: &'static [u16],
+    len: &'static [u8],
 }
 
 impl MvIndex {
+    fn get(index: usize) -> &'static Self {
+        static TABLES: [OnceLock<MvIndex>; 2] = [const { OnceLock::new() }; 2];
+        let index = usize::from(index != 0);
+        TABLES[index].get_or_init(|| Self::new(index))
+    }
+
     fn new(mv_table_index: usize) -> Self {
         let (code, len, xs, ys) = if mv_table_index == 0 {
             (
@@ -782,15 +787,7 @@ impl MvIndex {
         for i in 0..xs.len() {
             table[(xs[i] as usize) << 6 | ys[i] as usize] = i as u16;
         }
-        let pairs: Vec<[u32; 2]> = code
-            .iter()
-            .zip(len.iter())
-            .map(|(&c, &l)| [c as u32, l as u32])
-            .collect();
-        Self {
-            table,
-            vlc: Vlc::new(&pairs),
-        }
+        Self { table, code, len }
     }
 
     /// 写一个运动矢量**差分**（相对预测值，半像素单位）。
@@ -816,11 +813,7 @@ impl MvIndex {
             return Err(Error::Bad("运动矢量差分超出可表示范围"));
         }
         let code = self.table[(mx as usize) << 6 | my as usize] as usize;
-        let (c, l) = self
-            .vlc
-            .code_len(code)
-            .ok_or(Error::Bad("MV 符号下标越界"))?;
-        w.put(c, l);
+        w.put(u32::from(self.code[code]), u32::from(self.len[code]));
         if code == MV_ESCAPE {
             w.put(mx as u32, 6);
             w.put(my as u32, 6);
@@ -887,6 +880,9 @@ fn motion_estimate(
     // 初始候选也得夹（零 MV 本身可能超出「相对预测可编码」的范围 —— 起点没夹过就漏了）。
     let mut best = clamp2((0i32, 0i32));
     let mut best_sad = sad_of(best, u32::MAX);
+    if best_sad == 0 {
+        return best;
+    }
     // ---- 三层搜索：宽范围粗搜 → 逐级细化 ----
     //
     // 旧版是「两个中心各 ±4 **半像素**（= ±2 像素）全密搜」+ ±1 半像素细化 ——
@@ -1080,11 +1076,11 @@ fn code012(w: &mut BitWriter, n: u8) {
 }
 
 /// `msmpeg4_encode_dc`：符号 + 可选 escape + 符号位。
-fn write_dc(w: &mut BitWriter, dc_vlc: &Vlc, level: i32) {
+fn write_dc(w: &mut BitWriter, dc_vlc: &[[u32; 2]], level: i32) {
     let sign = u32::from(level < 0);
     let a = level.abs();
     let code = a.min(DC_MAX);
-    if let Some((c, n)) = dc_vlc.code_len(code as usize) {
+    if let Some(&[c, n]) = dc_vlc.get(code as usize) {
         w.put(c, n);
     }
     if code == DC_MAX {
