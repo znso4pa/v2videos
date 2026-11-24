@@ -41,6 +41,7 @@ pub mod error;
 pub mod fdct;
 pub mod fft;
 pub mod idct;
+mod imdct;
 pub mod mc;
 pub mod predict;
 pub mod rl;
@@ -53,6 +54,7 @@ pub use error::{Error, Result};
 pub use fdct::{fdct, fdct_i, fdct_i_float, fdct_llm};
 pub use fft::fft_in_place;
 pub use idct::{idct48_add, idct84_add, idct_add, idct_put};
+pub use imdct::ImdctPlan;
 pub use mc::{
     edge_emu_into, mc_chroma8, mc_luma16, mc_mb, mc_params, mid_pred, put_pixels, sad_luma16,
     sad_luma16_capped, Frame, McParams, Planes, ZIGZAG,

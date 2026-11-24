@@ -30,9 +30,11 @@
 //! 第一帧的「上一帧后半」是全零 —— 这就是编码器那 1024 个样本的延迟（priming）。
 
 use crate::mdct::{
-    imdct_fast, kbd_aac_window, long_start_window, long_stop_window, short_window, sine_window,
+    kbd_aac_window, long_start_window, long_stop_window, short_window, sine_window,
     LONG_LEN, SHORT_LEN,
 };
+
+use v2v_kernel::ImdctPlan;
 
 /// 短窗那一串在 2048 的帧缓冲里居中摆放时，两端各留的零长度。
 const SHORT_PAD: usize = (2 * LONG_LEN - 9 * SHORT_LEN) / 2;
@@ -45,6 +47,8 @@ pub struct Synthesis {
     long: [Vec<f32>; 2],
     /// 短窗 256 点。
     short: [Vec<f32>; 2],
+    long_imdct: ImdctPlan,
+    short_imdct: ImdctPlan,
     /// `LONG_START` / `LONG_STOP` 的 2048 点过渡窗。
     start: [Vec<f32>; 2],
     stop: [Vec<f32>; 2],
@@ -70,6 +74,8 @@ impl Synthesis {
         Self {
             long: [long_sine, long_kbd],
             short: [short_sine, short_kbd],
+            long_imdct: ImdctPlan::new(LONG_LEN, 1.0 / LONG_LEN as f64),
+            short_imdct: ImdctPlan::new(SHORT_LEN, 1.0 / SHORT_LEN as f64),
             start: [start_sine, start_kbd],
             stop: [stop_sine, stop_kbd],
             overlap: vec![vec![0f32; LONG_LEN]; channels],
@@ -108,12 +114,13 @@ impl Synthesis {
         let cur = usize::from(shape != 0);
         let prev = self.prev_shape[ch] as usize;
         self.prev_shape[ch] = cur as u8;
-        let mut buf = vec![0f32; 2 * LONG_LEN];
+        let mut buf = [0f32; 2 * LONG_LEN];
 
         if seq == 2 {
-            let mut tmp = vec![0f32; 2 * SHORT_LEN];
+            let mut tmp = [0f32; 2 * SHORT_LEN];
             for w in 0..8 {
-                imdct_fast(&coefs[w * SHORT_LEN..(w + 1) * SHORT_LEN], &mut tmp);
+                self.short_imdct
+                    .apply(&coefs[w * SHORT_LEN..(w + 1) * SHORT_LEN], &mut tmp);
                 let off = SHORT_PAD + w * SHORT_LEN;
                 if w == 0 {
                     // 第 0 个短窗的**上升半**与上一帧的尾巴重叠，用上一帧的窗形。
@@ -136,13 +143,12 @@ impl Synthesis {
                 // 0 与任何没见过的值都按普通长窗处理：`parse_ics_info` 只可能给出 0..=3。
                 _ => &self.long,
             };
-            let mut tmp = vec![0f32; 2 * LONG_LEN];
-            imdct_fast(coefs, &mut tmp);
+            self.long_imdct.apply(coefs, &mut buf);
             for i in 0..LONG_LEN {
-                buf[i] = tmp[i] * win[prev][i];
+                buf[i] *= win[prev][i];
             }
             for i in LONG_LEN..2 * LONG_LEN {
-                buf[i] = tmp[i] * win[cur][i];
+                buf[i] *= win[cur][i];
             }
         }
 

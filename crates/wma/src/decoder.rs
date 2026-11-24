@@ -21,8 +21,7 @@ use crate::params::WmaParams;
 use crate::tables::*;
 use crate::{Error, Result};
 
-// FFT 走共享数值内核（AGENTS.md 不变量 3：不许复刻第二份）。
-use v2v_kernel::fft_in_place;
+use v2v_kernel::ImdctPlan;
 
 const NB_LSP_COEFS: usize = 10;
 const LSP_POW_BITS: u32 = 7;
@@ -31,26 +30,7 @@ const HIGH_BAND_MAX_SIZE: usize = 16;
 const BLOCK_MIN_BITS: u32 = 7;
 const BLOCK_MAX_SIZE: usize = 2048;
 
-/// 一个 `(码长, 码字) → 符号` 的前缀码。
-///
-/// ## ⚠️ 这里曾经是「逐位读 + **线性扫全表**」
-///
-/// 旧版 `decode` 每一位都要 `entries.iter().find(..)` 扫一遍整张表：
-///
-/// ```text
-///   for len in 1..=max_len {
-///       code = (code << 1) | bit;
-///       entries.iter().find(|(l, c, _)| l == len && c == code)   // ← 每次都扫全表
-///   }
-/// ```
-///
-/// 复杂度 `O(码长 × 项数)`，而 WMA 的系数表有 **666~1000+ 项** ——
-/// `sample` 采样（整轨 208 秒）显示 `Vlc::decode` 一个人占了 WMA 解码的 **58%**
-/// （349/605 个样本）。
-///
-/// 现在内部直接用 `v2v-kernel` 的**二叉树** `Vlc`（`O(码长)`）——
-/// 走树/建树的逻辑只有那一份，这里只做「表格式转换 + 位源适配」，
-/// 不把树复刻第二遍（AGENTS.md 不变量 3）。
+/// 把 WMA 码表转为共享 VLC，由内核查短前缀表或逐位解长码。
 struct Vlc {
     inner: v2v_kernel::Vlc,
 }
@@ -101,12 +81,12 @@ impl Vlc {
         }
     }
 
-    /// 走树解一个符号（位流结束或未定义前缀都返回 `Bad`）。
+    /// 解一个符号（位流结束或未定义前缀都返回 `Bad`）。
     fn decode(&self, r: &mut BitReader) -> Result<u32> {
         self.inner
-            .decode_bits(|| r.bit().ok().map(u32::from))
+            .decode(&mut r.inner)
             .map(|sym| sym as u32)
-            .ok_or_else(|| Error::Bad("VLC 里没有这个码"))
+            .map_err(|_| Error::Bad("VLC 里没有这个码"))
     }
 }
 
@@ -166,9 +146,7 @@ pub struct WmaDecoder {
     output: Vec<f32>,
     frame_out: [Vec<f32>; 2],
 
-    /// IMDCT 的 FFT scratch（复用，避免每块都分配）。长度 `2 · BLOCK_MAX_SIZE`。
-    imdct_re: Vec<f64>,
-    imdct_im: Vec<f64>,
+    imdct_plans: Vec<ImdctPlan>,
 
     // ---- 比特池（superframe 跨包搬运）----
     /// 上一包没用完、留给下一包接着解的那半帧的字节。
@@ -388,8 +366,9 @@ impl WmaDecoder {
             coefs: [vec![0.0; BLOCK_MAX_SIZE], vec![0.0; BLOCK_MAX_SIZE]],
             output: vec![0.0; BLOCK_MAX_SIZE * 2],
             frame_out: [vec![0.0; BLOCK_MAX_SIZE * 2], vec![0.0; BLOCK_MAX_SIZE * 2]],
-            imdct_re: vec![0.0; BLOCK_MAX_SIZE * 2],
-            imdct_im: vec![0.0; BLOCK_MAX_SIZE * 2],
+            imdct_plans: (0..nb)
+                .map(|k| ImdctPlan::new(frame_len >> k, -1.0))
+                .collect(),
             last_superframe: Vec::new(),
             last_bitoffset: 0,
             superframe_index: 0,
@@ -687,15 +666,17 @@ impl WmaDecoder {
         if self.params.version == 1 {
             mdct_norm *= n4.sqrt(); // v1 的归一化不一样（wmadec.c 634 行）
         }
+        let gain = 10f32.powf(total_gain as f32 * 0.05);
         for ch in 0..channels {
             if !self.channel_coded[ch] {
                 continue;
             }
-            let mult = 10f32.powf(total_gain as f32 * 0.05) / self.max_exponent[ch] * mdct_norm;
+            let mult = gain / self.max_exponent[ch] * mdct_norm;
             let esize = self.exponents_bsize[ch] as usize;
             let coefs_start = self.params.coefs_start;
             let coefs_end = self.coefs_end[bsize];
-            let mut out = vec![0f32; self.block_len];
+            let out = &mut self.coefs[ch][..self.block_len];
+            out.fill(0.0);
             let mut w = 0usize;
             if self.params.use_noise_coding {
                 let mult1 = mult;
@@ -791,7 +772,6 @@ impl WmaDecoder {
                     w += 1;
                 }
             }
-            self.coefs[ch][..self.block_len].copy_from_slice(&out);
         }
 
         // ---- MS 立体声（在 MDCT 之前）----
@@ -827,7 +807,7 @@ impl WmaDecoder {
 
         for ch in 0..channels {
             if self.channel_coded[ch] {
-                self.imdct(ch);
+                self.imdct(ch, bsize);
             } else if !(self.ms_stereo && ch == 1) {
                 for v in self.output.iter_mut() {
                     *v = 0.0;
@@ -847,16 +827,10 @@ impl WmaDecoder {
     /// 相反数 —— 实测：我们的输出与 ffmpeg 的 PCM 互相关正好是 **−1.0000**
     /// （完美反相、幅度与波形全对）。所以这里取负号，不是「调参」。
     ///
-    /// 推导与代价见 `imdct_kernel`；这里只负责把解码器的缓冲递过去。
-    fn imdct(&mut self, ch: usize) {
+    /// 推导见 `ImdctPlan`。
+    fn imdct(&mut self, ch: usize, bsize: usize) {
         let n = self.block_len;
-        let m = 2 * n;
-        imdct_kernel(
-            &self.coefs[ch][..n],
-            &mut self.output[..m],
-            &mut self.imdct_re[..m],
-            &mut self.imdct_im[..m],
-        );
+        self.imdct_plans[bsize].apply(&self.coefs[ch][..n], &mut self.output[..2 * n]);
     }
 
     /// 加窗并把这一块叠加到 `frame_out[ch][index..]`。
@@ -1049,123 +1023,6 @@ impl WmaDecoder {
     }
 }
 
-/// IMDCT 的内核（不含 `self`，便于单测直接对着「按定义算」对账）。
-///
-/// `coefs` 长 `n`（块长），`out` 长 `2n`，`re`/`im` 是长度 ≥ `2n` 的复用 scratch。
-///
-/// ## 定义（与第一版逐点等价，只换了算法）
-///
-/// ```text
-///   out[i] = −Σ_{k=0}^{n-1} coefs[k]·cos( π/n ·(k+0.5)·(i + 0.5 + n/2) ),   i = 0..2n−1
-/// ```
-///
-/// ## 为什么能走 FFT
-///
-/// **第一步：`2n` 个输出 = `n` 点 DCT-IV + 三段对称。**
-/// 令 `u[j] = Σ_k coefs[k]·cos(π/n·(j+0.5)(k+0.5))`（`j = 0..n−1`，就是 DCT-IV）。
-/// 把 `i + 0.5 + n/2` 写成 `(i + n/2) + 0.5`，立刻看出 `out[i] = −u(i + n/2)`
-/// （把 `u` 看成 `j` 的连续函数）；而 `u` 有两条对称性，都是一行能验的：
-///
-/// ```text
-///   u(−1−j) = u(j)        （余弦是偶函数）
-///   u(j+2n) = −u(j)       （相位差 2π(k+1/2) —— 正好差一个 π）
-/// ```
-///
-/// 用它们把 `i + n/2 ∈ [n/2, 5n/2)` 折回 `[0, n)`：
-///
-/// ```text
-///   i ∈ [0, n/2)     : out[i] = −u[i + n/2]
-///   i ∈ [n/2, 3n/2)  : out[i] = +u[3n/2 − 1 − i]
-///   i ∈ [3n/2, 2n)   : out[i] = +u[i − 3n/2]
-/// ```
-///
-/// **第二步：DCT-IV 走 FFT。** 把相位拆开（记 `m = 2n`）：
-///
-/// ```text
-///   π/n·(j+0.5)(k+0.5) = πk(2j+1)/m + π(2j+1)/(4n)
-///   ⇒  u[j] = Re{ e^{−iφ_j}·D[j] },   φ_j = π(2j+1)/(4n) = (j + 0.5)·π/m
-///       D = FFT_m(b),   b[k] = coefs[k]·e^{−iπk/m}（k ≥ n 补零）
-/// ```
-///
-/// `D[j] = Σ_k b[k]·e^{−2πijk/m}` 正好是 **`m` 点 FFT 的第 `j` 个 bin**（前 `n` 个）。
-/// 两条相位（预旋转的 `−πk/m`、后旋转的 `−φ_j`）**都是线性的**，所以旋转因子都用
-/// 切比雪夫递推生成 —— 一次变换只调 4 次 `sin`/`cos`，不建表。
-///
-/// ## 为什么值得换
-///
-/// 原来逐 `(k, i)` 是 **O(n²)**：`n = 2048` 时每块每声道 840 万次内层迭代
-/// （1024 点块也有 210 万次）。实测它一个人占了整条转码链路的 **32%**
-/// （`sample` 采样：`finish_block` 2007/6261，而 `finish_block` 的时间 99% 在它里面）。
-/// 现在是一次 `m` 点 FFT + `O(n)` 旋转，同一份输出。
-///
-/// ⚠️ **数值上不是逐位相同**：旧版每加一项就把部分和舍进 f32（2048 项 → 误差按随机
-/// 游走 ~3e-6 相对），新版在 f64 里累完只收一次（~1e-12）。落到 s16 的 PCM 上是个别
-/// 样本 **±1** —— 对 ffmpeg 的对账容差是 4，实测没变（见 `TODO.md`）。
-fn imdct_kernel(coefs: &[f32], out: &mut [f32], re: &mut [f64], im: &mut [f64]) {
-    let n = coefs.len();
-    let m = 2 * n;
-    debug_assert_eq!(out.len(), m);
-    debug_assert!(n.is_power_of_two(), "块长必须是 2 的幂（FFT 的要求）");
-    let pi = std::f64::consts::PI;
-
-    // ---- 预旋转 + 补零：b[k] = coefs[k]·e^{−iπk/m} ----
-    {
-        let step = pi / m as f64;
-        let two_cos = 2.0 * step.cos();
-        let mut prev = (-step).cos();
-        let mut cur = 1.0f64; // cos(0)
-        let mut prev_i = (-step).sin();
-        let mut cur_i = 0.0f64; // sin(0)
-        for k in 0..m {
-            let c = if k < n { f64::from(coefs[k]) } else { 0.0 };
-            re[k] = c * cur;
-            im[k] = -c * cur_i;
-            // cos(θ+step) = 2cos(step)cos(θ) − cos(θ−step)（sin 同理）
-            let next = two_cos * cur - prev;
-            prev = cur;
-            cur = next;
-            let next_i = two_cos * cur_i - prev_i;
-            prev_i = cur_i;
-            cur_i = next_i;
-        }
-    }
-
-    fft_in_place(re, im);
-
-    // ---- 后旋转：u[j] = Re{ e^{−iφ_j}·D[j] }，就地写回 `im` ----
-    {
-        let step = pi / m as f64;
-        let base = step * 0.5; // φ_0
-        let two_cos = 2.0 * step.cos();
-        let mut prev = (base - step).cos();
-        let mut cur = base.cos();
-        let mut prev_i = (base - step).sin();
-        let mut cur_i = base.sin();
-        for j in 0..n {
-            let (r, i2) = (re[j], im[j]);
-            im[j] = r * cur + i2 * cur_i;
-            let next = two_cos * cur - prev;
-            prev = cur;
-            cur = next;
-            let next_i = two_cos * cur_i - prev_i;
-            prev_i = cur_i;
-            cur_i = next_i;
-        }
-    }
-
-    // ---- 三段对称展开（`u` 现在在 `im[..n]`）----
-    let u = &im[..n];
-    for i in 0..n / 2 {
-        out[i] = -(u[i + n / 2] as f32);
-    }
-    for i in n / 2..3 * n / 2 {
-        out[i] = u[3 * n / 2 - 1 - i] as f32;
-    }
-    for i in 3 * n / 2..m {
-        out[i] = u[i - 3 * n / 2] as f32;
-    }
-}
-
 /// 指数值：`10^(exp / 16)`。
 ///
 /// ⚠️ ffmpeg 的表是 `pow_tab[i] = 10^((i-60)/16)`（156 项，第 60 项 = 1.0），
@@ -1277,7 +1134,7 @@ mod tests {
     #[test]
     fn fast_imdct_matches_the_definition() {
         // 覆盖 WMA 真会用的块长：`BLOCK_MIN_BITS = 7` → 128，到 `frame_len` 上限 2048。
-        for &n in &[128usize, 512, 2048] {
+        for &n in &[128usize, 256, 512, 1024, 2048] {
             let mut state = 0x5eed_1234u32;
             let coefs: Vec<f32> = (0..n)
                 .map(|_| {
@@ -1289,9 +1146,7 @@ mod tests {
 
             let m = 2 * n;
             let mut got = vec![0f32; m];
-            let mut re = vec![0f64; m];
-            let mut im = vec![0f64; m];
-            imdct_kernel(&coefs, &mut got, &mut re, &mut im);
+            ImdctPlan::new(n, -1.0).apply(&coefs, &mut got);
 
             let peak = want.iter().fold(0f32, |m, v| m.max(v.abs()));
             let worst = got

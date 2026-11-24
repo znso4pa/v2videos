@@ -9,6 +9,7 @@ struct Matrices {
     long_windows: [[f64; 36]; 3],
     short_window: [f64; 12],
     dct_weights: [f64; 31],
+    synthesis_window: [f64; 512],
     alias: [(f64, f64); 8],
 }
 
@@ -49,6 +50,7 @@ impl Matrices {
                 long_windows,
                 short_window,
                 dct_weights,
+                synthesis_window: SYNTHESIS_WINDOW.map(f64::from),
                 alias,
             }
         })
@@ -57,7 +59,7 @@ impl Matrices {
 
 pub(crate) struct Synthesis {
     overlap: [[f64; 18]; 32],
-    history: [f64; 1024],
+    history: [[f64; 64]; 16],
     head: usize,
 }
 
@@ -65,7 +67,7 @@ impl Synthesis {
     pub(crate) fn new() -> Self {
         Self {
             overlap: [[0.0; 18]; 32],
-            history: [0.0; 1024],
+            history: [[0.0; 64]; 16],
             head: 0,
         }
     }
@@ -125,24 +127,26 @@ impl Synthesis {
         }
 
         for slot in &slots {
-            self.head = (self.head + 960) % 1024;
+            self.head = (self.head + 15) % 16;
             synthesis_vector(
                 slot,
                 &m.dct_weights,
-                &mut self.history[self.head..self.head + 64],
+                &mut self.history[self.head],
             );
-            for sample in 0..32 {
-                let mut sum = 0.0;
-                for bank in 0..8 {
-                    let base = self.head + 128 * bank + sample;
-                    sum +=
-                        self.history[base % 1024] * f64::from(SYNTHESIS_WINDOW[64 * bank + sample]);
-                    sum += self.history[(base + 96) % 1024]
-                        * f64::from(SYNTHESIS_WINDOW[64 * bank + 32 + sample]);
+            let mut samples = [0.0; 32];
+            for (bank, window) in m.synthesis_window.chunks_exact(64).enumerate() {
+                let first = (self.head + 2 * bank) % 16;
+                let second = (first + 1) % 16;
+                let a = &self.history[first][..32];
+                let b = &self.history[second][32..];
+                // 每个输出保持原有的 16 项累加顺序，按相邻采样并行计算。
+                for (k, sample) in samples.iter_mut().enumerate() {
+                    *sample += a[k] * window[k];
+                    *sample += b[k] * window[k + 32];
                 }
-                // D 的表存成 ×65536，输出 i16 刻度需要 ×32768。
-                out.push((sum * 0.5) as f32);
             }
+            // D 的表存成 ×65536，输出 i16 刻度需要 ×32768。
+            out.extend(samples.map(|sum| (sum * 0.5) as f32));
         }
     }
 }
@@ -158,9 +162,9 @@ fn imdct_pair(n: usize, row: usize) -> (usize, usize, f64) {
 }
 
 fn imdct_basis<const N: usize>() -> [[f64; N]; N] {
-    std::array::from_fn(|row| {
-        let (i, _, _) = imdct_pair(N, row);
-        std::array::from_fn(|k| {
+    std::array::from_fn(|k| {
+        std::array::from_fn(|row| {
+            let (i, _, _) = imdct_pair(N, row);
             (PI / (4 * N) as f64 * (2 * i + N + 1) as f64 * (2 * k + 1) as f64).cos()
         })
     })
@@ -168,9 +172,15 @@ fn imdct_basis<const N: usize>() -> [[f64; N]; N] {
 
 #[inline]
 fn imdct<const N: usize>(input: &[f64; N], basis: &[[f64; N]; N], window: &[f64], out: &mut [f64]) {
-    for (row, coefficients) in basis.iter().enumerate() {
+    // 矩阵按输入系数存放，每个输出的内积仍按输入顺序相加。
+    let mut sums = [-0.0; N];
+    for (&value, weights) in input.iter().zip(basis) {
+        for (sum, &weight) in sums.iter_mut().zip(weights) {
+            *sum += weight * value;
+        }
+    }
+    for (row, raw) in sums.into_iter().enumerate() {
         let (i, j, sign) = imdct_pair(N, row);
-        let raw: f64 = coefficients.iter().zip(input).map(|(a, b)| a * b).sum();
         out[i] += raw * window[i];
         out[j] += (raw * sign) * window[j];
     }

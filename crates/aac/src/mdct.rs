@@ -346,77 +346,13 @@ pub fn imdct(input: &[f32], out: &mut [f32]) {
     }
 }
 
-/// FFT 版 IMDCT：`N → 2N`，**与 `imdct` 同一个定标**（`1/n`，即规范的 `2/窗长`）。
-///
-/// 解码端用这一条。推导与 `mdct` 对称，只把相位挪到输出侧：
-///
-/// ```text
-///   y[n] = (2/N)·Σ_k X[k]·cos(π/N·(n+n0)(k+0.5))
-///        = (2/N)·Re{ e^{iθ_n} · Σ_k X[k]·e^{i2πnk/(2N)} }
-///   其中 θ_n = π(n+n0)/(2N)，Z[k] = X[k]·e^{iπ·n0·k/N}
-/// ```
-///
-/// 括号里那个和是 **2N 点逆 DFT** 的第 `n` 个 bin。FFT 只做正向，所以用
-/// 「输入取共轭 → 正变换 → 输出取共轭」拿（`v2v-kernel` 的 FFT 文档里写的就是这条）。
-///
-/// ⚠️ 两条相位都是**线性**的，所以旋转因子用切比雪夫递推生成，一次变换只调
-/// 4 次 `sin`/`cos`。与 `mdct` 一样，递推的状态**每次调用重新起**，不跨调用。
+/// FFT 版 IMDCT，定标为 `1/n`。连续处理相同块长时可复用 `ImdctPlan`。
 pub fn imdct_fast(input: &[f32], out: &mut [f32]) {
     let n = input.len();
-    debug_assert_eq!(out.len(), 2 * n);
-    debug_assert!(n.is_power_of_two());
-    let m = 2 * n;
-    let n0 = 0.5 + n as f64 / 2.0;
-    let step = PI / m as f64; // π/(2N)
-
-    let mut re = vec![0f64; m];
-    let mut im = vec![0f64; m];
-
-    // 预旋转：Z[k] = X[k]·e^{i·π·n0·k/N}，相位步长 = 2·step·n0（对 k 线性）
-    {
-        let s = 2.0 * step * n0;
-        let two_cos = 2.0 * s.cos();
-        let mut prev = (-s).cos();
-        let mut cur = 1.0f64; // cos(0)
-        let mut prev_i = (-s).sin();
-        let mut cur_i = 0.0f64; // sin(0)
-        for k in 0..n {
-            let x = f64::from(input[k]);
-            re[k] = x * cur;
-            im[k] = x * cur_i;
-            let next = two_cos * cur - prev;
-            prev = cur;
-            cur = next;
-            let next_i = two_cos * cur_i - prev_i;
-            prev_i = cur_i;
-            cur_i = next_i;
-        }
-    }
-
-    // 逆变换 = 共轭 → 正变换 → 共轭；输入那一次共轭折进下面这一行。
-    for v in im.iter_mut() {
-        *v = -*v;
-    }
-    fft_in_place(&mut re, &mut im);
-
-    // 后旋转：y[n] = (2/N)·Re{ e^{iθ_n}·conj(F[n]) } = (2/N)(re·cosθ + im·sinθ)
-    {
-        let base = step * n0;
-        let two_cos = 2.0 * step.cos();
-        let mut prev = (base - step).cos();
-        let mut cur = base.cos();
-        let mut prev_i = (base - step).sin();
-        let mut cur_i = base.sin();
-        let scale = 1.0 / n as f64;
-        for (i, o) in out.iter_mut().enumerate() {
-            *o = (scale * (re[i] * cur + im[i] * cur_i)) as f32;
-            let next = two_cos * cur - prev;
-            prev = cur;
-            cur = next;
-            let next_i = two_cos * cur_i - prev_i;
-            prev_i = cur_i;
-            cur_i = next_i;
-        }
+    if n == 1 {
+        imdct(input, out);
+    } else {
+        v2v_kernel::ImdctPlan::new(n, 1.0 / n as f64).apply(input, out);
     }
 }
 

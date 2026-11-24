@@ -140,11 +140,16 @@ struct Part<'a, 'b> {
 }
 
 impl Part<'_, '_> {
+    #[inline]
     fn read(&mut self, n: u32) -> Result<u32> {
         if self.bits.bit_pos() + n as usize > self.end {
             return Err(Error::Eof);
         }
-        self.bits.u(n)
+        if n == 1 {
+            self.bits.bit()
+        } else {
+            self.bits.u(n)
+        }
     }
 
     fn vlc(&mut self, table: &Vlc) -> Result<usize> {
@@ -351,10 +356,15 @@ impl Granule {
             }),
         });
         let mut out = [0; 576];
-        for i in (0..2 * self.big_values).step_by(2) {
-            let region = usize::from(i >= self.regions[0]) + usize::from(i >= self.regions[1]);
-            let table = self.tables[region];
-            if table == 0 {
+        let big_lines = 2 * self.big_values;
+        // 区域边界以系数编号表示，按每对系数的起点选择码本。
+        let [first, second] = self.regions.map(|end| (2 * end.div_ceil(2)).min(big_lines));
+        for (table, range) in self
+            .tables
+            .into_iter()
+            .zip([0..first, first..second, second..big_lines])
+        {
+            if table == 0 || range.is_empty() {
                 continue;
             }
             let [book, linbits] = PAIR_MAP[table];
@@ -362,12 +372,15 @@ impl Granule {
                 return Err(Error::Bad("MP3 reserved Huffman table"));
             }
             let book = book as usize;
-            let symbol = PAIRS[book][r.vlc(&books.pairs[book])?].2;
-            out[i] = r.signed((symbol >> 4).into(), linbits)?;
-            out[i + 1] = r.signed((symbol & 15).into(), linbits)?;
+            let vlc = &books.pairs[book];
+            for pair in out[range].chunks_exact_mut(2) {
+                let symbol = PAIRS[book][r.vlc(vlc)?].2;
+                pair[0] = r.signed((symbol >> 4).into(), linbits)?;
+                pair[1] = r.signed((symbol & 15).into(), linbits)?;
+            }
         }
 
-        for quad in out[2 * self.big_values..].chunks_exact_mut(4) {
+        for quad in out[big_lines..].chunks_exact_mut(4) {
             if r.bits.bit_pos() >= r.end {
                 break;
             }
@@ -419,6 +432,13 @@ impl Granule {
     fn requantize(&self, h: Header, sf: &[u8; 39], ints: &[i16; 576], out: &mut [f64; 576]) {
         static POW: OnceLock<[f64; 8207]> = OnceLock::new();
         let pow = POW.get_or_init(|| std::array::from_fn(|i| (i as f64).powf(4.0 / 3.0)));
+        // 全局增益与标度因子各 8 位，PRETAB 最大为 3，短窗增益 3 位。
+        const MIN_EXP: i32 = -210 - 4 * (255 + 3) - 8 * 7;
+        const MAX_EXP: i32 = 255 - 210;
+        static GAINS: OnceLock<[f64; (MAX_EXP - MIN_EXP + 1) as usize]> = OnceLock::new();
+        let gains = GAINS.get_or_init(|| {
+            std::array::from_fn(|i| (f64::from(MIN_EXP + i as i32) * 0.25).exp2())
+        });
         let mut start = 0;
         for (i, band) in self.bands(h).enumerate() {
             let end = start + band.len;
@@ -432,7 +452,7 @@ impl Granule {
             if let Some(w) = band.window {
                 exponent -= 8 * self.subgain[w] as i32;
             }
-            let gain = (f64::from(exponent) * 0.25).exp2();
+            let gain = gains[(exponent - MIN_EXP) as usize];
             for (y, &x) in out[start..end].iter_mut().zip(&ints[start..end]) {
                 *y = gain * pow[x.unsigned_abs() as usize] * f64::from(x.signum());
             }

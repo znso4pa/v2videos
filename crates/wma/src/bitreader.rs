@@ -1,60 +1,47 @@
-//! MSB 优先的位读取器（WMA 用的就是这个方向，见模块文档里的实测）。
+//! 共享 MSB 位读取器的 WMA 接口。
 
 use crate::{Error, Result};
 
 pub struct BitReader<'a> {
-    buf: &'a [u8],
-    /// 已读位数。
-    pos: usize,
+    pub(crate) inner: v2v_kernel::BitReader<'a>,
 }
 
 impl<'a> BitReader<'a> {
     pub fn new(buf: &'a [u8]) -> Self {
-        Self { buf, pos: 0 }
+        Self {
+            inner: v2v_kernel::BitReader::new(buf),
+        }
     }
 
     /// 读 `n` 位（`n <= 32`），MSB 在前。
     pub fn get(&mut self, n: u32) -> Result<u32> {
-        if n == 0 {
-            return Ok(0);
-        }
         if n > 32 {
             return Err(Error::Bad("一次最多读 32 位"));
         }
-        if self.pos + n as usize > self.buf.len() * 8 {
-            return Err(Error::Bad("读越界"));
-        }
-        let mut v = 0u32;
-        for _ in 0..n {
-            let byte = self.buf[self.pos >> 3];
-            let bit = (byte >> (7 - (self.pos & 7))) & 1;
-            v = (v << 1) | bit as u32;
-            self.pos += 1;
-        }
-        Ok(v)
+        self.inner.u(n).map_err(|_| Error::Bad("读越界"))
     }
 
     /// 读 1 位（`get_bits1`）。
     pub fn bit(&mut self) -> Result<u32> {
-        self.get(1)
+        self.inner.bit().map_err(|_| Error::Bad("读越界"))
     }
 
     /// 已读位数（`get_bits_count`）。
     pub fn bit_pos(&self) -> usize {
-        self.pos
+        self.inner.bit_pos()
     }
 
     pub fn skip(&mut self, n: usize) -> Result<()> {
-        if self.pos + n > self.buf.len() * 8 {
+        if n > self.bits_left() {
             return Err(Error::Bad("跳过越界"));
         }
-        self.pos += n;
+        self.inner.set_pos(self.inner.bit_pos() + n);
         Ok(())
     }
 
     /// 剩余位数。
     pub fn bits_left(&self) -> usize {
-        self.buf.len() * 8 - self.pos
+        self.inner.bits_left()
     }
 }
 

@@ -25,10 +25,13 @@
 //!
 //! 遇到还没做的部分**明确报 `Unsupported`**，不猜、不静默跳过。
 
-use crate::encode::{CB_DIM, CB_ESC, CB_MAXVAL, CB_RANGE, CB_UNSIGNED};
+use std::sync::OnceLock;
+
+use crate::encode::{spectral_power, CB_DIM, CB_ESC, CB_MAXVAL, CB_RANGE, CB_UNSIGNED};
 use crate::mdct::{LONG_LEN, SHORT_LEN};
 use crate::synthesis::Synthesis;
 use crate::{Error, Result};
+use v2v_kernel::Vlc;
 use v2v_tables::aac as t;
 
 /// 一个 TNS 滤波器（解码端只用得上「作用在哪个窗口 / 覆盖几条带 / 阶数 / 方向 / LPC」）。
@@ -683,12 +686,12 @@ impl Decoder {
         let range = usize::from(CB_RANGE[cb]);
         let maxval = i32::from(CB_MAXVAL[cb]);
         let unsigned = CB_UNSIGNED[cb];
-        let codes = &t::SPECTRAL_CODE[cb - 1];
-        let lens = &t::SPECTRAL_BITS[cb - 1];
-        let size = t::SPECTRAL_SIZE[cb - 1] as usize;
+        let vlc = &spectral_vlc()[cb - 1];
         let mut pos = 0usize;
         while pos < out.len() {
-            let idx = decode_spectral(r, codes, lens, size)?;
+            let idx = vlc
+                .decode(&mut r.inner)
+                .map_err(|_| Error::Bad("谱数据的 Huffman 码无效"))?;
             let mut vals = [0i32; 4];
             // `curidx = ((d0·range + d1)·range + d2)…`，反过来取数字。
             let mut t = idx;
@@ -793,18 +796,18 @@ impl Decoder {
     }
 }
 
-/// 谱数据的 Huffman：在 `size` 个码字里找匹配的 `(code, len)`。
-fn decode_spectral(r: &mut BitReader, codes: &[u16], lens: &[u8], size: usize) -> Result<usize> {
-    let mut code = 0u32;
-    for len in 1..=19u32 {
-        code = (code << 1) | r.u(1)?;
-        for i in 0..size {
-            if u32::from(lens[i]) == len && u32::from(codes[i]) == code {
-                return Ok(i);
-            }
-        }
-    }
-    Err(Error::Bad("谱数据的 Huffman 码无效"))
+/// 各谱码本在首次解码时建立共享 VLC 的前缀快表。
+fn spectral_vlc() -> &'static [Vlc; 11] {
+    static TABLES: OnceLock<[Vlc; 11]> = OnceLock::new();
+    TABLES.get_or_init(|| {
+        std::array::from_fn(|cb| {
+            let size = usize::from(t::SPECTRAL_SIZE[cb]);
+            let words: Vec<_> = (0..size)
+                .map(|i| [u32::from(t::SPECTRAL_CODE[cb][i]), u32::from(t::SPECTRAL_BITS[cb][i])])
+                .collect();
+            Vlc::new(&words)
+        })
+    })
 }
 
 /// escape 序列：**一元前缀 + `len` 位尾数**，幅值 = `(1 << len) | 尾数`。
@@ -872,7 +875,7 @@ fn dequant_one(q: i32) -> f32 {
     if q == 0 {
         return 0.0;
     }
-    let m = (q.unsigned_abs() as f64).powf(4.0 / 3.0) as f32;
+    let m = spectral_power(q.unsigned_abs() as usize) as f32;
     if q < 0 {
         -m
     } else {
@@ -881,48 +884,40 @@ fn dequant_one(q: i32) -> f32 {
 }
 
 /// 标度因子 Huffman：`SCALEFACTOR_CODE/BITS`（121 项）→ 索引。
-fn decode_scalefactor(r: &mut BitReader) -> Result<u32> {
-    let mut code: u32 = 0;
-    for len in 1..=19u32 {
-        code = (code << 1) | r.u(1)?;
-        for (i, (&c, &l)) in t::SCALEFACTOR_CODE
+fn decode_scalefactor(r: &mut BitReader) -> Result<usize> {
+    static VLC: OnceLock<Vlc> = OnceLock::new();
+    let vlc = VLC.get_or_init(|| {
+        let words: Vec<_> = t::SCALEFACTOR_CODE
             .iter()
-            .zip(t::SCALEFACTOR_BITS.iter())
-            .enumerate()
-        {
-            if u32::from(l) == len && c == code {
-                return Ok(i as u32);
-            }
-        }
-    }
-    Err(Error::Bad("scalefactor 的 Huffman 码无效".into()))
+            .zip(&t::SCALEFACTOR_BITS)
+            .map(|(&code, &bits)| [code, u32::from(bits)])
+            .collect();
+        Vlc::new(&words)
+    });
+    vlc.decode(&mut r.inner)
+        .map_err(|_| Error::Bad("scalefactor 的 Huffman 码无效"))
 }
 
-/// 位读取器（MSB 优先）。
+/// AAC 语法读取保留原有的截断错误，与 VLC 共用内核游标。
 struct BitReader<'a> {
-    d: &'a [u8],
-    bit: usize,
+    inner: v2v_kernel::BitReader<'a>,
 }
 
 impl<'a> BitReader<'a> {
     fn new(d: &'a [u8]) -> Self {
-        Self { d, bit: 0 }
-    }
-    fn pos(&self) -> usize {
-        self.bit
-    }
-    fn u(&mut self, n: u32) -> Result<u32> {
-        let mut v = 0u32;
-        for _ in 0..n {
-            let byte = self.bit / 8;
-            if byte >= self.d.len() {
-                return Err(Error::Bad("位流提前结束".into()));
-            }
-            let shift = 7 - (self.bit % 8);
-            v = (v << 1) | u32::from((self.d[byte] >> shift) & 1);
-            self.bit += 1;
+        Self {
+            inner: v2v_kernel::BitReader::new(d),
         }
-        Ok(v)
+    }
+
+    fn pos(&self) -> usize {
+        self.inner.bit_pos()
+    }
+
+    #[inline]
+    fn u(&mut self, n: u32) -> Result<u32> {
+        let value = if n == 1 { self.inner.bit() } else { self.inner.u(n) };
+        value.map_err(|_| Error::Bad("位流提前结束"))
     }
 }
 
@@ -941,7 +936,7 @@ mod tests {
             }
             let bytes = w.finish();
             let mut r = BitReader::new(&bytes);
-            let got = decode_scalefactor(&mut r).unwrap() as usize;
+            let got = decode_scalefactor(&mut r).unwrap();
             assert_eq!(got, idx, "索引 {idx} 往返成了 {got}");
         }
     }

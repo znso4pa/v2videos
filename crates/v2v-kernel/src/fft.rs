@@ -18,21 +18,28 @@
 //!
 //! ## 先要正确，再谈快
 //!
-//! 教科书版：位反转置换 + 逐级蝶形，每级现算 `half` 个旋转因子（`e^{-2πik/size}`）。
-//! 曾经想把旋转因子换成递推，结果跨 block 的状态没重置 —— AAC 那边的
-//! `fast_mdct_matches_the_definition` 当场抓住（相对偏差 2e13）。
+//! 位反转置换后执行逐级蝶形，旋转因子按级的长度缓存。
 //!
 //! 搬到这里之后多了一条**直接对着 O(n²) 的 DFT** 钉的测试（`matches_direct_dft`）：
 //! 它不依赖任何上层变换，换实现时先看它。
 
-use std::f64::consts::PI;
+use std::{f64::consts::PI, sync::OnceLock};
+
+// 4096 点覆盖 AAC 与 WMA 的变换。这些级的表合计约 64 KiB。
+static TWIDDLES: [OnceLock<Vec<(f64, f64)>>; 12] = [const { OnceLock::new() }; 12];
+
+fn twiddles(size: usize) -> Vec<(f64, f64)> {
+    (0..size / 2)
+        .map(|k| {
+            let angle = -2.0 * PI * k as f64 / size as f64;
+            (angle.cos(), angle.sin())
+        })
+        .collect()
+}
 
 /// 原地 radix-2 复数 FFT（DIT）。`re` 与 `im` 等长，长度必须是 2 的幂。
 ///
-/// 位反转置换 → 逐级蝶形。旋转因子**每级现算**（`cos`/`sin`），不建全局表：
-/// 一次调用是 `log2(len)` 级、合计 `len/2` 个旋转因子 —— 与「递推生成」相比多花
-/// 一点三角函数，换掉的是「跨调用状态」这类难查的错。这条在 AAC 与 WMA 两条
-/// 对账链路上都量过，不是瓶颈（见各自 crate 里的性能记录）。
+/// 4096 点以内的旋转因子由各级共用。更长的变换仍支持，额外的级在调用时生成。
 pub fn fft_in_place(re: &mut [f64], im: &mut [f64]) {
     let len = re.len();
     debug_assert!(len.is_power_of_two());
@@ -57,25 +64,29 @@ pub fn fft_in_place(re: &mut [f64], im: &mut [f64]) {
     let mut size = 2usize;
     while size <= len {
         let half = size / 2;
-        let tw: Vec<(f64, f64)> = (0..half)
-            .map(|k| {
-                let a = -2.0 * PI * (k as f64) / (size as f64);
-                (a.cos(), a.sin())
-            })
-            .collect();
-        let mut start = 0usize;
-        while start < len {
-            for (k, &(w_re, w_im)) in tw.iter().enumerate() {
-                let a = start + k;
-                let b = a + half;
-                let tr = re[b] * w_re - im[b] * w_im;
-                let ti = re[b] * w_im + im[b] * w_re;
-                re[b] = re[a] - tr;
-                im[b] = im[a] - ti;
-                re[a] += tr;
-                im[a] += ti;
+        let uncached;
+        let tw = if let Some(cache) = TWIDDLES.get(size.trailing_zeros() as usize - 1) {
+            cache.get_or_init(|| twiddles(size))
+        } else {
+            uncached = twiddles(size);
+            &uncached
+        };
+        for (re_chunk, im_chunk) in re.chunks_exact_mut(size).zip(im.chunks_exact_mut(size)) {
+            let (lo_re, hi_re) = re_chunk.split_at_mut(half);
+            let (lo_im, hi_im) = im_chunk.split_at_mut(half);
+            for (((a_re, a_im), (b_re, b_im)), &(w_re, w_im)) in lo_re
+                .iter_mut()
+                .zip(lo_im)
+                .zip(hi_re.iter_mut().zip(hi_im))
+                .zip(tw)
+            {
+                let tr = *b_re * w_re - *b_im * w_im;
+                let ti = *b_re * w_im + *b_im * w_re;
+                *b_re = *a_re - tr;
+                *b_im = *a_im - ti;
+                *a_re += tr;
+                *a_im += ti;
             }
-            start += size;
         }
         size <<= 1;
     }

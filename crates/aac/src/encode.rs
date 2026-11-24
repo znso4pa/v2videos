@@ -1131,6 +1131,7 @@ impl Encoder {
                 if sd < lo_scan {
                     sd += step;
                 }
+                let first_grid_point = sd;
                 while sd <= hi_scan {
                     evaluate(sd, &mut best);
                     sd += step;
@@ -1139,9 +1140,13 @@ impl Encoder {
                 // 窗口下界（`floor = sf_floor + 偏移`）很可能不在格点上 ——
                 // 而**安静频带的最优点恰恰就在 floor 上**（那是「什么都不裁」的下界）。
                 // 少了它实测掉 **0.83 dB**（12.13 → 11.30），补回来就恢复。
-                // 端点被反复求值不要紧 —— 帧内缓存让重复求值几乎免费。
-                evaluate(lo_scan, &mut best);
-                evaluate(hi_scan, &mut best);
+                // 端点已经在这一轮的网格上时，重复求值不会改变严格小于的平手规则。
+                if first_grid_point != lo_scan {
+                    evaluate(lo_scan, &mut best);
+                }
+                if sd - step != hi_scan && hi_scan != lo_scan {
+                    evaluate(hi_scan, &mut best);
+                }
                 if step == 1 {
                     break;
                 }
@@ -1789,13 +1794,17 @@ fn round_quant(power: f64, scale: f64) -> i32 {
     (power * scale).round() as i32
 }
 
-/// Escape 系数的反量化。幅值受 13 位限制，`q^(4/3)` 可跨频带和帧复用。
-/// 与直接计算使用相同的 f64 幂和缩放乘法。
+/// Escape 系数的反量化，乘编码搜索所用的标度因子。
 fn dequant_one(q: i32, sf: u8) -> f64 {
+    spectral_power(q as usize) * f64::from(iq(sf))
+}
+
+/// 幅值受 13 位限制，编解码共用相同的 f64 反量化幂表。
+pub(crate) fn spectral_power(q: usize) -> f64 {
     static POWERS: std::sync::OnceLock<[f64; ESCAPE_COEF_MAX as usize + 1]> =
         std::sync::OnceLock::new();
     let powers = POWERS.get_or_init(|| std::array::from_fn(|q| (q as f64).powf(4.0 / 3.0)));
-    powers[q as usize] * f64::from(iq(sf))
+    powers[q]
 }
 
 fn band_energy(band: &[f32]) -> f32 {

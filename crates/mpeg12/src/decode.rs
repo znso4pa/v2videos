@@ -960,7 +960,7 @@ fn store_pred_block(
     interlaced_dct: bool,
     mv_x: i32,
     mv_y: i32,
-    residual: &[i32; 64],
+    residual: Option<&[i32; 64]>,
     chroma_format: u8,
 ) {
     let (chroma, origin_x, origin_y, stride, row_step) =
@@ -981,7 +981,12 @@ fn store_pred_block(
         4 | 6 | 8 | 10 => &mut frame.u,
         _ => &mut frame.v,
     };
-    store_pred(&pred, residual, plane, stride, origin_y * plane_width + origin_x);
+    let base = origin_y * plane_width + origin_x;
+    if let Some(residual) = residual {
+        store_pred(&pred, residual, plane, stride, base);
+    } else {
+        store_pixels(&pred, plane, stride, base);
+    }
 }
 
 /// 解一个帧内块。
@@ -2347,13 +2352,13 @@ fn decode_p_frame_into(
                             &mut r, quant, &tables.inter_lut, tables.inter_rl, tables.scan,
                             tables.inter_eob, !frame_picture,
                         )?;
-                        idct_residual(&coeffs)
+                        Some(idct_residual(&coeffs))
                     } else {
-                        [0i32; 64]
+                        None
                     };
                     store_pred_block(
                         &mut frame, reference, block, column, mb_row, width, height, cw, ch,
-                        interlaced_dct, mv_f[0][0], mv_f[0][1], &residual, chroma_format,
+                        interlaced_dct, mv_f[0][0], mv_f[0][1], residual.as_ref(), chroma_format,
                     );
                 }
             }
@@ -2379,7 +2384,7 @@ fn write_b_block(
     bwd: bool,
     mv_f: (i32, i32),
     mv_b: (i32, i32),
-    residual: &[i32; 64],
+    residual: Option<&[i32; 64]>,
     width: usize,
     height: usize,
     cw: usize,
@@ -2421,7 +2426,12 @@ fn write_b_block(
         4 | 6 | 8 | 10 => &mut frame.u,
         _ => &mut frame.v,
     };
-    store_pred(&pred, residual, out_plane, stride, origin_y * plane_width + origin_x);
+    let base = origin_y * plane_width + origin_x;
+    if let Some(residual) = residual {
+        store_pred(&pred, residual, out_plane, stride, base);
+    } else {
+        store_pixels(&pred, out_plane, stride, base);
+    }
 }
 
 /// 一个只有预测、没有残差的 B 帧宏块（跳过宏块）。
@@ -2444,10 +2454,9 @@ fn write_predicted_mb(
     chroma_format: u8,
     mb_blocks: usize,
 ) {
-    let zero = [0i32; 64];
     for block in 0..mb_blocks {
         write_b_block(
-            frame, forward, backward, block, column, mb_row, fwd, bwd, mv_f, mv_b, &zero, width,
+            frame, forward, backward, block, column, mb_row, fwd, bwd, mv_f, mv_b, None, width,
             height, cw, ch, interlaced_dct, chroma_format,
         );
     }
@@ -2455,16 +2464,13 @@ fn write_predicted_mb(
 
 /// 合并前向 / 后向两路预测（双向取平均）。
 fn combine_pred(pf: &Option<[u8; 64]>, pb: &Option<[u8; 64]>) -> [u8; 64] {
-    let mut out = [0u8; 64];
-    for i in 0..64 {
-        out[i] = match (pf, pb) {
-            (Some(a), Some(b)) => ((a[i] as u16 + b[i] as u16 + 1) >> 1) as u8,
-            (Some(a), None) => a[i],
-            (None, Some(b)) => b[i],
-            (None, None) => 0,
-        };
+    match (pf, pb) {
+        (Some(a), Some(b)) => {
+            std::array::from_fn(|i| ((u16::from(a[i]) + u16::from(b[i]) + 1) >> 1) as u8)
+        }
+        (Some(a), None) | (None, Some(a)) => *a,
+        (None, None) => [0; 64],
     }
-    out
 }
 
 /// 写一个 B 帧场运动宏块的预测（两场各自前向 / 后向 / 双向）。
@@ -2912,14 +2918,14 @@ fn decode_b_frame_into(
                             &mut r, quant, &tables.inter_lut, tables.inter_rl, tables.scan,
                             tables.inter_eob, !frame_picture,
                         )?;
-                        idct_residual(&coeffs)
+                        Some(idct_residual(&coeffs))
                     } else {
-                        [0i32; 64]
+                        None
                     };
                     write_b_block(
                         &mut frame, forward, backward, block, column, mb_row, mb.forward,
                         mb.backward, (mv_f[0][0], mv_f[0][1]), (mv_b[0][0], mv_b[0][1]),
-                        &residual, width, height, cw, ch, interlaced_dct, chroma_format,
+                        residual.as_ref(), width, height, cw, ch, interlaced_dct, chroma_format,
                     );
                 }
             }

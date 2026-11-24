@@ -11,7 +11,7 @@
 //! - ✅ **码表**（`tables.rs`，由 `tools/gen_wma_tables.py` 从 ffmpeg 的数据文件生成，
 //!   带 Kraft 和自检）
 //! - ✅ **帧头 → 指数解码（LSP / VLC）→ 位分配 → 系数（6 张 RL 表）→ IMDCT**
-//!   （IMDCT 走 **FFT**：`2n` 个输出折成 `n` 点 DCT-IV + 三段对称，再折成一次 `2n` 点 FFT）
+//!   （IMDCT 走 **FFT**：`2n` 个输出折成 `n` 点 DCT-IV + 三段对称，再折成一次 `n/2` 点复数 FFT）
 //! - ✅ **v2 整轨对账**：真样本整轨与 ffmpeg PCM **最大差 3**
 //! - ✅ **v1 整轨对账**：真样本整轨与 ffmpeg PCM **最大差 2**
 //!
