@@ -484,4 +484,197 @@ impl Ctx<'_, '_> {
             }
         }
     }
+
+    // ================= 重叠平滑（overlap smoothing） =================
+    //
+    // 上游 `ff_vc1_i_overlap_filter()` / `ff_vc1_p_overlap_filter()`
+    // （`vc1_loopfilter.c`）+ `vc1dsp.c` 的 `vc1_h_s_overlap` / `vc1_v_s_overlap`。
+    //
+    // ⚠️ 上游把这两个滤波器作用在**块数组**上，但那时块数组已经是**像素域**的了
+    // （`vc1_decode_i_block` 之后立刻 `vc1_inv_trans_8x8`，overlap 在 put 之前跑）。
+    // 所以重叠平滑本质上是**纯像素域的跨块边滤波**，本实现直接作用在帧像素上，
+    // 省掉上游那套「写像素落后一圈」的块缓冲轮转。
+    //
+    // 为什么可以直接写帧：上游延迟写像素只是为了「滤波跑之前邻居的像素还没定稿」。
+    // 本实现是**立刻**写像素，滤波时四个相邻宏块都已经在帧里了；而重叠平滑对同一条
+    // 边只滤一次，读写顺序与上游一致（先所有横边、再所有竖边；块号 0..5 从小到大），
+    // 所以结果逐像素相同。
+    //
+    // 唯一的理论差异：上游把中间结果留在 `int16_t` 块里（可能超出 0..255），最后
+    // `put_signed_pixels_clamped` 才 clip；这里写回 u8 时立刻 clip。横竖两遍都会碰到的
+    // 那 4 个角像素在**极端对比**下可能差 1 级。实测样本上没有出现。
+    //
+    // 上游 B 帧**不做** overlap（`vc1_decode_b_blocks` 里没有这个调用），只有 I / BI / P 做。
+
+    /// 一条**竖边**的重叠平滑（`vc1_h_s_overlap`）：`x` 是右侧块的第一列，`y` 起 `rows` 行。
+    ///
+    /// `rnd1` 从 `rnd1_0` 开始、`rnd2 = 7 - rnd1`，每行互换 —— 这就是上游
+    /// `if (flags & 1) { rnd2 = 7 - rnd2; rnd1 = 7 - rnd1; }`。
+    /// （`flags & 2` 只给隔行用，渐进式永远是 `rnd1_0 = 4`。）
+    fn h_s_overlap(&mut self, plane: usize, x: isize, y: isize, rows: usize, rnd1_0: i32) {
+        let stride = self.plane_stride(plane) as isize;
+        let d = self.plane_mut(plane);
+        let mut rnd1 = rnd1_0;
+        let mut rnd2 = 7 - rnd1;
+        for r in 0..rows as isize {
+            let base = (y + r) * stride + x;
+            let at = |k: isize| (base + k) as usize;
+            let a = d[at(-2)] as i32;
+            let b = d[at(-1)] as i32;
+            let c = d[at(0)] as i32;
+            let e = d[at(1)] as i32;
+            let d1 = a - e;
+            let d2 = a - e + b - c;
+            d[at(-2)] = (((a << 3) - d1 + rnd1) >> 3).clamp(0, 255) as u8;
+            d[at(-1)] = (((b << 3) - d2 + rnd2) >> 3).clamp(0, 255) as u8;
+            d[at(0)] = (((c << 3) + d2 + rnd1) >> 3).clamp(0, 255) as u8;
+            d[at(1)] = (((e << 3) + d1 + rnd2) >> 3).clamp(0, 255) as u8;
+            rnd2 = 7 - rnd2;
+            rnd1 = 7 - rnd1;
+        }
+    }
+
+    /// 一条**横边**的重叠平滑（`vc1_v_s_overlap`）：`y` 是下方块的第一行，`x` 起 `cols` 列。
+    ///
+    /// 核与 `h_s_overlap` 一样，只是采样方向沿列；取的是上方块的**第 6、7 行**
+    /// 与下方块的**第 0、1 行**（上游 `top[48]` / `top[56]` / `bottom[0]` / `bottom[8]`）。
+    fn v_s_overlap(&mut self, plane: usize, x: isize, y: isize, cols: usize) {
+        let stride = self.plane_stride(plane) as isize;
+        let d = self.plane_mut(plane);
+        let mut rnd1 = 4;
+        let mut rnd2 = 3;
+        for c in 0..cols as isize {
+            let base = y * stride + x + c;
+            let at = |k: isize| (base + k * stride) as usize;
+            let a = d[at(-2)] as i32;
+            let b = d[at(-1)] as i32;
+            let c0 = d[at(0)] as i32;
+            let e = d[at(1)] as i32;
+            let d1 = a - e;
+            let d2 = a - e + b - c0;
+            d[at(-2)] = (((a << 3) - d1 + rnd1) >> 3).clamp(0, 255) as u8;
+            d[at(-1)] = (((b << 3) - d2 + rnd2) >> 3).clamp(0, 255) as u8;
+            d[at(0)] = (((c0 << 3) + d2 + rnd1) >> 3).clamp(0, 255) as u8;
+            d[at(1)] = (((e << 3) + d1 + rnd2) >> 3).clamp(0, 255) as u8;
+            rnd2 = 7 - rnd2;
+            rnd1 = 7 - rnd1;
+        }
+    }
+
+    /// 块 `i` 在 `(mx, my)` 处的「是不是帧内」（上游 `v->mb_type[0][block_index[i]]`）。
+    fn blk_is_intra(&self, mx: usize, my: usize, i: usize) -> bool {
+        let idx = if i < 4 {
+            self.blk(mx, my, i)
+        } else {
+            self.cblk(mx, my, i - 4)
+        };
+        self.grids.mb_type[idx] != 0
+    }
+
+    /// 块 `i` 左边那个块「是不是帧内」（上游 `v->mb_type[0][block_index[i] - 1]`）。
+    fn blk_left_is_intra(&self, mx: usize, my: usize, i: usize) -> bool {
+        let idx = if i < 4 {
+            self.blk(mx, my, i)
+        } else {
+            self.cblk(mx, my, i - 4)
+        };
+        self.grids.mb_type[idx - 1] != 0
+    }
+
+    /// `(mx, my)` 的块 `i` 的竖边重叠平滑。`i` 的几何：
+    /// `0/1` 上半（行 0..8）、`2/3` 下半（行 8..16）、`4/5` 色度；
+    /// `i & 1` 选左右半（左半的边在宏块左边界，右半的边在中线）。
+    fn h_overlap_mb(&mut self, mx: usize, my: usize, i: usize) {
+        if i < 4 {
+            let x = (mx * 16 + (i & 1) * 8) as isize;
+            let y = (my * 16 + (i >> 1) * 8) as isize;
+            self.h_s_overlap(0, x, y, 8, 4);
+        } else {
+            let x = (mx * 8) as isize;
+            let y = (my * 8) as isize;
+            self.h_s_overlap(i - 3, x, y, 8, 4);
+        }
+    }
+
+    /// `(mx, my)` 的块 `i` 的横边重叠平滑（`(mx, my)` 是**下方**那个宏块）。
+    fn v_overlap_mb(&mut self, mx: usize, my: usize, i: usize) {
+        if i < 4 {
+            let x = (mx * 16 + (i & 1) * 8) as isize;
+            let y = (my * 16 + (i >> 1) * 8) as isize;
+            self.v_s_overlap(0, x, y, 8);
+        } else {
+            let x = (mx * 8) as isize;
+            let y = (my * 8) as isize;
+            self.v_s_overlap(i - 3, x, y, 8);
+        }
+    }
+
+    /// `ff_vc1_i_overlap_filter()`（I / BI 帧）。
+    pub(crate) fn i_overlap_filter(&mut self, mbx: usize, mby: usize) {
+        // 渐进式 Simple/Main：只有 `pq >= 9` 才开（没有 `condover` 那套逐宏块开关）。
+        if self.hdr.pq < 9 {
+            return;
+        }
+        // ---- 横滤波（竖边）：本宏块的左边 + 内部中线 ----
+        for i in 0..6usize {
+            if mbx == 0 && (i & 5) != 1 {
+                continue;
+            }
+            self.h_overlap_mb(mbx, mby, i);
+        }
+        // ---- 竖滤波（横边）：左边那个宏块的上边 + 内部中线 ----
+        for i in 0..6usize {
+            if mby == 0 && (i & 2) == 0 {
+                continue;
+            }
+            if mbx > 0 {
+                self.v_overlap_mb(mbx - 1, mby, i);
+            }
+            if mbx == self.mb_width - 1 {
+                self.v_overlap_mb(mbx, mby, i);
+            }
+        }
+    }
+
+    /// `ff_vc1_p_overlap_filter()`（P 帧）：与 I 帧同一套几何，但**两侧都得是帧内块**
+    /// 才滤（帧间块的像素来自运动补偿，不能动）。
+    pub(crate) fn p_overlap_filter(&mut self, mbx: usize, mby: usize) {
+        if self.hdr.pq < 9 {
+            return;
+        }
+        for i in 0..6usize {
+            if mbx == 0 && (i & 5) != 1 {
+                continue;
+            }
+            if self.blk_is_intra(mbx, mby, i) && self.blk_left_is_intra(mbx, mby, i) {
+                self.h_overlap_mb(mbx, mby, i);
+            }
+        }
+        for i in 0..6usize {
+            if mby == 0 && (i & 2) == 0 {
+                continue;
+            }
+            // ⚠️ 两个判据都要看**上面那一行**的 `mb_type`。第一行（`mby == 0`）没有
+            // 上一行：上游读到的是分配时清零的填充区（恒 0），于是判据恒假 ——
+            // 等价于「第一行一条横边都不滤」，这里显式跳过（`mby - 1` 也会下溢）。
+            if mby == 0 {
+                continue;
+            }
+            // ⚠️ 判据与几何**不是一一对应**的（上游就这样）：`i = 0/1` 判的是
+            // 「左边宏块的同号块」与「它上面那个块」，而滤的是 `i = 0/1` 对应的
+            // 上一行块。照抄，别「顺手改对」—— 改了就和上游分叉了。
+            if mbx > 0
+                && self.blk_is_intra(mbx - 1, mby, i)
+                && self.blk_is_intra(mbx - 1, mby - 1, i)
+            {
+                self.v_overlap_mb(mbx - 1, mby, i);
+            }
+            if mbx == self.mb_width - 1
+                && self.blk_is_intra(mbx, mby, i)
+                && self.blk_is_intra(mbx, mby - 1, i)
+            {
+                self.v_overlap_mb(mbx, mby, i);
+            }
+        }
+    }
 }

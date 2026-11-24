@@ -19,6 +19,7 @@ use v2v_kernel::{Error, Result, Vlc};
 
 use crate::decoder::Ctx;
 use crate::idct;
+use crate::mv::BmvType;
 use crate::tables;
 
 // ---- 前缀码（每张表建一次树，全局共用）----
@@ -93,9 +94,42 @@ static DCPRED: [u16; 32] = [
     49, 47, 45, 43, 41, 39, 38, 37, 35, 34, 33,
 ];
 
+/// 色度 DC 定标与亮度**同一张表**。
+///
+/// ⚠️ 这里差点写错，留个记号：`ff_mpv_common_defaults()` 里 `c_dc_scale_table` 确实
+/// 先被赋成 `ff_mpeg1_dc_scale_table`（整张表全是 8），但 `vc1dec.c` 的
+/// `vc1_decode_init()` **紧接着把两张表都换成了** `ff_wmv3_dc_scale_table`：
+/// ```c
+/// s->y_dc_scale_table = ff_wmv3_dc_scale_table;
+/// s->c_dc_scale_table = ff_wmv3_dc_scale_table;
+/// ```
+/// 只看第一处赋值会以为色度恒为 8 —— 实测那样整帧色度会偏 1..7 级
+/// （判据是逐像素 0 差，立刻就红）。所以这里跟着亮度走。
+#[inline]
+fn c_dc_scale(y_dc_scale: i32) -> i32 {
+    y_dc_scale
+}
+
 /// `offset_table[1]` 与 `size_table`：`GET_MVDATA` 里那两张本地小表。
 static MV_OFFSET: [u8; 9] = [0, 1, 3, 7, 15, 31, 63, 127, 255];
 static MV_SIZE: [u8; 6] = [0, 2, 3, 4, 5, 8];
+
+/// `ff_vc1_pred_dc()` 里那句跨量化步长的换算：
+/// `(int)((unsigned)v * y_dc_scale_table[q2] * ff_vc1_dqscale[i] + 0x20000) >> 18`。
+///
+/// ⚠️ **右移必须是算术右移**。上游先把 `(unsigned)` 乘积**转回 `int`** 再 `>> 18`，
+/// 所以负数走的是算术右移；在 `u32` 上做逻辑右移会把 `-24` 变成 `16352` 这种
+/// 大正数 —— 差值恰好是 `1 << 14`，不是「差一点」，而是整块 DC 被抬到天上。
+/// 实测（2026-11-09）：一个 P 帧的帧内宏块因此 6 个块全饱和成 255，
+/// 而且**只有这一块**错（要求邻居量化步长不同 + 邻居 DC 为负，两个条件同时成立才触发）。
+#[inline]
+fn dc_rescale(v: i32, q2: i32, dqscale_index: i32) -> i32 {
+    let prod = (v as u32)
+        .wrapping_mul(tables::DC_SCALE[q2.clamp(0, 31) as usize] as u32)
+        .wrapping_mul(tables::DQSCALE[dqscale_index as usize])
+        .wrapping_add(0x20000);
+    (prod as i32) >> 18
+}
 
 impl Ctx<'_, '_> {
     // ================= I 帧 =================
@@ -115,15 +149,20 @@ impl Ctx<'_, '_> {
             _ => tables::CS_MID_RATE_INTRA as usize,
         };
         self.codingset2 = self.coding_set2();
-        // I 帧的 DC 定标整帧一样（y 与 c 用同一张表）。
+        // I 帧的 DC 定标整帧一样（y 与 c 各查各的表）。
         self.y_dc_scale = tables::DC_SCALE[self.hdr.pq as usize] as i32;
-        self.c_dc_scale = self.y_dc_scale;
+        self.c_dc_scale = c_dc_scale(self.y_dc_scale);
 
         for mby in 0..self.mb_height {
             for mbx in 0..self.mb_width {
                 *self.last_mb = (mbx, mby);
                 *self.last_bits = self.r.bit_pos();
                 self.decode_i_mb(mbx, mby)?;
+                // ⚠️ 顺序不能换：上游 `vc1_decode_i_blocks` 是
+                // 「解宏块 → overlap → 写像素 → 环路滤波」。本实现写像素是立刻做的，
+                // 所以只剩「解 → overlap → 环路滤波」，而环路滤波必须**在 overlap
+                // 之后**（它滤的边可能刚被 overlap 改过）。
+                self.i_overlap_filter(mbx, mby);
                 if self.loop_filter {
                     self.i_loop_filter(mbx, mby);
                 }
@@ -150,6 +189,12 @@ impl Ctx<'_, '_> {
     fn decode_i_mb(&mut self, mbx: usize, mby: usize) -> Result<()> {
         let cbp = vlc_mb_intra().decode(&mut self.r)? as u32;
         let ac_pred = self.r.bit()? != 0;
+        // ⚠️ 重叠平滑真的在跑的时候，I 帧的块值是**以 0 为中心**的残差
+        // （写像素时要 +128）。上游 `vc1_decode_i_blocks`：
+        //   if (overlap && pq >= 9) { overlap; vc1_put_blocks_clamped(v, 1); }
+        //   else                    { vc1_put_blocks_clamped(v, 0); }
+        // 漏掉这个 +128，整帧会整体暗 128 级 —— 而且只在 `pq >= 9` 的 I 帧里现形。
+        let signed = self.seq.overlap && self.hdr.pq >= 9;
         for k in 0..6usize {
             let mut val = (cbp >> (5 - k)) & 1;
             let bi = self.blk(mbx, mby, k);
@@ -161,7 +206,7 @@ impl Ctx<'_, '_> {
                 self.grids.coded_block[bi] = val as u8;
             }
             let block = self.decode_i_block(mbx, mby, k, val != 0, ac_pred)?;
-            self.put_block(mbx, mby, k, block, false);
+            self.put_block(mbx, mby, k, block, signed);
         }
         Ok(())
     }
@@ -190,6 +235,8 @@ impl Ctx<'_, '_> {
                 *self.last_mb = (mbx, mby);
                 *self.last_bits = self.r.bit_pos();
                 self.decode_p_mb(mbx, mby)?;
+                // 与 I 帧同理：overlap 必须在环路滤波之前（见 `decode_i_blocks`）。
+                self.p_overlap_filter(mbx, mby);
                 if self.loop_filter {
                     self.p_loop_filter(mbx, mby);
                 }
@@ -202,8 +249,8 @@ impl Ctx<'_, '_> {
     ///
     /// 返回 `(dmv_x, dmv_y, mb_intra, mb_has_coeffs)`。
     fn get_mvdata(&mut self) -> Result<(i32, i32, bool, bool)> {
-        let mv_table_index = self.hdr.p.as_ref().unwrap().mv_table_index as usize;
-        let qs = self.hdr.p.as_ref().unwrap().quarter_sample;
+        let mv_table_index = self.mv_table_index() as usize;
+        let qs = self.quarter_sample();
         let mut index = 1 + vlc_p_mv_diff(mv_table_index).decode(&mut self.r)? as i32;
         let mb_has_coeffs;
         if index > 36 {
@@ -513,6 +560,312 @@ impl Ctx<'_, '_> {
         self.mbp.cbp[mb_pos] = block_cbp;
         self.mbp.ttblk[mb_pos] = block_tt;
         self.mbp.is_intra[mb_pos] = block_intra;
+        // 临时探针（排查完即删）。
+        {
+            static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *F.get_or_init(|| std::env::var_os("V2V_P_DBG").is_some()) {
+                let d = |i: usize| -> i16 {
+                    if i < 4 {
+                        self.grids.dc_luma[self.blk(mbx, mby, i)]
+                    } else {
+                        self.grids.dc_chroma[self.cblk(mbx, mby, i - 4)]
+                    }
+                };
+                eprintln!(
+                    "PMB {mbx} {mby} fourmv={} skip={} intra={} cbp={} bintra={} mq={} dc={},{},{},{},{},{}",
+                    fourmv as u8,
+                    skipped as u8,
+                    (block_intra != 0) as u8,
+                    block_cbp,
+                    block_intra,
+                    mquant,
+                    d(0),
+                    d(1),
+                    d(2),
+                    d(3),
+                    d(4),
+                    d(5)
+                );
+            }
+        }
+        Ok(())
+    }
+
+    // ================= B 帧 =================
+
+    /// `vc1_decode_b_blocks()`。
+    pub(crate) fn decode_b_blocks(&mut self) -> Result<()> {
+        // ⚠️ 两张码表**都**从 `c_ac_table_index` 来（上游 `vc1_decode_b_blocks` 里
+        // 是两个一模一样的 switch），与 P 帧同一套。
+        self.codingset = match self.hdr.c_ac_table_index {
+            0 => {
+                if self.hdr.pqindex <= 8 {
+                    tables::CS_HIGH_RATE_INTRA as usize
+                } else {
+                    tables::CS_LOW_MOT_INTRA as usize
+                }
+            }
+            1 => tables::CS_HIGH_MOT_INTRA as usize,
+            _ => tables::CS_MID_RATE_INTRA as usize,
+        };
+        self.codingset2 = self.coding_set2();
+        self.tt_index = (self.hdr.pq > 4) as usize + (self.hdr.pq > 12) as usize;
+
+        for mby in 0..self.mb_height {
+            for mbx in 0..self.mb_width {
+                *self.last_mb = (mbx, mby);
+                *self.last_bits = self.r.bit_pos();
+                self.decode_b_mb(mbx, mby)?;
+                // ⚠️ B 帧用的是 **I 帧**那套环路滤波（上游 `ff_vc1_i_loop_filter`）：
+                // 它不读 cbp / ttblk / is_intra，每条边都无条件滤 —— 换成 P 那套
+                // 会按「边两侧的 MV 是否相同」跳过滤波，B 帧的 MV 面根本没有那个语义。
+                if self.loop_filter {
+                    self.i_loop_filter(mbx, mby);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `vc1_b_mc()`：按方向做运动补偿。
+    fn b_mc(&mut self, mbx: usize, mby: usize, direct: bool, mvtype: BmvType) {
+        // 临时探针（排查完即删）。
+        {
+            static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *F.get_or_init(|| std::env::var_os("V2V_B_DBG").is_some()) {
+                let xy = self.blk(mbx, mby, 0);
+                eprintln!(
+                    "MC {mbx},{mby} direct={direct} type={mvtype:?} f={:?} b={:?}",
+                    self.grids.mv[xy], self.grids.mv_bwd[xy]
+                );
+            }
+        }
+        if direct || mvtype == BmvType::Interpolated {
+            // 前向先写进帧，后向再与它平均（上游 `mc_1mv(0)` + `interp_mc()`）。
+            self.mc_1mv_dir(mbx, mby, 0, false);
+            self.mc_1mv_dir(mbx, mby, 1, true);
+        } else {
+            let dir = (mvtype == BmvType::Backward) as usize;
+            self.mc_1mv_dir(mbx, mby, dir, false);
+        }
+    }
+
+    /// `vc1_decode_b_mb()`（渐进式）。
+    ///
+    /// 与 P 帧的差别集中在前半段：B 帧的宏块类型不是一张 VLC，而是
+    /// **「直接预测位 + 跳过位 + MVDATA + 一个 012 的方向码」**四样拼出来的。
+    /// 后半段（系数、逆变换、写像素）与 P 帧一模一样，所以复用同一批函数。
+    fn decode_b_mb(&mut self, mbx: usize, mby: usize) -> Result<()> {
+        // 临时探针：`V2V_B_DBG=1` 时把每个宏块的决定打出来（排查完即删）。
+        let dbg = {
+            static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *F.get_or_init(|| std::env::var_os("V2V_B_DBG").is_some())
+        };
+        if !dbg {
+            return self.decode_b_mb_inner(mbx, mby);
+        }
+        let xy = self.blk(mbx, mby, 0);
+        let r = self.decode_b_mb_inner(mbx, mby);
+        eprintln!(
+            "MB {mbx},{mby} f={:?} b={:?} q={} intra={}",
+            self.grids.mv[xy], self.grids.mv_bwd[xy], self.mbp.qscale[self.mbidx(mbx, mby)],
+            self.grids.mb_type[xy],
+        );
+        r
+    }
+
+    fn decode_b_mb_inner(&mut self, mbx: usize, mby: usize) -> Result<()> {
+        let (direct, skipped) = {
+            let b = self.hdr.b.as_ref().unwrap();
+            let direct = if b.direct_plane.raw {
+                self.r.bit()? != 0
+            } else {
+                b.direct_plane.get(mbx, mby) != 0
+            };
+            let skipped = if b.skip_plane.raw {
+                self.r.bit()? != 0
+            } else {
+                b.skip_plane.get(mbx, mby) != 0
+            };
+            (direct, skipped)
+        };
+        let (cbptab, tt, ttmbf) = {
+            let b = self.hdr.b.as_ref().unwrap();
+            (b.cbptab, b.tt, b.ttmbf)
+        };
+        let bfrac = self.hdr.b.as_ref().map_or(0, |b| b.bfraction);
+        let mb_pos = self.mbidx(mbx, mby);
+
+        let mut mquant = self.hdr.pq as i32;
+        let mut block_cbp = 0u32;
+        let mut block_tt = 0u32;
+        let mut block_intra = 0u8;
+        let mut mb_intra = false;
+        let mut mb_has_coeffs = false;
+        let mut ac_pred = false;
+        let mut dmv_x = [0i32; 2];
+        let mut dmv_y = [0i32; 2];
+        let mut bmvtype = BmvType::Backward;
+
+        // 逐宏块的 qscale 初值是 0（上游 `qscale_table[mb_pos] = 0`），
+        // 只有真的读到量化变化时才被改。
+        self.mbp.qscale[mb_pos] = 0;
+
+        if !direct {
+            if !skipped {
+                let (x, y, intra, has) = self.get_mvdata()?;
+                dmv_x[0] = x;
+                dmv_y[0] = y;
+                dmv_x[1] = x;
+                dmv_y[1] = y;
+                mb_intra = intra;
+                mb_has_coeffs = has;
+            }
+            if skipped || !mb_intra {
+                // 方向码（`decode012`）。`bfraction >= 128` 时 0/1 的含义**互换** ——
+                // 因为「前向」的定义跟着当前帧更靠近哪一侧而变。
+                bmvtype = match self.decode012()? {
+                    0 => {
+                        if bfrac >= 128 {
+                            BmvType::Backward
+                        } else {
+                            BmvType::Forward
+                        }
+                    }
+                    1 => {
+                        if bfrac >= 128 {
+                            BmvType::Forward
+                        } else {
+                            BmvType::Backward
+                        }
+                    }
+                    _ => {
+                        // 双向：前向的差分被清掉，后向留着上面读到的那一份。
+                        dmv_x[0] = 0;
+                        dmv_y[0] = 0;
+                        BmvType::Interpolated
+                    }
+                };
+            }
+        }
+        for i in 0..6usize {
+            let bi = self.blk(mbx, mby, i);
+            self.grids.mb_type[bi] = mb_intra as u8;
+            self.set_dc(mbx, mby, i, 0);
+        }
+
+        if skipped {
+            let bmvtype = if direct {
+                BmvType::Interpolated
+            } else {
+                bmvtype
+            };
+            self.pred_b_mv(mbx, mby, dmv_x, dmv_y, direct, bmvtype, false)?;
+            self.b_mc(mbx, mby, direct, bmvtype);
+            return Ok(());
+        }
+
+        if direct {
+            let cbp = vlc_p_cbpcy(cbptab as usize).decode(&mut self.r)? as u32;
+            mquant = self.get_mquant(mquant, mbx, mby)?;
+            self.mbp.qscale[mb_pos] = mquant;
+            let mut ttmb: i32 = tt as i32;
+            if !ttmbf {
+                ttmb = vlc_ttmb(self.tt_index).decode(&mut self.r)? as i32;
+            }
+            dmv_x = [0; 2];
+            dmv_y = [0; 2];
+            self.pred_b_mv(mbx, mby, dmv_x, dmv_y, true, bmvtype, false)?;
+            self.b_mc(mbx, mby, true, bmvtype);
+
+            let mut first_block = true;
+            for i in 0..6usize {
+                let val = (cbp >> (5 - i)) & 1;
+                if val != 0 {
+                    let (pat, t) = self.decode_p_block(mbx, mby, i, mquant, ttmb, first_block)?;
+                    block_cbp |= pat << (i << 2);
+                    block_tt |= t;
+                    if !ttmbf && ttmb < 8 {
+                        ttmb = -1;
+                    }
+                    first_block = false;
+                }
+            }
+            self.mbp.cbp[mb_pos] = block_cbp;
+            self.mbp.ttblk[mb_pos] = block_tt;
+            self.mbp.is_intra[mb_pos] = 0;
+            return Ok(());
+        }
+
+        // ---- 非 direct ----
+        if !mb_has_coeffs && !mb_intra {
+            // 没有编码块：等于跳过，宏块层到此为止。
+            self.pred_b_mv(mbx, mby, dmv_x, dmv_y, false, bmvtype, false)?;
+            self.b_mc(mbx, mby, false, bmvtype);
+            return Ok(());
+        }
+
+        let cbp;
+        if mb_intra && !mb_has_coeffs {
+            mquant = self.get_mquant(mquant, mbx, mby)?;
+            self.mbp.qscale[mb_pos] = mquant;
+            ac_pred = self.r.bit()? != 0;
+            cbp = 0u32;
+            self.pred_b_mv(mbx, mby, dmv_x, dmv_y, false, bmvtype, true)?;
+        } else {
+            if bmvtype == BmvType::Interpolated {
+                // 双向：**再读一次** MVDATA，这次给前向（后向留着第一次读到的）。
+                let (x, y, intra, has) = self.get_mvdata()?;
+                dmv_x[0] = x;
+                dmv_y[0] = y;
+                mb_intra = intra;
+                mb_has_coeffs = has;
+                if !mb_has_coeffs {
+                    self.pred_b_mv(mbx, mby, dmv_x, dmv_y, false, bmvtype, mb_intra)?;
+                    self.b_mc(mbx, mby, false, bmvtype);
+                    return Ok(());
+                }
+            }
+            self.pred_b_mv(mbx, mby, dmv_x, dmv_y, false, bmvtype, mb_intra)?;
+            if !mb_intra {
+                self.b_mc(mbx, mby, false, bmvtype);
+            } else {
+                ac_pred = self.r.bit()? != 0;
+            }
+            cbp = vlc_p_cbpcy(cbptab as usize).decode(&mut self.r)? as u32;
+            mquant = self.get_mquant(mquant, mbx, mby)?;
+            self.mbp.qscale[mb_pos] = mquant;
+        }
+
+        let mut ttmb: i32 = tt as i32;
+        if !ttmbf && !mb_intra && mb_has_coeffs {
+            ttmb = vlc_ttmb(self.tt_index).decode(&mut self.r)? as i32;
+        }
+
+        let mut first_block = true;
+        for i in 0..6usize {
+            let val = (cbp >> (5 - i)) & 1;
+            let bi = self.blk(mbx, mby, i);
+            self.grids.mb_type[bi] = mb_intra as u8;
+            if mb_intra {
+                self.set_avail(mbx, mby, i);
+                let block = self.decode_intra_block(mbx, mby, i, val != 0, mquant, ac_pred)?;
+                self.put_block(mbx, mby, i, block, true);
+                block_cbp |= 0xF << (i << 2);
+                block_intra |= 1 << i;
+            } else if val != 0 {
+                let (pat, t) = self.decode_p_block(mbx, mby, i, mquant, ttmb, first_block)?;
+                block_cbp |= pat << (i << 2);
+                block_tt |= t;
+                if !ttmbf && ttmb < 8 {
+                    ttmb = -1;
+                }
+                first_block = false;
+            }
+        }
+        self.mbp.cbp[mb_pos] = block_cbp;
+        self.mbp.ttblk[mb_pos] = block_tt;
+        self.mbp.is_intra[mb_pos] = block_intra;
         Ok(())
     }
 
@@ -767,7 +1120,7 @@ impl Ctx<'_, '_> {
         let mut quant = mquant.abs();
         quant = quant.min(31); // av_clip_uintp2(quant, 5)
         self.y_dc_scale = tables::DC_SCALE[quant as usize] as i32;
-        self.c_dc_scale = self.y_dc_scale;
+        self.c_dc_scale = c_dc_scale(self.y_dc_scale);
 
         // ---- DC ----
         let mut dcdiff = vlc_dc(self.hdr.dc_table_index as usize, n >= 4).decode(&mut self.r)? as i32;
@@ -783,9 +1136,26 @@ impl Ctx<'_, '_> {
             }
         }
         let (pred, mut dir) = self.p_pred_dc(mbx, mby, n, quant);
+        // 临时探针（排查完即删）。
+        {
+            static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *F.get_or_init(|| std::env::var_os("V2V_DC_DBG").is_some()) {
+                let (a, b, c) = self.dc_abc(mbx, mby, n);
+                eprintln!(
+                    "DC {mbx} {mby} n={n} diff={dcdiff} pred={pred} dir={dir} aav={} cav={} abc=({a},{b},{c}) q1={} qs={:?}",
+                    self.a_avail as u8,
+                    self.c_avail as u8,
+                    self.mbp.qscale[self.mbidx(mbx, mby)],
+                    &self.mbp.qscale[self.mbidx(mbx, mby).saturating_sub(1)
+                        ..(self.mbidx(mbx, mby) + 1).min(self.mbp.qscale.len())]
+                );
+            }
+        }
         dcdiff += pred;
         self.set_dc(mbx, mby, n, dcdiff as i16);
-        block[0] = (dcdiff * self.y_dc_scale) as i16;
+        // 亮度与色度各用各的定标（`pq >= 9` 时两者不同，见 `C_DC_SCALE`）。
+        let dc_scale = if n < 4 { self.y_dc_scale } else { self.c_dc_scale };
+        block[0] = (dcdiff * dc_scale) as i16;
 
         let mut use_pred = ac_pred;
         if !self.a_avail {
@@ -929,7 +1299,7 @@ impl Ctx<'_, '_> {
     ) -> Result<(u32, u32)> {
         // ⚠️ 只取这一个标量。原来是 `self.hdr.p...clone()` —— 这个函数**每块**都进一次
         // （一个宏块 6 次，ABT 更多），克隆会把两张位平面一起拷，代价是 malloc + 几 KB memcpy。
-        let ttmbf = self.hdr.p.as_ref().unwrap().ttmbf;
+        let ttmbf = self.ttmbf();
         let pquantizer = self.hdr.pquantizer;
         let halfpq = self.hdr.halfpq as i32;
         let mut block = [0i16; 64];
@@ -1170,13 +1540,21 @@ impl Ctx<'_, '_> {
     fn i_pred_dc(&self, mbx: usize, mby: usize, n: usize) -> (i32, bool) {
         let scale = if n < 4 { self.y_dc_scale } else { self.c_dc_scale } as usize;
         let (mut a, mut b, mut c) = self.dc_abc(mbx, mby, n);
-        // 本实现 `overlap` 恒为 false -> 走 `pq < 9 || !overlap` 那一支。
+        // 外边界值分两支（上游 `if (pq < 9 || !overlap) ... else ...`）：
+        // **重叠平滑真的在跑**的时候，块边界会被滤成「以 0 为中心」，所以预测的
+        // 外边界也得是 0；用 `DCPRED`（约等于 128 对应的 DC）会让第一行/第一列
+        // 的整块偏亮 —— 而只在 `overlap && pq >= 9` 的帧里现形。
+        let outer = if self.seq.overlap && self.hdr.pq >= 9 {
+            0i16
+        } else {
+            DCPRED[scale] as i16
+        };
         if mby == 0 && !(n == 2 || n == 3) {
-            b = DCPRED[scale] as i16;
+            b = outer;
             a = b;
         }
         if mbx == 0 && !(n == 1 || n == 3) {
-            b = DCPRED[scale] as i16;
+            b = outer;
             c = b;
         }
         if (a as i32 - b as i32).abs() <= (b as i32 - c as i32).abs() {
@@ -1202,21 +1580,13 @@ impl Ctx<'_, '_> {
         if self.c_avail && !(n == 1 || n == 3) {
             let q2 = self.mbp.qscale[mb_pos - 1].abs();
             if q2 != 0 && q2 != q1 {
-                c = ((c as u32)
-                    .wrapping_mul(tables::DC_SCALE[q2.min(31) as usize] as u32)
-                    .wrapping_mul(tables::DQSCALE[dqscale_index as usize])
-                    + 0x20000
-                    >> 18) as i32;
+                c = dc_rescale(c, q2, dqscale_index);
             }
         }
         if self.a_avail && !(n == 2 || n == 3) {
             let q2 = self.mbp.qscale[mb_pos - self.mb_stride].abs();
             if q2 != 0 && q2 != q1 {
-                a = ((a as u32)
-                    .wrapping_mul(tables::DC_SCALE[q2.min(31) as usize] as u32)
-                    .wrapping_mul(tables::DQSCALE[dqscale_index as usize])
-                    + 0x20000
-                    >> 18) as i32;
+                a = dc_rescale(a, q2, dqscale_index);
             }
         }
         if self.a_avail && self.c_avail && n != 3 {
@@ -1229,11 +1599,7 @@ impl Ctx<'_, '_> {
             }
             let q2 = self.mbp.qscale[off].abs();
             if q2 != 0 && q2 != q1 {
-                b = ((b as u32)
-                    .wrapping_mul(tables::DC_SCALE[q2.min(31) as usize] as u32)
-                    .wrapping_mul(tables::DQSCALE[dqscale_index as usize])
-                    + 0x20000
-                    >> 18) as i32;
+                b = dc_rescale(b, q2, dqscale_index);
             }
         }
         if self.c_avail && (!self.a_avail || (a - b).abs() <= (b - c).abs()) {

@@ -39,8 +39,8 @@ pub use v2v_tables::vc1 as tables;
 pub use bitplane::{Bitplane, Imode};
 pub use decoder::{Decoder, Frame};
 pub use header::{
-    Dquant, FrameHeader, HeaderState, MvMode, PFrameHeader, PictType, Profile, QuantizerMode,
-    SeqHeader,
+    BFrameHeader, Dquant, FrameHeader, HeaderState, MvMode, PFrameHeader, PictType, Profile,
+    QuantizerMode, SeqHeader,
 };
 
 // 位读取器 / 前缀码 / 错误类型都复用共享内核 `v2v-kernel` 那一套 —— 与 mp4v 一样，

@@ -15,6 +15,32 @@ use v2v_kernel::mc::mid_pred;
 use crate::decoder::Ctx;
 use crate::header::MvMode;
 
+/// B 帧的预测方向（上游 `BMV_TYPE_*`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BmvType {
+    Forward = 0,
+    Backward = 1,
+    Interpolated = 2,
+}
+
+/// `scale_mv()`（`vc1_pred.h`）：把后向参考帧的 MV 按 `bfraction` 缩放到本帧。
+///
+/// ⚠️ 两处**必须照抄**：
+/// - `inv` 是「换成另一侧」—— 减的是 `B_FRACTION_DEN`（256），不是取负；
+/// - 半像素（`!qs`）那一支最后**乘 2**（半像素单位换成四分之一像素单位），
+///   而且加的是 `255` 不是 `256`。写成 `value * n / 256` 会在负值上差 1。
+fn scale_mv(value: i32, bfrac: i32, inv: bool, qs: bool) -> i32 {
+    let mut n = bfrac;
+    if inv {
+        n -= 256;
+    }
+    if !qs {
+        2 * ((value * n + 255) >> 9)
+    } else {
+        (value * n + 128) >> 8
+    }
+}
+
 impl Ctx<'_, '_> {
     /// `ff_vc1_pred_mv(v, n, dmv_x, dmv_y, mv1, ...)`。
     ///
@@ -202,5 +228,152 @@ impl Ctx<'_, '_> {
     pub(crate) fn mv_of(&self, mbx: usize, mby: usize, n: usize) -> (i32, i32) {
         let m = self.grids.mv[self.blk(mbx, mby, n)];
         (m[0] as i32, m[1] as i32)
+    }
+
+    /// `ff_vc1_pred_b_mv()`（渐进式）：B 帧的 MV 预测。
+    ///
+    /// 与 P 帧那条路的**三处**不同，少一处整帧就偏：
+    /// 1. 两套 MV 面（前向 `mv` / 后向 `mv_bwd`），各有自己的空间预测链；
+    /// 2. `direct` 时 MV 不是从位流读的，而是**后向参考帧的 MV 按 `bfraction` 缩放**
+    ///    （上游读 `next_pic.motion_val[1]`），缩放之后再按 8.4.5.4 做 pullback；
+    /// 3. **不做 hybrid 预测** —— 上游那两个 `if (0 && …)` 就是把它关了，
+    ///    所以 B 帧这里一位都不用从位流读。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn pred_b_mv(
+        &mut self,
+        mbx: usize,
+        mby: usize,
+        dmv_x: [i32; 2],
+        dmv_y: [i32; 2],
+        direct: bool,
+        mvtype: BmvType,
+        mb_intra: bool,
+    ) -> Result<()> {
+        let qs = self.quarter_sample();
+        let bfrac = self.hdr.b.as_ref().map_or(0, |b| b.bfraction as i32);
+        let wrap = self.b8_stride as isize;
+        let xy = self.blk(mbx, mby, 0) as isize;
+        let (rx, ry) = (self.hdr.range_x, self.hdr.range_y);
+
+        if mb_intra {
+            self.grids.mv[xy as usize] = [0, 0];
+            self.grids.mv_bwd[xy as usize] = [0, 0];
+            return Ok(());
+        }
+
+        let mut dmv_x = dmv_x;
+        let mut dmv_y = dmv_y;
+        if !qs {
+            // 半像素模式：差分是半像素单位，MV 面里存的是四分之一像素。
+            for i in 0..2 {
+                dmv_x[i] *= 2;
+                dmv_y[i] *= 2;
+            }
+        }
+
+        // ---- direct 缩放：**每个宏块都算**，不只是 direct 的那些 ----
+        //
+        // ⚠️ 上游把这两份放在函数**开头**无条件算出来，然后
+        //   - direct 宏块：直接用；
+        //   - 非 direct 宏块：只覆盖**本宏块实际要用的那个方向**，另一个方向
+        //     **保留这里的缩放值**；
+        //   - 最后把两个方向**都**写进 MV 面（`vc1_pred.c` 第 885–888 行）。
+        //
+        // 漏掉「另一个方向也保留缩放值」这一步，后果非常隐蔽：该宏块本身像素
+        // 是对的，但**右边 / 下边那个宏块**做空间预测时读到 0 而不是缩放值，
+        // 于是从那里开始整片 MV 偏移 —— 症状是「坏宏块连成一片」，位游标却完全正常。
+        let base = self.next_mv[xy as usize];
+        let mut mvf = [
+            scale_mv(base[0] as i32, bfrac, false, qs),
+            scale_mv(base[1] as i32, bfrac, false, qs),
+        ];
+        let mut mvb = [
+            scale_mv(base[0] as i32, bfrac, true, qs),
+            scale_mv(base[1] as i32, bfrac, true, qs),
+        ];
+        // pullback（8.4.5.4）：注意这里用的是 `<<6` 与 `-60`，与下面非 direct 的
+        // `<<5` / `-28` **不是同一套**（上游就是两套）。
+        {
+            let (qx, qy) = ((mbx as i32) << 6, (mby as i32) << 6);
+            let (xmax, ymax) = (
+                ((self.mb_width as i32) << 6) - 4,
+                ((self.mb_height as i32) << 6) - 4,
+            );
+            mvf[0] = mvf[0].clamp(-60 - qx, xmax - qx);
+            mvf[1] = mvf[1].clamp(-60 - qy, ymax - qy);
+            mvb[0] = mvb[0].clamp(-60 - qx, xmax - qx);
+            mvb[1] = mvb[1].clamp(-60 - qy, ymax - qy);
+        }
+        let want_fwd = matches!(mvtype, BmvType::Forward | BmvType::Interpolated);
+        let want_bwd = matches!(mvtype, BmvType::Backward | BmvType::Interpolated);
+        for dir in 0..2usize {
+            if direct || (dir == 0 && !want_fwd) || (dir == 1 && !want_bwd) {
+                continue;
+            }
+            let plane = if dir == 0 {
+                &self.grids.mv
+            } else {
+                &self.grids.mv_bwd
+            };
+            let off = if mbx == self.mb_width - 1 { -2 } else { 2 };
+            // ⚠️ 邻居只在「用得到」的时候才读：第一行（`mby == 0`）的 `A` / `B` 落在
+            // 网格的**上边界之外**（b8 网格只留了一行一行距的余量，而这里是两行），
+            // 读它就是负下标。上游那边有更大的 padding，所以它敢无条件读。
+            let (mut px, mut py);
+            if mby != 0 {
+                let a = plane[(xy - wrap * 2) as usize];
+                let b = plane[(xy - wrap * 2 + off) as usize];
+                if self.mb_width == 1 {
+                    px = a[0] as i32;
+                    py = a[1] as i32;
+                } else {
+                    // 左边界：上游会先把 `C` 写 0 再用它，这里直接用 0。
+                    let c = if mbx != 0 {
+                        plane[(xy - 2) as usize]
+                    } else {
+                        [0i16; 2]
+                    };
+                    px = mid_pred(a[0] as i32, b[0] as i32, c[0] as i32);
+                    py = mid_pred(a[1] as i32, b[1] as i32, c[1] as i32);
+                }
+            } else if mbx != 0 {
+                let c = plane[(xy - 2) as usize];
+                px = c[0] as i32;
+                py = c[1] as i32;
+            } else {
+                px = 0;
+                py = 0;
+            }
+            // pullback（8.3.5.3.4）：Simple/Main 用 `sh = 5`。
+            let sh = 5;
+            let (qx, qy) = ((mbx as i32) << sh, (mby as i32) << sh);
+            let mv_lo = 4 - (1 << sh);
+            let (xmax, ymax) = (
+                ((self.mb_width as i32) << sh) - 4,
+                ((self.mb_height as i32) << sh) - 4,
+            );
+            if qx + px < mv_lo {
+                px = mv_lo - qx;
+            }
+            if qy + py < mv_lo {
+                py = mv_lo - qy;
+            }
+            if qx + px > xmax {
+                px = xmax - qx;
+            }
+            if qy + py > ymax {
+                py = ymax - qy;
+            }
+            let vx = ((px + dmv_x[dir] + rx) & ((rx << 1) - 1)) - rx;
+            let vy = ((py + dmv_y[dir] + ry) & ((ry << 1) - 1)) - ry;
+            if dir == 0 {
+                mvf = [vx, vy];
+            } else {
+                mvb = [vx, vy];
+            }
+        }
+        self.grids.mv[xy as usize] = [mvf[0] as i16, mvf[1] as i16];
+        self.grids.mv_bwd[xy as usize] = [mvb[0] as i16, mvb[1] as i16];
+        Ok(())
     }
 }

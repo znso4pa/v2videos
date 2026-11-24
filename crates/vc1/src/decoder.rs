@@ -59,6 +59,12 @@ pub(crate) struct Grids {
     pub mb_type: Vec<u8>,
     /// 亮度 MV：b8 网格。
     pub mv: Vec<[i16; 2]>,
+    /// B 帧的**后向** MV（上游 `cur_pic.motion_val[1]`）：b8 网格。
+    ///
+    /// 只在本帧里有意义：B 帧不是参考帧，这套 MV 不会传给后面的帧。
+    /// 前向 MV 仍然放在 `mv` 里 —— B 帧的两套 MV 各有自己的空间预测链，
+    /// 混用一套会让后向预测读到前向的值（差得不显眼，但整帧都在错）。
+    pub mv_bwd: Vec<[i16; 2]>,
     /// 逐宏块的**色度** MV（上游叫 `luma_mv`，名字骗人）：宏块网格。
     pub luma_mv: Vec<[i16; 2]>,
 }
@@ -190,6 +196,25 @@ impl Scans {
 /// VC-1 解码器（一帧进、一帧出）。
 ///
 /// 尺寸来自**容器**：Simple/Main profile 的序列头里没有宽高。
+///
+/// ## 三块平面 + 两套参考
+///
+/// B 帧要**同时**读前后两个参考帧，所以这里不是「当前 + 上一帧」，而是
+/// **三块**平面轮转（上游同样是 `last_pic` / `next_pic` / `cur_pic` 三块）：
+///
+/// | 字段 | 上游对应 | 用途 |
+/// |---|---|---|
+/// | `planes` | `cur_pic` | 本帧解码目标；也是 B 帧解出来之后停留的地方 |
+/// | `ref_planes` | `last_pic` | **前向**参考（显示顺序上在 B 之前的那个参考帧） |
+/// | `next_planes` | `next_pic` | **后向**参考（刚解出来、显示顺序上在 B 之后） |
+///
+/// 参考帧的轮转发生在**解完一个 I / P / BI 帧**之后：`next → last`、`本帧 → next`。
+/// 一次 `swap` 就够，不需要整帧 memcpy（每个宏块都会覆盖自己的 16×16 / 8×8，
+/// 所以换下来的那块可以直接当下一帧的草稿）。
+///
+/// ⚠️ **B 帧不参与轮转**：它既不是参考帧，也不该动 `last` / `next`。
+/// 顺手把 B 帧写进参考链，后面 P 帧的前向参考就会指向一个 B 帧 —— 画面「能看」，
+/// 但每个 B 之后都错，而且越错越远。
 pub struct Decoder {
     seq: SeqHeader,
     width: u32,
@@ -200,12 +225,25 @@ pub struct Decoder {
     scans: Scans,
     /// 当前帧（宏块对齐、**未裁剪** —— 运动补偿会读到显示高度以外的行）。
     planes: Planes,
-    /// 参考帧（同尺寸，未裁剪）。
+    /// **前向**参考帧（同尺寸，未裁剪）。
     ref_planes: Planes,
+    /// **后向**参考帧（同尺寸，未裁剪）。
+    next_planes: Planes,
+    /// `ref_planes` / `next_planes` 是否已经有内容。
     has_ref: bool,
+    has_next: bool,
+    /// `next_planes` 那一帧的亮度 MV 面 —— B 帧的**直接预测**要读它
+    /// （上游 `s->next_pic.motion_val[1]`：P 帧的运动补偿会把自己的 MV 写进这个面）。
+    next_mv: Vec<[i16; 2]>,
+    /// 最近解出的那一帧落在哪块平面里（参考帧在 `next_planes`，B 帧在 `planes`）。
+    last_in_next: bool,
     grids: Grids,
     mbp: MbPlanes,
     luts: Luts,
+    /// 已经解好、可以按**显示顺序**交出去的帧（B 帧让显示顺序落后解码顺序一帧）。
+    out: std::collections::VecDeque<Frame>,
+    /// 已解出、但显示时机还没到的参考帧（下一个 B 帧要先于它显示）。
+    pending: Option<Frame>,
     /// 最后开始解的那个宏块与当时的位游标 —— 出错时用来定位
     /// （错误类型里塞不下动态信息，所以放在这儿）。
     last_mb: (usize, usize),
@@ -226,9 +264,12 @@ impl Decoder {
                 "vc1: res_fasttx=0（走 MS-MPEG-4 simple_idct 的那一档）还没做".into(),
             ));
         }
-        if seq.overlap {
-            return Err(Error::Unsupported("vc1: overlap smoothing 还没做".into()));
-        }
+        // ⚠️ `overlap` **不在这里拒**：它只决定「块边界的重叠平滑滤波器开不开」，
+        // 而上游那个滤波器**只在 `pq >= 9` 时才真的跑**（`vc1_block.c` 里
+        // `if (v->overlap && v->pq >= 9) ff_vc1_p_overlap_filter(v);`），
+        // 低码率素材（`pq < 9`）即使序列头写着 `overlap = 1` 也一位像素都不改。
+        // 实测：真样本（`overlap = 1`、`pq = 7/8`）逐帧对 ffmpeg **0 像素差**。
+        // 所以判据挪到**逐帧**：见 `decode_frame` 里那个 `pq >= 9` 的检查。
         let mb_width = (width as usize).div_ceil(16);
         let mb_height = (height as usize).div_ceil(16);
         let mb_stride = mb_width + 1;
@@ -251,7 +292,11 @@ impl Decoder {
             scans: Scans::new(),
             planes: Planes::new(mb_width * 16, mb_height * 16),
             ref_planes: Planes::new(mb_width * 16, mb_height * 16),
+            next_planes: Planes::new(mb_width * 16, mb_height * 16),
             has_ref: false,
+            has_next: false,
+            next_mv: vec![[0, 0]; b8_len],
+            last_in_next: false,
             grids: Grids {
                 // ⚠️ DC 网格的**初值**是 1024（上游 `dc_val_base` 分配时就填这个），
                 // 不是 0：I 帧第一块的预测就落在这上面。
@@ -262,6 +307,7 @@ impl Decoder {
                 coded_block: vec![0; b8_len],
                 mb_type: vec![0; b8_len],
                 mv: vec![[0, 0]; b8_len],
+                mv_bwd: vec![[0, 0]; b8_len],
                 luma_mv: vec![[0, 0]; mb_len],
             },
             mbp: MbPlanes {
@@ -271,6 +317,8 @@ impl Decoder {
                 ttblk: vec![0; mb_len],
             },
             luts: Luts::new(),
+            out: std::collections::VecDeque::with_capacity(2),
+            pending: None,
             last_mb: (0, 0),
             last_bits: 0,
         })
@@ -283,15 +331,46 @@ impl Decoder {
     pub fn decode_frame(&mut self, data: &[u8]) -> Result<usize> {
         let mut r = BitReader::new(data);
         let hdr = FrameHeader::parse_from(&mut r, &self.seq, self.mb_width, self.mb_height, &mut self.state)?;
+        // 临时探针（排查完即删）。
+        if std::env::var_os("V2V_PQ_DBG").is_some() {
+            eprintln!(
+                "FQ {:?} pq={} pqidx={} ovl={} lf={} rnd={}",
+                hdr.pict_type, hdr.pq, hdr.pqindex, self.seq.overlap, self.seq.loop_filter, hdr.rnd
+            );
+        }
         let mb_stride = self.mb_width + 1;
         let b8_stride = self.mb_width * 2 + 1;
 
+        // ⚠️ **每帧开头两张 MV 面都要清零**。上游 `ff_mpv_frame_start` 每帧都
+        // `alloc_picture()`，而 `motion_val` 的缓冲池带 `ZERO_EVERY_TIME` ——
+        // 也就是说「上一帧的 MV」在这里是**不存在**的。
+        // 不清的话，B 帧 direct 模式会读到上一帧残留的 MV，而这只在
+        // 「本帧某个块没人写过」时才现形，症状是**零星几个宏块**偏 —— 极难认。
+        self.grids.mv.fill([0, 0]);
+        self.grids.mv_bwd.fill([0, 0]);
+
         // 亮度补偿：每帧先轮转表；本帧声明了补偿就现造一张（串在旧表上）。
-        self.luts.rotate();
-        if let Some(p) = &hdr.p {
-            if p.mv_mode == crate::header::MvMode::IntensityComp {
-                self.luts.set_ic(p.lumscale, p.lumshift);
+        //
+        // ⚠️ **B 帧不轮转**。上游 `rotate_luts()` 对 B / BI 帧走的是另一支：
+        // 不换 `last` / `next`，只是把 `curr_*` 指向 `aux_*`（渐进式根本用不到）。
+        // 轮转了的话，B 帧后面的 P 帧 `last_luty` 就少挪一格 —— 只有在
+        // 「P 帧声明了亮度补偿、中间又夹了 B」时才现形，最难查。
+        let is_b = hdr.pict_type == PictType::B;
+        if !is_b {
+            self.luts.rotate();
+            if let Some(p) = &hdr.p {
+                if p.mv_mode == crate::header::MvMode::IntensityComp {
+                    self.luts.set_ic(p.lumscale, p.lumshift);
+                }
             }
+        }
+        // ⚠️ 参考链的**前半段**在这里做（上游 `ff_mpv_frame_start`：非 B 帧开头
+        // `last = next`）。挪到「解完之后」就会差一帧：第一个 P 帧的前向参考
+        // 还是空的，运动补偿直接返回，整帧像素留在草稿缓冲里 —— 症状是
+        // 「I 帧对、之后全错」，很像宏块层写错了。
+        if !is_b {
+            std::mem::swap(&mut self.ref_planes, &mut self.next_planes);
+            self.has_ref = self.has_next;
         }
 
         let bits_used;
@@ -307,11 +386,15 @@ impl Decoder {
                 scans: &self.scans,
                 planes: &mut self.planes,
                 ref_planes: &self.ref_planes,
+                next_planes: &self.next_planes,
+                next_mv: &self.next_mv,
                 has_ref: self.has_ref,
+                has_next: self.has_next,
                 grids: &mut self.grids,
                 mbp: &mut self.mbp,
                 luts: &self.luts,
                 use_ic: self.luts.last_use_ic,
+                use_ic_next: self.luts.next_use_ic,
                 last_mb: &mut self.last_mb,
                 last_bits: &mut self.last_bits,
                 r,
@@ -329,22 +412,77 @@ impl Decoder {
             match hdr.pict_type {
                 PictType::I => ctx.decode_i_blocks()?,
                 PictType::P => ctx.decode_p_blocks()?,
+                // BI 帧（`bfraction == 0`）：帧头是「先按 B 读一位、再按 I 读」，
+                // 宏块层**整个是 I 帧那套**（上游 `vc1_block.c` 第 3012 行）。
+                PictType::B if hdr.bi_type => ctx.decode_i_blocks()?,
+                PictType::B => {
+                    if !self.has_ref || !self.has_next {
+                        return Err(Error::Bad(
+                            "vc1: B 帧之前没有凑齐前后两个参考帧（流从 B 帧开始？）",
+                        ));
+                    }
+                    ctx.decode_b_blocks()?
+                }
             }
             bits_used = ctx.r.bit_pos();
         }
 
-        // 本帧成为下一帧的参考。交换比整帧 memcpy 便宜，且两边都写满（每个宏块都会
-        // 覆盖自己那 16×16 / 8×8 像素），不需要先清空。
-        std::mem::swap(&mut self.planes, &mut self.ref_planes);
-        self.has_ref = true;
+        // ---- 参考链与输出顺序 ----
+        //
+        // B 帧不是参考帧：解完直接进输出队列，`last` / `next` 一动不动。
+        // 参考帧（I / P / BI）则要轮转，并且**先**把上一帧参考交出去 ——
+        // 因为紧接着的 B 帧要显示在它前面。
+        if is_b {
+            // ⚠️ `last_in_next` 必须在**裁帧之前**改：它决定裁哪一块平面。
+            // 先裁后改会把上一帧参考当成这一帧交出去 —— 显示顺序整体错一格。
+            self.last_in_next = false;
+            let f = self.crop_current();
+            self.out.push_back(f);
+        } else {
+            // 参考链的后半段：`next = cur`（本帧刚解出来的那块草稿就是新的后向参考）。
+            std::mem::swap(&mut self.next_planes, &mut self.planes);
+            // 本帧的 **`motion_val[1]` 那一面**成为「后向参考的 MV 面」（B 帧 direct
+            // 预测要读的就是它）。⚠️ 不是 `motion_val[0]` —— 两者在 P 帧里内容**不同**：
+            // `motion_val[1]` 只由 `mc_1mv`（1MV 宏块）与 `mc_4mv_chroma`（4MV 宏块的
+            // 色度 MV）写，帧内块与 4MV 的四个亮度块**保持 0**。
+            std::mem::swap(&mut self.next_mv, &mut self.grids.mv_bwd);
+            self.has_next = true;
+            self.last_in_next = true;
+
+            let f = self.crop_current();
+            if let Some(prev) = self.pending.replace(f) {
+                self.out.push_back(prev);
+            }
+        }
         Ok(bits_used)
     }
 
-    /// 最近解出的那一帧（裁到显示尺寸）。
-    pub fn frame(&self) -> Frame {
+    /// 取一帧**按显示顺序**该输出的画面（没有就 `None`）。
+    ///
+    /// 一个样本解完之后可能一帧都取不到（参考帧要等后面的 B 帧先显示），
+    /// 也可能刚好一帧 —— 调用方应当「解一个样本，把能取的都取干」。
+    pub fn next_display_frame(&mut self) -> Option<Frame> {
+        self.out.pop_front()
+    }
+
+    /// 样本喂完了：把延迟着的那一帧交出来（B 帧的收尾）。
+    pub fn flush(&mut self) -> Option<Frame> {
+        self.pending.take()
+    }
+
+    /// 把 `last_in_next` 指的那块平面裁成显示尺寸。
+    fn crop_current(&self) -> Frame {
+        let src = if self.last_in_next {
+            &self.next_planes
+        } else {
+            &self.planes
+        };
+        self.crop(src)
+    }
+
+    fn crop(&self, src: &Planes) -> Frame {
         let pw = self.mb_width * 16;
         let (w, h) = (self.width as usize, self.height as usize);
-        let src = &self.ref_planes;
         let mut y = Vec::with_capacity(w * h);
         for r in 0..h {
             y.extend_from_slice(&src.y[r * pw..r * pw + w]);
@@ -366,14 +504,21 @@ impl Decoder {
         }
     }
 
-    /// 最近解出的那一帧的**宏块对齐、未裁剪**平面（对账测试用：ffmpeg 吐的也是这个尺寸）。
+    /// 最近解出的那一帧（裁到显示尺寸）—— **解码顺序**的最后那一帧。
     ///
-    /// ⚠️ 名字叫 `planes` 而返回 `ref_planes` 是**故意的**，不是拷错了字段：
-    /// 解码完一帧后 `ref_planes` 就是「那一帧」。clippy 的 `misnamed_getters`
-    /// 只看名字与字段名像不像，看不出这层语义。
-    #[allow(clippy::misnamed_getters)]
+    /// ⚠️ 要按**显示顺序**取帧用 [`Decoder::next_display_frame`]：B 帧的显示位置
+    /// 在它前面那个参考帧之前，两者不是一回事。
+    pub fn frame(&self) -> Frame {
+        self.crop_current()
+    }
+
+    /// 最近解出的那一帧的**宏块对齐、未裁剪**平面（对账测试用：ffmpeg 吐的也是这个尺寸）。
     pub fn planes(&self) -> &Planes {
-        &self.ref_planes
+        if self.last_in_next {
+            &self.next_planes
+        } else {
+            &self.planes
+        }
     }
 
     /// **解到一半**的那一帧的工作平面 —— 只在 `decode_frame` 返回 `Err` 之后有意义。
@@ -414,13 +559,21 @@ pub(crate) struct Ctx<'a, 'b> {
     pub b8_off: usize,
     pub scans: &'b Scans,
     pub planes: &'a mut Planes,
+    /// 前向参考帧（B 帧的 `dir = 0`）。
     pub ref_planes: &'a Planes,
+    /// 后向参考帧（B 帧的 `dir = 1`）。
+    pub next_planes: &'a Planes,
+    /// 后向参考帧的亮度 MV 面（直接预测要读）。
+    pub next_mv: &'a [[i16; 2]],
     pub has_ref: bool,
+    pub has_next: bool,
     pub grids: &'a mut Grids,
     pub mbp: &'a mut MbPlanes,
     pub luts: &'a Luts,
     /// 本帧的运动补偿要不要先把参考帧按 `luts.last_*` 映射一遍。
     pub use_ic: bool,
+    /// 后向参考帧的那张表（B 帧的后向 MC 用它，上游 `next_use_ic`）。
+    pub use_ic_next: bool,
     pub last_mb: &'a mut (usize, usize),
     pub last_bits: &'a mut usize,
     pub r: BitReader<'b>,
@@ -496,13 +649,64 @@ impl Ctx<'_, '_> {
         }
     }
 
-    /// 参考帧某个平面的像素。
+    /// 参考帧某个平面的像素。`dir` = 0 前向、1 后向。
     #[inline]
-    pub(crate) fn ref_plane(&self, plane: usize) -> &[u8] {
+    pub(crate) fn ref_plane(&self, dir: usize, plane: usize) -> &[u8] {
+        let p = if dir == 0 { self.ref_planes } else { self.next_planes };
         match plane {
-            0 => &self.ref_planes.y,
-            1 => &self.ref_planes.u,
-            _ => &self.ref_planes.v,
+            0 => &p.y,
+            1 => &p.u,
+            _ => &p.v,
+        }
+    }
+
+    /// 参考帧是否就绪（`dir` = 0 前向、1 后向）。
+    #[inline]
+    pub(crate) fn has_dir(&self, dir: usize) -> bool {
+        if dir == 0 {
+            self.has_ref
+        } else {
+            self.has_next
+        }
+    }
+
+    /// 本帧的 `ttmbf`（P 与 B 帧头里都有这一位；I 帧恒 `true`）。
+    #[inline]
+    pub(crate) fn ttmbf(&self) -> bool {
+        match (&self.hdr.p, &self.hdr.b) {
+            (Some(p), _) => p.ttmbf,
+            (_, Some(b)) => b.ttmbf,
+            _ => true,
+        }
+    }
+
+    /// 本帧的 `mspel`（P 与 B 帧头里都有这一位）。
+    #[inline]
+    pub(crate) fn mspel(&self) -> bool {
+        match (&self.hdr.p, &self.hdr.b) {
+            (Some(p), _) => p.mspel,
+            (_, Some(b)) => b.mspel,
+            _ => false,
+        }
+    }
+
+    /// 本帧的 `quarter_sample`（P 与 B 帧头里都有这一位）。
+    #[inline]
+    pub(crate) fn quarter_sample(&self) -> bool {
+        match (&self.hdr.p, &self.hdr.b) {
+            (Some(p), _) => p.quarter_sample,
+            (_, Some(b)) => b.quarter_sample,
+            _ => false,
+        }
+    }
+
+    /// 本帧的 `mv_table_index`（P 与 B 帧头里都有这一位）。
+    #[inline]
+    pub(crate) fn mv_table_index(&self) -> u8 {
+        match (&self.hdr.p, &self.hdr.b) {
+            (Some(p), _) => p.mv_table_index,
+            (_, Some(b)) => b.mv_table_index,
+            _ => 0,
         }
     }
 }

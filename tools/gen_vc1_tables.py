@@ -256,6 +256,29 @@ class Out:
         return "".join(self.buf)
 
 
+def bfraction_lut(text):
+    """`ff_vc1_bfraction_lut` —— ⚠️ 源文件里它被 `#if B_FRACTION_DEN == 840` 分成了**两份**。
+
+    本仓要的是 `#else` 那份：`vc1data.h` 里 `B_FRACTION_DEN` 就是 **256**，
+    表值是「分母 256 的定标」（`128 /*1/2*/` 那一组）。
+
+    直接 `body()` 会抓到 **840 那一份**（它在前面，值是 420/280/…）—— 能编译、能跑，
+    算出来的 MV 全部差一个 840/256 的系数，而且**只在有 B 帧的素材上错**。
+    所以这里显式切掉 840 分支，并把首项 / 尾项核一遍：取错了当场报错，不留给下游。
+    """
+    start = text.index("#if B_FRACTION_DEN == 840")
+    else_at = text.index("#else", start)
+    end = text.index("#endif", else_at)
+    vals = flat(text[else_at:end], "ff_vc1_bfraction_lut")
+    if len(vals) != 23:
+        raise SystemExit(f"bfraction 表长度 {len(vals)}，期望 23")
+    if vals[0] != 128 or vals[-1] != 0 or vals[-2] != -1:
+        raise SystemExit(
+            f"bfraction 表取错了（首项 {vals[0]} 应为 128、尾两项应为 -1/0）—— 是不是抓了 840 那一份？"
+        )
+    return vals
+
+
 def header():
     """文件头：出处、许可、版权声明（版权行从源文件现读，见 `ffmpeg_src.py`）。"""
     out = Out()
@@ -447,6 +470,15 @@ def gen():
     # ---- 变换类型：帧头的 2 bit -> `TT_*`。
     out.w("// ---- 帧头 `ttfrm`（2 bit）-> `TT_*`。\n\n")
     out.flat("TTFRM_TO_TT", "u8", [resolve(n) for n in sym_flat(data_c, "ff_vc1_ttfrm_to_tt")])
+
+    # ---- B 帧的 `bfraction`：3~7 bit 的下标 -> 比例（分母 `B_FRACTION_DEN` = 256）。
+    #
+    # 直接预测（direct mode）的 MV 要按它缩放：`bfraction` 是「当前帧离前向参考有多远」。
+    # 下标 21 是保留值（解码端要报错），22 表示 BI 帧 —— 表尾那两项 `-1` / `0` 就是它们。
+    out.w(
+        "// ---- B 帧的 `bfraction`（表 100）：下标 -> 定标值，**分母 256**（`B_FRACTION_DEN`）。\n\n"
+    )
+    out.flat("BFRACTION_LUT", "i16", bfraction_lut(data_c))
 
     return out.text()
 

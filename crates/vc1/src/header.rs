@@ -232,11 +232,14 @@ impl SeqHeader {
     }
 }
 
-/// 图像类型。B / BI 本实现还没做（宏块层不支持双向预测），解析到就报错。
+/// 图像类型。BI 帧（可以当参考帧的 B 帧）不单独列一个变体 —— 它是 `B` 加
+/// [`BFrameHeader::bi_type`]，因为**语法与 B 完全一样**，只有「帧头里多读 7 位缓冲满度、
+/// 取整位被置 1」这两处不同（上游也是先记成 BI、解完再改回 B）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PictType {
     I,
     P,
+    B,
 }
 
 /// 帧头解析要**跨帧**记住的东西。
@@ -279,10 +282,42 @@ pub struct PFrameHeader {
     pub skip_plane: Bitplane,
 }
 
+/// B 帧独有的帧头字段。
+///
+/// 比 P 帧少得多：**没有 4MV / 亮度补偿 / 混合 MV 这些模式** —— B 帧的帧级 MV 模式
+/// 只有「1MV 四分之一像素」与「1MV 半像素双线性」两种，而「这个宏块是直接预测还是
+/// 自己带 MV」是一张**位平面**（`direct_plane`），不是帧级模式。
+#[derive(Debug, Clone)]
+pub struct BFrameHeader {
+    /// 当前帧离**前向参考**有多远，定标分母 256（见 `tables::BFRACTION_LUT`）。
+    pub bfraction: i16,
+    /// 表下标（3~7 位读出，原样留着便于对账；21 是保留值，解析时就拒了）。
+    pub bfraction_lut_index: u8,
+    /// `bfraction == 0` 的 B 帧：**它本身可以当参考帧**（上游叫 BI）。
+    pub bi_type: bool,
+    /// 帧级 MV 模式：只有 `OneMv`（四分之一像素）与 `OneMvHpelBilin`（半像素双线性）。
+    pub mv_mode: MvMode,
+    pub quarter_sample: bool,
+    pub mspel: bool,
+    /// 逐宏块的「直接预测」标志位平面。
+    pub direct_plane: Bitplane,
+    /// 逐宏块的跳过标志位平面。
+    pub skip_plane: Bitplane,
+    pub mv_table_index: u8,
+    pub cbptab: u8,
+    pub ttmbf: bool,
+    pub tt: u8,
+}
+
 /// 帧头。
 #[derive(Debug, Clone)]
 pub struct FrameHeader {
     pub pict_type: PictType,
+    /// 这是不是 **BI 帧**（`bfraction == 0` 的 B 帧）。
+    ///
+    /// 位流里的类型位写着 B，但它的帧头后半段与宏块层**都是 I 帧那套**，
+    /// 而且它自己可以当参考帧。所以 `pict_type` 仍是 `B`，这个标志才是「怎么解」。
+    pub bi_type: bool,
     /// 取整控制（见 `HeaderState::rnd`）。
     pub rnd: bool,
     pub pqindex: u8,
@@ -313,6 +348,8 @@ pub struct FrameHeader {
     pub dc_table_index: u8,
     /// P 帧独有；I 帧为 `None`。
     pub p: Option<PFrameHeader>,
+    /// B 帧独有；I / P 帧为 `None`。
+    pub b: Option<BFrameHeader>,
 }
 
 /// 帧级量化变化（`vop_dquant_decoding()`）。
@@ -443,22 +480,50 @@ impl FrameHeader {
         let _framecnt = r.u(2)?; // 帧序号，解码不用
         let rangeredfrm = if seq.rangered { r.bit()? != 0 } else { false };
 
-        // 图像类型：一位定 P；否则（有 B 帧时才再读一位）定 I。
+        // 图像类型：一位定 P；否则（有 B 帧时才再读一位）定 I / B。
         let pict_type = if r.bit()? != 0 {
             PictType::P
         } else if seq.max_b_frames != 0 && r.bit()? == 0 {
-            return Err(Error::Unsupported("vc1: B 帧（宏块层的双向预测还没做）".into()));
+            PictType::B
         } else {
             PictType::I
         };
-        if pict_type == PictType::I {
+
+        // B 帧的 `bfraction`：当前帧离前向参考有多远（直接预测的 MV 要按它缩放）。
+        // 下标 7 是转义（再读 4 位）；21 是保留值 —— 上游在这里报错，本实现同样拒掉，**不猜**。
+        //
+        // 下标 22 的定标值是 **0**，那是 **BI 帧**：位流里的类型位仍写着 B，但
+        // `bfraction == 0` 之后上游把它改成 `AV_PICTURE_TYPE_BI`（`vc1.c` 第 657 行），
+        // 于是**帧头的后半段按 I 帧的语法读**（缓冲满度 / `respic` / `x8_type` /
+        // 亮度 AC 码表都在），`switch` 里一个分支都不进（没有位平面、没有码表选择），
+        // 宏块层直接走 `vc1_decode_i_blocks`（`vc1_block.c` 第 3012 行）。
+        // 所以 BI 不是「另一种 B」，是「帧头里先按 B 读一位，再按 I 读」——
+        // `bi_type` 这个标志就是为了让后面的条件都写成「I 或者 BI」。
+        let mut bfraction = 0i16;
+        let mut bfraction_lut_index = 0u8;
+        let mut bi_type = false;
+        if pict_type == PictType::B {
+            let mut idx = r.u(3)? as u8;
+            if idx == 7 {
+                idx = 7 + r.u(4)? as u8;
+            }
+            if idx == 21 {
+                return Err(Error::Bad("vc1: bfraction 的下标是保留值 21"));
+            }
+            bfraction_lut_index = idx;
+            bfraction = tables::BFRACTION_LUT[idx as usize];
+            bi_type = bfraction == 0;
+        }
+        // 缓冲满度：I 与 BI 有这一段。
+        if pict_type == PictType::I || bi_type {
             let _buffer_fullness = r.u(7)?;
         }
 
-        // 取整控制：位流里没有这一位 —— I 帧置 1，P 帧翻转。
-        match pict_type {
-            PictType::I => state.rnd = true,
-            PictType::P => state.rnd ^= true,
+        // 取整控制：位流里没有这一位 —— I / BI 置 1，P 帧翻转，**B 帧不动**。
+        if pict_type == PictType::I || bi_type {
+            state.rnd = true;
+        } else if pict_type == PictType::P {
+            state.rnd ^= true;
         }
         let rnd = state.rnd;
 
@@ -486,12 +551,16 @@ impl FrameHeader {
         let range_x = 1 << (k_x - 1);
         let range_y = 1 << (k_y - 1);
 
-        // 多分辨率：逐帧改分辨率。只支持 I/P，而 P 也带这个字段
-        // （上游的条件是「非 B 帧」，我们这里恒真）。
-        let respic = if seq.multires { r.u(2)? as u8 } else { 0 };
-        // IntraX8：`res_x8` 置位时 I 帧的帧头多一位。本实现还没做 IntraX8，
-        // 但**位要读掉**，否则后面全错位。
-        let x8_type = seq.res_x8 && pict_type == PictType::I && r.bit()? != 0;
+        // 多分辨率：逐帧改分辨率。**B 帧没有这个字段** —— 但注意 BI 帧有：
+        // 上游读它的时候类型还是 BI（不是 B），所以这里的条件是「不是 B，或者是 BI」。
+        let respic = if seq.multires && !(pict_type == PictType::B && !bi_type) {
+            r.u(2)? as u8
+        } else {
+            0
+        };
+        // IntraX8：`res_x8` 置位时 I 帧（**和 BI 帧** —— 上游此刻的类型还是 BI）
+        // 的帧头多一位。本实现还没做 IntraX8，但**位要读掉**，否则后面全错位。
+        let x8_type = seq.res_x8 && (pict_type == PictType::I || bi_type) && r.bit()? != 0;
 
         let mut p = None;
         // I 帧的帧头里没有帧级量化变化这一段（上游只在 P / B 分支里读）。
@@ -571,10 +640,97 @@ impl FrameHeader {
             frame_dquant = dquant;
         }
 
+        let mut b = None;
+        if pict_type == PictType::B && !bi_type {
+            let trace = std::env::var_os("V2V_HDR_TRACE").is_some();
+            if trace {
+                eprintln!(
+                    "[hdr] B 起点 pos={} bfidx={} bf={} bi={} pq={} halfpq={}",
+                    r.bit_pos(),
+                    bfraction_lut_index,
+                    bfraction,
+                    bi_type,
+                    pq,
+                    halfpq
+                );
+            }
+            // B 帧的帧级 MV 模式**只有两种**，直接 1 位读出来 —— 不走 `MV_PMODE_TABLE`
+            // （那张表是 P 帧的，5 项里有 4MV / 亮度补偿，B 帧一个都不许有）。
+            let mv_mode = if r.bit()? != 0 {
+                MvMode::OneMv
+            } else {
+                MvMode::OneMvHpelBilin
+            };
+            let quarter_sample = mv_mode == MvMode::OneMv;
+            let mspel = quarter_sample;
+            // ⚠️ **不动 `state.quarter_sample`**：上游只在 P 帧里把「上一帧的值」存成
+            // `qs_last`（P 帧的混合 MV 要它），B 帧的 `quarter_sample` 只是本帧自己的。
+            // 顺手把 B 帧的值写进状态，下一个 P 帧的 `qs_last` 就会指向一个 B 帧 —— 错得很安静。
+
+            // 顺序：直接预测位平面 → 跳过位平面 → 码表 → 量化变化 → 变换类型。
+            if trace {
+                eprintln!("[hdr]   mv_mode 读完 pos={}", r.bit_pos());
+            }
+            let direct_plane = bitplane::decode(r, mb_width, mb_height).map_err(|e| {
+                if trace {
+                    eprintln!("[hdr]   direct plane 失败: {e}");
+                }
+                e
+            })?;
+            if trace {
+                eprintln!(
+                    "[hdr]   direct plane 读完 pos={} imode={:?}",
+                    r.bit_pos(),
+                    direct_plane.imode
+                );
+            }
+            let skip_plane = bitplane::decode(r, mb_width, mb_height)?;
+            if trace {
+                eprintln!("[hdr]   skip plane 读完 pos={}", r.bit_pos());
+            }
+            let mv_table_index = r.u(2)? as u8;
+            let cbptab = r.u(2)? as u8;
+            let dquant = if seq.dquant != 0 {
+                vop_dquant(r, seq, pq, &mut halfpq)?
+            } else {
+                None
+            };
+            if trace {
+                eprintln!("[hdr]   dquant 读完 pos={} dq={:?}", r.bit_pos(), dquant);
+            }
+            let (ttmbf, tt) = if seq.vstransform {
+                let ttmbf = r.bit()? != 0;
+                let tt = if ttmbf {
+                    tables::TTFRM_TO_TT[r.u(2)? as usize]
+                } else {
+                    tables::TT_8X8
+                };
+                (ttmbf, tt)
+            } else {
+                (true, tables::TT_8X8)
+            };
+            b = Some(BFrameHeader {
+                bfraction,
+                bfraction_lut_index,
+                bi_type,
+                mv_mode,
+                quarter_sample,
+                mspel,
+                direct_plane,
+                skip_plane,
+                mv_table_index,
+                cbptab,
+                ttmbf,
+                tt,
+            });
+            frame_dquant = dquant;
+        }
+
         let (mut c_ac_table_index, mut y_ac_table_index, mut dc_table_index) = (0u8, None, 0u8);
         if !x8_type {
             c_ac_table_index = decode012(r)?;
-            if pict_type == PictType::I {
+            // 亮度 AC 码表：I 与 BI 都有（上游 `pict_type == I || pict_type == BI`）。
+            if pict_type == PictType::I || bi_type {
                 y_ac_table_index = Some(decode012(r)?);
             }
             dc_table_index = r.bit()? as u8;
@@ -582,6 +738,7 @@ impl FrameHeader {
 
         Ok(Self {
             pict_type,
+            bi_type,
             rnd,
             pqindex,
             pq,
@@ -598,6 +755,7 @@ impl FrameHeader {
             y_ac_table_index,
             dc_table_index,
             p,
+            b,
         })
     }
 }

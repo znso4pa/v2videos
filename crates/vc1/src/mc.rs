@@ -299,11 +299,14 @@ impl Ctx<'_, '_> {
     ///
     /// 逐行交替用两张表（`[0]` / `[1]`）—— 上游对**隔行**的两场各有一张表，
     /// 渐进式下退化成「按行的奇偶交替」，但交替这件事本身是语义的一部分，不能省。
-    fn apply_ic(&self, plane: usize, buf: &mut [u8], k: usize, row_parity: i32) {
-        let (lut0, lut1) = if plane == 0 {
-            (&self.luts.last_y[0], &self.luts.last_y[1])
-        } else {
-            (&self.luts.last_uv[0], &self.luts.last_uv[1])
+    ///
+    /// `dir` 选哪一组表：0 = 前向参考（`last_*`），1 = 后向参考（`next_*`）。
+    fn apply_ic(&self, dir: usize, plane: usize, buf: &mut [u8], k: usize, row_parity: i32) {
+        let (lut0, lut1) = match (dir, plane == 0) {
+            (0, true) => (&self.luts.last_y[0], &self.luts.last_y[1]),
+            (0, false) => (&self.luts.last_uv[0], &self.luts.last_uv[1]),
+            (_, true) => (&self.luts.next_y[0], &self.luts.next_y[1]),
+            (_, false) => (&self.luts.next_uv[0], &self.luts.next_uv[1]),
         };
         for j in 0..k {
             // 行 `j` 对应源行 `row_parity + j`（`row_parity = src_y - pad`）。
@@ -320,14 +323,23 @@ impl Ctx<'_, '_> {
         }
     }
 
-    /// 从参考帧取一块到本地缓冲（越界处边缘复制）。
+    /// 从参考帧取一块到本地缓冲（越界处边缘复制）。`dir` = 0 前向、1 后向。
     ///
     /// ⚠️ 缓冲的 **(0,0)** 对应参考帧的 `(src_x - pad, src_y - pad)`，而插值基准在
     /// `(pad, pad)` —— 与上游 `emulated_edge_mc` + `srcY += mspel*(1+linesize)` 同一套布局。
     /// 把源块放到 `(pad, pad)` 会让四分之一像素（`pad = 1`）整体错开一个像素：
     /// **平坦区看不出来，边缘才差 1** —— 最难查的那种。
-    fn load_ref(&self, plane: usize, src_x: i32, src_y: i32, k: usize, pad: usize, buf: &mut [u8]) {
-        let data = self.ref_plane(plane);
+    fn load_ref(
+        &self,
+        dir: usize,
+        plane: usize,
+        src_x: i32,
+        src_y: i32,
+        k: usize,
+        pad: usize,
+        buf: &mut [u8],
+    ) {
+        let data = self.ref_plane(dir, plane);
         let stride = self.plane_stride(plane);
         let (w, h) = if plane == 0 {
             (self.mb_width * 16, self.mb_height * 16)
@@ -355,53 +367,104 @@ impl Ctx<'_, '_> {
         }
     }
 
-    /// `ff_vc1_mc_1mv()`（渐进式）。
+    /// `ff_vc1_mc_1mv()`（渐进式）：P 帧的**前向**运动补偿。
     pub(crate) fn mc_1mv(&mut self, mbx: usize, mby: usize) {
-        if !self.has_ref {
+        self.mc_1mv_dir(mbx, mby, 0, false);
+    }
+
+    /// `ff_vc1_mc_1mv(v, dir)` / `ff_vc1_interp_mc(v)` 合一（渐进式）。
+    ///
+    /// - `dir`：0 = 前向参考（`ref_planes`），1 = 后向参考（`next_planes`）。
+    /// - `avg`：`false` = 直接把预测写进当前帧（`ff_vc1_mc_1mv`）；
+    ///   `true` = 把预测与**已经写在帧里**的那一份取平均（`ff_vc1_interp_mc`）。
+    ///
+    /// 两者除了源帧不同，还有两处**必须照抄**的差异：
+    /// 1. `fastuvmc` 的修正方向**相反**（上游 `interp_mc` 与 `mc_1mv` 写的就是反的）；
+    /// 2. `interp_mc` 的亮度补偿用 `next_luty`（后向参考那一套表）。
+    pub(crate) fn mc_1mv_dir(&mut self, mbx: usize, mby: usize, dir: usize, avg: bool) {
+        if !self.has_dir(dir) {
             return;
         }
-        // ⚠️ 只取标量 —— `hdr.p.clone()` 会把两张位平面一起拷（每块一次 malloc + memcpy）。
-        let (mx, my) = self.mv_of(mbx, mby, 0);
+        let (mx, my) = if dir == 0 {
+            self.mv_of(mbx, mby, 0)
+        } else {
+            let m = self.grids.mv_bwd[self.blk(mbx, mby, 0)];
+            (m[0] as i32, m[1] as i32)
+        };
+        let use_ic = if dir == 0 { self.use_ic } else { self.use_ic_next };
         let mb_pos = self.mbidx(mbx, mby);
+        // ⚠️ **P 帧在这里把自己的 MV 抄进 `motion_val[1]`**（上游 `ff_vc1_mc_1mv`
+        // 里 `if (s->pict_type == P)` 那一段，四个块都写）。B 帧的 direct 模式
+        // 读的就是后向参考帧的这一面 —— 不写的话 direct 预测恒等于「MV 全 0」，
+        // 症状是 B 帧**大片**偏，但位游标完全正常。
+        if dir == 0 && self.hdr.pict_type == crate::header::PictType::P {
+            for i in 0..4usize {
+                let bi = self.blk(mbx, mby, i);
+                self.grids.mv_bwd[bi] = [mx as i16, my as i16];
+            }
+        }
         let mut uvmx = (mx + ((mx & 3) == 3) as i32) >> 1;
         let mut uvmy = (my + ((my & 3) == 3) as i32) >> 1;
-        self.grids.luma_mv[mb_pos] = [uvmx as i16, uvmy as i16];
+        // `luma_mv` 只由**前向**那一次写（上游 `interp_mc` 不碰它）。
+        if dir == 0 {
+            self.grids.luma_mv[mb_pos] = [uvmx as i16, uvmy as i16];
+        }
 
-        // ---- 快路：整像素且无亮度补偿 ⇒ 输出就是参考块原样搬过来 ----
-        //
-        // 静态素材里「MV 预测出来恰好是 (0,0)」的宏块很多（跳过的宏块尤其如此）。
-        // 走通用路径要 `load_ref`（19×19 逐像素 clamp）+ 256 次 `mspel_filter` 调用，
-        // 而正确答案只是把参考块拷过来。`use_ic` 时必须绕开（那会改像素值）。
-        if mx == 0 && my == 0 && !self.use_ic {
-            let (dx, dy) = (mbx * 16, mby * 16);
-            let ys = self.plane_stride(0);
-            let cs = self.plane_stride(1);
+        let stride = self.plane_stride(0);
+        let cstride = self.plane_stride(1);
+        let (dx, dy) = (mbx * 16, mby * 16);
+        let (cdx, cdy) = (dx / 2, dy / 2);
+
+        // ---- 快路：整像素且无亮度补偿 ⇒ 输出就是参考块（或与已有像素平均） ----
+        if mx == 0 && my == 0 && !use_ic {
             {
-                let (src, dst) = (&self.ref_planes.y, &mut self.planes.y);
+                let (src, dst) = if dir == 0 {
+                    (&self.ref_planes.y, &mut self.planes.y)
+                } else {
+                    (&self.next_planes.y, &mut self.planes.y)
+                };
                 for j in 0..16 {
-                    let o = (dy + j) * ys + dx;
-                    dst[o..o + 16].copy_from_slice(&src[o..o + 16]);
+                    let o = (dy + j) * stride + dx;
+                    if avg {
+                        for i in 0..16 {
+                            dst[o + i] = ((dst[o + i] as u32 + src[o + i] as u32 + 1) >> 1) as u8;
+                        }
+                    } else {
+                        dst[o..o + 16].copy_from_slice(&src[o..o + 16]);
+                    }
                 }
             }
-            let (cdx, cdy) = (dx / 2, dy / 2);
             for plane in [1usize, 2] {
-                let (src, dst) = if plane == 1 {
-                    (&self.ref_planes.u, &mut self.planes.u)
-                } else {
-                    (&self.ref_planes.v, &mut self.planes.v)
+                let (src, dst) = match (dir, plane) {
+                    (0, 1) => (&self.ref_planes.u, &mut self.planes.u),
+                    (0, _) => (&self.ref_planes.v, &mut self.planes.v),
+                    (_, 1) => (&self.next_planes.u, &mut self.planes.u),
+                    (_, _) => (&self.next_planes.v, &mut self.planes.v),
                 };
                 for j in 0..8 {
-                    let o = (cdy + j) * cs + cdx;
-                    dst[o..o + 8].copy_from_slice(&src[o..o + 8]);
+                    let o = (cdy + j) * cstride + cdx;
+                    if avg {
+                        for i in 0..8 {
+                            dst[o + i] = ((dst[o + i] as u32 + src[o + i] as u32 + 1) >> 1) as u8;
+                        }
+                    } else {
+                        dst[o..o + 8].copy_from_slice(&src[o..o + 8]);
+                    }
                 }
             }
             return;
         }
         if self.seq.fastuvmc {
-            uvmx += if uvmx < 0 { uvmx & 1 } else { -(uvmx & 1) };
-            uvmy += if uvmy < 0 { uvmy & 1 } else { -(uvmy & 1) };
+            if avg {
+                // `interp_mc` 的写法（与 `mc_1mv` 反号 —— 上游就是这样）。
+                uvmx += if uvmx < 0 { -(uvmx & 1) } else { uvmx & 1 };
+                uvmy += if uvmy < 0 { -(uvmy & 1) } else { uvmy & 1 };
+            } else {
+                uvmx += if uvmx < 0 { uvmx & 1 } else { -(uvmx & 1) };
+                uvmy += if uvmy < 0 { uvmy & 1 } else { -(uvmy & 1) };
+            }
         }
-        let mspel = self.hdr.p.as_ref().unwrap().mspel as usize;
+        let mspel = self.mspel() as usize;
         let mut src_x = mbx as i32 * 16 + (mx >> 2);
         let mut src_y = mby as i32 * 16 + (my >> 2);
         let mut uvsrc_x = mbx as i32 * 8 + (uvmx >> 2);
@@ -414,19 +477,46 @@ impl Ctx<'_, '_> {
 
         let mut buf = [0u8; BUF * BUF];
         let k = 17 + 2 * mspel;
-        self.load_ref(0, src_x, src_y, k, mspel, &mut buf);
-        if self.use_ic {
-            self.apply_ic(0, &mut buf, k, src_y - mspel as i32);
+        self.load_ref(dir, 0, src_x, src_y, k, mspel, &mut buf);
+        if use_ic {
+            self.apply_ic(dir, 0, &mut buf, k, src_y - mspel as i32);
         }
         let base = mspel * BUF_STRIDE + mspel;
-        let stride = self.plane_stride(0);
-        let (dx, dy) = (mbx * 16, mby * 16);
         let rnd = self.hdr.rnd as i32;
         let rnd_bit = self.hdr.rnd;
-        {
+        let dxy_mspel = (((my & 3) << 2) | (mx & 3)) as usize;
+        let dxy_hpel = ((my & 2) | ((mx & 2) >> 1)) as usize;
+        if avg {
+            // 先算到临时块里，再与帧里已有的那一份平均（上游 `op_avg`：
+            // `(a + b + 1) >> 1`，`b` 是**已经夹到 0..255** 的插值结果）。
+            let mut tmp = [0u8; 16 * 16];
+            if mspel != 0 {
+                let mut tmpi = [0i16; (16 + 3) * 16];
+                mspel_mc::<16>(
+                    &mut tmp,
+                    16,
+                    0,
+                    0,
+                    &buf,
+                    base,
+                    (dxy_mspel & 3) as u32,
+                    (dxy_mspel >> 2) as u32,
+                    rnd,
+                    &mut tmpi,
+                );
+            } else {
+                hpel_mc(&mut tmp, 16, 0, 0, 16, &buf, base, dxy_hpel, rnd_bit);
+            }
+            let dst = self.plane_mut(0);
+            for j in 0..16 {
+                for i in 0..16 {
+                    let o = (dy + j) * stride + dx + i;
+                    dst[o] = ((dst[o] as u32 + tmp[j * 16 + i] as u32 + 1) >> 1) as u8;
+                }
+            }
+        } else {
             let dst = self.plane_mut(0);
             if mspel != 0 {
-                let dxy = (((my & 3) << 2) | (mx & 3)) as usize;
                 let mut tmp = [0i16; (16 + 3) * 16];
                 mspel_mc::<16>(
                     dst,
@@ -435,34 +525,42 @@ impl Ctx<'_, '_> {
                     dy,
                     &buf,
                     base,
-                    (dxy & 3) as u32,
-                    (dxy >> 2) as u32,
+                    (dxy_mspel & 3) as u32,
+                    (dxy_mspel >> 2) as u32,
                     rnd,
                     &mut tmp,
                 );
             } else {
-                let dxy = ((my & 2) | ((mx & 2) >> 1)) as usize;
-                hpel_mc(dst, stride, dx, dy, 16, &buf, base, dxy, rnd_bit);
+                hpel_mc(dst, stride, dx, dy, 16, &buf, base, dxy_hpel, rnd_bit);
             }
         }
 
         // 色度：永远是「四分之一像素双线性」。
-        let cdx = uvmx & 3;
-        let cdy = uvmy & 3;
-        let cstride = self.plane_stride(1);
+        let cdx_q = uvmx & 3;
+        let cdy_q = uvmy & 3;
         let mut bufv = [0u8; BUF * BUF];
-        self.load_ref(1, uvsrc_x, uvsrc_y, 9, 0, &mut buf);
-        self.load_ref(2, uvsrc_x, uvsrc_y, 9, 0, &mut bufv);
-        if self.use_ic {
-            self.apply_ic(1, &mut buf, 9, uvsrc_y);
-            self.apply_ic(2, &mut bufv, 9, uvsrc_y);
+        self.load_ref(dir, 1, uvsrc_x, uvsrc_y, 9, 0, &mut buf);
+        self.load_ref(dir, 2, uvsrc_x, uvsrc_y, 9, 0, &mut bufv);
+        if use_ic {
+            self.apply_ic(dir, 1, &mut buf, 9, uvsrc_y);
+            self.apply_ic(dir, 2, &mut bufv, 9, uvsrc_y);
         }
-        {
-            let dst = self.plane_mut(1);
-            chroma_mc(dst, cstride, dx / 2, dy / 2, &buf, 0, cdx << 1, cdy << 1, rnd_bit);
+        for (plane, b) in [(1usize, &buf), (2usize, &bufv)] {
+            if avg {
+                let mut tmp = [0u8; 8 * 8];
+                chroma_mc(&mut tmp, 8, 0, 0, b, 0, cdx_q << 1, cdy_q << 1, rnd_bit);
+                let dst = self.plane_mut(plane);
+                for j in 0..8 {
+                    for i in 0..8 {
+                        let o = (cdy + j) * cstride + cdx + i;
+                        dst[o] = ((dst[o] as u32 + tmp[j * 8 + i] as u32 + 1) >> 1) as u8;
+                    }
+                }
+            } else {
+                let dst = self.plane_mut(plane);
+                chroma_mc(dst, cstride, cdx, cdy, b, 0, cdx_q << 1, cdy_q << 1, rnd_bit);
+            }
         }
-        let dst = self.plane_mut(2);
-        chroma_mc(dst, cstride, dx / 2, dy / 2, &bufv, 0, cdx << 1, cdy << 1, rnd_bit);
     }
 
     /// `ff_vc1_mc_4mv_luma()`（渐进式）。
@@ -471,7 +569,7 @@ impl Ctx<'_, '_> {
             return;
         }
         let (mx, my) = self.mv_of(mbx, mby, n);
-        let mspel = self.hdr.p.as_ref().unwrap().mspel as usize;
+        let mspel = self.mspel() as usize;
         let (bx, by) = (
             mbx * 16 + (n & 1) * 8,
             mby * 16 + (n & 2) * 4,
@@ -492,9 +590,9 @@ impl Ctx<'_, '_> {
         src_y = src_y.clamp(-16, (self.mb_height * 16) as i32);
         let mut buf = [0u8; BUF * BUF];
         let k = 9 + 2 * mspel;
-        self.load_ref(0, src_x, src_y, k, mspel, &mut buf);
+        self.load_ref(0, 0, src_x, src_y, k, mspel, &mut buf);
         if self.use_ic {
-            self.apply_ic(0, &mut buf, k, src_y - mspel as i32);
+            self.apply_ic(0, 0, &mut buf, k, src_y - mspel as i32);
         }
         let base = mspel * BUF_STRIDE + mspel;
         let stride = self.plane_stride(0);
@@ -583,6 +681,14 @@ impl Ctx<'_, '_> {
         }
         let (tx, ty, valid_count) = self.get_chroma_mv(mbx, mby);
         let mb_pos = self.mbidx(mbx, mby);
+        // ⚠️ 4MV 宏块的 `motion_val[1]` **只写第 0 块**，写的是**色度 MV**
+        // （上游 `ff_vc1_mc_4mv_chroma`；四个亮度块那几格保持 0 —— 渐进式下
+        // `mc_4mv_luma` 不碰这一面）。B 帧 direct 读的是第 0 块，所以这里写错
+        // 就等于「4MV 宏块后面那个 B 帧的 direct 预测」全偏。
+        {
+            let b0 = self.blk(mbx, mby, 0);
+            self.grids.mv_bwd[b0] = [tx as i16, ty as i16];
+        }
         if valid_count == 0 {
             self.grids.luma_mv[mb_pos] = [0, 0];
             return;
@@ -600,11 +706,11 @@ impl Ctx<'_, '_> {
         uvsrc_y = uvsrc_y.clamp(-8, (self.mb_height * 8) as i32);
         let mut buf = [0u8; BUF * BUF];
         let mut bufv = [0u8; BUF * BUF];
-        self.load_ref(1, uvsrc_x, uvsrc_y, 9, 0, &mut buf);
-        self.load_ref(2, uvsrc_x, uvsrc_y, 9, 0, &mut bufv);
+        self.load_ref(0, 1, uvsrc_x, uvsrc_y, 9, 0, &mut buf);
+        self.load_ref(0, 2, uvsrc_x, uvsrc_y, 9, 0, &mut bufv);
         if self.use_ic {
-            self.apply_ic(1, &mut buf, 9, uvsrc_y);
-            self.apply_ic(2, &mut bufv, 9, uvsrc_y);
+            self.apply_ic(0, 1, &mut buf, 9, uvsrc_y);
+            self.apply_ic(0, 2, &mut bufv, 9, uvsrc_y);
         }
         let cstride = self.plane_stride(1);
         let (dx, dy) = (mbx * 8, mby * 8);

@@ -67,8 +67,30 @@ fn frame_headers_match_ffmpeg_pict_log() {
             let got = match h.pict_type {
                 PictType::I => 'I',
                 PictType::P => 'P',
+                // BI 帧在 ffmpeg 的日志里也是 `B`（上游解完帧头就把类型改回 B 了）。
+                PictType::B => 'B',
             };
             assert_eq!(got, want.pict_type, "{path}: 第 {i} 帧 pict_type");
+
+            // 跳过位平面：I / P / B 都可能有（I 帧没有，见下面那条断言）。
+            let skip_plane = h
+                .p
+                .as_ref()
+                .map(|p| &p.skip_plane)
+                .or_else(|| h.b.as_ref().map(|b| &b.skip_plane));
+            if let Some(plane) = skip_plane {
+                let (imode, invert) = want
+                    .skip_plane
+                    .unwrap_or_else(|| panic!("{path}: 第 {i} 帧 ffmpeg 没打跳过位平面"));
+                assert_eq!(
+                    plane.imode as u8, imode,
+                    "{path}: 第 {i} 帧跳过位平面的 imode"
+                );
+                assert_eq!(
+                    plane.invert as u8, invert,
+                    "{path}: 第 {i} 帧跳过位平面的 invert"
+                );
+            }
 
             if let Some(p) = &h.p {
                 match (want.mv_type_plane, &p.mv_type_plane) {
@@ -86,21 +108,38 @@ fn frame_headers_match_ffmpeg_pict_log() {
                     (Some(_), None) => panic!("{path}: 第 {i} 帧 ffmpeg 有 MV 类型位平面，我们没解"),
                     (None, Some(_)) => panic!("{path}: 第 {i} 帧 ffmpeg 没有 MV 类型位平面，我们解了一张"),
                 }
+            } else {
+                assert!(
+                    want.mv_type_plane.is_none(),
+                    "{path}: 第 {i} 帧不是 P 帧，ffmpeg 却打了 MV 类型位平面"
+                );
+            }
+
+            if let Some(b) = &h.b {
+                // 「直接预测」位平面是 B 帧独有的 —— 它的位置（在跳过平面**之前**）
+                // 就是 B 帧帧头的判据：顺序错了这张位平面的 imode 立刻变。
                 let (imode, invert) = want
-                    .skip_plane
-                    .unwrap_or_else(|| panic!("{path}: 第 {i} 帧 ffmpeg 没打跳过位平面"));
+                    .direct_plane
+                    .unwrap_or_else(|| panic!("{path}: 第 {i} 帧 ffmpeg 没打直接预测位平面"));
                 assert_eq!(
-                    p.skip_plane.imode as u8, imode,
-                    "{path}: 第 {i} 帧跳过位平面的 imode"
+                    b.direct_plane.imode as u8, imode,
+                    "{path}: 第 {i} 帧直接预测位平面的 imode"
                 );
                 assert_eq!(
-                    p.skip_plane.invert as u8, invert,
-                    "{path}: 第 {i} 帧跳过位平面的 invert"
+                    b.direct_plane.invert as u8, invert,
+                    "{path}: 第 {i} 帧直接预测位平面的 invert"
                 );
             } else {
                 assert!(
-                    want.mv_type_plane.is_none() && want.skip_plane.is_none(),
-                    "{path}: 第 {i} 帧是 I 帧，ffmpeg 却打了位平面行"
+                    want.direct_plane.is_none(),
+                    "{path}: 第 {i} 帧不是 B 帧，ffmpeg 却打了直接预测位平面"
+                );
+            }
+
+            if h.p.is_none() && h.b.is_none() {
+                assert!(
+                    want.skip_plane.is_none(),
+                    "{path}: 第 {i} 帧是 I 帧，ffmpeg 却打了跳过位平面"
                 );
             }
         }

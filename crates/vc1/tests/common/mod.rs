@@ -92,6 +92,8 @@ pub struct PictLog {
     pub mv_type_plane: Option<(u8, u8)>,
     /// 「跳过」位平面：`(imode, invert)`。
     pub skip_plane: Option<(u8, u8)>,
+    /// 「直接预测」位平面（**只有 B 帧有**）：`(imode, invert)`。
+    pub direct_plane: Option<(u8, u8)>,
 }
 
 /// 跑一遍 `ffmpeg -debug pict`，把**序列头里的 profile** 与逐帧日志一起抓回来。
@@ -156,9 +158,12 @@ pub fn ffmpeg_pict_log(path: &str) -> Option<(u8, Vec<PictLog>)> {
     let mut frames: Vec<PictLog> = Vec::new();
     let mut mv_type: Option<(u8, u8)> = None;
     let mut skip: Option<(u8, u8)> = None;
+    let mut direct: Option<(u8, u8)> = None;
     for line in &real.1 {
         if let Some(rest) = line.split("MB MV Type plane encoding:").nth(1) {
             mv_type = parse_imode(rest);
+        } else if let Some(rest) = line.split("MB Direct Type plane encoding:").nth(1) {
+            direct = parse_imode(rest);
         } else if let Some(rest) = line.split("MB Skip plane encoding:").nth(1) {
             skip = parse_imode(rest);
         } else if let Some(rest) = line.split("pict_type: ").nth(1) {
@@ -167,6 +172,7 @@ pub fn ffmpeg_pict_log(path: &str) -> Option<(u8, Vec<PictLog>)> {
                 pict_type,
                 mv_type_plane: mv_type.take(),
                 skip_plane: skip.take(),
+                direct_plane: direct.take(),
             });
         }
     }

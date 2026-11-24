@@ -29,23 +29,15 @@ fn read_frame(r: &mut impl Read, buf: &mut [u8]) -> bool {
     true
 }
 
-/// 逐帧比「我们解出来的平面」与「ffmpeg 吐的裸帧」。
+/// 逐帧比「我们解出来的帧」与「ffmpeg 吐的裸帧」。
 ///
-/// 我们的平面是**宏块对齐**的（宽 = mb_width*16，高 = mb_height*16），
-/// ffmpeg 吐的是**裁剪到显示尺寸**的，所以按行比可见部分。
-fn compare(
-    ours: &v2v_kernel::mc::Planes,
-    theirs: &[u8],
-    w: usize,
-    h: usize,
-    mb_w: usize,
-    mb_h: usize,
-) -> (usize, usize, i32) {
+/// ⚠️ 比的是**显示顺序**的那一帧（[`v2v_vc1::Decoder::next_display_frame`]），
+/// 不是「刚解出来的那一帧」：B 帧的显示位置在它后面那个参考帧之前。
+fn compare_frame(ours: &v2v_vc1::Frame, theirs: &[u8], w: usize, h: usize) -> (usize, usize, i32) {
     let (mut diff, mut first, mut maxd) = (0usize, usize::MAX, 0i32);
-    let pw = mb_w * 16;
     for r in 0..h {
         for c in 0..w {
-            let a = ours.y[r * pw + c] as i32;
+            let a = ours.y[r * w + c] as i32;
             let b = theirs[r * w + c] as i32;
             if a != b {
                 diff += 1;
@@ -57,12 +49,11 @@ fn compare(
         }
     }
     let cw = w / 2;
-    let cw_full = pw / 2;
     let ch = h / 2;
     for r in 0..ch {
         for c in 0..cw {
             for (i, plane) in [&ours.u, &ours.v].iter().enumerate() {
-                let a = plane[r * cw_full + c] as i32;
+                let a = plane[r * cw + c] as i32;
                 let b = theirs[(w * h) + i * cw * ch + r * cw + c] as i32;
                 if a != b {
                     diff += 1;
@@ -74,34 +65,58 @@ fn compare(
             }
         }
     }
-    let _ = (mb_h, mb_w);
     (diff, first, maxd)
+}
+
+/// 逐宏块找出**所有**不一致的位置（`V2V_FRAME_LOG=1` 时打出来）。
+///
+/// 一两个宏块坏 = 那个宏块的语法/模式判错；**连成一片** = MV 预测链或参考帧错了。
+/// 这两种症状长得不一样，分开看才知道该往哪查。
+fn bad_mb_list(
+    ours: &v2v_vc1::Frame,
+    theirs: &[u8],
+    w: usize,
+    h: usize,
+    mb_w: usize,
+    mb_h: usize,
+) -> Vec<(usize, usize)> {
+    let mut v = Vec::new();
+    for my in 0..mb_h {
+        for mx in 0..mb_w {
+            let (x0, y0) = (mx * 16, my * 16);
+            'rows: for r in y0..(y0 + 16).min(h) {
+                for c in x0..(x0 + 16).min(w) {
+                    if ours.y[r * w + c] != theirs[r * w + c] {
+                        v.push((mx, my));
+                        break 'rows;
+                    }
+                }
+            }
+        }
+    }
+    v
 }
 
 /// 按**宏块**（而不是像素）找第一处不一致 —— 宏块层一错就整块错，
 /// 而环路滤波只改边上的两列/两行，两者要分开看。
-fn first_mismatching_mb(
-    ours: &v2v_kernel::mc::Planes,
+fn first_bad_mb_frame(
+    ours: &v2v_vc1::Frame,
     theirs: &[u8],
     w: usize,
     h: usize,
     mb_w: usize,
     mb_h: usize,
 ) -> Option<(usize, usize)> {
-    let pw = mb_w * 16;
     for my in 0..mb_h {
         for mx in 0..mb_w {
             let (x0, y0) = (mx * 16, my * 16);
             let mut bad = false;
-            for r in y0..(y0 + 16).min(h) {
+            'rows: for r in y0..(y0 + 16).min(h) {
                 for c in x0..(x0 + 16).min(w) {
-                    if ours.y[r * pw + c] != theirs[r * w + c] {
+                    if ours.y[r * w + c] != theirs[r * w + c] {
                         bad = true;
-                        break;
+                        break 'rows;
                     }
-                }
-                if bad {
-                    break;
                 }
             }
             if bad {
@@ -128,6 +143,9 @@ fn frames_match_ffmpeg_pixel_exact() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     let verbose = std::env::var("V2V_FRAME_LOG").is_ok();
+    let mut dump = std::env::var("V2V_DUMP")
+        .ok()
+        .map(|p| std::fs::File::create(p).expect("建解帧文件"));
 
     let mut checked = 0usize;
     for path in &samples {
@@ -153,66 +171,125 @@ fn frames_match_ffmpeg_pixel_exact() {
         // ffmpeg 的裸帧（stdout，边解边读，不落盘）。
         let mut child = Command::new("ffmpeg")
             .args(["-loglevel", "error", "-nostdin", "-i", path])
-            .args(["-f", "rawvideo", "-pix_fmt", "yuv420p", "-"])
+            .args(["-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-"])
             .stdout(Stdio::piped())
             .spawn()
             .unwrap_or_else(|e| panic!("{path}: 起不了 ffmpeg: {e}"));
         let mut out = BufReader::new(child.stdout.take().unwrap());
         let mut raw = vec![0u8; w * h + 2 * (w / 2) * (h / 2)];
 
-        let mut n = 0usize;
         let mut bad = 0usize;
         let mut overrun = 0usize;
         let mut tail_bits: Vec<usize> = Vec::new();
-        while read_frame(&mut out, &mut raw) {
-            if n >= frames.len() {
-                eprintln!("{path}: ffmpeg 多吐了一帧（我们只有 {} 帧）", frames.len());
-                break;
-            }
-            let bits = match dec.decode_frame(&frames[n]) {
+        let mut n = 0usize;
+        // 一个样本解完可能一帧都取不到（参考帧要等后面的 B 先显示），
+        // 所以是「解一个、把能取的取干」，不是「一进一出」。
+        for (i, data) in frames.iter().enumerate() {
+            let bits = match dec.decode_frame(data) {
                 Ok(b) => b,
                 Err(e) => {
-                    // 出错时把「已经解出来的部分」与 ffmpeg 的那一帧比一遍：
-                    // **第一处不一致的宏块**就是位流开始跑偏的地方（宏块层错了
-                    // 只影响它自己和后面的，前面的像素仍然是对的）。
-                    let (diff, first, _) = compare(dec.partial_planes(), &raw, w, h, mb_w, mb_h);
-                    let (fx, fy) = (first % w, first / w);
-                    let mb = first_mismatching_mb(dec.partial_planes(), &raw, w, h, mb_w, mb_h);
                     panic!(
-                        "{path}: 第 {n} 帧解码失败（最后解到宏块 {:?}，位游标 {}）: {e}\n\
-                         已解出的部分里有 {diff} 个像素与 ffmpeg 不同；首个不一致像素在 ({fx},{fy})，\
-                         首个不一致的宏块是 {mb:?}",
+                        "{path}: 第 {i} 帧解码失败（最后解到宏块 {:?}，位游标 {}）: {e}",
                         dec.last_mb(),
                         dec.last_mb_bits()
                     )
                 }
             };
-            let avail = frames[n].len() * 8;
-            if n < 16 {
-                eprintln!("[diag] 第 {n} 帧：{} 字节", frames[n].len());
+            let avail = data.len() * 8;
+            if verbose {
+                // 帧类型是排查「哪一类帧错」的唯一线索，跟字节数一起打。
+                let t = v2v_vc1::FrameHeader::parse(
+                    data,
+                    &seq,
+                    mb_w,
+                    mb_h,
+                    &mut Default::default(),
+                )
+                .map(|h| format!("{:?}{}", h.pict_type, if h.bi_type { "(BI)" } else { "" }))
+                .unwrap_or_else(|e| format!("<{e}>"));
+                eprintln!("[diag] 第 {i} 个样本：{t}，{} 字节", data.len());
             }
             if bits > avail {
                 overrun += 1;
             }
             tail_bits.push(avail.saturating_sub(bits));
-            let (diff, first, maxd) = compare(dec.planes(), &raw, w, h, mb_w, mb_h);
+
+            while let Some(f) = dec.next_display_frame() {
+                if !read_frame(&mut out, &mut raw) {
+                    panic!("{path}: ffmpeg 的裸帧提前结束（我们这边还有帧没对上）");
+                }
+                let (diff, first, maxd) = compare_frame(&f, &raw, w, h);
+                if let Some(mut fd) = dump.take() {
+                    // `V2V_DUMP=路径`：把解出来的帧按 yuv420p 落盘，方便事后用别的工具比。
+                    let mut buf = Vec::with_capacity(raw.len());
+                    buf.extend_from_slice(&f.y);
+                    buf.extend_from_slice(&f.u);
+                    buf.extend_from_slice(&f.v);
+                    use std::io::Write;
+                    fd.write_all(&buf).expect("写解帧");
+                    dump = Some(fd);
+                }
+                if diff != 0 {
+                    bad += 1;
+                    if bad <= 3 || verbose {
+                        let (fy, fx) = (first / w, first % w);
+                        let mb = first_bad_mb_frame(&f, &raw, w, h, mb_w, mb_h);
+                        eprintln!(
+                            "{path}: 第 {n} 帧不一致：{diff} 个像素不同（最大差 {maxd}，\
+                             首个像素在 ({fx}, {fy})，首个不一致宏块 {mb:?}，\
+                             来自第 {i} 个样本，用掉 {bits}/{avail} 位）"
+                        );
+                        if verbose {
+                            let all = bad_mb_list(&f, &raw, w, h, mb_w, mb_h);
+                            eprintln!("  坏宏块 {} 个 / {}：{:?}", all.len(), mb_w * mb_h, all);
+                            // 头 12 个不一致的像素：(x, y, 我们, 对账) —— 差多少、
+                            // 是「偏 1」还是「整块错位」，看一眼就知道。
+                            let mut shown = 0;
+                            'scan: for r in 0..h {
+                                for c in 0..w {
+                                    let o = r * w + c;
+                                    if f.y[o] != raw[o] {
+                                        eprint!(" ({c},{r}){}→{}", f.y[o], raw[o]);
+                                        shown += 1;
+                                        if shown >= 12 {
+                                            break 'scan;
+                                        }
+                                    }
+                                }
+                            }
+                            eprintln!();
+                        }
+                    }
+                } else if verbose {
+                    eprintln!(
+                        "{path}: 第 {n} 帧一致（来自第 {i} 个样本，用掉 {bits}/{avail} 位）"
+                    );
+                }
+                n += 1;
+                if limit != 0 && n >= limit {
+                    break;
+                }
+            }
+            if limit != 0 && n >= limit {
+                break;
+            }
+        }
+        // 收尾：延迟着的那一帧。
+        while let Some(f) = dec.flush() {
+            if !read_frame(&mut out, &mut raw) {
+                panic!("{path}: ffmpeg 的裸帧提前结束（我们这边还有收尾帧没对上）");
+            }
+            let (diff, first, maxd) = compare_frame(&f, &raw, w, h);
             if diff != 0 {
                 bad += 1;
                 if bad <= 3 || verbose {
                     let (fy, fx) = (first / w, first % w);
-                    // 按**宏块**报第一处不一致：宏块层错整块错，环路滤波只改边上两列/两行 ——
-                    // 两者分开看才知道该往哪条路查。
-                    let mb = first_mismatching_mb(dec.planes(), &raw, w, h, mb_w, mb_h);
+                    let mb = first_bad_mb_frame(&f, &raw, w, h, mb_w, mb_h);
                     eprintln!(
-                        "{path}: 第 {n} 帧不一致：{diff} 个像素不同（最大差 {maxd}，\
-                         首个像素在 ({fx}, {fy})，首个不一致宏块 {mb:?}，用掉 {bits}/{avail} 位）"
+                        "{path}: 收尾帧 {n} 不一致：{diff} 个像素不同（最大差 {maxd}，\
+                         首个像素在 ({fx}, {fy})，首个不一致宏块 {mb:?}）"
                     );
                 }
-            } else if verbose {
-                eprintln!(
-                    "{path}: 第 {n} 帧一致（用掉 {bits}/{avail} 位，剩 {} 位）",
-                    avail.saturating_sub(bits)
-                );
             }
             n += 1;
             if limit != 0 && n >= limit {
@@ -236,6 +313,36 @@ fn frames_match_ffmpeg_pixel_exact() {
         checked += 1;
     }
     assert!(checked > 0, "给了样本但没有一个是 WMV3");
+}
+
+/// 把「序列头 + 逐帧数据」原样落盘（`V2V_DUMP_STREAM=目录`）。
+///
+/// 只为「拿别的解码器当 oracle 逐宏块对账」时用：上游的调试转储要喂它同样的
+/// 码流分帧，自己从 ASF 里切比直接抄一遍更不容易出岔子。
+#[test]
+fn dump_stream_for_oracle() {
+    let Ok(dir) = std::env::var("V2V_DUMP_STREAM") else {
+        return;
+    };
+    let samples = common::sample_list();
+    for path in &samples {
+        let Some(track) = common::video_track(path) else {
+            continue;
+        };
+        if track.fourcc != common::FOURCC_WMV3 {
+            continue;
+        }
+        let frames = common::all_video_frames(path, track.number).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(format!("{dir}/extra.bin"), &track.extra).unwrap();
+        let mut out = Vec::new();
+        for f in &frames {
+            out.extend_from_slice(&(f.len() as u32).to_le_bytes());
+            out.extend_from_slice(f);
+        }
+        std::fs::write(format!("{dir}/frames.bin"), &out).unwrap();
+        eprintln!("{path}: 写了 {} 帧到 {dir}", frames.len());
+    }
 }
 
 /// 只跑 I 帧的语法层判据：**位游标正好落在帧尾**。
