@@ -1424,6 +1424,28 @@ fn block_geometry(
     }
 }
 
+/// 块内运动补偿的可选后端。相位的最低位为横向半像素，次低位为纵向半像素。
+#[cfg(feature = "mc8-hook")]
+pub type Mc8 = fn(reference: &[u8], base: usize, row_step: usize, phase: u8) -> [u8; 64];
+
+#[cfg(feature = "mc8-hook")]
+static MC8: std::sync::OnceLock<(&'static str, Mc8)> = std::sync::OnceLock::new();
+
+/// 注册逐像素等价的内核。进程内只采用第一次注册。
+#[cfg(feature = "mc8-hook")]
+pub fn set_mc8(name: &'static str, f: Mc8) {
+    let _ = MC8.set((name, f));
+}
+
+/// 当前块内运动补偿后端。默认构建使用 Rust 块预测。
+pub fn mc8_backend() -> &'static str {
+    #[cfg(feature = "mc8-hook")]
+    if let Some((name, _)) = MC8.get() {
+        return name;
+    }
+    "rust"
+}
+
 /// 从参考帧按运动矢量取一个 8×8 预测块（半像素双线性）。
 ///
 /// 亮度：整数部分 `mv >> 1`、小数位 `mv & 1`。
@@ -1480,6 +1502,10 @@ fn predict_block(
     if interior {
         let row0 = sy as usize * stride + sx as usize;
         let step = row_step as usize * stride;
+        #[cfg(feature = "mc8-hook")]
+        if let Some((_, kernel)) = MC8.get() {
+            return kernel(reference, row0, step, (fx | (fy << 1)) as u8);
+        }
         return match (fx, fy) {
             (0, 0) => interpolate_interior::<false, false>(reference, row0, step),
             (1, 0) => interpolate_interior::<true, false>(reference, row0, step),

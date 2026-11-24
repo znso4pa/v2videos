@@ -49,6 +49,7 @@ hw = ["dep:v2v-android"]
 # **默认关**：MPEG 的码表不小，只吃 WMV 的产物不该背上它。
 # 它同时打开 `v2v-player` 的同名 feature —— `v2v_player::mpeg` 在那里也是非默认的。
 mpeg12 = ["dep:v2v-mpeg12", "dep:v2v-mpegps", "v2v-player/mpeg12", "player"]
+mpeg12-c = ["mpeg12", "v2v-player/mpeg12-c"]
 
 [dependencies]
 # 只用它的 `Error`（全仓编解码器共用那一个），做错误码映射。

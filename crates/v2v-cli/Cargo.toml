@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [features]
 mp3-ffi = ["dep:v2v-audio-ffi"]
+mpeg12-c = ["v2v-player/mpeg12-c"]
 
 [dependencies]
 # 只用它的 `Error`（全仓编解码器共用那一个），`Error::Codec` 收的就是它。

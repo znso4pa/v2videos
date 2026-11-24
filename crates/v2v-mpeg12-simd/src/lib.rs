@@ -10,7 +10,7 @@
 //! 1. **审计范围明确** —— unsafe 只允许出现在这里，别处照旧零 unsafe；
 //! 2. **能单独编 `.so` / `.a`** —— `crate-type` 里带了 `staticlib` / `cdylib`，
 //!    宿主只链这一个 crate 就能拿到最小体积的内核；
-//! 3. **有 oracle 兜底** —— 关掉 `unsafe-kernels` feature，行为与 `v2v-mpeg12`
+//! 3. **有 oracle 兜底** —— 关掉 `unsafe-kernels` 和 `c-kernels`，行为与 `v2v-mpeg12`
 //!    逐字节一致（有测试钉着）。
 //!
 //! ## unsafe 的规矩（本 crate 内）
@@ -43,7 +43,8 @@ pub extern "C" fn v2v_mpeg12_simd_version() -> *const c_char {
 /// 见 [`kernels::available`] 与 [`kernels::installed`] 的区别。
 ///
 /// - bit 0：半像素平均（`kernels::avg_rows`）—— 写了但**没装**（实测无收益）
-/// - bit 1：IDCT 列通道（`kernels::idct_cols`）—— 已装（aarch64）
+/// - bit 1：IDCT 列通道（`kernels::idct_cols`）
+/// - bit 2：MIT C 的 8×8 半像素预测
 #[no_mangle]
 pub extern "C" fn v2v_mpeg12_simd_kernels() -> u32 {
     kernels::available()
@@ -54,14 +55,13 @@ pub extern "C" fn v2v_mpeg12_simd_kernels() -> u32 {
 // ---------------------------------------------------------------------------
 
 pub mod kernels;
+#[cfg(v2v_c_mc8)]
+mod mc8;
 
 /// 把本 crate 的内核装进解码器（进程内调一次即可）。
 pub use kernels::install;
 
 /// 解码入口（转调 `v2v-mpeg12`，安全路径仍是 oracle）。
 ///
-/// ⚠️ **别把它当成「加速版」**：这里只是转调，加速来自 [`install`] 装进去的内核
-/// （目前只有 IDCT 列通道，实测收益在噪声内 —— 见 TODO 的 2026-10-27 一节）。
-/// 要加新内核，得先在 `v2v-mpeg12` 里留一个挂载点（本 crate 依赖 mpeg12，
-/// 反过来不行，所以挂载点必须在 mpeg12 侧）。
+/// 先调用 [`install`]，解码器才会使用当前构建提供的替换内核。
 pub use v2v_mpeg12::decode::{decode_frame, MtDecoder};

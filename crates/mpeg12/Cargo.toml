@@ -6,6 +6,9 @@ license.workspace = true
 repository.workspace = true
 description = "MPEG-1/2 video elementary stream parser"
 
+[features]
+mc8-hook = []
+
 [dependencies]
 # 码表（LGPL 派生数据）单独一个 crate —— 见 crates/tables/src/lib.rs
 v2v-tables = { path = "../tables", default-features = false, features = ["mpeg12"] }

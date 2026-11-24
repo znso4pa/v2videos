@@ -940,7 +940,34 @@ MPEG-4 Part 2 试验了给运动搜索增加 SAD 截断，另测了缓存截断�
 在独立的 MIT C/NEON PoC 中，8×8 预测跨 FFI 的微基准快约 22%，32768 个预测块逐字节相同。
 把内核替换进 MPEG-2 后，四轮单线程配对解码的渐进组中位耗时从 1.205 降到 1.180 ms/帧，
 隔行组从 1.205 升到 1.220 ms/帧。每组各 96 帧的两路输出逐字节一致，对 FFmpeg 最大像素差
-均为 1。整条链路没有稳定收益，PoC 未合入。
+均为 1。整条链路没有稳定收益，该路径现在作为可选后端提供。
+
+### 10.2 MPEG-1/2 的可选 MIT C 内核
+
+`mpeg12-c` 在 ARM64 的 macOS、iOS、Linux、Android 上通过 FFI 使用原创 MIT C/NEON
+做参考画面范围内 8×8 块的半像素预测。边缘块仍走 Rust；未启用 feature 或平台不支持时使用
+Rust 后端。MPEG-1/2 解码器和码表沿用各自的许可证。
+
+```bash
+cargo build --release -p v2v-cli --features mpeg12-c -j 2
+./target/release/v2v bench --cases decode/mpeg12 --reps 5 /path/to/sample.mpg
+
+# 通过现有 v2v_mpeg_open / v2v_mpeg_read_video 使用同一后端
+cargo build --release -p v2v-capi --no-default-features --features mpeg12-c -j 2
+```
+
+基准 TSV 的 `mpeg12_mc` 记录实际启用的预测后端（`rust` 或 `c-neon`）。Rust 播放器使用
+`v2v-player/mpeg12-c`，底层 `v2v-mpeg12-simd` 则使用 `c-kernels` 并调用 `install()`。
+
+2026-11-25 Apple M3，release，单线程。两种构建交替跑四组，每组 `--reps 5` 取最快，表中取中位数。
+
+| MPEG-2 用例 | Rust ms | Rust + C ms | FFmpeg ms | Rust + C / FFmpeg |
+|---|---:|---:|---:|---:|
+| 480p 渐进，240 帧 | 203.42 | 203.88 | 92.91 | 2.19× |
+| 480i 隔行帧图，240 帧 | 213.95 | 207.73 | 94.59 | 2.20× |
+
+两组共 480 帧在 Rust 和 Rust + C 构建之间逐字节一致。默认继续使用纯 Rust；本机实测渐进持平，
+隔行节省约 3% 耗时。
 
 
 ## 能力矩阵

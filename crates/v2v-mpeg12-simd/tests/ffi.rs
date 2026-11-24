@@ -33,6 +33,12 @@ fn ffi_surface_is_usable() {
             "打开 unsafe-kernels 时半像素平均内核必须可用（本 crate 的门面）"
         );
         #[cfg(not(feature = "unsafe-kernels"))]
-        assert_eq!(mask, 0, "关掉 unsafe-kernels 时不应报告任何内核");
+        assert_eq!(
+            mask & !v2v_mpeg12_simd::kernels::KERNEL_MC8_C,
+            0,
+            "关掉 unsafe-kernels 时只能报告 C 内核"
+        );
+        #[cfg(not(feature = "c-kernels"))]
+        assert_eq!(mask & v2v_mpeg12_simd::kernels::KERNEL_MC8_C, 0);
     }
 }

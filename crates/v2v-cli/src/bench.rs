@@ -397,12 +397,14 @@ fn measure_mpeg(report: &mut Report, path: &Path, opts: &Options) -> Result<(), 
     let stem = file_label(path);
     let probe = MpgPlayer::open(path).map_err(|e| format!("{}：{e}", path.display()))?;
     let (w, h) = probe.size();
+    let backend = probe.motion_compensation_backend();
     drop(probe);
 
     let case = format!("decode/mpeg12/{stem}/{w}x{h}");
     if !opts.wants(&case) {
         return Ok(());
     }
+    report.set("mpeg12_mc", backend);
     let mut best = f64::INFINITY;
     let mut frames = 0u64;
     for _ in 0..opts.reps {

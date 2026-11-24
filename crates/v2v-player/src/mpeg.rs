@@ -12,6 +12,8 @@
 //! v2v-player = { path = "...", default-features = false, features = ["mpeg12"] }
 //! ```
 //!
+//! 需要在支持的平台上启用块内 C/NEON 预测时，改用 `mpeg12-c` feature。
+//!
 //! ## 音频
 //!
 //! **不解**。MPEG-1 的音轨是 MP2（MPEG-1 Audio Layer II），本仓没有它的解码器；
@@ -108,6 +110,8 @@ impl MpgPlayer {
             1000.0 / 30.0
         };
         let (width, height) = (sequence.width, sequence.height);
+        #[cfg(feature = "mpeg12-c")]
+        v2v_mpeg12_simd::install();
         Ok(Self {
             sequence,
             pictures,
@@ -122,6 +126,11 @@ impl MpgPlayer {
             width,
             height,
         })
+    }
+
+    /// 当前块内运动补偿后端的标识，供性能报告记录。
+    pub fn motion_compensation_backend(&self) -> &'static str {
+        decode::mc8_backend()
     }
 
     /// 画面尺寸与帧率（毫秒/帧）。
