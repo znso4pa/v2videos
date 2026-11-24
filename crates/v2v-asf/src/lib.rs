@@ -47,6 +47,13 @@ use std::io::{Read, Seek};
 use cursor::{Cursor, StreamReader};
 use types::PayloadExt;
 
+/// 建议的读缓冲大小。
+///
+/// ASF 包很小（几 KB 一个），`BufReader::new` 的 8 KiB 默认值会让「一个包一次 `read`」
+/// 退化成「每个包都撞系统调用」—— 138 MB 的样本实测要打一万七千次。256 KiB 装得下
+/// 几十个包，系统调用数掉到 1/32。只是读取粒度，**不改变任何字节语义**。
+pub const READ_BUFFER_SIZE: usize = 256 * 1024;
+
 /// 一帧 payload 头的最小长度。
 const FRAME_HEADER_SIZE: i64 = 6;
 

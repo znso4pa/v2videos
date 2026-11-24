@@ -833,28 +833,35 @@ impl WmaDecoder {
     }
 
     /// 加窗并把这一块叠加到 `frame_out[ch][index..]`。
+    ///
+    /// 每一段都先切好切片再 `zip` 迭代：范围一次性检查完，循环体里没有逐元素边界检查，
+    /// 也让编译器能把「乘 + 加」向量化。数值顺序与逐下标写法**完全相同**（同一个下标
+    /// 只做同一次乘加），所以输出逐字节不变。
     fn window_add(&mut self, ch: usize, index: usize, bsize: usize) {
         let bl = self.block_len;
+        let out = &mut self.frame_out[ch];
+        let src = &self.output;
         let mut out_i = index;
         let mut in_i = 0usize;
 
         // 左半
         if self.block_len_bits <= self.prev_block_len_bits {
             let win = &self.windows[bsize];
-            for i in 0..bl {
-                self.frame_out[ch][out_i + i] += self.output[in_i + i] * win[i];
+            let dst = &mut out[out_i..out_i + bl];
+            for ((d, &s), &w) in dst.iter_mut().zip(&src[in_i..in_i + bl]).zip(win) {
+                *d += s * w;
             }
         } else {
             let blk = 1usize << self.prev_block_len_bits;
             let n = (bl - blk) / 2;
             let b2 = (self.params.frame_len_bits - self.prev_block_len_bits) as usize;
             let win = &self.windows[b2];
-            for i in 0..blk {
-                self.frame_out[ch][out_i + n + i] += self.output[in_i + n + i] * win[i];
+            let dst = &mut out[out_i + n..out_i + n + blk];
+            for ((d, &s), &w) in dst.iter_mut().zip(&src[in_i + n..in_i + n + blk]).zip(win) {
+                *d += s * w;
             }
-            for i in 0..n {
-                self.frame_out[ch][out_i + n + blk + i] = self.output[in_i + n + blk + i];
-            }
+            out[out_i + n + blk..out_i + n + blk + n]
+                .copy_from_slice(&src[in_i + n + blk..in_i + n + blk + n]);
         }
         out_i += bl;
         in_i += bl;
@@ -862,23 +869,25 @@ impl WmaDecoder {
         // 右半（窗反向）
         if self.block_len_bits <= self.next_block_len_bits {
             let win = &self.windows[bsize];
-            for i in 0..bl {
-                self.frame_out[ch][out_i + i] = self.output[in_i + i] * win[bl - 1 - i];
+            let dst = &mut out[out_i..out_i + bl];
+            for ((d, &s), &w) in dst.iter_mut().zip(&src[in_i..in_i + bl]).zip(win.iter().rev()) {
+                *d = s * w;
             }
         } else {
             let blk = 1usize << self.next_block_len_bits;
             let n = (bl - blk) / 2;
             let b2 = (self.params.frame_len_bits - self.next_block_len_bits) as usize;
             let win = &self.windows[b2];
-            for i in 0..n {
-                self.frame_out[ch][out_i + i] = self.output[in_i + i];
+            out[out_i..out_i + n].copy_from_slice(&src[in_i..in_i + n]);
+            let dst = &mut out[out_i + n..out_i + n + blk];
+            for ((d, &s), &w) in dst
+                .iter_mut()
+                .zip(&src[in_i + n..in_i + n + blk])
+                .zip(win[..blk].iter().rev())
+            {
+                *d = s * w;
             }
-            for i in 0..blk {
-                self.frame_out[ch][out_i + n + i] = self.output[in_i + n + i] * win[blk - 1 - i];
-            }
-            for i in 0..n {
-                self.frame_out[ch][out_i + n + blk + i] = 0.0;
-            }
+            out[out_i + n + blk..out_i + n + blk + n].fill(0.0);
         }
     }
 

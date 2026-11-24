@@ -565,7 +565,8 @@ impl AudioTrack {
 /// 打开一个解封装实例（同一文件会被开两次，见模块文档）。
 fn open_demux(path: &Path) -> Result<AsfDemuxer<BufReader<File>>> {
     let file = File::open(path).map_err(|e| Error::Bad(format!("打不开 {}: {e}", path.display())))?;
-    AsfDemuxer::new(BufReader::new(file)).map_err(Error::from)
+    let reader = BufReader::with_capacity(v2v_asf::READ_BUFFER_SIZE, file);
+    AsfDemuxer::new(reader).map_err(Error::from)
 }
 
 fn demux_info(demux: &AsfDemuxer<BufReader<File>>) -> Result<Info> {
