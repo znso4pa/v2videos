@@ -526,7 +526,7 @@ impl Encoder {
                     &dc_diff,
                     &dir,
                     self.cfg.ac_pred,
-                    &rl,
+                    rl,
                     &mut ac,
                 )?;
                 w.append(&best);
@@ -610,8 +610,8 @@ impl Encoder {
             mv_prev: &mv_prev,
             intra_mbs: 0,
             intra_skips: 0,
-            rl_intra: &rl_intra,
-            rl_inter: &rl_inter,
+            rl_intra,
+            rl_inter,
             me_cache: MeSadCache::new(),
         };
         for mby in 0..mb_h {
@@ -659,7 +659,12 @@ impl Encoder {
 }
 
 /// 帧内 RL 表：`ff_mpeg4_rl_intra`，`n = 102`（下标 102 是 escape）、`last = 67`。
-fn intra_rl_table() -> RlTable {
+fn intra_rl_table() -> &'static EncodeRl {
+    static TABLE: std::sync::OnceLock<EncodeRl> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| EncodeRl::new(intra_rl_source()))
+}
+
+fn intra_rl_source() -> RlTable {
     RlTable::new(
         &tables::RL_INTRA_VLC,
         &tables::RL_INTRA_RUN,
@@ -673,7 +678,12 @@ fn intra_rl_table() -> RlTable {
 /// 注意取的是**第 0 档**（恒等）—— ffmpeg 的 `ff_rl_init` 会按 qscale 预乘出 1..31 档，
 /// 解码端帧间取第 `qscale` 档；那是「解出来即最终系数」的便利做法。
 /// **编码器要的是量化后的原始 level**，所以用恒等的第 0 档，反量化自己另算一趟。
-fn inter_rl_table() -> RlTable {
+fn inter_rl_table() -> &'static EncodeRl {
+    static TABLE: std::sync::OnceLock<EncodeRl> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| EncodeRl::new(inter_rl_source()))
+}
+
+fn inter_rl_source() -> RlTable {
     RlTable::new(
         &tables::RL_INTER_VLC,
         &tables::RL_INTER_RUN,
@@ -710,7 +720,7 @@ fn write_mb(
     dc_diff: &[i32; 6],
     dir: &[usize; 6],
     use_ac_pred: bool,
-    rl_intra: &RlTable,
+    rl_intra: &EncodeRl,
     ac: &mut AcGrid,
 ) -> Result<()> {
     // ---- AC 预测：按 n = 0..5 走（块 1 要读块 0 刚存进去的值）----
@@ -771,7 +781,7 @@ fn write_inter_mb(
     mv: (i32, i32),
     pred: (i32, i32),
     blocks: &[[i32; 64]; 6],
-    rl_inter: &RlTable,
+    rl_inter: &EncodeRl,
 ) -> Result<()> {
     write_inter_mcbpc(w, cbp & 3)?;
     write_cbpy(w, (cbp >> 2) ^ 0xF)?;
@@ -832,7 +842,7 @@ fn intra_try(
     dc_diff: &[i32; 6],
     dir: &[usize; 6],
     use_ac_pred: bool,
-    rl_intra: &RlTable,
+    rl_intra: &EncodeRl,
     ac: &mut AcGrid,
 ) -> Result<(BitWriter, bool)> {
     let mut plain = BitWriter::new();
@@ -948,8 +958,8 @@ struct PState<'a> {
     intra_mbs: usize,
     /// 被预判挡掉的帧内试编次数（见 `INTRA_SKIP_RATIO`）。
     intra_skips: usize,
-    rl_intra: &'a RlTable,
-    rl_inter: &'a RlTable,
+    rl_intra: &'a EncodeRl,
+    rl_inter: &'a EncodeRl,
     /// 运动估计的候选 SAD 记忆表（见 `MeSadCache`）。
     me_cache: MeSadCache,
 }
@@ -1866,11 +1876,10 @@ fn store_ac_val(ac: &mut AcGrid, n: usize, cell: (usize, usize), block: &[i32; 6
 ///
 /// 与 MP43 的 `write_ac` **不是一回事**：MP43 的三种 escape 含义不同
 /// （第一 escape 补 level、第二 escape 补 run、第三 escape 明文 1+6+8 位）。
-/// 这里 ffmpeg 是预先算好一张「统一表」在 ESC0/ESC1/ESC2/ESC3 里挑最短的 ——
-/// 我们**在写的时候现算**同样的挑选，省掉那张 8192 项的表。
+/// 进程第一次编码时按原码表选好最短码字。写位流与 trellis 读同一份结果。
 fn write_ac(
     w: &mut BitWriter,
-    rl: &RlTable,
+    rl: &EncodeRl,
     block: &[i32; 64],
     scan: &[u8; 64],
     intra: bool,
@@ -1893,6 +1902,73 @@ fn write_ac(
     Ok(())
 }
 
+/// 非 ESC3 码字的最低位总是符号，只缓存正幅值。每个词条高 6 位存长度，
+/// 低 26 位存码字，零词条交给 ESC3。原始码表只用于初始化。
+struct EncodeRl {
+    words: Box<[u32]>,
+    stride: usize,
+    escape: u32,
+    escape_len: u32,
+}
+
+impl EncodeRl {
+    fn new(rl: RlTable) -> Self {
+        let (escape, escape_len) = rl.code_len(rl.escape_symbol()).expect("MPEG-4 RL escape");
+        let max_level = (0..2)
+            .flat_map(|last| (0..64).map(move |run| (last, run)))
+            .map(|(last, run)| rl.max_level_at(last, run))
+            .max()
+            .unwrap_or(0);
+        // ESC1 最多把同一个 run 的最大短码幅值加两次。ESC0/ESC2 都要能直接
+        // 查到幅值。大于这个界的 level 只能用 ESC3。
+        let stride = 1 + 2 * max_level as usize;
+        let mut words = vec![0; 2 * 64 * stride];
+        for last in [false, true] {
+            for run in 0..64 {
+                for level in 1..stride {
+                    let (code, len) =
+                        select_rl(&rl, last, run, level as i32).expect("valid MPEG-4 RL tables");
+                    if len != escape_len + 23 {
+                        assert!(len <= 26);
+                        words[(usize::from(last) * 64 + run) * stride + level] = (len << 26) | code;
+                    }
+                }
+            }
+        }
+        Self {
+            words: words.into_boxed_slice(),
+            stride,
+            escape,
+            escape_len,
+        }
+    }
+
+    #[inline]
+    fn code_len(&self, last: bool, run: usize, level: i32) -> (u32, u32) {
+        debug_assert!(run < 64);
+        let magnitude = level.unsigned_abs() as usize;
+        if magnitude < self.stride {
+            let entry = self.words[(usize::from(last) * 64 + run) * self.stride + magnitude];
+            if entry != 0 {
+                return (
+                    (entry & ((1 << 26) - 1)) | u32::from(level < 0),
+                    entry >> 26,
+                );
+            }
+        }
+        (
+            escape3_code(self.escape, last, run, level),
+            self.escape_len + 23,
+        )
+    }
+}
+
+#[inline]
+fn escape3_code(escape: u32, last: bool, run: usize, level: i32) -> u32 {
+    let header = (((escape << 2 | 0b11) << 1 | u32::from(last)) << 6 | run as u32) << 1 | 1;
+    (header << 13) | (((level as u32) & 0xfff) << 1) | 1
+}
+
 /// 一个 `(last, run, level)` 的最省写法。
 ///
 /// 四种候选（`init_uni_mpeg4_rl_tab` 的逻辑，现算而不是查表）：
@@ -1905,18 +1981,15 @@ fn write_ac(
 /// | ESC3 | `esc` `11` last(1) run(6) 1 level(12) 1 | `len(esc)+23` |
 ///
 /// 严格取最短的（并列时取靠前的候选，与 ffmpeg 的 `len < best` 一致）。
-fn write_rl(w: &mut BitWriter, rl: &RlTable, last: bool, run: usize, level: i32) -> Result<()> {
-    let (code, len) = best_rl(rl, last, run, level)?;
+fn write_rl(w: &mut BitWriter, rl: &EncodeRl, last: bool, run: usize, level: i32) -> Result<()> {
+    let (code, len) = rl.code_len(last, run, level);
     debug_assert!(len <= 32, "一次最多写 32 位，ESC3 是 {len} 位");
     w.put(code, len);
     Ok(())
 }
 
-/// 一个 `(last, run, level)` 的**最省写法**：`(code, len)`。
-///
-/// ⚠️ 位数的唯一真源 —— 写位流（`write_rl`）与代价模型（`rl_cost`）都走这里。
-/// 各算一份必然分叉（本仓踩过：`band_cost` 与 `write_band` 的 escape 计数不一样）。
-fn best_rl(rl: &RlTable, last: bool, run: usize, level: i32) -> Result<(u32, u32)> {
+/// 直接比较四种码字，供缓存初始化和逐项对账。
+fn select_rl(rl: &RlTable, last: bool, run: usize, level: i32) -> Result<(u32, u32)> {
     let esc = rl.escape_symbol();
     let (esc_code, esc_len) = rl
         .code_len(esc)
@@ -1962,21 +2035,19 @@ fn best_rl(rl: &RlTable, last: bool, run: usize, level: i32) -> Result<(u32, u32
             }
         }
     }
-    // ESC3：`esc` `11` last run(6) 1 level(12) 1 —— 12 位有符号，用补码低 12 位。
-    {
-        let bits = ((((esc_code << 2 | 0b11) << 1 | u32::from(last)) << 6 | run as u32) << 1 | 1)
-            << 12
-            | ((level as u32) & 0xfff);
-        let bits = bits << 1 | 1;
-        better(bits, esc_len + 23, &mut best);
-    }
+    // ESC3：`esc` `11` last run(6) 1 level(12) 1，电平用补码低 12 位。
+    better(
+        escape3_code(esc_code, last, run, level),
+        esc_len + 23,
+        &mut best,
+    );
 
     best.ok_or(Error::Bad("AC 系数写不出来"))
 }
 
-/// 一个 `(last, run, level)` 要花多少位（`best_rl` 的长度那一半）。
-fn rl_cost(rl: &RlTable, last: bool, run: usize, level: i32) -> u32 {
-    best_rl(rl, last, run, level).map_or(32, |(_, len)| len)
+/// 写出和 trellis 代价采用同一个码字的长度。
+fn rl_cost(rl: &EncodeRl, last: bool, run: usize, level: i32) -> u32 {
+    rl.code_len(last, run, level).1
 }
 
 /// 系数级 RD（trellis）：在**扫描序**上做一遍 DP，逐系数在 `{L, L∓1}` 里挑
@@ -2001,7 +2072,7 @@ fn rl_cost(rl: &RlTable, last: bool, run: usize, level: i32) -> u32 {
 ///   （本仓在另一条线上踩过「λ 比实测最优大 90 倍」）。
 fn trellis_levels(
     quant: &Quant,
-    rl: &RlTable,
+    rl: &EncodeRl,
     coeff: &[i32; 64],
     levels: &mut [i32; 64],
     lambda: i64,
@@ -2465,7 +2536,7 @@ mod tests {
     /// 按 trellis 自己的模型算一个 level 排布的代价（失真 + λ·位数）——只服务下面那条对拍。
     fn model_cost(
         quant: &Quant,
-        rl: &RlTable,
+        rl: &EncodeRl,
         coeff: &[i32; 64],
         levels: &[i32; 64],
         lambda: i64,
@@ -2507,7 +2578,7 @@ mod tests {
             base[k] = quant.quantize(k, coeff[k], false);
         }
         let mut got = base;
-        trellis_levels(&quant, &rl, &coeff, &mut got, lambda);
+        trellis_levels(&quant, rl, &coeff, &mut got, lambda);
 
         let positions: Vec<usize> = (0..64)
             .filter(|&i| base[ZIGZAG[i] as usize] != 0)
@@ -2531,10 +2602,10 @@ mod tests {
                 cand[k] = set[m % n].clamp(-2047, 2047);
                 m /= n;
             }
-            best = best.min(model_cost(&quant, &rl, &coeff, &cand, lambda));
+            best = best.min(model_cost(&quant, rl, &coeff, &cand, lambda));
         }
         assert_eq!(
-            model_cost(&quant, &rl, &coeff, &got, lambda),
+            model_cost(&quant, rl, &coeff, &got, lambda),
             best,
             "DP 没取到暴力枚举的最小值"
         );
@@ -2557,15 +2628,14 @@ mod tests {
         base[k] = quant.quantize(k, coeff[k], false);
         assert_eq!(base[k].abs(), 1, "前提：基线是 ±1（这样 0 才在候选集里）");
         let mut out = base;
-        trellis_levels(&quant, &rl, &coeff, &mut out, 400);
+        trellis_levels(&quant, rl, &coeff, &mut out, 400);
         assert_eq!(out[k], 0, "λ 够大时，昂贵的高频小系数该被砍掉");
         assert!(
-            model_cost(&quant, &rl, &coeff, &out, 400)
-                <= model_cost(&quant, &rl, &coeff, &base, 400)
+            model_cost(&quant, rl, &coeff, &out, 400) <= model_cost(&quant, rl, &coeff, &base, 400)
         );
         // 反过来：λ = 0（只看失真）必须留着它 —— 这半条是「砍」的对照
         let mut kept = base;
-        trellis_levels(&quant, &rl, &coeff, &mut kept, 0);
+        trellis_levels(&quant, rl, &coeff, &mut kept, 0);
         assert!(kept[k].abs() >= 1, "λ=0 时不该砍");
     }
 
@@ -2586,7 +2656,7 @@ mod tests {
                 base[k] = quant.quantize(k, coeff[k], false);
             }
             let mut out = base;
-            trellis_levels(&quant, &rl, &coeff, &mut out, quant.lambda());
+            trellis_levels(&quant, rl, &coeff, &mut out, quant.lambda());
             for k in 0..64 {
                 if base[k] == 0 {
                     assert_eq!(out[k], 0, "不许新增非零系数");
@@ -2805,13 +2875,33 @@ mod tests {
     }
 
     #[test]
+    fn cached_rl_matches_direct_selection_for_all_signed_levels() {
+        for (direct, cached) in [
+            (intra_rl_source(), intra_rl_table()),
+            (inter_rl_source(), inter_rl_table()),
+        ] {
+            for last in [false, true] {
+                for run in 0..64 {
+                    for level in -2048..=2047 {
+                        assert_eq!(
+                            cached.code_len(last, run, level),
+                            select_rl(&direct, last, run, level).unwrap(),
+                            "last={last} run={run} level={level}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn escape3_costs_the_escape_code_plus_twenty_three_bits() {
         // 帧内表的 escape 码是 `0000011`（7 位，`ff_mpeg4_intra_vlc[102] = (3, 7)`），
         // 所以 ESC3 一共 7 + 2 + 1 + 6 + 1 + 12 + 1 = 30 位。
         // 用一个大 level 逼出 ESC3（12 位能表示 ±2047，但表里没有这么大的 level）。
         let rl = intra_rl_table();
         let mut w = BitWriter::new();
-        write_rl(&mut w, &rl, true, 30, 2000).unwrap();
+        write_rl(&mut w, rl, true, 30, 2000).unwrap();
         assert_eq!(w.bit_pos(), 30);
     }
 
@@ -2820,7 +2910,7 @@ mod tests {
         // (last=0, run=0, level=1) 在表里，应当只花 ESC0 的位数。
         let rl = intra_rl_table();
         let mut w = BitWriter::new();
-        write_rl(&mut w, &rl, false, 0, 1).unwrap();
+        write_rl(&mut w, rl, false, 0, 1).unwrap();
         assert!(w.bit_pos() <= 4, "最常用的系数不该走 escape");
     }
 
