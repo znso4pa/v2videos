@@ -91,23 +91,23 @@ pub fn fdct_i_float(pix: &[i32], stride: usize, out: &mut [i32; 64]) {
 // 参考：ffmpeg n4.4 的 `libavcodec/jfdctint_template.c`（`ff_jpeg_fdct_islow`）——
 // JPEG 参考实现里的 LL&M，注释明说「results scaled up by an overall factor of 8」。
 
-const CONST_BITS: u32 = 13;
-const PASS1_BITS: u32 = 4;
+pub(crate) const CONST_BITS: u32 = 13;
+pub(crate) const PASS1_BITS: u32 = 4;
 /// 列趟的输出移位。上游是 `PASS1_BITS`；我们**再加 3 位**把「×8」收回去。
-const OUT_SHIFT: u32 = PASS1_BITS + 3;
+pub(crate) const OUT_SHIFT: u32 = PASS1_BITS + 3;
 
-const FIX_0_298631336: i32 = 2446;
-const FIX_0_390180644: i32 = 3196;
-const FIX_0_541196100: i32 = 4433;
-const FIX_0_765366865: i32 = 6270;
-const FIX_0_899976223: i32 = 7373;
-const FIX_1_175875602: i32 = 9633;
-const FIX_1_501321110: i32 = 12299;
-const FIX_1_847759065: i32 = 15137;
-const FIX_1_961570560: i32 = 16069;
-const FIX_2_053119869: i32 = 16819;
-const FIX_2_562915447: i32 = 20995;
-const FIX_3_072711026: i32 = 25172;
+pub(crate) const FIX_0_298631336: i32 = 2446;
+pub(crate) const FIX_0_390180644: i32 = 3196;
+pub(crate) const FIX_0_541196100: i32 = 4433;
+pub(crate) const FIX_0_765366865: i32 = 6270;
+pub(crate) const FIX_0_899976223: i32 = 7373;
+pub(crate) const FIX_1_175875602: i32 = 9633;
+pub(crate) const FIX_1_501321110: i32 = 12299;
+pub(crate) const FIX_1_847759065: i32 = 15137;
+pub(crate) const FIX_1_961570560: i32 = 16069;
+pub(crate) const FIX_2_053119869: i32 = 16819;
+pub(crate) const FIX_2_562915447: i32 = 20995;
+pub(crate) const FIX_3_072711026: i32 = 25172;
 
 #[inline(always)]
 fn descale(x: i32, n: u32) -> i32 {
@@ -190,6 +190,15 @@ fn butterfly_col(d: [i32; 8]) -> [i32; 8] {
 
 /// **蝶形版正变换** —— 定标与 `fdct_i`（f64 版）完全相同（`F(0,0) = 8 × 均值`）。
 pub fn fdct_llm(pix: &[i32], stride: usize, out: &mut [i32; 64]) {
+    #[cfg(all(feature = "unsafe-kernels", target_arch = "aarch64"))]
+    if crate::simd::fdct_llm_fast(pix, stride, out) {
+        return;
+    }
+    fdct_llm_scalar(pix, stride, out);
+}
+
+/// 标量参考实现 —— **默认就是它**在跑（NEON 要开 `unsafe-kernels`），也是测试的判据。
+pub(crate) fn fdct_llm_scalar(pix: &[i32], stride: usize, out: &mut [i32; 64]) {
     let mut tmp = [[0i32; 8]; 8];
     for y in 0..8 {
         let mut row = [0i32; 8];
@@ -295,6 +304,32 @@ mod tests {
                 .unwrap();
             // 整数 IDCT 的舍入 + 16 位截断，允许 ±1
             assert!(worst <= 1, "正向+反向没能还原：最大差 {worst}");
+        }
+    }
+
+    /// NEON 路径必须与标量**逐系数相同** —— 包括负残差（P 帧走的就是它）。
+    ///
+    /// 这条是「新判据先确认它会红」的那种测试：把 `tr8` 里的列顺序写反、或把
+    /// `rshr` 的位数写错，它立刻失败。
+    #[cfg(all(feature = "unsafe-kernels", target_arch = "aarch64"))]
+    #[test]
+    fn neon_llm_matches_scalar() {
+        let mut seed = 0x1357_9bdfu32;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((seed >> 16) % 1023) as i32 - 511
+        };
+        for _ in 0..500 {
+            // stride 9 故意不等于 8：转置若把步长当成 8，这里就会露馅。
+            let mut pix = [0i32; 8 * 9];
+            for v in pix.iter_mut() {
+                *v = next();
+            }
+            let mut fast = [0i32; 64];
+            let mut slow = [0i32; 64];
+            super::fdct_llm(&pix, 9, &mut fast);
+            super::fdct_llm_scalar(&pix, 9, &mut slow);
+            assert_eq!(fast, slow, "NEON 与标量不一致");
         }
     }
 }

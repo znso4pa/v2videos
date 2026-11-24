@@ -225,6 +225,201 @@ mod neon {
         }
         acc
     }
+
+    // ---- 正向 8×8 DCT ----
+    //
+    // 结构是「两次 8×8 转置 + 两次逐元素蝶形」：转置一次把行趟变成 8 个向量之间的
+    // 逐元素运算（车道 = 行号），再转回来让列趟同样逐元素。蝶形的算式与
+    // `fdct.rs` 的标量版**逐项相同**；`descale(x, n)` 正是 `vrshrq_n_s32`
+    // （加 2^(n-1) 再算术右移），所以两边逐位一致，不是近似。
+
+    use crate::fdct as fd;
+
+    /// 8 个 i32 车道 = 两个 `int32x4_t`。蝶形全是逐元素的，用一对寄存器表示
+    /// 「8 车道向量」后，标量版可以照抄成方法调用。
+    #[derive(Clone, Copy)]
+    struct V8(int32x4_t, int32x4_t);
+
+    impl V8 {
+        #[inline(always)]
+        unsafe fn add(self, o: Self) -> Self {
+            unsafe { V8(vaddq_s32(self.0, o.0), vaddq_s32(self.1, o.1)) }
+        }
+        #[inline(always)]
+        unsafe fn sub(self, o: Self) -> Self {
+            unsafe { V8(vsubq_s32(self.0, o.0), vsubq_s32(self.1, o.1)) }
+        }
+        #[inline(always)]
+        unsafe fn mul(self, k: i32) -> Self {
+            unsafe {
+                let k = vdupq_n_s32(k);
+                V8(vmulq_s32(self.0, k), vmulq_s32(self.1, k))
+            }
+        }
+        #[inline(always)]
+        unsafe fn shl<const N: i32>(self) -> Self {
+            unsafe { V8(vshlq_n_s32::<N>(self.0), vshlq_n_s32::<N>(self.1)) }
+        }
+        #[inline(always)]
+        unsafe fn rshr<const N: i32>(self) -> Self {
+            unsafe { V8(vrshrq_n_s32::<N>(self.0), vrshrq_n_s32::<N>(self.1)) }
+        }
+    }
+
+    /// 4×4 i32 转置（输入 4 行，输出 4 列）。
+    #[inline(always)]
+    unsafe fn tr4(a: int32x4_t, b: int32x4_t, c: int32x4_t, d: int32x4_t) -> [int32x4_t; 4] {
+        unsafe {
+            let t0 = vtrn1q_s32(a, b);
+            let t1 = vtrn2q_s32(a, b);
+            let t2 = vtrn1q_s32(c, d);
+            let t3 = vtrn2q_s32(c, d);
+            [
+                vcombine_s32(vget_low_s32(t0), vget_low_s32(t2)),
+                vcombine_s32(vget_low_s32(t1), vget_low_s32(t3)),
+                vcombine_s32(vget_high_s32(t0), vget_high_s32(t2)),
+                vcombine_s32(vget_high_s32(t1), vget_high_s32(t3)),
+            ]
+        }
+    }
+
+    /// 8×8 转置：入参每项是 (列 0..3, 列 4..7)，出参每项是 (行 0..3, 行 4..7)。
+    #[inline(always)]
+    unsafe fn tr8(r: [V8; 8]) -> [V8; 8] {
+        unsafe {
+            let a = tr4(r[0].0, r[1].0, r[2].0, r[3].0);
+            let b = tr4(r[0].1, r[1].1, r[2].1, r[3].1);
+            let c = tr4(r[4].0, r[5].0, r[6].0, r[7].0);
+            let d = tr4(r[4].1, r[5].1, r[6].1, r[7].1);
+            [
+                V8(a[0], c[0]),
+                V8(a[1], c[1]),
+                V8(a[2], c[2]),
+                V8(a[3], c[3]),
+                V8(b[0], d[0]),
+                V8(b[1], d[1]),
+                V8(b[2], d[2]),
+                V8(b[3], d[3]),
+            ]
+        }
+    }
+
+    /// 行趟：含 `PASS1_BITS` 的放大（下标 0/4）。
+    #[inline(always)]
+    unsafe fn bfly_row(d: [V8; 8]) -> [V8; 8] {
+        unsafe {
+            let (t0, t7) = (d[0].add(d[7]), d[0].sub(d[7]));
+            let (t1, t6) = (d[1].add(d[6]), d[1].sub(d[6]));
+            let (t2, t5) = (d[2].add(d[5]), d[2].sub(d[5]));
+            let (t3, t4) = (d[3].add(d[4]), d[3].sub(d[4]));
+            let t10 = t0.add(t3);
+            let t13 = t0.sub(t3);
+            let t11 = t1.add(t2);
+            let t12 = t1.sub(t2);
+            let mut o = [d[0]; 8];
+            o[0] = t10.add(t11).shl::<{ fd::PASS1_BITS as i32 }>();
+            o[4] = t10.sub(t11).shl::<{ fd::PASS1_BITS as i32 }>();
+            let z1 = t12.add(t13).mul(fd::FIX_0_541196100);
+            o[2] = z1
+                .add(t13.mul(fd::FIX_0_765366865))
+                .rshr::<{ (fd::CONST_BITS - fd::PASS1_BITS) as i32 }>();
+            o[6] = z1
+                .add(t12.mul(-fd::FIX_1_847759065))
+                .rshr::<{ (fd::CONST_BITS - fd::PASS1_BITS) as i32 }>();
+            let z1 = t4.add(t7);
+            let z2 = t5.add(t6);
+            let z3 = t4.add(t6);
+            let z4 = t5.add(t7);
+            let z5 = z3.add(z4).mul(fd::FIX_1_175875602);
+            let m4 = t4.mul(fd::FIX_0_298631336);
+            let m5 = t5.mul(fd::FIX_2_053119869);
+            let m6 = t6.mul(fd::FIX_3_072711026);
+            let m7 = t7.mul(fd::FIX_1_501321110);
+            let z1 = z1.mul(-fd::FIX_0_899976223);
+            let z2 = z2.mul(-fd::FIX_2_562915447);
+            let z3 = z3.mul(-fd::FIX_1_961570560).add(z5);
+            let z4 = z4.mul(-fd::FIX_0_390180644).add(z5);
+            o[7] = m4.add(z1).add(z3).rshr::<{ (fd::CONST_BITS - fd::PASS1_BITS) as i32 }>();
+            o[5] = m5.add(z2).add(z4).rshr::<{ (fd::CONST_BITS - fd::PASS1_BITS) as i32 }>();
+            o[3] = m6.add(z2).add(z3).rshr::<{ (fd::CONST_BITS - fd::PASS1_BITS) as i32 }>();
+            o[1] = m7.add(z1).add(z4).rshr::<{ (fd::CONST_BITS - fd::PASS1_BITS) as i32 }>();
+            o
+        }
+    }
+
+    /// 列趟：不含 `PASS1_BITS` 的放大（`OUT_SHIFT` 里已经收了那 3 位）。
+    #[inline(always)]
+    unsafe fn bfly_col(d: [V8; 8]) -> [V8; 8] {
+        unsafe {
+            let (t0, t7) = (d[0].add(d[7]), d[0].sub(d[7]));
+            let (t1, t6) = (d[1].add(d[6]), d[1].sub(d[6]));
+            let (t2, t5) = (d[2].add(d[5]), d[2].sub(d[5]));
+            let (t3, t4) = (d[3].add(d[4]), d[3].sub(d[4]));
+            let t10 = t0.add(t3);
+            let t13 = t0.sub(t3);
+            let t11 = t1.add(t2);
+            let t12 = t1.sub(t2);
+            let mut o = [d[0]; 8];
+            o[0] = t10.add(t11).rshr::<{ fd::OUT_SHIFT as i32 }>();
+            o[4] = t10.sub(t11).rshr::<{ fd::OUT_SHIFT as i32 }>();
+            let z1 = t12.add(t13).mul(fd::FIX_0_541196100);
+            o[2] = z1
+                .add(t13.mul(fd::FIX_0_765366865))
+                .rshr::<{ (fd::CONST_BITS + fd::OUT_SHIFT) as i32 }>();
+            o[6] = z1
+                .add(t12.mul(-fd::FIX_1_847759065))
+                .rshr::<{ (fd::CONST_BITS + fd::OUT_SHIFT) as i32 }>();
+            let z1 = t4.add(t7);
+            let z2 = t5.add(t6);
+            let z3 = t4.add(t6);
+            let z4 = t5.add(t7);
+            let z5 = z3.add(z4).mul(fd::FIX_1_175875602);
+            let m4 = t4.mul(fd::FIX_0_298631336);
+            let m5 = t5.mul(fd::FIX_2_053119869);
+            let m6 = t6.mul(fd::FIX_3_072711026);
+            let m7 = t7.mul(fd::FIX_1_501321110);
+            let z1 = z1.mul(-fd::FIX_0_899976223);
+            let z2 = z2.mul(-fd::FIX_2_562915447);
+            let z3 = z3.mul(-fd::FIX_1_961570560).add(z5);
+            let z4 = z4.mul(-fd::FIX_0_390180644).add(z5);
+            o[7] = m4.add(z1).add(z3).rshr::<{ (fd::CONST_BITS + fd::OUT_SHIFT) as i32 }>();
+            o[5] = m5.add(z2).add(z4).rshr::<{ (fd::CONST_BITS + fd::OUT_SHIFT) as i32 }>();
+            o[3] = m6.add(z2).add(z3).rshr::<{ (fd::CONST_BITS + fd::OUT_SHIFT) as i32 }>();
+            o[1] = m7.add(z1).add(z4).rshr::<{ (fd::CONST_BITS + fd::OUT_SHIFT) as i32 }>();
+            o
+        }
+    }
+
+    /// 8×8 正向 DCT。调用方负责保证 8 行 × 8 列都落在 `pix` 内。
+    pub unsafe fn fdct_llm(pix: *const i32, stride: usize, out: *mut i32) {
+        unsafe {
+            let mut r = [V8(vdupq_n_s32(0), vdupq_n_s32(0)); 8];
+            for y in 0..8usize {
+                let p = pix.add(y * stride);
+                r[y] = V8(vld1q_s32(p), vld1q_s32(p.add(4)));
+            }
+            let f = bfly_col(tr8(bfly_row(tr8(r))));
+            for v in 0..8usize {
+                let q = out.add(v * 8);
+                vst1q_s32(q, f[v].0);
+                vst1q_s32(q.add(4), f[v].1);
+            }
+        }
+    }
+}
+
+/// 正向 8×8 DCT 的 NEON 入口。
+///
+/// 前置条件在这里验（8 行 × 8 列都得在切片内），不满足就返回 `false` 让调用方
+/// 走标量 —— 内核不赌调用方有没有把边缘块补齐。
+#[cfg(all(feature = "unsafe-kernels", target_arch = "aarch64"))]
+pub fn fdct_llm_fast(pix: &[i32], stride: usize, out: &mut [i32; 64]) -> bool {
+    if stride < 8 || pix.len() < 7 * stride + 8 {
+        return false;
+    }
+    // SAFETY: 上面两条就是 NEON 版读写的全部前置条件；`out` 是定长 64 个 i32。
+    unsafe { neon::fdct_llm(pix.as_ptr(), stride, out.as_mut_ptr()) };
+    true
 }
 
 #[cfg(test)]
