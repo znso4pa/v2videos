@@ -456,6 +456,8 @@ struct BandCostCache {
     /// `band_cost` 用的量化 scratch（不封顶的 `q`）—— 挂在这里**零额外分配**：
     /// 一条带最多 ~80 个系数，容量涨一次就不再动。
     q_scratch: Vec<i32>,
+    /// 各组谱线的 |x|^(3/4)，同一帧内的所有 sf 候选公用。
+    powers: Vec<Vec<f64>>,
 }
 
 /// 「这一格还没算过」的哨兵 —— 真码本只到 11，所以 `0xFF` 安全。
@@ -467,13 +469,19 @@ impl BandCostCache {
         Self {
             tables: Vec::new(),
             q_scratch: Vec::new(),
+            powers: Vec::new(),
         }
     }
 
     /// 按这一帧的形状准备（组数 + 每组条带数）。形状没变就只清空，**不重新分配**。
-    fn reset(&mut self, shapes: &[usize]) {
-        self.tables.resize_with(shapes.len(), Vec::new);
-        for (g, &n) in shapes.iter().enumerate() {
+    fn reset(&mut self, groups: &[(&[f32], &[u16], usize)]) {
+        self.tables.resize_with(groups.len(), Vec::new);
+        self.powers.resize_with(groups.len(), Vec::new);
+        for (g, &(spec, swb, _)) in groups.iter().enumerate() {
+            let powers = &mut self.powers[g];
+            powers.clear();
+            powers.extend(spec.iter().map(|&c| quant_power(c.abs())));
+            let n = swb.len() - 1;
             let t = &mut self.tables[g];
             t.resize_with(n, Vec::new);
             for band in t.iter_mut() {
@@ -1108,7 +1116,7 @@ impl Encoder {
             let zero_cost: f32 = band.iter().map(|&c| c * c).sum();
             let mut best: Option<(f32, u8, u8)> = None; // (代价, sf, cb)
             let mut evaluate = |sf: i32, best: &mut Option<(f32, u8, u8)>| {
-                let (dist, cb, bits) = cached_band_cost(cache, gi, sfb, band, sf as u8);
+                let (dist, cb, bits) = cached_band_cost(cache, gi, sfb, band, lo, sf as u8);
                 // 代价 = 失真 + λ·位数，**全零带在同一把尺子上**。
                 //
                 // ⚠️ 「砍不砍这条带」必须在这儿比：`band_cost_rd` 内部那次
@@ -1458,8 +1466,7 @@ impl Encoder {
             .collect();
 
         // 缓存按这一帧的形状重置（形状没变就只清空，不重新分配）。
-        let shapes: Vec<usize> = group_specs.iter().map(|&(_, swb, _)| swb.len() - 1).collect();
-        st.cost_cache.reset(&shapes);
+        st.cost_cache.reset(&group_specs);
 
         // ---- 3. 搜「位数 ≤ 预算」的最小偏移 ----
         //
@@ -1776,8 +1783,18 @@ fn quant_one(a: f32, q34: f32, maxval: i32) -> i32 {
 /// 而这里是逐系数调的最内层；`x^0.75 = √x · √√x` 两次硬件开方就够。
 /// （ffmpeg 那种 **pow34 查表 + 插值**试过：既没更快，还把质量打掉 0.78 dB → 撤。）
 fn quant_uncapped(a: f32, q34: f32) -> i32 {
-    let r = f64::from(a).sqrt();
-    (r * r.sqrt() * f64::from(q34)).round() as i32
+    round_quant(quant_power(a), f64::from(q34))
+}
+
+#[inline]
+fn quant_power(a: f32) -> f64 {
+    let root = f64::from(a).sqrt();
+    root * root.sqrt()
+}
+
+#[inline]
+fn round_quant(power: f64, scale: f64) -> i32 {
+    (power * scale).round() as i32
 }
 
 /// 反量化：`q^(4/3) · IQ(sf)` —— 与解码端的 `dequant(q) · sf_gain(sf)` 一致。
@@ -1895,12 +1912,14 @@ fn cached_band_cost(
     gi: usize,
     sfb: usize,
     band: &[f32],
+    start: usize,
     sf: u8,
 ) -> (f32, u8, u32) {
     if let Some(v) = cache.get(gi, sfb, sf) {
         return v;
     }
-    let v = band_cost_rd(band, sf, &mut cache.q_scratch);
+    let powers = &cache.powers[gi][start..start + band.len()];
+    let v = band_cost_rd(band, powers, sf, &mut cache.q_scratch);
     cache.put(gi, sfb, sf, v);
     v
 }
@@ -1986,52 +2005,41 @@ fn cached_band_cost(
 ///
 /// 一条路径两个出口是有意的：决策口径只有一份，位数的口径也只有一份
 /// （`band_bits`，与 `write_band` 对拍钉住）。
-fn band_cost_rd(band: &[f32], sf: u8, qu: &mut Vec<i32>) -> (f32, u8, u32) {
-    // ---- 量化只算一次，11 本码本共用 ----
-    //
-    // 同一个 `sf` 下所有码本的**量化步长相同**（都是 `q34(sf)`），差别只在
-    // `CB_MAXVAL`（`1,1,2,2,4,4,7,7,12,12,16`）—— 也就是说每个码本要的
-    // `q = min(round(|x|^0.75·q34), maxval)` 只差**一个封顶**。
-    // 所以把不封顶的 `q` 算一遍存进 scratch，各码本自己 `.min(maxval)` 就够：
-    // 值与「每个码本各自重算」**逐位相同**（`quant_one` 本来就是
-    // `round(...)` 再 `.min()`），省掉的却是最贵的那一步 —— 每个系数两次开方。
-    // escape 那条路同理：`escape_coef` 是同一个数封顶到 8191。
-    //
-    // 这条是量出来的：把 `band_cost` 短路掉，AAC 从 ~0.80 s 掉到 ~0.23 s
-    // （t2、200 帧），说明**码本评估就是 AAC 的大头**。另外两条更「聪明」的捷径
-    // 试过都**不成立**，别再走：
-    // - 「按 `CB_MAXVAL` 查表直接定赢家」：`sf` 极端时 `iq` 极小，cb1 与 cb9 的
-    //   失真在 **f32** 里舍成同一个值，平手规则就选了编号小的那个 → 结果不同。
-    // - 「部分失真越界就提前收工」：安静带上 11 本码本给出**相同**失真，
-    //   部分和永远越不过界 → 只快 4%。
+fn band_cost_rd(band: &[f32], powers: &[f64], sf: u8, qu: &mut Vec<i32>) -> (f32, u8, u32) {
+    let scale = f64::from(q34(sf));
+    let mut peak = 0;
     qu.clear();
-    qu.resize(band.len(), 0);
-    let q34v = q34(sf);
-    for (j, &c) in band.iter().enumerate() {
-        qu[j] = quant_uncapped(c.abs(), q34v);
+    for &power in powers {
+        let q = round_quant(power, scale);
+        qu.push(q);
+        peak = peak.max(q);
     }
-    // ---- 11 本码本只有 **6 个不同的封顶值**，而失真只取决于封顶值 ----
-    //
-    // `CB_MAXVAL` = `1,1,2,2,4,4,7,7,12,12,16`：同封顶值的那两本（1/2、3/4、5/6、
-    // 7/8、9/10）反量化值**完全相同**（都是 `±min(q, maxval)·iq`，与码本无关）→
-    // 失真逐位相同。按「平手取编号小」的规矩，取小的那本当代表即可：
-    // `[1, 3, 5, 7, 9, 11]` 六次。cb=11 是 escape（大系数走 13 位真实值），单独算。
-    //
-    // ⚠️ **不算位数** —— 旧版在这里把每本的位数也算了一遍（`bit_tab` 查表、无符号
-    // 码本的符号位计数、escape 的位数），而 `band_cost` 从来只看失真
-    // （`let (_bits, dist) = ...`）：位数是 `write_band` 写位流时自己算的。白算。
+
+    // 相同封顶的码本共享逐系数的重建值。第一个不截断任何系数的普通码本
+    // 之后，所有更大码本（含 escape）都给出同一失真，平手仍选编号较小者。
+    let levels = distortion_levels(sf);
     let mut best: Option<(f32, u8)> = None;
-    for cb in [1usize, 3, 5, 7, 9, CB_ESC] {
-        let dist = band_dist(band, sf, cb, qu);
-        if best.is_none_or(|(bc, _)| dist < bc) {
+    for cb in [1usize, 3, 5, 7, 9] {
+        let limit = i32::from(CB_MAXVAL[cb]);
+        let dist = band_dist(band, qu, levels, limit);
+        if best.is_none_or(|(cost, _)| dist < cost) {
             best = Some((dist, cb as u8));
+        }
+        if peak <= limit {
+            break;
+        }
+    }
+    if peak > i32::from(CB_MAXVAL[9]) {
+        let dist = escape_dist(band, qu, levels, sf);
+        if best.is_none_or(|(cost, _)| dist < cost) {
+            best = Some((dist, CB_ESC as u8));
         }
     }
     // cb == 0 是「全零带」的伪码本，作为兜底参与比较：量化后还不如直接清零，
     // 就把这条带标成零（代价 = 原始能量）。
     let zero_cost: f32 = band.iter().map(|&c| c * c).sum();
     match best {
-        Some((c, cb)) if c <= zero_cost => (c, cb, band_bits(band, sf, cb, qu)),
+        Some((cost, cb)) if cost <= zero_cost => (cost, cb, band_bits(band, sf, cb, qu)),
         _ => (zero_cost, 0, 0),
     }
 }
@@ -2098,85 +2106,42 @@ fn band_bits(band: &[f32], sf: u8, cb: u8, qu: &[i32]) -> u32 {
     bits
 }
 
-/// 一个频带在**某个码本的封顶值**下的平方失真（**不算位数**）。
-///
-/// 这是代价模型的核心：编码器按它选 `sf` 与码本，所以它必须与解码端算同一个值
-/// （见下面「符号要带」那条）。
-///
-/// ⚠️ **只算失真**：位数由 `write_band` 写位流时自己算 —— 旧版在这里也算了一遍
-/// （`bit_tab` 查表、无符号码本的符号位计数、escape 的位数），而 `band_cost`
-/// 从来只看失真（`let (_bits, dist) = ...`）。白算。
-///
-/// `qu` 是**不封顶**的量化值（`band_cost` 里一次算好、六次求值共用）：
-/// 每个封顶值要的 `q` 就是 `qu[j].min(maxval)` —— 与各自重算逐位相同。
-fn band_dist(band: &[f32], sf: u8, cb: usize, qu: &[i32]) -> f32 {
-    let dim = CB_DIM[cb];
-    // ⚠️ 前提：频带长度是**码本维度的整数倍**。AAC 的 swb 频带宽度都是 4 的倍数
-    // （长窗、短窗都一样），所以真实调用方一定满足；但少了这条断言，
-    // 传进一个短尾块就会在下面 `chunk[j]`（j 走到 dim-1）越界 panic。
-    debug_assert_eq!(band.len() % dim, 0, "频带长度必须是码本维度的整数倍");
-    debug_assert_eq!(qu.len(), band.len());
-    let maxval = i32::from(CB_MAXVAL[cb]);
-    let unsigned = CB_UNSIGNED[cb];
-    let size = tables::SPECTRAL_SIZE[cb - 1] as usize;
-    let vecs = tables::CODEBOOK_VECTORS[cb - 1];
-    // ⚠️ `iq(sf)` **提到循环外**：它只跟 `sf` 有关（是个 `exp()`），
-    // 原来写在逐系数的循环里 —— 那是每个系数一次超越函数。
-    let iq_sf = f64::from(iq(sf));
+/// 码本重建幅值按单个量化系数索引。escape 码本覆盖普通码本用到的所有幅度；
+/// 取第一行的第二维，保留原表的舍入值。码本的元组索引只用于数位和写位。
+fn distortion_levels(sf: u8) -> &'static [f64; 16] {
+    static LEVELS: std::sync::OnceLock<[[f64; 16]; 256]> = std::sync::OnceLock::new();
+    &LEVELS.get_or_init(|| {
+        let vectors = tables::CODEBOOK_VECTORS[CB_ESC - 1];
+        std::array::from_fn(|i| {
+            let gain = f64::from(iq(i as u8));
+            std::array::from_fn(|q| f64::from(vectors[2 * q + 1]) * gain)
+        })
+    })[sf as usize]
+}
 
-    let mut dist = 0f32;
-    for (ci, chunk) in band.chunks(dim).enumerate() {
-        let q0 = ci * dim;
-        // 量化这一组（`qu` 不封顶，各码本只差一个封顶）。
-        let mut q = [0i32; 4];
-        for (j, &c) in chunk.iter().enumerate() {
-            let m = qu[q0 + j].min(maxval);
-            q[j] = if unsigned || c >= 0.0 { m } else { -m };
-        }
-        // 索引：`curidx = curidx * range + (q + off)`。
-        let off = if unsigned { 0 } else { maxval };
-        let mut curidx = 0usize;
-        for j in 0..dim {
-            curidx = curidx * usize::from(CB_RANGE[cb]) + (q[j] + off) as usize;
-        }
-        if curidx >= size {
-            // 索引越界说明这一组量化超了码本能表示的范围 —— 用一个「必然不优」
-            // 的极大代价把它排除掉（而不是 panic：穷举 sf 时会大量出现这种情况）。
-            return f32::MAX / 2.0;
-        }
-        // escape 码本：矢量里 `64` 的位置要用那 13 位的真实值（幅值）。
-        let mut esc = [0i32; 4];
-        if cb == CB_ESC {
-            for j in 0..dim {
-                if vecs[curidx * dim + j] == 64 {
-                    // `escape_coef` = 同一个量化值封顶到 8191（`2^13 - 1`）。
-                    esc[j] = qu[q0 + j].min((1 << 13) - 1);
-                }
-            }
-        }
-        for j in 0..dim {
-            let v = f64::from(vecs[curidx * dim + j]);
-            // ⚠️ **符号要带**：escape 码本是无符号的，符号位由「逐维写符号」单独发出
-            // （`write_band` 同款），解码端会把符号乘回去 —— 代价模型必须与解码端
-            // 算同一个值。
-            //
-            // 这里曾经漏掉 escape 那一路的符号（只写 `dequant_one(esc[j], sf)`，是个幅值），
-            // 于是负系数的误差被估成 `(|c| + rec)²` 量级 —— 编码器**系统性避开 escape**，
-            // 把大系数逼去撞 `maxval ≤ 16` 的普通码本。修好之后的实测（真样本的 `.mp4`
-            // 音频路径、对 ffmpeg 解出的 WMA PCM 比 SNR）：64k +0.001、128k +0.019、
-            // **256k +0.289 dB** —— 码率越高越吃这条（低码率下 sf 预算本来就主导）。
-            let sign = if chunk[j] < 0.0 { -1.0 } else { 1.0 };
-            let rec = if v == 64.0 {
-                // escape：真实值来自那 13 位（幅值），符号乘回去。
-                dequant_one(esc[j], sf) * sign
+fn band_dist(band: &[f32], qu: &[i32], levels: &[f64; 16], limit: i32) -> f32 {
+    band.iter()
+        .zip(qu)
+        .map(|(&c, &q)| {
+            let d = f64::from(c.abs()) - levels[q.min(limit) as usize];
+            (d * d) as f32
+        })
+        .sum()
+}
+
+fn escape_dist(band: &[f32], qu: &[i32], levels: &[f64; 16], sf: u8) -> f32 {
+    band.iter()
+        .zip(qu)
+        .map(|(&c, &q)| {
+            let amplitude = if q < i32::from(CB_MAXVAL[CB_ESC]) {
+                levels[q as usize]
             } else {
-                v.abs() * sign * iq_sf
+                dequant_one(q.min((1 << 13) - 1), sf)
             };
-            let d = f64::from(chunk[j]) - rec;
-            dist += (d * d) as f32;
-        }
-    }
-    dist
+            let d = f64::from(c.abs()) - amplitude;
+            (d * d) as f32
+        })
+        .sum()
 }
 
 /// escape 值的量化 —— 照 `aaccoder.c`：
@@ -2625,7 +2590,8 @@ mod tests {
             }
             for sf in [60u8, 100, 140, 180, 220] {
                 let mut qu = Vec::new();
-                let (_, cb, _) = band_cost_rd(&band, sf, &mut qu);
+                let powers: Vec<_> = band.iter().map(|c| quant_power(c.abs())).collect();
+                let (_, cb, _) = band_cost_rd(&band, &powers, sf, &mut qu);
                 if cb == 0 {
                     assert_eq!(band_bits(&band, sf, cb, &qu), 0, "全零带没有位数");
                     continue;
@@ -2888,6 +2854,28 @@ mod tests {
     }
 
     #[test]
+    fn distortion_levels_match_every_codebook_coordinate() {
+        let levels = distortion_levels(100);
+        for cb in 1..=CB_ESC {
+            let dim = CB_DIM[cb];
+            let range = usize::from(CB_RANGE[cb]);
+            let offset = if CB_UNSIGNED[cb] { 0 } else { i32::from(CB_MAXVAL[cb]) };
+            for (i, tuple) in tables::CODEBOOK_VECTORS[cb - 1].chunks_exact(dim).enumerate() {
+                let mut index = i;
+                for &v in tuple.iter().rev() {
+                    let q = ((index % range) as i32 - offset).unsigned_abs() as usize;
+                    index /= range;
+                    if cb == CB_ESC && q == usize::from(CB_MAXVAL[CB_ESC]) {
+                        assert_eq!(v, 64);
+                    } else {
+                        assert_eq!(f64::from(v.abs()), levels[q]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn band_cost_matches_the_reference() {
         // 「量化一次、11 本共用」必须与「每个码本各自重算」**逐位相同**：
         // 失真用 `to_bits` 比（浮点值也要一模一样），码本编号直接比
@@ -2923,8 +2911,9 @@ mod tests {
                     }
                 })
                 .collect();
-            for &sf in &[0u8, 20, 40, 60, 80, 100, 120, 140, 160, 200, 230, 255] {
-                let fast = band_cost_rd(&band, sf, &mut scratch);
+            let powers: Vec<_> = band.iter().map(|c| quant_power(c.abs())).collect();
+            for sf in 0..=u8::MAX {
+                let fast = band_cost_rd(&band, &powers, sf, &mut scratch);
                 let full = band_cost_reference(&band, sf);
                 assert_eq!(
                     fast.0.to_bits(),
