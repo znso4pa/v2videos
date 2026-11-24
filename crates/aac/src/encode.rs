@@ -94,7 +94,7 @@ const SCALE_MAX_DIFF: i32 = 60;
 /// `dim = BT_PAIR ? 2 : 4`。
 pub const CB_DIM: [usize; 12] = [0, 4, 4, 4, 4, 2, 2, 2, 2, 2, 2, 2];
 
-/// 码本是否「无符号」（无符号的**不写符号位**）。
+/// 无符号码本的码字只编码幅值，非零项另写符号位。
 pub const CB_UNSIGNED: [bool; 12] = [
     false, false, false, true, true, false, false, true, true, true, true, true,
 ];
@@ -107,6 +107,7 @@ pub const CB_RANGE: [u8; 12] = [0, 3, 3, 3, 3, 9, 9, 8, 8, 13, 13, 17];
 
 /// 只有第 11 本是 escape 码本（`ESC_BT`）。
 pub(crate) const CB_ESC: usize = 11;
+const ESCAPE_COEF_MAX: i32 = (1 << 13) - 1;
 
 /// λ 的指数搜索上界，**单位是 1/8**：`λ = 2^(k/8)`，`k ∈ [0, 208]`。
 const MAX_LAMBDA_K8: i32 = 280;
@@ -446,13 +447,9 @@ const MS_MARGIN: f64 = 0.98;
 /// 会被反复求值，而它的值只取决于该带的谱系数（一帧内不变）。
 ///
 /// 缓存返回的值与现算**逐位相同**，所以输出逐字节不变 —— 纯提速。
-/// 内存：每带 `256 × (f32,u8)` = 2 KB；长窗约 50 条带 → 100 KB，短窗最多 8 组
-/// 共 ~112 条带 → 约 230 KB。**挂在声道状态上跨帧复用，不随帧增长。**
+/// 每带保留 256 个候选，挂在声道状态上跨帧复用。
 struct BandCostCache {
-    /// `tables[组][带][sf] = (失真, 码本, 位数)`；码本为 `NO_CB` = 还没算过。
-    ///
-    /// 位数与 λ 无关，所以同一个 `(带, sf)` 在**所有** λ 取值下都能复用（二分 λ 时这是关键）。
-    tables: Vec<Vec<Vec<(f32, u8, u32)>>>,
+    bands: Vec<Vec<CachedBand>>,
     /// `band_cost` 用的量化 scratch（不封顶的 `q`）—— 挂在这里**零额外分配**：
     /// 一条带最多 ~80 个系数，容量涨一次就不再动。
     q_scratch: Vec<i32>,
@@ -460,14 +457,21 @@ struct BandCostCache {
     powers: Vec<Vec<f64>>,
 }
 
+#[derive(Default)]
+struct CachedBand {
+    /// 每个 sf 的 (失真, 码本, 位数)，码本为 `NO_CB` 时还没算过。
+    costs: Vec<(f32, u8, u32)>,
+    energy: f32,
+    peak_power: f64,
+}
+
 /// 「这一格还没算过」的哨兵 —— 真码本只到 11，所以 `0xFF` 安全。
 const NO_CB: u8 = 0xFF;
-
 
 impl BandCostCache {
     fn new() -> Self {
         Self {
-            tables: Vec::new(),
+            bands: Vec::new(),
             q_scratch: Vec::new(),
             powers: Vec::new(),
         }
@@ -475,39 +479,24 @@ impl BandCostCache {
 
     /// 按这一帧的形状准备（组数 + 每组条带数）。形状没变就只清空，**不重新分配**。
     fn reset(&mut self, groups: &[(&[f32], &[u16], usize)]) {
-        self.tables.resize_with(groups.len(), Vec::new);
+        self.bands.resize_with(groups.len(), Vec::new);
         self.powers.resize_with(groups.len(), Vec::new);
         for (g, &(spec, swb, _)) in groups.iter().enumerate() {
             let powers = &mut self.powers[g];
             powers.clear();
             powers.extend(spec.iter().map(|&c| quant_power(c.abs())));
             let n = swb.len() - 1;
-            let t = &mut self.tables[g];
-            t.resize_with(n, Vec::new);
-            for band in t.iter_mut() {
-                band.resize(256, (0.0, NO_CB, 0));
-                for e in band.iter_mut() {
+            let bands = &mut self.bands[g];
+            bands.resize_with(n, CachedBand::default);
+            for (band, edges) in bands.iter_mut().zip(swb.windows(2)) {
+                let range = usize::from(edges[0])..usize::from(edges[1]);
+                band.energy = band_energy(&spec[range.clone()]);
+                band.peak_power = powers[range].iter().copied().fold(0.0, f64::max);
+                band.costs.resize(256, (0.0, NO_CB, 0));
+                for e in &mut band.costs {
                     e.1 = NO_CB;
                 }
             }
-        }
-    }
-
-    #[inline]
-    fn get(&self, g: usize, b: usize, sf: u8) -> Option<(f32, u8, u32)> {
-        let e = *self.tables.get(g)?.get(b)?.get(sf as usize)?;
-        (e.1 != NO_CB).then_some(e)
-    }
-
-    #[inline]
-    fn put(&mut self, g: usize, b: usize, sf: u8, v: (f32, u8, u32)) {
-        if let Some(e) = self
-            .tables
-            .get_mut(g)
-            .and_then(|t| t.get_mut(b))
-            .and_then(|t| t.get_mut(sf as usize))
-        {
-            *e = v;
         }
     }
 }
@@ -1076,6 +1065,8 @@ impl Encoder {
             let lo = swb[sfb] as usize;
             let hi = swb[sfb + 1] as usize;
             let band = &spec[lo..hi];
+            let powers = &cache.powers[gi][lo..hi];
+            let cached = &mut cache.bands[gi][sfb];
 
             // 搜索窗口 = 「整帧下界 + 偏移」∩「差分约束 ±60」∩ `0..=255`。
             //
@@ -1113,10 +1104,11 @@ impl Encoder {
             // 评估次数从 ~31 降到 ~21（窗口 120 宽时），而每一趟都要跑一遍 ——
             // 这是**又省时间又省 CPU** 的那一类（不靠多线程，也不增加内存）。
             // 「全零带」的代价 = 本带能量（与 sf 无关 → 整条带算一次）。
-            let zero_cost: f32 = band.iter().map(|&c| c * c).sum();
+            let zero_cost = cached.energy;
             let mut best: Option<(f32, u8, u8)> = None; // (代价, sf, cb)
             let mut evaluate = |sf: i32, best: &mut Option<(f32, u8, u8)>| {
-                let (dist, cb, bits) = cached_band_cost(cache, gi, sfb, band, lo, sf as u8);
+                let (dist, cb, bits) =
+                    cached_band_cost(cached, band, powers, sf as u8, &mut cache.q_scratch);
                 // 代价 = 失真 + λ·位数，**全零带在同一把尺子上**。
                 //
                 // ⚠️ 「砍不砍这条带」必须在这儿比：`band_cost_rd` 内部那次
@@ -1166,7 +1158,7 @@ impl Encoder {
             let (_, sf, cb) = best.expect("候选集非空");
             band_sf[sfb] = i32::from(sf);
             band_cb[sfb] = cb;
-            band_zero[sfb] = cb == 0 || band_is_zero(band, sf);
+            band_zero[sfb] = cb == 0 || round_quant(cached.peak_power, f64::from(q34(sf))) == 0;
             if !band_zero[sfb] {
                 *prev_sf = Some(i32::from(sf));
             }
@@ -1797,17 +1789,17 @@ fn round_quant(power: f64, scale: f64) -> i32 {
     (power * scale).round() as i32
 }
 
-/// 反量化：`q^(4/3) · IQ(sf)` —— 与解码端的 `dequant(q) · sf_gain(sf)` 一致。
+/// Escape 系数的反量化。幅值受 13 位限制，`q^(4/3)` 可跨频带和帧复用。
+/// 与直接计算使用相同的 f64 幂和缩放乘法。
 fn dequant_one(q: i32, sf: u8) -> f64 {
-    (q as f64).powf(4.0 / 3.0) * f64::from(iq(sf))
+    static POWERS: std::sync::OnceLock<[f64; ESCAPE_COEF_MAX as usize + 1]> =
+        std::sync::OnceLock::new();
+    let powers = POWERS.get_or_init(|| std::array::from_fn(|q| (q as f64).powf(4.0 / 3.0)));
+    powers[q as usize] * f64::from(iq(sf))
 }
 
-/// 频带是不是「全零带」：按 `sf` 量化之后每个系数都是 0。
-///
-/// `sf` 就是量化参数本身（0..255 的 `sf` 域，与 `rusty_aac` 一致）。
-fn band_is_zero(band: &[f32], sf: u8) -> bool {
-    let q34v = q34(sf);
-    band.iter().all(|&c| quant_one(c.abs(), q34v, 16) == 0)
+fn band_energy(band: &[f32]) -> f32 {
+    band.iter().map(|&c| c * c).sum()
 }
 
 /// 先算好每带的 Bark 中心频率 —— 「邻近带」是按 Bark 距离算的，
@@ -1908,20 +1900,29 @@ fn masking_thresholds(
 /// 值**逐位相同**（同一帧里同一条带的谱系数不变），所以决策不会变 → 输出逐字节不变。
 #[inline]
 fn cached_band_cost(
-    cache: &mut BandCostCache,
-    gi: usize,
-    sfb: usize,
+    cached: &mut CachedBand,
     band: &[f32],
-    start: usize,
+    powers: &[f64],
     sf: u8,
+    quantized: &mut Vec<i32>,
 ) -> (f32, u8, u32) {
-    if let Some(v) = cache.get(gi, sfb, sf) {
-        return v;
+    let entry = &mut cached.costs[usize::from(sf)];
+    if entry.1 == NO_CB {
+        // 量化对非负幅值单调，最大值量化为零时整带都为零。重建为零时，
+        // 失真使用与频带能量相同的 f32 平方和。平手选第一个码本，它的零元组在表中央。
+        *entry = if round_quant(cached.peak_power, f64::from(q34(sf))) == 0
+            && !cached.energy.is_nan()
+        {
+            let dim = CB_DIM[1];
+            let zero_index = usize::from(tables::SPECTRAL_SIZE[0]) / 2;
+            let bits =
+                band.len().div_ceil(dim) as u32 * u32::from(tables::SPECTRAL_BITS[0][zero_index]);
+            (cached.energy, 1, bits)
+        } else {
+            band_cost_rd(band, powers, sf, cached.energy, quantized)
+        };
     }
-    let powers = &cache.powers[gi][start..start + band.len()];
-    let v = band_cost_rd(band, powers, sf, &mut cache.q_scratch);
-    cache.put(gi, sfb, sf, v);
-    v
+    *entry
 }
 
 // 历史上这里接过两套「按可闻度分配」，**实测都是净亏**，已撤：
@@ -2005,7 +2006,13 @@ fn cached_band_cost(
 ///
 /// 一条路径两个出口是有意的：决策口径只有一份，位数的口径也只有一份
 /// （`band_bits`，与 `write_band` 对拍钉住）。
-fn band_cost_rd(band: &[f32], powers: &[f64], sf: u8, qu: &mut Vec<i32>) -> (f32, u8, u32) {
+fn band_cost_rd(
+    band: &[f32],
+    powers: &[f64],
+    sf: u8,
+    zero_cost: f32,
+    qu: &mut Vec<i32>,
+) -> (f32, u8, u32) {
     let scale = f64::from(q34(sf));
     let mut peak = 0;
     qu.clear();
@@ -2037,9 +2044,8 @@ fn band_cost_rd(band: &[f32], powers: &[f64], sf: u8, qu: &mut Vec<i32>) -> (f32
     }
     // cb == 0 是「全零带」的伪码本，作为兜底参与比较：量化后还不如直接清零，
     // 就把这条带标成零（代价 = 原始能量）。
-    let zero_cost: f32 = band.iter().map(|&c| c * c).sum();
     match best {
-        Some((cost, cb)) if cost <= zero_cost => (cost, cb, band_bits(band, sf, cb, qu)),
+        Some((cost, cb)) if cost <= zero_cost => (cost, cb, band_bits(band, cb, qu)),
         _ => (zero_cost, 0, 0),
     }
 }
@@ -2055,7 +2061,7 @@ fn band_cost_rd(band: &[f32], powers: &[f64], sf: u8, qu: &mut Vec<i32>) -> (f32
 ///
 /// ⚠️ 由 `band_bits_matches_what_write_band_actually_writes` 对拍钉住：
 /// 这里的计数与写出端**必须**一致，否则 RD 代价模型会追着错的位数量走。
-fn band_bits(band: &[f32], sf: u8, cb: u8, qu: &[i32]) -> u32 {
+fn band_bits(band: &[f32], cb: u8, qu: &[i32]) -> u32 {
     if cb == 0 {
         return 0;
     }
@@ -2063,48 +2069,59 @@ fn band_bits(band: &[f32], sf: u8, cb: u8, qu: &[i32]) -> u32 {
     let dim = CB_DIM[cb];
     let maxval = i32::from(CB_MAXVAL[cb]);
     let unsigned = CB_UNSIGNED[cb];
-    let bit_tab = &tables::SPECTRAL_BITS[cb - 1];
-    let size = tables::SPECTRAL_SIZE[cb - 1] as usize;
-    let vecs = tables::CODEBOOK_VECTORS[cb - 1];
-    let q34v = q34(sf);
+    let bit_tab = &SPECTRAL_BITS_WITH_SIGN[cb - 1][..usize::from(tables::SPECTRAL_SIZE[cb - 1])];
+    let range = usize::from(CB_RANGE[cb]);
+    let offset = if unsigned { 0 } else { maxval };
     let mut bits = 0u32;
-    for (ci, chunk) in band.chunks(dim).enumerate() {
-        let q0 = ci * dim;
-        let mut q = [0i32; 4];
-        for (j, &c) in chunk.iter().enumerate() {
-            let m = qu[q0 + j].min(maxval);
-            q[j] = if unsigned || c >= 0.0 { m } else { -m };
+    for (chunk, quantized) in band.chunks(dim).zip(qu[..band.len()].chunks(dim)) {
+        let mut index = 0usize;
+        for (&c, &q) in chunk.iter().zip(quantized) {
+            let magnitude = q.min(maxval);
+            let level = if unsigned || c >= 0.0 { magnitude } else { -magnitude };
+            index = index * range + (level + offset) as usize;
         }
-        let off = if unsigned { 0 } else { maxval };
-        let mut curidx = 0usize;
-        for j in 0..dim {
-            curidx = curidx * usize::from(CB_RANGE[cb]) + (q[j] + off) as usize;
+        for _ in chunk.len()..dim {
+            index = index * range + offset as usize;
         }
-        if curidx >= size {
-            // 越界 = 这一本写不出来（穷举 sf 时大量出现）：给个「必然不优」的数，
-            // 与 `band_dist` 的 f32::MAX/2 一个套路。
+        let Some(&code_bits) = bit_tab.get(index) else {
             return u32::MAX / 2;
-        }
-        bits += u32::from(bit_tab[curidx]);
-        // 无符号码本：逐维写非零系数的符号。
-        if unsigned {
-            for j in 0..dim {
-                if vecs[curidx * dim + j] != 0 {
-                    bits += 1;
-                }
-            }
-        }
-        // escape 码本：矢量里是 `64` 的那几维要写真实幅值。
+        };
+        bits += u32::from(code_bits);
         if cb == CB_ESC {
-            for j in 0..dim {
-                if vecs[curidx * dim + j] == 64 {
-                    bits += escape_bits(escape_coef(chunk[j].abs(), q34v));
+            for &q in quantized {
+                if q >= maxval {
+                    bits += escape_bits(q.min(ESCAPE_COEF_MAX));
                 }
             }
         }
     }
     bits
 }
+
+/// 无符号码本每个非零维度附带一个符号位，位数从原始码字和矢量表派生。
+static SPECTRAL_BITS_WITH_SIGN: [[u8; 289]; 11] = {
+    let mut bits = tables::SPECTRAL_BITS;
+    let mut cb = 1;
+    while cb <= CB_ESC {
+        if CB_UNSIGNED[cb] {
+            let dim = CB_DIM[cb];
+            let vectors = tables::CODEBOOK_VECTORS[cb - 1];
+            let mut index = 0;
+            while index < tables::SPECTRAL_SIZE[cb - 1] as usize {
+                let mut j = 0;
+                while j < dim {
+                    if vectors[index * dim + j] != 0 {
+                        bits[cb - 1][index] += 1;
+                    }
+                    j += 1;
+                }
+                index += 1;
+            }
+        }
+        cb += 1;
+    }
+    bits
+};
 
 /// 码本重建幅值按单个量化系数索引。escape 码本覆盖普通码本用到的所有幅度；
 /// 取第一行的第二维，保留原表的舍入值。码本的元组索引只用于数位和写位。
@@ -2136,7 +2153,7 @@ fn escape_dist(band: &[f32], qu: &[i32], levels: &[f64; 16], sf: u8) -> f32 {
             let amplitude = if q < i32::from(CB_MAXVAL[CB_ESC]) {
                 levels[q as usize]
             } else {
-                dequant_one(q.min((1 << 13) - 1), sf)
+                dequant_one(q.min(ESCAPE_COEF_MAX), sf)
             };
             let d = f64::from(c.abs()) - amplitude;
             (d * d) as f32
@@ -2153,7 +2170,7 @@ fn escape_dist(band: &[f32], qu: &[i32], levels: &[f64; 16], sf: u8) -> f32 {
 /// `error in spectral data, ESC overflow` —— 而且**只在幅度大的素材上发作**，
 /// 纯正弦那种稀疏频谱测不出来。实测在真样本整段转换上撞到的就是这个。
 fn escape_coef(a: f32, q34: f32) -> i32 {
-    quant_one(a, q34, (1 << 13) - 1).min((1 << 13) - 1)
+    quant_one(a, q34, ESCAPE_COEF_MAX)
 }
 
 /// 写一个 escape 序列。
@@ -2579,7 +2596,7 @@ mod tests {
         // （代价模型追着错的位数量走，RD 就白做了）。这条用**实际写出的位流长度**当裁判。
         let mut state = 987_654_321u32;
         for trial in 0..48usize {
-            let len = 4 * (1 + trial % 8);
+            let len = 4 * (1 + trial % 8) - (trial / 8 % 4);
             let mut band = vec![0f32; len];
             for v in band.iter_mut() {
                 state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
@@ -2589,20 +2606,20 @@ mod tests {
                 *v = unit * scale;
             }
             for sf in [60u8, 100, 140, 180, 220] {
-                let mut qu = Vec::new();
-                let powers: Vec<_> = band.iter().map(|c| quant_power(c.abs())).collect();
-                let (_, cb, _) = band_cost_rd(&band, &powers, sf, &mut qu);
-                if cb == 0 {
-                    assert_eq!(band_bits(&band, sf, cb, &qu), 0, "全零带没有位数");
-                    continue;
+                let scale = f64::from(q34(sf));
+                let qu: Vec<_> = band
+                    .iter()
+                    .map(|c| round_quant(quant_power(c.abs()), scale))
+                    .collect();
+                for cb in 0..=CB_ESC as u8 {
+                    let mut w = BitWriter::new();
+                    write_band(&mut w, &band, sf, cb).expect("这一档必须写得出来");
+                    assert_eq!(
+                        band_bits(&band, cb, &qu) as usize,
+                        w.bit_pos(),
+                        "sf={sf} cb={cb} len={len}：计数与实际写出的位数对不上"
+                    );
                 }
-                let mut w = BitWriter::new();
-                write_band(&mut w, &band, sf, cb).expect("这一档必须写得出来");
-                assert_eq!(
-                    band_bits(&band, sf, cb, &qu) as usize,
-                    w.bit_pos(),
-                    "sf={sf} cb={cb} len={len}：计数与实际写出的位数对不上"
-                );
             }
         }
     }
@@ -2826,7 +2843,8 @@ mod tests {
                 // 与生产代码同款：escape 那一路也要乘符号（见 `band_code` 的说明）。
                 let sign = if chunk[j] < 0.0 { -1.0 } else { 1.0 };
                 let rec = if v == 64.0 {
-                    dequant_one(escape_coef(chunk[j].abs(), q34v), sf) * sign
+                    let q = f64::from(escape_coef(chunk[j].abs(), q34v));
+                    q.powf(4.0 / 3.0) * f64::from(iq(sf)) * sign
                 } else {
                     v.abs() * sign * iq_sf
                 };
@@ -2912,8 +2930,22 @@ mod tests {
                 })
                 .collect();
             let powers: Vec<_> = band.iter().map(|c| quant_power(c.abs())).collect();
+            let mut cache = BandCostCache::new();
+            cache.reset(&[(&band, &[0, len as u16], 1)]);
             for sf in 0..=u8::MAX {
-                let fast = band_cost_rd(&band, &powers, sf, &mut scratch);
+                let fast = band_cost_rd(&band, &powers, sf, band_energy(&band), &mut scratch);
+                let cached = cached_band_cost(
+                    &mut cache.bands[0][0],
+                    &band,
+                    &cache.powers[0],
+                    sf,
+                    &mut cache.q_scratch,
+                );
+                assert_eq!(
+                    (cached.0.to_bits(), cached.1, cached.2),
+                    (fast.0.to_bits(), fast.1, fast.2),
+                    "case {case} sf {sf}：缓存代价不同"
+                );
                 let full = band_cost_reference(&band, sf);
                 assert_eq!(
                     fast.0.to_bits(),
