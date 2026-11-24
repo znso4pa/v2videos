@@ -164,6 +164,7 @@ impl Encoder {
         let q = qscale as i32;
         let qmul = q << 1;
         let qadd = (q - 1) | 1;
+        let ac_quant = AcQuantizer::new(qmul, qadd);
         let y_dc_scale = tables::OLD_Y_DC_SCALE[qscale as usize] as i32;
         let c_dc_scale = tables::C_DC_SCALE[qscale as usize] as i32;
 
@@ -212,7 +213,7 @@ impl Encoder {
                     // AC：反量化是 `level*qmul ± qadd`，反过来取最接近的那个 level
                     let mut has_ac = false;
                     for k in 1..64 {
-                        let l = quantize(c[k], qmul, qadd);
+                        let l = ac_quant.quantize(c[k]);
                         let l = l.clamp(-MAX_ESCAPE_LEVEL, MAX_ESCAPE_LEVEL);
                         blk[k] = l;
                         if l != 0 {
@@ -379,6 +380,7 @@ impl Encoder {
         let q = q_target as i32;
         let qmul = q << 1;
         let qadd = (q - 1) | 1;
+        let ac_quant = AcQuantizer::new(qmul, qadd);
         // P 帧里帧内宏块的 DC 缩放（与 I 帧/解码端同表：亮度用 OLD 表）。
         let y_dc_scale = tables::OLD_Y_DC_SCALE[q_target as usize] as i32;
         let c_dc_scale = tables::C_DC_SCALE[q_target as usize] as i32;
@@ -470,7 +472,7 @@ impl Encoder {
                     let mut blk = [0i32; 64];
                     let mut has = false;
                     for k in 0..64usize {
-                        let l_raw = quantize(coef[k], qmul, qadd);
+                        let l_raw = ac_quant.quantize(coef[k]);
                         let l = l_raw.clamp(-MAX_ESCAPE_LEVEL, MAX_ESCAPE_LEVEL);
                         if l != l_raw {
                             clamped = true;
@@ -526,7 +528,7 @@ impl Encoder {
                         blk[0] = div_round(coef[0], scale);
                         let mut has_ac = false;
                         for k in 1..64usize {
-                            let l_raw = quantize(coef[k], qmul, qadd);
+                            let l_raw = ac_quant.quantize(coef[k]);
                             let l = l_raw.clamp(-MAX_ESCAPE_LEVEL, MAX_ESCAPE_LEVEL);
                             if l != l_raw {
                                 clamped = true;
@@ -1044,14 +1046,27 @@ fn div_round(a: i32, b: i32) -> i32 {
     }
 }
 
-/// 反量化的逆：`level` 使 `level*qmul ± qadd` 最接近 `f`。
-fn quantize(f: i32, qmul: i32, qadd: i32) -> i32 {
-    if f > 0 {
-        div_round(f - qadd, qmul).max(0)
-    } else if f < 0 {
-        div_round(f + qadd, qmul).min(0)
-    } else {
-        0
+/// 帧内 AC 和帧间系数共用的量化参数，每次编码一帧时计算一次。
+struct AcQuantizer {
+    reciprocal: u64,
+    bias: u32,
+}
+
+impl AcQuantizer {
+    fn new(qmul: i32, qadd: i32) -> Self {
+        Self {
+            reciprocal: (1u64 << 32).div_ceil(qmul as u64),
+            bias: (qmul / 2 - qadd) as u32,
+        }
+    }
+
+    #[inline]
+    fn quantize(&self, coefficient: i32) -> i32 {
+        // |f| <= qadd 时两种公式都给零。其余情况把四舍五入的 qmul/2 合并进偏移。
+        // 倒数乘法在 n*qmul < 2^32 时精确。8 位像素或残差的 8×8 DCT 系数远小于此界。
+        let numerator = u64::from(coefficient.unsigned_abs() + self.bias);
+        let level = ((numerator * self.reciprocal) >> 32) as i32;
+        if coefficient < 0 { -level } else { level }
     }
 }
 
@@ -1177,8 +1192,11 @@ mod tests {
         // 解码：level>0 → level*qmul+qadd；level<0 → level*qmul-qadd；level==0 → 0
         for q in 1..=31i32 {
             let (qmul, qadd) = (q << 1, (q - 1) | 1);
-            for f in -300..=300i32 {
-                let l = quantize(f, qmul, qadd);
+            let ac_quant = AcQuantizer::new(qmul, qadd);
+            for f in -(1 << 13)..=1 << 13 {
+                let l = ac_quant.quantize(f);
+                let exact = div_round(f.abs() - qadd, qmul).max(0) * f.signum();
+                assert_eq!(l, exact, "q={q} f={f}");
                 let back = if l > 0 {
                     l * qmul + qadd
                 } else if l < 0 {
