@@ -881,6 +881,22 @@ pub fn idct_cols_scalar(b: &[i32; 64], out: &mut [i32; 64]) {
     }
 }
 
+/// 一行 8 字节在平面里放得下吗 —— 放不下就只写放得下的那几个字节。
+///
+/// **为什么需要**：MPEG-1/2 的宏块恒为 16×16，而画面高度**不必**是 16 的倍数
+/// （实测 640×360：最后一行宏块占 352..=367，其中 360..=367 在画面外）。
+/// 帧缓冲按可见尺寸分配，于是最后那一行宏块的写回会越界 —— 原来直接 panic。
+///
+/// 快路（整块在内）与原来**逐字节相同**，只多一次比较；越界只发生在最后一行宏块上。
+#[inline(always)]
+fn store_row(row: &[u8; 8], out: &mut [u8], base: usize) {
+    let n = out.len().saturating_sub(base).min(8);
+    if n == 0 {
+        return; // 整行都在画面外
+    }
+    out[base..base + n].copy_from_slice(&row[..n]);
+}
+
 /// 把残差（+ 一个偏移）写到平面，夹到 0..=255。帧内块偏移 128。
 fn store_block(residual: &[i32; 64], offset: i32, out: &mut [u8], stride: usize, at: usize) {
     let _g = prof::on().then(|| prof::Guard::new(prof::STORE));
@@ -891,8 +907,7 @@ fn store_block(residual: &[i32; 64], offset: i32, out: &mut [u8], stride: usize,
         for x in 0..8 {
             row[x] = (residual[y * 8 + x] + offset).clamp(0, 255) as u8;
         }
-        let base = at + y * stride;
-        out[base..base + 8].copy_from_slice(&row);
+        store_row(&row, out, at + y * stride);
     }
 }
 
@@ -907,8 +922,7 @@ fn store_pred(pred: &[u8; 64], residual: &[i32; 64], out: &mut [u8], stride: usi
         for x in 0..8 {
             row[x] = (pred[y * 8 + x] as i32 + residual[y * 8 + x]).clamp(0, 255) as u8;
         }
-        let base = at + y * stride;
-        out[base..base + 8].copy_from_slice(&row);
+        store_row(&row, out, at + y * stride);
     }
 }
 
@@ -916,7 +930,8 @@ fn store_pred(pred: &[u8; 64], residual: &[i32; 64], out: &mut [u8], stride: usi
 fn store_pixels(pred: &[u8; 64], out: &mut [u8], stride: usize, at: usize) {
     let _g = prof::on().then(|| prof::Guard::new(prof::STORE));
     for y in 0..8 {
-        out[at + y * stride..at + y * stride + 8].copy_from_slice(&pred[y * 8..y * 8 + 8]);
+        let row: [u8; 8] = pred[y * 8..y * 8 + 8].try_into().expect("定长 8");
+        store_row(&row, out, at + y * stride);
     }
 }
 
