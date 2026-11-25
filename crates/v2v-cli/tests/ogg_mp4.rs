@@ -234,8 +234,19 @@ fn ogg_to_mp4_pcm_is_bit_exact_with_the_wav_route() {
         );
     }
 
-    let _ = std::fs::remove_dir_all(mp4.parent().unwrap());
-    let _ = std::fs::remove_dir_all(&wav_dir);
+    if !keep_temp() {
+        let _ = std::fs::remove_dir_all(mp4.parent().unwrap());
+        let _ = std::fs::remove_dir_all(&wav_dir);
+    }
+}
+
+/// 临时目录要不要留。
+///
+/// 默认删掉；`V2V_KEEP_TEMP=1` 时留着 —— 判据红的时候，光看 `assert` 的
+/// 那句话往往不够（「末尾 SNR 3.4 dB」不能告诉你**哪一段**坏了），
+/// 得把产物捞出来自己量。
+fn keep_temp() -> bool {
+    std::env::var_os("V2V_KEEP_TEMP").is_some()
 }
 
 #[test]
@@ -343,5 +354,7 @@ fn ogg_to_mp4_aac_is_one_track_and_aligned_at_lag_zero() {
         "末尾的 SNR 只有 {tail_snr:.1} dB —— 尾巴被截断或补成静音了"
     );
 
-    let _ = std::fs::remove_dir_all(mp4.parent().unwrap());
+    if !keep_temp() {
+        let _ = std::fs::remove_dir_all(mp4.parent().unwrap());
+    }
 }

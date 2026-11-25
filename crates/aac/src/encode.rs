@@ -412,12 +412,33 @@ fn push_history(hist: &mut [f32], samples: &[f32]) {
 ///
 /// ## 判据：比两套表示的 **L1 范数**
 ///
-/// `M = (L+R)/2`、`S = (L-R)/2`。L1 是**齐次**的（整体放大 2 倍 = sf 抬 2 档、位数不变），
-/// 所以直接比 L1 就是比「各自在自己那一档 sf 下要花多少位」：
+/// `M = (L+R)/2`、`S = (L-R)/2`（解码端是 `L = M+S`、`R = M−S`，这两个式子由它
+/// 反解出来，不能改）。L1 是**齐次**的（整体放大 2 倍 = sf 抬 2 档、位数不变），
+/// 所以「各自在自己那一档 sf 下要花多少位」可以拿 L1 近似。
 ///
-/// - 相关性强（`L ≈ R`）：`L1(M) + L1(S) ≈ L1(L)`，而 L/R 是 `2·L1(L)` → **选 M/S**
-/// - 不相关：`≈ 1.4·(L1(L) + L1(R))` → 选 L/R
-/// - 反相（`R = -L`）：两者相等（平局 → 选 L/R，少一次变换）
+/// ## ⚠️ 这个判据**几乎恒为真**
+///
+/// 三角不等式直接给出 `L1(M) + L1(S) ≤ L1(L) + L1(R)`（`M`/`S` 还各自带了 1/2
+/// 的定标，让左边更小），所以 `MS_MARGIN = 0.98` 只挡得住「比值落在 0.98~1.0」
+/// 这一小段。实测比值（1024 点、等幅）：
+///
+/// | 素材 | `l1_ms / l1_lr` | 结果 |
+/// |---|---|---|
+/// | `L == R` | 0.50 | M/S |
+/// | 反相 `R = −L` | 0.50 | M/S |
+/// | 两个不相关正弦 | 0.64 | M/S |
+/// | 左右独立白噪声 | 0.71 | M/S |
+/// | 一个声道静音 | 1.00 | **L/R** |
+/// | 全零 | `0/0` → `0 < 0` 假 | **L/R** |
+///
+/// 也就是说**只有「全零帧」和「一个声道静音」会走 L/R**，任何非零立体声内容
+/// 都走 M/S。这不是「M/S 真的更省」：那 1/2 的定标会被 sf 吸收掉，不是收益 ——
+/// 判据实际是在拿「减半之后的 L1」和「没减半的 L1」比。真判据得比**位数**
+/// （编码器里已经有代价模型），那是另一次改动；在那之前别指望它会选 L/R。
+///
+/// ⚠️ 这个偏差有个直接后果：**L/R 域那条路几乎不被走到**，所以「原始域历史」
+/// （`ChannelState::overlap`）写错了也长期没有判据能发现 —— 见 2026-11-26 的
+/// 事故（`overlap` 被写成 M/S，末尾补零帧换回 L/R 域时右声道淡出到静音）。
 ///
 /// ## ⚠️ 为什么是「逐帧」而不是「逐带」
 ///
@@ -510,7 +531,7 @@ struct ChannelState {
     /// 上一帧的后半段（`N` 个样本），与这一帧拼成 `2N`（AAC 是 50% 重叠）——
     /// **原始域**（L / R）的那一份。
     overlap: Vec<f32>,
-    /// 同一件事，但存的是 **M/S 域**（`M = (L+R)/2` / `S = L-R`）的那一份。
+    /// 同一件事，但存的是 **M/S 域**（`M = (L+R)/2` / `S = (L-R)/2`）的那一份。
     ///
     /// ⚠️ **两套历史都要维护**，因为 M/S 是**逐帧**决策的：MDCT 的重叠必须与
     /// 本帧实际编的那个域一致（TDAC 要求「上一帧那一半」是同一个信号），
@@ -739,7 +760,16 @@ impl Encoder {
             })
             .collect();
         for ch in 0..n {
-            push_history(&mut chans[ch].overlap, &coded[ch]);
+            // ⚠️ **推进 `overlap` 用的是 `frame.planes`，不是 `coded`** ——
+            // 这一份是**原始域**（L / R）的历史，本帧用不用 M/S 都得记原始信号。
+            // 写成 `coded[ch]` 的话，M/S 帧会把 M / S 灌进 L/R 那一份：等下一帧
+            // 换回 L/R 域，`hist` 拿到的就不是「上一帧的后半」而是 M / S，MDCT
+            // 的左半错位 —— TDAC 破坏，那半块只剩淡出。
+            // 实测（2026-11-26）：单声道内容装在立体声里（`L == R`，于是 `S == 0`）
+            // 的 Ogg，末尾那个补零帧走 L/R 域，右声道的 `overlap` 被写成了 0，
+            // 最后 896 个采样点**只有左声道是对的**（右声道淡出到静音）；
+            // 判据「末尾 2048 个交织样本 SNR」从 70 dB 掉到 3.4 dB。
+            push_history(&mut chans[ch].overlap, &frame.planes[ch]);
             if let Some(ms) = ms_planes.as_deref() {
                 push_history(&mut chans[ch].overlap_ms, &ms[ch]);
             }
@@ -2587,6 +2617,94 @@ mod tests {
                 four.encode_frame(f).expect("4 线程"),
                 "第 {i} 帧：单声道下线程数不该影响输出"
             );
+        }
+    }
+
+    /// 一段**两个声道完全相同**的正弦 —— `S = (L−R)/2 ≡ 0`，M/S 一定胜出。
+    ///
+    /// 为什么专门要「完全相同」：M/S 帧把 S 灌进 L/R 那份历史时，错的量正好是
+    /// **0**（而不是一个「看起来像噪声」的数）。0 是个特别容易被放过的错值 ——
+    /// 它在「历史被清零」和「本来就是静音」之间没有区别。
+    fn mono_into_stereo(n: usize) -> Frame {
+        let p: Vec<f32> = (0..n)
+            .map(|i| (i as f32 * 0.0627).sin() * 6000.0)
+            .collect();
+        Frame {
+            planes: vec![p.clone(), p],
+        }
+    }
+
+    /// 两声道频率不同 → 不相关。**注意它仍然选 M/S**（判据偏向 M/S，见
+    /// `use_midside` 的表格）—— 留在这里是为了让「L/R 不是靠不相关走到的」这件事
+    /// 有据可查，别再照着直觉编一条永远绿的判据。
+    fn decorrelated(n: usize) -> Frame {
+        Frame {
+            planes: vec![
+                (0..n).map(|i| (i as f32 * 0.0627).sin() * 6000.0).collect(),
+                (0..n).map(|i| (i as f32 * 0.1431).sin() * 6000.0).collect(),
+            ],
+        }
+    }
+
+    /// 两个域都**真的**走得到 —— 下面那条判据的**前提**。
+    ///
+    /// 单独立一条：`use_midside` 的判据一改（比如 `MS_MARGIN` 调狠了、或者换成比
+    /// 位数），域切换的触发条件就不再是「全零帧」，重建判据会变成一条**永远绿**的
+    /// 装饰。前提也要有判据。
+    #[test]
+    fn both_domains_are_reachable() {
+        let a = mono_into_stereo(LONG_LEN);
+        assert!(
+            use_midside(&a.planes[0], &a.planes[1]),
+            "有内容的帧应该走 M/S"
+        );
+        // 全零帧：`l1_ms` 与 `l1_lr` 都是 0，`0 < 0` 为假 → L/R。
+        // 这正是收尾时那一帧补零（`flush_aac` 的第二步），也是 2026-11-26 事故的触发点。
+        let z = vec![0f32; LONG_LEN];
+        assert!(!use_midside(&z, &z), "全零帧应该走 L/R");
+        // 不相关**不**会走到 L/R —— 把这条也钉住，免得下次又有人这么假设。
+        let d = decorrelated(LONG_LEN);
+        assert!(
+            use_midside(&d.planes[0], &d.planes[1]),
+            "两个不相关正弦仍然走 M/S（判据偏向 M/S）"
+        );
+    }
+
+    /// **`overlap` 存的是原始域（L / R），M/S 帧也不能把它写成 M / S。**
+    ///
+    /// 这条钉的是一个真实事故（2026-11-26）：`push_history(&mut overlap, &coded[ch])`
+    /// 把 `coded`（M/S 帧时就是 M / S）灌进了「原始域」那一份。`L == R` 的素材上
+    /// `S ≡ 0`，于是右声道的 L/R 历史被**清零**；下一帧只要换回 L/R 域，MDCT 的左半
+    /// 就不是「上一帧的后半」而是 0 —— TDAC 破坏，那一块的后半段只剩淡出。
+    ///
+    /// 症状长在**输出尾巴上**（末尾那个补零帧正好走 L/R 域），实测右声道最后
+    /// 896 个采样点淡出到静音，而左声道完好 —— 「只错一个声道」正是这个 bug 的指纹。
+    #[test]
+    fn overlap_history_stays_in_the_original_domain() {
+        let f = mono_into_stereo(LONG_LEN);
+        assert!(use_midside(&f.planes[0], &f.planes[1]), "前提：这一帧必须走 M/S");
+        let mut enc = Encoder::new(EncoderConfig::default()).expect("建编码器");
+        enc.encode_frame(&f).expect("编一帧");
+
+        for ch in 0..2 {
+            let got = &enc.chans[ch].overlap;
+            let want = &f.planes[ch];
+            for i in 0..LONG_LEN {
+                assert!(
+                    (got[i] - want[i]).abs() < 1e-6,
+                    "第 {ch} 声道第 {i} 个样本：`overlap` 是 {} 而原始信号是 {} \
+                     —— M/S 帧把 `overlap` 写成 M / S 了",
+                    got[i],
+                    want[i]
+                );
+            }
+            // 同一帧的 M/S 那一份**必须**是 S（= 0），否则下面这条判据抓不到东西。
+            if ch == 1 {
+                assert!(
+                    enc.chans[1].overlap_ms.iter().all(|v| v.abs() < 1e-6),
+                    "前提：L == R 时 S 应该恒为 0"
+                );
+            }
         }
     }
 

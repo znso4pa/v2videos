@@ -1,8 +1,12 @@
 //! Ogg 解封装**真样本**对账。
 //!
 //! ```text
-//! V2V_OGG_SAMPLE=/path/to/x.ogg cargo test -p v2v-ogg -- --nocapture
+//! V2V_OGG_REF_SAMPLE=/path/to/ref.ogg cargo test -p v2v-ogg --test real_sample -- --nocapture
 //! ```
+//!
+//! ⚠️ 这里的**期望值是写死在一份具体样本上的**（88 个包 / 2001 ms / 首包 172 字节），
+//! 所以它读 `V2V_OGG_REF_SAMPLE` 而不是共用的 `V2V_OGG_SAMPLE` —— 见
+//! `ref_sample_path()` 的说明。
 //!
 //! ## 对账基准从哪来
 //!
@@ -38,11 +42,18 @@ impl PacketTiming for ConstantLongBlock {
     }
 }
 
-fn sample_path() -> Option<String> {
-    match std::env::var("V2V_OGG_SAMPLE") {
+/// 这条测试的**期望值是写死在某一份具体样本上的**（88 个包、2001 ms、首包 172 字节…），
+/// 所以它读的是**另一个**环境变量 `V2V_OGG_REF_SAMPLE`，不是 `V2V_OGG_SAMPLE`。
+///
+/// ⚠️ 为什么必须分开（2026-11-26 踩的）：`V2V_OGG_SAMPLE` 被 `ogg_wav.rs` /
+/// `ogg_mp4.rs` / `remux_real.rs` / `demux_bench.rs` 共用，那几条**对样本无要求**。
+/// 用同一份 600 s 的样本跑全仓测试时，这条就红在「25841 个包 vs 88 个」——
+/// 看着像解封装坏了，其实只是**换了素材**。判据挑的样本是判据的一部分。
+fn ref_sample_path() -> Option<String> {
+    match std::env::var("V2V_OGG_REF_SAMPLE") {
         Ok(p) if std::path::Path::new(&p).is_file() => Some(p),
         _ => {
-            eprintln!("SKIP: V2V_OGG_SAMPLE 未设置或文件不存在");
+            eprintln!("SKIP: V2V_OGG_REF_SAMPLE 未设置或文件不存在");
             None
         }
     }
@@ -50,7 +61,7 @@ fn sample_path() -> Option<String> {
 
 #[test]
 fn demuxes_every_packet_of_the_real_sample() {
-    let Some(path) = sample_path() else { return };
+    let Some(path) = ref_sample_path() else { return };
     let file = File::open(&path).unwrap();
 
     // 从第一页起就校验 CRC —— 真样本必须全过，顺带把 CRC 实现钉在真实数据上。
@@ -136,7 +147,7 @@ fn demuxes_every_packet_of_the_real_sample() {
 
 #[test]
 fn duration_matches_ffprobe() {
-    let Some(path) = sample_path() else { return };
+    let Some(path) = ref_sample_path() else { return };
     let mut f = File::open(&path).unwrap();
     let ms = duration_ms(&mut f).unwrap().expect("末页 granule");
     // ffprobe: duration=2.001270（88256 采样 @ 44100）
