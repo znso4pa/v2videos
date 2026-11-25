@@ -8,7 +8,7 @@
 
 ## 现状
 
-**链路已经打通到 `.wmv → .mp4`**：**23 个 crate、约 9.2 万行 Rust（含测试）**，**零第三方运行时依赖**
+**链路已经打通到 `.wmv → .mp4`**：**24 个 crate、约 9.4 万行 Rust（含测试）**，**零第三方运行时依赖**
 （`Cargo.lock` 里只有本仓的包，外加 `cc` 那条**构建**链 —— 只服务 `v2v-android` 的 C shim）。
 
 ```text
@@ -21,6 +21,9 @@ v2v-mpegps MPEG-1/2 program stream（`.mpg` / `.dat` / `.vob`）解封装
 v2v-ogg    Ogg 解封装（页 / 跨页包重组 / 流识别 / 时间戳）—— **只有 Vorbis 的容器层**：
            识别出 Opus / Theora / FLAC / Speex / Skeleton 后明确报 `Unsupported`；
            包时长由 `PacketTiming` 外部喂，容器不依赖任何编解码器
+v2v-vorbis Vorbis I **解码**（码本 / floor 1 / residue 0·1·2 / 声道耦合 / hybrid 窗 /
+           IMDCT + 重叠相加）—— **只有解码器**，且**没有 floor 0**（LSP，setup 阶段
+           明确报 `Unsupported`）。全部概率模型都在码流里，所以是 MIT 侧、无派生码表
 v2v-kernel 编解码器**共用的信号处理内核**：位读写 / VLC / RL 表容器 / FDCT / IDCT / FFT /
            帧缓冲（`Frame` / `Planes`）/ 运动补偿 / SAD / 宏块层预测 / NEON
            —— 全仓唯一允许 `unsafe` 的地方，且只有 `simd` 一个模块

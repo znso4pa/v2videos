@@ -64,6 +64,7 @@ MIT_CRATES = [
     "v2v-mp4",
     "v2v-ogg",
     "v2v-player",
+    "v2v-vorbis",
 ]
 
 

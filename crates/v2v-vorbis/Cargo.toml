@@ -1,0 +1,14 @@
+[package]
+name = "v2v-vorbis"
+description = "纯 Rust 的 Vorbis I 解码 —— 码本 / floor / residue / MDCT，无 C、无 FFI"
+version.workspace = true
+edition.workspace = true
+license = "MIT"
+
+[dependencies]
+# 共享数值内核：MDCT（与 AAC / WMA 同一份实现）。
+v2v-kernel = { path = "../v2v-kernel" }
+
+[dev-dependencies]
+# 真样本对账要自己拆 Ogg 页/包 —— 解封装不是本 crate 的职责。
+v2v-ogg = { path = "../v2v-ogg" }

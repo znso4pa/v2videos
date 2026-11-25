@@ -1,0 +1,391 @@
+//! floor：频谱包络。规范第 6 章（type 0）与第 7 章（type 1）。
+//!
+//! **只做 type 1。** 现实里的编码器（libvorbis / ffmpeg 原生编码器）产出的都是
+//! floor 1；floor 0 是 LSP 表示，曲线公式在规范里是图片，本实现没做 ——
+//! 遇到 floor 0 的流在 **setup 阶段就明确报 `Unsupported`**，不假装能解。
+//!
+//! floor 1 的曲线计算有两条容易写错的地方：
+//!
+//! 1. **第 1 步（振幅预测）和第 2 步（画线）用的点集不一样**：差值为 0 的点在
+//!    预测里要用（它把线钉在那儿），画线时却要**跳过**。跳过是为了让折线更平滑。
+//! 2. **整数除法要向零取整**（`render_line` 的 `base`），不是向下取整 ——
+//!    Rust 的 `/` 对 `i32` 就是向零取整，照抄即可，但换成移位就会错。
+
+use crate::bit::BitReader;
+use crate::codebook::Codebook;
+use crate::error::{Error, Result};
+use crate::ilog;
+
+/// `{256, 128, 86, 64}` —— 由 `floor1_multiplier` 选。
+const RANGES: [u32; 4] = [256, 128, 86, 64];
+
+/// floor 1 的静态反 dB 表：`table[i] = 10^((i - 255) * 7 / 256)`。
+///
+/// 规范 10.1 给的是 256 个具体数值。它们不是抄来的数据，而是**一个公式的采样**：
+/// 相邻两项相差 `7/256`（≈0.547 dB）的幅度比，第 255 项正好是 1.0（0 dB），
+/// 第 0 项 `10^(-255*7/256) = 1.0649863e-07` 与规范印的第一个数一致（见测试）。
+/// 这里按公式算，省掉一张手抄表 —— 抄错一位不会报错，只会让某段频谱偏一点。
+pub fn inverse_db_table() -> [f32; 256] {
+    let mut t = [0f32; 256];
+    for (i, v) in t.iter_mut().enumerate() {
+        *v = 10f64.powf((i as f64 - 255.0) * 7.0 / 256.0) as f32;
+    }
+    t
+}
+
+/// floor 1 的配置。
+pub struct Floor1 {
+    partition_class: Vec<u8>,
+    class_dimensions: Vec<u8>,
+    class_subclasses: Vec<u8>,
+    class_masterbooks: Vec<u8>,
+    /// `subclass_books[class][j]`，`-1` 表示这个位置不编码（值为 0）。
+    subclass_books: Vec<Vec<i16>>,
+    multiplier: i32,
+    /// 展开顺序（list order）的 X 列表。
+    x_list: Vec<u16>,
+    /// 按 X 升序排好的下标（曲线合成第 2 步要排序）。
+    sorted: Vec<usize>,
+    /// 每个下标在 list order 里的低 / 高邻居（预测要用）。
+    low: Vec<usize>,
+    high: Vec<usize>,
+}
+
+/// 一个包的 floor 1 解码结果（曲线合成第 1 步之后）。
+pub struct Floor1Packet {
+    y: Vec<i32>,
+    step2: Vec<bool>,
+}
+
+impl Floor1 {
+    /// 读 floor 1 配置。规范 7.2.2。
+    pub fn read(bit: &mut BitReader, codebooks: &[Codebook]) -> Result<Self> {
+        let partitions = bit.read(5)? as usize;
+        let mut partition_class = Vec::with_capacity(partitions);
+        let mut maximum_class: i32 = -1;
+        for _ in 0..partitions {
+            let c = bit.read(4)? as u8;
+            maximum_class = maximum_class.max(c as i32);
+            partition_class.push(c);
+        }
+
+        let classes = (maximum_class + 1) as usize;
+        let mut class_dimensions = vec![0u8; classes];
+        let mut class_subclasses = vec![0u8; classes];
+        let mut class_masterbooks = vec![0u8; classes];
+        let mut subclass_books = vec![Vec::new(); classes];
+        for i in 0..classes {
+            class_dimensions[i] = bit.read(3)? as u8 + 1;
+            let subclasses = bit.read(2)? as u8;
+            class_subclasses[i] = subclasses;
+            if subclasses > 0 {
+                let book = bit.read(8)?;
+                if book as usize >= codebooks.len() {
+                    return Err(Error::Bad(format!(
+                        "floor1 的 masterbook {book} 越界（共 {} 个码本）",
+                        codebooks.len()
+                    )));
+                }
+                class_masterbooks[i] = book as u8;
+            }
+            let n = 1usize << subclasses;
+            let mut books = Vec::with_capacity(n);
+            for _ in 0..n {
+                let book = bit.read(8)? as i32 - 1; // 0 表示「没有」，读到的值减一
+                if book >= codebooks.len() as i32 {
+                    return Err(Error::Bad(format!(
+                        "floor1 的 subclass book {book} 越界（共 {} 个码本）",
+                        codebooks.len()
+                    )));
+                }
+                books.push(book as i16);
+            }
+            subclass_books[i] = books;
+        }
+
+        let multiplier = bit.read(2)? as i32 + 1;
+        let rangebits = bit.read(4)?;
+
+        let mut x_list = vec![0u16, (1u32 << rangebits) as u16];
+        for &c in &partition_class {
+            for _ in 0..class_dimensions[c as usize] {
+                let x = bit.read(rangebits)?;
+                if x_list.len() >= 65 {
+                    return Err(Error::Bad(
+                        "floor1 的 X 列表超过 65 项（规范上限）".into(),
+                    ));
+                }
+                x_list.push(x as u16);
+            }
+        }
+        // X 必须两两不同：重复会让 low/high 邻居的定义失去意义。
+        {
+            let mut seen = x_list.clone();
+            seen.sort_unstable();
+            if seen.windows(2).any(|w| w[0] == w[1]) {
+                return Err(Error::Bad("floor1 的 X 列表有重复值".into()));
+            }
+        }
+
+        // 排序置换：曲线合成第 2 步按 X 升序遍历。
+        let mut sorted: Vec<usize> = (0..x_list.len()).collect();
+        sorted.sort_by_key(|&i| x_list[i]);
+
+        // 低 / 高邻居：都在**list order** 里找（规范 9.2.4 / 9.2.5）。
+        let values = x_list.len();
+        let mut low = vec![0usize; values];
+        let mut high = vec![0usize; values];
+        for i in 2..values {
+            let mut l = 0usize;
+            let mut h = 1usize;
+            for j in 0..i {
+                if x_list[j] < x_list[i] && x_list[j] > x_list[l] {
+                    l = j;
+                }
+                if x_list[j] > x_list[i] && x_list[j] < x_list[h] {
+                    h = j;
+                }
+            }
+            low[i] = l;
+            high[i] = h;
+        }
+
+        Ok(Self {
+            partition_class,
+            class_dimensions,
+            class_subclasses,
+            class_masterbooks,
+            subclass_books,
+            multiplier,
+            x_list,
+            sorted,
+            low,
+            high,
+        })
+    }
+
+    pub fn multiplier(&self) -> i32 {
+        self.multiplier
+    }
+
+    /// 解一个包的 floor。返回 `None` 表示这个声道本帧「未使用」（全零）。
+    ///
+    /// 规范 7.2.3：包尾读完算**正常**，按 `nonzero` 未置位处理（返回 `None`）。
+    pub fn decode(&self, bit: &mut BitReader, codebooks: &[Codebook]) -> Result<Option<Floor1Packet>> {
+        let values = self.x_list.len();
+        let mut y = vec![0i32; values];
+        let mut step2 = vec![false; values];
+
+        match self.decode_inner(bit, codebooks, &mut y, &mut step2) {
+            Ok(()) => Ok(Some(Floor1Packet { y, step2 })),
+            Err(Error::Eop) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn decode_inner(
+        &self,
+        bit: &mut BitReader,
+        codebooks: &[Codebook],
+        y: &mut [i32],
+        step2: &mut [bool],
+    ) -> Result<()> {
+        if !bit.read_bool()? {
+            return Err(Error::Eop); // 「未使用」，与「读到包尾」走同一条出口
+        }
+        let range = RANGES[(self.multiplier - 1) as usize];
+        let bits = ilog(range - 1);
+        y[0] = bit.read(bits)? as i32;
+        y[1] = bit.read(bits)? as i32;
+
+        let mut offset = 2usize;
+        for &c in &self.partition_class {
+            let c = c as usize;
+            let cdim = self.class_dimensions[c] as usize;
+            let cbits = self.class_subclasses[c];
+            let csub = (1u32 << cbits) - 1;
+            let mut cval = if cbits > 0 {
+                codebooks[self.class_masterbooks[c] as usize].decode_scalar(bit)? as u32
+            } else {
+                0
+            };
+            for _ in 0..cdim {
+                let book = self.subclass_books[c][(cval & csub) as usize];
+                cval >>= cbits;
+                y[offset] = if book >= 0 {
+                    codebooks[book as usize].decode_scalar(bit)? as i32
+                } else {
+                    0
+                };
+                offset += 1;
+            }
+        }
+        debug_assert_eq!(offset, self.x_list.len());
+
+        // 第 1 步：把「总是非负」的差值还原成 ±，沿已有的线做预测。
+        step2[0] = true;
+        step2[1] = true;
+        for i in 2..self.x_list.len() {
+            let lo = self.low[i];
+            let hi = self.high[i];
+            let predicted = render_point(
+                self.x_list[lo] as i32,
+                y[lo],
+                self.x_list[hi] as i32,
+                y[hi],
+                self.x_list[i] as i32,
+            );
+            let val = y[i];
+            let highroom = range as i32 - predicted;
+            let lowroom = predicted;
+            let room = if highroom < lowroom { highroom * 2 } else { lowroom * 2 };
+            if val != 0 {
+                step2[lo] = true;
+                step2[hi] = true;
+                step2[i] = true;
+                y[i] = if val >= room {
+                    if highroom > lowroom {
+                        val - lowroom + predicted
+                    } else {
+                        predicted - val + highroom - 1
+                    }
+                } else if val & 1 == 1 {
+                    predicted - (val + 1) / 2
+                } else {
+                    predicted + val / 2
+                };
+            } else {
+                step2[i] = false;
+                y[i] = predicted;
+            }
+        }
+        // 规范建议夹到 [0, range)：合法的 setup 不会越界，坏 setup 也不该让查表崩。
+        for v in y.iter_mut() {
+            *v = (*v).clamp(0, range as i32 - 1);
+        }
+        Ok(())
+    }
+
+    /// 曲线合成（第 2 步 + 反 dB 查表），写满 `out`（长度 = 块大小 / 2）。
+    pub fn curve(&self, pkt: &Floor1Packet, out: &mut [f32]) {
+        let table = inverse_db_table();
+        let n = out.len();
+        let mult = self.multiplier;
+
+        let mut lx = 0usize;
+        let mut ly = pkt.y[self.sorted[0]] * mult;
+        let mut hx = 0usize;
+        let mut hy = ly;
+
+        for &idx in self.sorted.iter().skip(1) {
+            if !pkt.step2[idx] {
+                continue;
+            }
+            hy = pkt.y[idx] * mult;
+            hx = self.x_list[idx] as usize;
+            render_line(lx, ly, hx, hy, out);
+            lx = hx;
+            ly = hy;
+        }
+        if hx < n {
+            render_line(hx, hy, n, hy, out);
+        }
+
+        for v in out.iter_mut() {
+            let i = (*v as usize).min(255);
+            *v = table[i];
+        }
+    }
+}
+
+/// 规范 9.2.6：在线段上求 `X` 处的 `Y`（整数算法）。
+fn render_point(x0: i32, y0: i32, x1: i32, y1: i32, x: i32) -> i32 {
+    let dy = y1 - y0;
+    let adx = x1 - x0;
+    let ady = dy.abs();
+    let err = ady * (x - x0);
+    let off = err / adx; // 向零取整
+    if dy < 0 {
+        y0 - off
+    } else {
+        y0 + off
+    }
+}
+
+/// 规范 9.2.7：把 `[x0, x1)` 之间的整数折线写进 `out`。
+///
+/// 注意端点：`x0` 写、`x1` **不写**（下一次调用从 `x1` 开始写）。
+fn render_line(x0: usize, y0: i32, x1: usize, y1: i32, out: &mut [f32]) {
+    let n = out.len();
+    if x0 >= n {
+        return;
+    }
+    let x1 = x1.min(n);
+    if x1 <= x0 {
+        return;
+    }
+    let dy = y1 - y0;
+    let adx = (x1 - x0) as i32;
+    let ady = dy.abs();
+    let base = dy / adx;
+    let mut y = y0;
+    let mut err = 0i32;
+    let sy = if dy < 0 { base - 1 } else { base + 1 };
+    let ady = ady - base.abs() * adx;
+
+    out[x0] = y as f32;
+    for x in (x0 + 1)..x1 {
+        err += ady;
+        if err >= adx {
+            err -= adx;
+            y += sy;
+        } else {
+            y += base;
+        }
+        out[x] = y as f32;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 反 dB 表的两个端点必须与规范 10.1 印出来的数一致 —— 这是「公式等价于那张表」
+    /// 的判据，不是「看起来差不多」。
+    #[test]
+    fn inverse_db_table_matches_the_published_values() {
+        let t = inverse_db_table();
+        assert_eq!(t[255], 1.0);
+        // 规范印的：1.0649863e-07 / 0.9389798 / 0.00033677814
+        assert!((t[0] as f64 - 1.0649863e-07).abs() / 1.0649863e-07 < 1e-5, "{}", t[0]);
+        assert!((t[254] as f64 - 0.9389798).abs() < 1e-6, "{}", t[254]);
+        assert!((t[128] as f64 - 0.00033677814).abs() / 0.00033677814 < 1e-5, "{}", t[128]);
+        // 单调递增
+        assert!(t.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    /// 规范 7.2.4 的例子：X = 0,16,32,...,128（list order 0,128,64,32,96,16,48,80,112），
+    /// Y 依次 110,20,-5,-45,0,-25,-10,30,-10。
+    ///
+    /// 这里只验 `render_point`：它决定「预测值」，错了整条曲线会歪。
+    #[test]
+    fn render_point_uses_integer_line() {
+        // (0,110) → (128,20) 在 X=64 处：dy=-90, off = 90*64/128 = 45 → 110-45 = 65
+        assert_eq!(render_point(0, 110, 128, 20, 64), 65);
+        // 正向：(0,0) → (100,50) 在 X=40 处 = 20
+        assert_eq!(render_point(0, 0, 100, 50, 40), 20);
+    }
+
+    /// `render_line` 写 `[x0, x1)`：端点归属错一位，整条曲线就整体平移。
+    #[test]
+    fn render_line_endpoints() {
+        let mut out = vec![0f32; 8];
+        render_line(2, 10, 6, 10, &mut out);
+        assert_eq!(out, vec![0.0, 0.0, 10.0, 10.0, 10.0, 10.0, 0.0, 0.0]);
+
+        // 斜线：(0,0) → (4,4)：0,1,2,3 写在 0..4
+        let mut out = vec![0f32; 8];
+        render_line(0, 0, 4, 4, &mut out);
+        assert_eq!(out[..5], [0.0, 1.0, 2.0, 3.0, 0.0]);
+    }
+}

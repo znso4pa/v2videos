@@ -226,6 +226,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "v2v-vorbis"
+version = "0.0.0"
+dependencies = [
+ "v2v-kernel",
+ "v2v-ogg",
+]
+
+[[package]]
 name = "v2v-wma"
 version = "0.0.0"
 dependencies = [
