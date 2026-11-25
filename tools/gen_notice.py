@@ -62,6 +62,7 @@ MIT_CRATES = [
     "v2v-mpeg12-simd",
     "v2v-mpegps",
     "v2v-mp4",
+    "v2v-ogg",
     "v2v-player",
 ]
 

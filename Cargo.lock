@@ -189,6 +189,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "v2v-ogg"
+version = "0.0.0"
+dependencies = [
+ "v2v-container",
+]
+
+[[package]]
 name = "v2v-player"
 version = "0.0.0"
 dependencies = [
