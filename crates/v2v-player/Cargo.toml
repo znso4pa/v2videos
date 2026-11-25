@@ -10,7 +10,7 @@ default = []
 # MPEG-1/2（`.mpg` / `.dat` 的 program stream），**只有视频**（MP2 音频本仓没有解码器）。
 # **非默认**：只吃 WMV 的宿主打 `.so` 时不该背上这套码表 —— 这是「最小体积」的开关。
 mpeg12 = ["dep:v2v-mpeg12", "dep:v2v-mpegps"]
-mpeg12-c = ["mpeg12", "dep:v2v-mpeg12-simd"]
+mpeg12-c = ["mpeg12", "dep:v2v-mpeg12-c"]
 
 [dependencies]
 # 只用它的 `Error`（全仓编解码器共用那一个），在 `From` 里换成播放器自己的错误。
@@ -22,4 +22,4 @@ v2v-vc1 = { path = "../vc1" }
 v2v-wma = { path = "../wma" }
 v2v-mpeg12 = { path = "../mpeg12", optional = true }
 v2v-mpegps = { path = "../v2v-mpegps", optional = true }
-v2v-mpeg12-simd = { path = "../v2v-mpeg12-simd", optional = true, features = ["c-kernels"] }
+v2v-mpeg12-c = { path = "../v2v-mpeg12-c", optional = true, features = ["neon"] }

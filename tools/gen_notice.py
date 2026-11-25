@@ -59,6 +59,7 @@ MIT_CRATES = [
     "v2v-container",
     "v2v-filter",
     "v2v-kernel",
+    "v2v-mpeg12-c",
     "v2v-mpeg12-simd",
     "v2v-mpegps",
     "v2v-mp4",

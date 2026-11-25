@@ -21,9 +21,9 @@ pub fn available() -> u32 {
     #[cfg(not(feature = "unsafe-kernels"))]
     let rust = 0;
 
-    #[cfg(v2v_c_mc8)]
-    let c = u32::from(crate::mc8::available()) * KERNEL_MC8_C;
-    #[cfg(not(v2v_c_mc8))]
+    #[cfg(feature = "c-kernels")]
+    let c = u32::from(v2v_mpeg12_c::available()) * KERNEL_MC8_C;
+    #[cfg(not(feature = "c-kernels"))]
     let c = 0;
 
     rust | c
@@ -39,10 +39,8 @@ pub fn install() {
     #[cfg(all(feature = "unsafe-kernels", target_arch = "aarch64"))]
     v2v_mpeg12::decode::set_idct_cols(idct_cols);
 
-    #[cfg(v2v_c_mc8)]
-    if crate::mc8::available() {
-        v2v_mpeg12::decode::set_mc8("c-neon", crate::mc8::predict);
-    }
+    #[cfg(feature = "c-kernels")]
+    v2v_mpeg12_c::install();
 }
 
 #[cfg(feature = "unsafe-kernels")]

@@ -973,16 +973,20 @@ cargo build --release -p v2v-capi --no-default-features --features mpeg12-c -j 2
 
 基准 TSV 的 `mpeg12_mc` 记录实际启用的预测后端（`rust` 或 `c-neon`）。Rust 播放器使用
 `v2v-player/mpeg12-c`，底层 `v2v-mpeg12-simd` 则使用 `c-kernels` 并调用 `install()`。
+C 内核位于 MIT crate `v2v-mpeg12-c`，播放器直接链接该内核。独立 SIMD 库继续提供旧有探测符号，
+`v2v-capi` 的导出与纯 Rust 构建一致。
 
-2026-11-25 Apple M3，release，单线程。两种构建交替跑四组，每组 `--reps 5` 取最快，表中取中位数。
+2026-11-25，ABI 隔离版在 Apple M3 上的 release 单线程快照。两种构建交替跑四组，每组
+`--reps 5` 取最快，表中取中位数。FFmpeg 9.0.1 列取八组参考耗时的中位数。
 
 | MPEG-2 用例 | Rust ms | Rust + C ms | FFmpeg ms | Rust + C / FFmpeg |
 |---|---:|---:|---:|---:|
-| 480p 渐进，240 帧 | 203.42 | 203.88 | 92.91 | 2.19× |
-| 480i 隔行帧图，240 帧 | 213.95 | 207.73 | 94.59 | 2.20× |
+| 480p 渐进，240 帧 | 117.26 | 116.54 | 54.93 | 2.12× |
+| 480i 隔行帧图，240 帧 | 119.36 | 119.08 | 55.87 | 2.13× |
 
-两组共 480 帧在 Rust 和 Rust + C 构建之间逐字节一致。默认继续使用纯 Rust；本机实测渐进持平，
-隔行节省约 3% 耗时。
+两组的 C 后端耗时均与 Rust 持平，`v2v bench --check` 通过。C 宿主对照两种 `v2v-capi` 构建，
+共 480 帧的像素逐字节一致，PTS 和关键帧标志也一致。对 FFmpeg 独立对账时，渐进组最大像素差
+为 1，隔行组两种构建在同一帧首次超过现有容差，该帧最大像素差为 6。
 
 
 ## 能力矩阵

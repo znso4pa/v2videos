@@ -111,7 +111,7 @@ impl MpgPlayer {
         };
         let (width, height) = (sequence.width, sequence.height);
         #[cfg(feature = "mpeg12-c")]
-        v2v_mpeg12_simd::install();
+        v2v_mpeg12_c::install();
         Ok(Self {
             sequence,
             pictures,

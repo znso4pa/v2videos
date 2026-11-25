@@ -118,7 +118,8 @@ fn header_declarations_match_exports() {
         decl.len()
     );
 
-    let Some(full) = build_product(&["hw", "mpeg12"]) else { return };
+    let mpeg = if cfg!(feature = "mpeg12-c") { "mpeg12-c" } else { "mpeg12" };
+    let Some(full) = build_product(&["hw", mpeg]) else { return };
     let Some(exp) = exported(&full) else {
         eprintln!("SKIP：没有可用的 nm（或它读不了 {}）", full.display());
         return;

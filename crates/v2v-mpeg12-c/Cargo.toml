@@ -1,0 +1,16 @@
+[package]
+name = "v2v-mpeg12-c"
+description = "MPEG-1/2 的 MIT C/NEON 运动补偿内核"
+version.workspace = true
+edition.workspace = true
+license = "MIT"
+publish = false
+
+[features]
+neon = ["dep:cc", "dep:v2v-mpeg12", "v2v-mpeg12/mc8-hook"]
+
+[dependencies]
+v2v-mpeg12 = { path = "../mpeg12", optional = true }
+
+[build-dependencies]
+cc = { version = "1", optional = true }

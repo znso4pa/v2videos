@@ -166,12 +166,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "v2v-mpeg12-simd"
+name = "v2v-mpeg12-c"
 version = "0.0.0"
 dependencies = [
  "cc",
+ "v2v-mpeg12",
+]
+
+[[package]]
+name = "v2v-mpeg12-simd"
+version = "0.0.0"
+dependencies = [
  "v2v-bench",
  "v2v-mpeg12",
+ "v2v-mpeg12-c",
  "v2v-mpegps",
 ]
 
@@ -205,7 +213,7 @@ dependencies = [
  "v2v-container",
  "v2v-kernel",
  "v2v-mpeg12",
- "v2v-mpeg12-simd",
+ "v2v-mpeg12-c",
  "v2v-mpegps",
  "v2v-vc1",
  "v2v-wma",

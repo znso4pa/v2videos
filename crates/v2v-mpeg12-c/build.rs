@@ -2,7 +2,7 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(v2v_c_mc8)");
     println!("cargo:rerun-if-changed=src/mc8_neon.c");
 
-    #[cfg(feature = "c-kernels")]
+    #[cfg(feature = "neon")]
     {
         let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
         let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();

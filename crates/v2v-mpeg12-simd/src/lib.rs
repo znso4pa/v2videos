@@ -55,8 +55,6 @@ pub extern "C" fn v2v_mpeg12_simd_kernels() -> u32 {
 // ---------------------------------------------------------------------------
 
 pub mod kernels;
-#[cfg(v2v_c_mc8)]
-mod mc8;
 
 /// 把本 crate 的内核装进解码器（进程内调一次即可）。
 pub use kernels::install;
