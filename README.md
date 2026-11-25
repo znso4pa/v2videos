@@ -925,8 +925,28 @@ Rust 流仍有此前的 `ext header missing` 诊断。Rust / FFmpeg 的亮度 PS
 
 MP42、MP43、WMV1、WMV2 的解码历史数据见第 1 节。MP43 编码优化前后对照见第 9 节。
 本轮尚缺 MPEG-4 Part 2 单独解码、MPEG-1 和 H.264 平台后端复测。
-独立生成的 640×360 MPEG-1 样本在已有的写块路径触发越界，速度行暂缺。
 MP3 编码与 Vorbis 编解码的实现状态见下表。
+
+**MPEG-1/2 非 16 对齐高度（11 月 26 日）。** 画面高度不是 16 的倍数时（640×360 的最后
+一行宏块占 352..=367），原实现只按可见高度分配平面，写块路径直接越界。现在平面按
+**16 对齐的编码高度**分配、**行距仍是可见宽度**，`Frame.height` 保持可见高度；运动补偿
+按编码高度做边缘复制（那几行补白是有效重建数据）。Apple M3，release，单线程，125 帧
+真码流（隔行 100 帧）：
+
+| 解码用例 | 本仓 ms/帧 | FFmpeg ms/帧 | 比值 | 逐像素最差 | 超差帧（>2） |
+|---|---:|---:|---:|---:|---:|
+| MPEG-1 640×360 渐进 | 0.33 | 0.225 | 1.47× | 1 | 0 |
+| MPEG-1 640×352 渐进 | 0.32 | 0.224 | 1.43× | 1 | 0 |
+| MPEG-2 720×576 渐进 | 0.60 | 0.395 | 1.52× | 1 | 0 |
+| MPEG-2 720×576 隔行 | 0.49 | 0.152 | 3.22× | 1 | 0 |
+| MPEG-2 640×360 隔行 | 0.28 | 0.104 | 2.69× | 1 | 0 |
+
+本仓用 `compare <clip> --bench=3`（进程内 3 遍取总时间，不含启动）；
+FFmpeg 用 `-threads 1 -benchmark -stream_loop 9 -f null -` 的 utime 除以 1250 帧
+（隔行 1000 帧）。**比值只对同一行成立** —— 两条 720×576 的码率差 5 倍（2.5 MB vs 0.5 MB），
+绝对毫秒不能横着比。隔行那两条相对耗时明显更差，是因为低码率流里几乎全是运动补偿与
+跳过宏块；同批剖析（`compare --prof`，MPEG-2 720×576 渐进）是系数 40%、逆变换 22%、
+写回 16%、运动补偿 10%、宏块头 4.5%。
 
 ### 10.1 耗时超过 FFmpeg 两倍的路径复测
 
@@ -1028,8 +1048,8 @@ C 内核位于 MIT crate `v2v-mpeg12-c`，播放器直接链接该内核。独�
 | **WMV1**（WMV7）           | ✅ I / P   | ❌         | 与 MP43 共用 MB 层，分叉在帧头、扫描表、DC 预测/缩放表（见「状态」那行）。**不做错误隐藏** —— 首帧不是 I 帧的流直接报错，ffmpeg 会拿垃圾当参考硬解 |
 | **WMV2**（WMV8）           | ✅ I/P + IntraX8 | ❌         | 帧头与 MB 层是另一套（`wmv2dec.c`）。比 WMV1 多：`parse_mb_skip`（4 种跳帧类型）、按 qscale 挑的 CBP 表、`mspel` 四抽头半像素 + `hshift`、**ABT**（4×8 / 8×4）、**环路滤波**、它自己那份 8×8 IDCT，以及 **IntraX8**（`j_type`，按 8×8 块走的内帧子解码器，WMV2 与 VC-1 共用 —— 见 `intrax8.rs`） |
 | **WMV9 / VC-1**          | ✅ I / P   | ❌         | **ffmpeg 里根本没有 VC-1/wmv3 编码器**（只有解码器），想要 WMV9 得另找路子。解码侧 `v2v-vc1` 已走完整条链路（Main profile / 渐进 / I/P，真 1080p 样本逐帧逐像素 0 差）；缺 **B 帧 / 隔行 / Advanced profile**、overlap smoothing、多分辨率、重同步标记 —— 遇到明确报 `Unsupported`，不静默出错 |
-| **MPEG-1**（`.mpg`） | ✅ I / P / B | ❌ | 走 `mpegps`（PS 容器）+ `mpeg12`。对 ffmpeg 逐帧比，容差 2（参考件是浮点 IDCT、我们是整数 IDCT）；真样本 50 帧全对 |
-| **MPEG-2** | ✅ I / P / B（progressive + 隔行帧图） | ❌ | 含场 DCT、场运动、4:2:2 / 4:4:4 色度。**隔行流的 B 帧场预测还没收敛**（PSNR 47 dB，个别像素差 165）—— 测试里只报数不卡断言，见 TODO |
+| **MPEG-1**（`.mpg`） | ✅ I / P / B | ❌ | 走 `mpegps`（PS 容器）+ `mpeg12`。对 ffmpeg 逐帧比，容差 2（参考件是浮点 IDCT、我们是整数 IDCT）；640×360（非 16 对齐）与 640×352 两条真样本各 125 帧，逐像素最差 1、超差帧 0 |
+| **MPEG-2** | ✅ I / P / B（progressive + 隔行帧图） | ❌ | 含场 DCT、场运动、4:2:2 / 4:4:4 色度。渐进与隔行（`+ildct+ilme -alternate_scan`）各 100~125 帧逐像素最差 1、超差帧 0，测试卡 `psnr >= 50 && worst <= 4`（曾为 47 dB / 165 的缺口，根因已修）。**场图**（`picture_structure = 1/2`）只有解码路径，ffmpeg 的 mpeg2 编码器只出帧图，所以缺硬件编码器样本，`field_pictures_match_the_reference` 拿现成样本会报 `no field frames decoded` |
 | **MPEG-4 Part 2**（`mp4v`） | ✅ I / P（H.263 与 **MPEG 矩阵**两种量化） | ✅ I / P   | 解码：AVI 里的 `FMP4` / `mp4v` / `DIVX` / `XVID` 都认，I / P 对 ffmpeg **逐像素 0 差**（`crates/mp4v/tests/ffmpeg_roundtrip.rs`，含独立来源的流）。`quant_type = 1`（MPEG 矩阵量化，含帧间**失配控制**）也已对齐 —— 所以「读回自己编的 `.mp4`」是通的。**不支持**：**自定义**量化矩阵（只做规范默认那对）、B / S 帧、4MV、`dquant`、隔行、GMC、数据分割、resync marker。编码默认走 **MPEG 型**（同体积下 SSIM 更高）+ 可选的**系数级 RD（trellis，默认关）** |
 | **H.264 / AVC**          | ⭕ 硬件（macOS VideoToolbox） | ⭕ 硬件（FFI）：macOS VideoToolbox / Android MediaCodec | 软件侧不在范围内（LGPL 侧链不了 x264，见「许可证」）；硬件侧走 `crates/v2v-android`（见「FFI」一节）—— 真实样本实测 PSNR 42.45 dB（同码率反超 ffmpeg 的 mpeg4 1.7 dB） |
 

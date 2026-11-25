@@ -215,9 +215,7 @@ fn main() {
             break;
         }
         let mut ours = Vec::with_capacity(frame_size);
-        ours.extend_from_slice(&frame.y);
-        ours.extend_from_slice(&frame.u);
-        ours.extend_from_slice(&frame.v);
+        frame.append_visible(&mut ours, sequence.chroma_format);
         if dump.is_some() {
             dumped.extend_from_slice(&ours);
         }

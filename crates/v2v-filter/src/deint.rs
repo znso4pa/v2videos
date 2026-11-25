@@ -119,7 +119,8 @@ fn check(f: &Frame) -> Result<()> {
         return Err(Error::Bad("帧的宽或高是 0"));
     }
     let (cw, ch) = (chroma_len(w), chroma_len(h));
-    if f.y.len() != w * h || f.u.len() != cw * ch || f.v.len() != cw * ch {
+    // `>=`：解码器的平面在高度上按 16 对齐，尾部多出看不见的行。
+    if f.y.len() < w * h || f.u.len() < cw * ch || f.v.len() < cw * ch {
         return Err(Error::Bad("平面长度与宽高不符（不是 4:2:0）"));
     }
     Ok(())

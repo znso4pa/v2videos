@@ -78,11 +78,12 @@ pub fn resize(src: &Frame, dw: u32, dh: u32, algo: Algo) -> Result<Frame> {
     if dw == 0 || dh == 0 {
         return Err(Error::Bad("目标宽或高是 0"));
     }
-    if src.y.len() != sw * sh {
+    // `>=`：解码器的平面在高度上按 16 对齐，尾部多出看不见的行（行距仍是 `sw`）。
+    if src.y.len() < sw * sh {
         return Err(Error::Bad("亮度平面长度与宽高不符"));
     }
     let (cw, ch) = (chroma_len(sw), chroma_len(sh));
-    if src.u.len() != cw * ch || src.v.len() != cw * ch {
+    if src.u.len() < cw * ch || src.v.len() < cw * ch {
         return Err(Error::Bad("色度平面长度与宽高不符（不是 4:2:0）"));
     }
 

@@ -24,6 +24,45 @@ pub struct Frame {
     pub v: Vec<u8>,
 }
 
+impl Frame {
+    /// 三个平面的**可见区域**尺寸：`(w, h, cw, ch)`。
+    ///
+    /// ⚠️ 平面的实际 `len()` 可能比 `w*h` 大：**按 16 对齐的编码高度分配**
+    /// （宏块恒 16×16，而画面高度不必是 16 的倍数 —— 640×360 的最后一行宏块
+    /// 占 352..=367）。行距仍是可见宽度，所以按 `y[r*w + c]` 取值不受影响；
+    /// 但**按整平面拼接**就会把尾部补白插到 Y / Cb 之间，整片错位。
+    /// 要拼整帧请用 [`Frame::append_visible`]。
+    pub fn visible_dims(&self, chroma_format: u8) -> (usize, usize, usize, usize) {
+        let (w, h) = (self.width as usize, self.height as usize);
+        let (cw, ch) = match chroma_format {
+            2 => (w.div_ceil(2), h),
+            3 => (w, h),
+            _ => (w.div_ceil(2), h.div_ceil(2)),
+        };
+        (w, h, cw, ch)
+    }
+
+    /// 把三个平面的可见区域按 I420 / I422 / I444 的紧凑布局追加到 `out`。
+    pub fn append_visible(&self, out: &mut Vec<u8>, chroma_format: u8) {
+        let (w, h, cw, ch) = self.visible_dims(chroma_format);
+        out.extend_from_slice(&self.y[..w * h]);
+        out.extend_from_slice(&self.u[..cw * ch]);
+        out.extend_from_slice(&self.v[..cw * ch]);
+    }
+
+    /// 把三个平面**就地裁到可见区域**：`len()` 变成 `w*h` / `cw*ch`。
+    ///
+    /// 行距本来就是可见宽度，所以可见区域正好是每个平面的**前缀** —— 只改长度、
+    /// 不搬内存。给「把帧交出去」的边界用：外部消费者历来假设 `y.len() == w*h`，
+    /// 而解码器为了宏块对齐会多留几条看不见的行（见 [`Frame::visible_dims`]）。
+    pub fn truncate_visible(&mut self, chroma_format: u8) {
+        let (w, h, cw, ch) = self.visible_dims(chroma_format);
+        self.y.truncate(w * h);
+        self.u.truncate(cw * ch);
+        self.v.truncate(cw * ch);
+    }
+}
+
 /// 极简热点剖析（**只在显式 `enable(true)` 之后开**，否则零开销）。
 ///
 /// 目的是回答「下一个 unsafe 内核该上哪儿」—— 不凭感觉。六个桶：
@@ -883,16 +922,19 @@ pub fn idct_cols_scalar(b: &[i32; 64], out: &mut [i32; 64]) {
 
 /// 一行 8 字节在平面里放得下吗 —— 放不下就只写放得下的那几个字节。
 ///
-/// **为什么需要**：MPEG-1/2 的宏块恒为 16×16，而画面高度**不必**是 16 的倍数
-/// （实测 640×360：最后一行宏块占 352..=367，其中 360..=367 在画面外）。
-/// 帧缓冲按可见尺寸分配，于是最后那一行宏块的写回会越界 —— 原来直接 panic。
+/// **为什么需要**：宏块恒为 16×16，而画面宽度**不必**是 16 的倍数。最后一个宏块列
+/// 右边那几个块会伸到行尾之外，而行距就是可见宽度 —— 直接写 8 字节会溢到下一行开头
+/// （不 panic，只是悄悄写错像素），整块都在行外的更是直接越界。
 ///
-/// 快路（整块在内）与原来**逐字节相同**，只多一次比较；越界只发生在最后一行宏块上。
+/// **高度方向不用它兜底**：平面按 16 对齐的编码高度分配（见 `base_frame`），
+/// 最后一行宏块的写回落在补白行里 —— 那几行是有效数据，不是垃圾桶。
+///
+/// 快路（整块在内）与原来**逐字节相同**，只多一次比较。
 #[inline(always)]
 fn store_row(row: &[u8; 8], out: &mut [u8], base: usize) {
     let n = out.len().saturating_sub(base).min(8);
     if n == 0 {
-        return; // 整行都在画面外
+        return; // 整块都在行外
     }
     out[base..base + n].copy_from_slice(&row[..n]);
 }
@@ -969,7 +1011,7 @@ fn store_pred_block(
     column: usize,
     mb_row: usize,
     width: usize,
-    height: usize,
+    ref_h: usize,
     cw: usize,
     ch: usize,
     interlaced_dct: bool,
@@ -981,7 +1023,7 @@ fn store_pred_block(
     let (chroma, origin_x, origin_y, stride, row_step) =
         block_geometry(block, column, mb_row, width, cw, interlaced_dct, chroma_format);
     let plane_width = if chroma { cw } else { width };
-    let (rw, rh) = if chroma { (cw, ch) } else { (width, height) };
+    let (rw, rh) = if chroma { (cw, ch) } else { (width, ref_h) };
     let ref_plane = match block {
         0..=3 => &reference.y,
         4 | 6 | 8 | 10 => &reference.u,
@@ -1845,7 +1887,7 @@ fn write_field_prediction(
     column: usize,
     mb_row: usize,
     width: usize,
-    height: usize,
+    ref_h: usize,
     cw: usize,
     ch: usize,
     field_select: [u8; 2],
@@ -1859,7 +1901,7 @@ fn write_field_prediction(
             let src_y = mb_row * 16 + field_select[j] as usize;
             let dst_y = mb_row * 16 + j;
             let pred = predict_block(
-                &reference.y, width, width, height, origin_x, src_y, mv[j][0], mv[j][1],
+                &reference.y, width, width, ref_h, origin_x, src_y, mv[j][0], mv[j][1],
                 false, 2, 2, chroma_format,
             );
             store_pixels(&pred, &mut frame.y, 2 * width, dst_y * width + origin_x);
@@ -1900,7 +1942,7 @@ fn write_field_picture_mb(
     column: usize,
     mb_row: usize,
     width: usize,
-    height: usize,
+    ref_h: usize,
     cw: usize,
     ch: usize,
     chroma_format: u8,
@@ -1912,7 +1954,7 @@ fn write_field_picture_mb(
         let (chroma, origin_x, origin_y, stride, _) =
             block_geometry(block, column, mb_row, width, cw, false, chroma_format);
         let plane_width = if chroma { cw } else { width };
-        let (rw, rh) = if chroma { (cw, ch) } else { (width, height) };
+        let (rw, rh) = if chroma { (cw, ch) } else { (width, ref_h) };
         let ref_plane = match block {
             0..=3 => &reference.y,
             4 | 6 | 8 | 10 => &reference.u,
@@ -1940,7 +1982,7 @@ fn write_dmv_prediction(
     column: usize,
     mb_row: usize,
     width: usize,
-    height: usize,
+    ref_h: usize,
     cw: usize,
     ch: usize,
     chroma_format: u8,
@@ -1951,7 +1993,7 @@ fn write_dmv_prediction(
         let (chroma, origin_x, origin_y, stride, _) =
             block_geometry(block, column, mb_row, width, cw, false, chroma_format);
         let plane_width = if chroma { cw } else { width };
-        let (rw, rh) = if chroma { (cw, ch) } else { (width, height) };
+        let (rw, rh) = if chroma { (cw, ch) } else { (width, ref_h) };
         let (sp, op): (&[u8], &[u8]) = if chroma {
             let is_u = matches!(block, 4 | 6 | 8 | 10);
             (
@@ -2043,7 +2085,15 @@ fn decode_p_frame_into(
     let width = sequence.width as usize;
     let height = sequence.height as usize;
     let chroma_format = sequence.chroma_format;
-    let (cw, ch) = chroma_dims(chroma_format, width, height);
+    // ⚠️ 参考帧按**编码高度**钳位，不是可见高度。
+    //
+    // 宏块恒 16×16，画面高度不必是 16 的倍数（640×360 的最后一行宏块占
+    // 352..=367）。那几行补白**是有效的重建数据**（`base_frame` 按 16 对齐分配），
+    // 预测可以引用；标准与参考实现也都是按编码高度做边缘复制。
+    // 按可见高度钳位 = 把「引用补白行」变成「读第 359 行」，实测症状是
+    // **亮度几乎不错、色度在底边错一片**（worst 14）—— 色度块在底边更容易够到边界。
+    let ph = height.div_ceil(16) * 16;
+    let (cw, ch) = chroma_dims(chroma_format, width, ph);
     let mb_blocks = mb_block_count(chroma_format);
     let mut frame = out;
 
@@ -2330,7 +2380,7 @@ fn decode_p_frame_into(
                 // dual prime：同场 `reference`、异场 `other`，两路平均。
                 let other_ref = other.unwrap_or(reference);
                 write_dmv_prediction(
-                    &mut frame, reference, other_ref, column, mb_row, width, height, cw, ch,
+                    &mut frame, reference, other_ref, column, mb_row, width, ph, cw, ch,
                     chroma_format, mv_f[0], mv_f[1],
                 );
                 for block in 0..mb_blocks {
@@ -2351,7 +2401,7 @@ fn decode_p_frame_into(
                 if frame_picture {
                     // 帧图：两场预测写进整帧。
                     write_field_prediction(
-                        &mut frame, reference, column, mb_row, width, height, cw, ch,
+                        &mut frame, reference, column, mb_row, width, ph, cw, ch,
                         field_select, mv_f, chroma_format,
                     );
                 } else {
@@ -2363,7 +2413,7 @@ fn decode_p_frame_into(
                         column,
                         mb_row,
                         width,
-                        height,
+                        ph,
                         cw,
                         ch,
                         chroma_format,
@@ -2398,7 +2448,7 @@ fn decode_p_frame_into(
                         None
                     };
                     store_pred_block(
-                        &mut frame, reference, block, column, mb_row, width, height, cw, ch,
+                        &mut frame, reference, block, column, mb_row, width, ph, cw, ch,
                         interlaced_dct, mv_f[0][0], mv_f[0][1], residual.as_ref(), chroma_format,
                     );
                 }
@@ -2488,7 +2538,7 @@ fn write_predicted_mb(
     mv_f: (i32, i32),
     mv_b: (i32, i32),
     width: usize,
-    height: usize,
+    ref_h: usize,
     cw: usize,
     ch: usize,
     interlaced_dct: bool,
@@ -2498,7 +2548,7 @@ fn write_predicted_mb(
     for block in 0..mb_blocks {
         write_b_block(
             frame, forward, backward, block, column, mb_row, fwd, bwd, mv_f, mv_b, None, width,
-            height, cw, ch, interlaced_dct, chroma_format,
+            ref_h, cw, ch, interlaced_dct, chroma_format,
         );
     }
 }
@@ -2523,7 +2573,7 @@ fn write_b_field_prediction(
     column: usize,
     mb_row: usize,
     width: usize,
-    height: usize,
+    ref_h: usize,
     cw: usize,
     ch: usize,
     fwd: bool,
@@ -2542,7 +2592,7 @@ fn write_b_field_prediction(
             let pf = if fwd {
                 let src_y = mb_row * 16 + fs_f[j] as usize;
                 Some(predict_block(
-                    &forward.y, width, width, height, origin_x, src_y, mv_f[j][0], mv_f[j][1],
+                    &forward.y, width, width, ref_h, origin_x, src_y, mv_f[j][0], mv_f[j][1],
                     false, 2, 2, chroma_format,
                 ))
             } else {
@@ -2551,7 +2601,7 @@ fn write_b_field_prediction(
             let pb = if bwd {
                 let src_y = mb_row * 16 + fs_b[j] as usize;
                 Some(predict_block(
-                    &backward.y, width, width, height, origin_x, src_y, mv_b[j][0], mv_b[j][1],
+                    &backward.y, width, width, ref_h, origin_x, src_y, mv_b[j][0], mv_b[j][1],
                     false, 2, 2, chroma_format,
                 ))
             } else {
@@ -2649,7 +2699,15 @@ fn decode_b_frame_into(
     let width = sequence.width as usize;
     let height = sequence.height as usize;
     let chroma_format = sequence.chroma_format;
-    let (cw, ch) = chroma_dims(chroma_format, width, height);
+    // ⚠️ 参考帧按**编码高度**钳位，不是可见高度。
+    //
+    // 宏块恒 16×16，画面高度不必是 16 的倍数（640×360 的最后一行宏块占
+    // 352..=367）。那几行补白**是有效的重建数据**（`base_frame` 按 16 对齐分配），
+    // 预测可以引用；标准与参考实现也都是按编码高度做边缘复制。
+    // 按可见高度钳位 = 把「引用补白行」变成「读第 359 行」，实测症状是
+    // **亮度几乎不错、色度在底边错一片**（worst 14）—— 色度块在底边更容易够到边界。
+    let ph = height.div_ceil(16) * 16;
+    let (cw, ch) = chroma_dims(chroma_format, width, ph);
     let mb_blocks = mb_block_count(chroma_format);
     let mut frame = out;
 
@@ -2739,12 +2797,12 @@ fn decode_b_frame_into(
                     write_predicted_mb(
                         &mut frame, forward, backward, col, row_s, p.kind.forward,
                         p.kind.backward, (p.mv_f[0][0], p.mv_f[0][1]),
-                        (p.mv_b[0][0], p.mv_b[0][1]), width, height, cw, ch, false,
+                        (p.mv_b[0][0], p.mv_b[0][1]), width, ph, cw, ch, false,
                         chroma_format, mb_blocks,
                     );
                 } else {
                     write_b_field_prediction(
-                        &mut frame, forward, backward, col, row_s, width, height, cw, ch,
+                        &mut frame, forward, backward, col, row_s, width, ph, cw, ch,
                         p.kind.forward, p.kind.backward, p.fs_f, p.mv_f, p.fs_b, p.mv_b,
                         chroma_format,
                     );
@@ -2995,10 +3053,19 @@ fn decode_b_frame_into(
 fn base_frame(sequence: &SequenceHeader, picture_type: PictureType, forward: Option<&Frame>) -> Frame {
     let width = sequence.width as usize;
     let height = sequence.height as usize;
-    let (cw, ch) = chroma_dims(sequence.chroma_format, width, height);
+    // ⚠️ **平面按 16 对齐的高度分配，`Frame.height` 仍是可见高度。**
+    //
+    // 宏块恒为 16×16，而画面高度不必是 16 的倍数（实测 640×360：最后一行宏块
+    // 占 352..=367，其中 360..=367 在画面外）。只分配可见高度的话，那一行宏块
+    // 要么越界 panic，要么被截断 —— 而**截断会改预测**：后续帧的宏块可能引用
+    // 这几行（ffmpeg 的帧缓冲也是按编码高度分配、输出时才裁剪）。
+    // 行距仍是 `width`，所以下游按 `y[r*w + c]` 取值一行都不用改，
+    // 只是 `len()` 比 `w*h` 多出末尾那几条看不见的行。
+    let ph = height.div_ceil(16) * 16;
+    let (cw, ch) = chroma_dims(sequence.chroma_format, width, ph);
     let (y, u, v) = match (picture_type, forward) {
         (PictureType::I, _) | (_, None) => (
-            vec![0u8; width * height],
+            vec![0u8; width * ph],
             vec![128u8; cw * ch],
             vec![128u8; cw * ch],
         ),
@@ -3026,13 +3093,9 @@ struct RowSpan<'a> {
 
 /// 把 `src` 的宏块行 `[r0, r1)` 拷进 `dst` 的同一段行（三个平面各一份）。
 fn copy_rows(dst: &mut Frame, src: &Frame, r0: usize, r1: usize, chroma_format: u8) {
-    let height = dst.height as usize;
-    let lw = dst.y.len() / height.max(1);
-    let ch = match chroma_format {
-        2 | 3 => height,
-        _ => height.div_ceil(2),
-    };
-    let cw = dst.u.len() / ch.max(1);
+    // 行宽就是**可见宽度** —— 平面只在高度上按 16 对齐，行距没变。
+    let lw = dst.width as usize;
+    let (cw, _) = chroma_dims(chroma_format, lw, dst.height as usize);
     let shift = if chroma_format == 1 { 1 } else { 0 };
     let (y0, y1) = (r0 * 16 * lw, r1 * 16 * lw);
     let (c0, c1) = ((r0 << (4 - shift)) * cw, (r1 << (4 - shift)) * cw);
@@ -3050,14 +3113,9 @@ fn fill_blank_rows(dst: &mut Frame, r0: usize, r1: usize, chroma_format: u8) {
 }
 
 fn row_span(frame: &mut Frame, rs: usize, re: usize, chroma_format: u8) -> RowSpan<'_> {
-    let height = frame.height as usize;
     let (ylen, ulen) = (frame.y.len(), frame.u.len());
-    let lw = ylen / height.max(1); // 亮度平面一行多少字节
-    let ch = match chroma_format {
-        2 | 3 => height,
-        _ => height.div_ceil(2),
-    };
-    let cw = ulen / ch.max(1);
+    let lw = frame.width as usize; // 亮度平面一行多少字节（行距 = 可见宽度）
+    let (cw, _) = chroma_dims(chroma_format, lw, frame.height as usize);
     // 4:2:0 的色度行数是亮度的一半；4:2:2 / 4:4:4 相同。
     let shift = if chroma_format == 1 { 1 } else { 0 };
     let (c0, c1) = ((rs << (4 - shift)) * cw, (re << (4 - shift)) * cw);
@@ -3212,10 +3270,12 @@ impl MtDecoder {
             }
         }
         for buf in &mut self.bufs[..want] {
-            if buf.y.len() != (sequence.width as usize) * (sequence.height as usize) {
-                let (w, h) = (sequence.width as usize, sequence.height as usize);
-                let (cw, ch) = chroma_dims(sequence.chroma_format, w, h);
-                buf.y.resize(w * h, 0);
+            // 平面按 16 对齐的高度开（与 `base_frame` 同一个理由）。
+            let (w, h) = (sequence.width as usize, sequence.height as usize);
+            let ph = h.div_ceil(16) * 16;
+            let (cw, ch) = chroma_dims(sequence.chroma_format, w, ph);
+            if buf.y.len() != w * ph {
+                buf.y.resize(w * ph, 0);
                 buf.u.resize(cw * ch, 128);
                 buf.v.resize(cw * ch, 128);
             }
@@ -3376,6 +3436,66 @@ pub fn decode_field(
             decode_b_frame(&field_seq, picture, data, same, other)
         }
         _ => Err(DecodeError::new("unsupported_picture_type", 0, 0)),
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    fn seq(width: u32, height: u32, chroma_format: u8) -> SequenceHeader {
+        SequenceHeader {
+            width,
+            height,
+            aspect: (1, 1),
+            frame_rate_milli: 25_000,
+            bit_rate: 0,
+            vbv_buffer_size: 0,
+            mpeg2: chroma_format != 1,
+            chroma_format,
+            progressive_sequence: true,
+        }
+    }
+
+    /// 平面按 **16 对齐的编码高度**分配，`Frame.height` 仍是可见高度。
+    ///
+    /// 为什么要有这条：宏块恒 16×16，而画面高度不必是 16 的倍数（640×360 的最后
+    /// 一行宏块占 352..=367）。只分配可见高度会越界；按可见高度**钳位参考**会读错行
+    /// （实测色度底边 worst 14）。两件事都靠「分配大、行距不变、可见高度另记」这一个
+    /// 布局约定，所以直接把它钉死。
+    ///
+    /// ⚠️ 覆盖不到的部分：这条只验**分配与截取的口径**，验不到 MC 真的按编码高度钳位
+    /// —— 那要真码流（见 `tests/frames.rs`，且样本必须是**非 16 对齐**的，否则永远绿）。
+    #[test]
+    fn planes_are_padded_to_the_coded_height() {
+        // (宽, 高, 色度格式, 编码高度, 补白后的 Cb 宽, 补白后的 Cb 高)
+        for (w, h, cf, ph, pcw, pch) in [
+            (640u32, 360u32, 1u8, 368usize, 320usize, 184usize),
+            (640, 352, 1, 352, 320, 176),
+            (720, 576, 1, 576, 360, 288),
+            (640, 361, 1, 368, 320, 184),
+            (352, 288, 2, 288, 176, 288),
+            (352, 288, 3, 288, 352, 288),
+        ] {
+            let frame = base_frame(&seq(w, h, cf), PictureType::I, None);
+            assert_eq!(frame.width, w);
+            assert_eq!(frame.height, h, "可见高度不能改成对齐高度");
+            assert_eq!(frame.y.len(), w as usize * ph, "{w}x{h} 4:{cf:x} 亮度平面");
+            assert_eq!(frame.u.len(), pcw * pch, "{w}x{h} 4:{cf:x} Cb 平面");
+            assert_eq!(frame.v.len(), pcw * pch, "{w}x{h} 4:{cf:x} Cr 平面");
+
+            // 拼整帧必须只取可见区域，长度与参考件的紧凑布局一致。
+            let (w, h) = (w as usize, h as usize);
+            let (cw, ch) = match cf {
+                2 => (w.div_ceil(2), h),
+                3 => (w, h),
+                _ => (w.div_ceil(2), h.div_ceil(2)),
+            };
+            let mut out = Vec::new();
+            frame.append_visible(&mut out, cf);
+            assert_eq!(out.len(), w * h + 2 * cw * ch);
+            assert_eq!(frame.visible_dims(cf), (w, h, cw, ch));
+        }
     }
 }
 

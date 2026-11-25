@@ -9,9 +9,19 @@
 //! 判据是**逐像素**，容差 2：浮点 IDCT 与整数 IDCT 在舍入上会有 ±1 差别，
 //! 那是实现选择；任何更大的差别都是 bug。
 //!
+//! ⚠️ **样本的高度必须不是 16 的倍数**（比如 640×360），否则测不到这一类：
+//! 宏块恒 16×16，最后一行宏块会伸到画面外；平面按 16 对齐分配、运动补偿按
+//! **编码高度**做边缘复制才对。用 640×352 / 720×576 这类对齐样本，
+//! 那个 bug 一样跑得通、一样绿 —— 实测 640×360 曾经「亮度几乎不错、色度底边
+//! 差 14」，而 640×352 从头到尾 worst 1。
+//!
 //! ⚠️ 覆盖不到的两块，用下面的片段补（都要各跑一遍）：
 //!
 //! ```bash
+//! # 高度非 16 对齐（640×360）：最后一行宏块伸到画面外，平面要按编码高度分配。
+//! ffmpeg -f lavfi -i testsrc=size=640x360:rate=25:duration=5 \
+//!   -c:v mpeg1video -b:v 4M -bf 2 -f mpeg m1_640x360.mpg
+//!
 //! # 隔行 DCT + 场运动估计（帧图）。这一条抓到过「B 帧跳过宏块照抄上一块的
 //! # field_motion，导致帧图里按场运动取像素、底场错 90」的 bug。
 //! ffmpeg -f lavfi -i testsrc=size=720x576:rate=25:duration=4 -vf setfield=tff \
@@ -24,10 +34,22 @@
 //! ```
 
 use v2v_mpeg12::{
-    PictureType, SequenceHeader, decode::decode_frame, decode::decode_i_frame, split_pictures,
-    split_units,
+    PictureType, SequenceHeader, decode::Frame, decode::decode_frame, decode::decode_i_frame,
+    split_pictures, split_units,
 };
 use v2v_mpegps::PsDemuxer;
+
+/// 把三个平面拼成参考件那种**紧凑**布局（只取可见区域）。
+///
+/// ⚠️ 不能直接 `extend_from_slice(&frame.y)`：解码器的平面按 **16 对齐的高度**
+/// 分配，`len()` 会比 `w*h` 多出末尾几条看不见的行 —— 整平面拼出来的长度与
+/// 参考件对不上，还会把尾部补白插到 Y/Cb 之间。症状是「整片错位、worst 233」，
+/// 看着像重建坏了，其实只是拼法错了。
+fn flatten(frame: &Frame, chroma_format: u8) -> Vec<u8> {
+    let mut out = Vec::new();
+    frame.append_visible(&mut out, chroma_format);
+    out
+}
 
 #[test]
 #[ignore = "needs V2V_MPEG12_SAMPLE (a .mpg) and V2V_MPEG12_REF (its first frame as I420)"]
@@ -54,10 +76,7 @@ fn the_first_i_frame_matches_the_reference() {
     }
     let frame = decoded.expect("an I picture");
 
-    let mut ours = Vec::new();
-    ours.extend_from_slice(&frame.y);
-    ours.extend_from_slice(&frame.u);
-    ours.extend_from_slice(&frame.v);
+    let ours = flatten(&frame, sequence.chroma_format);
     let expected = std::fs::read(&reference).expect("read the reference frame");
 
     assert_eq!(ours.len(), expected.len(), "frame size differs from the reference");
@@ -142,10 +161,7 @@ fn every_frame_matches_the_reference() {
         if i >= available {
             break;
         }
-        let mut ours = Vec::new();
-        ours.extend_from_slice(&frame.y);
-        ours.extend_from_slice(&frame.u);
-        ours.extend_from_slice(&frame.v);
+        let ours = flatten(frame, sequence.chroma_format);
         let want = &expected[i * frame_size..(i + 1) * frame_size];
 
         let (mut worst, mut at) = (0i32, 0usize);
@@ -168,28 +184,19 @@ fn every_frame_matches_the_reference() {
 
         // I 帧是单帧重建，逐像素卡 ≤2；P/B 帧把 ±1 的 IDCT 舍入逐帧累积，
         // 所以用 PSNR + 一个较宽的硬上限，而不是逐像素 ≤2。
+        //
+        // 隔行流（场运动 / 交替扫描）曾经另开一档 `psnr >= 40 && worst <= 200`，
+        // 理由是「B 帧场预测还没收敛，修前 47 dB / 165」。那个根因修掉之后实测
+        // **720×576 与 640×360 都是 worst 1、超差帧 0**，所以并回同档 ——
+        // 留一条只为「已知缺口」开的口子，缺口没了它就只是虚假的安全感。
         match kind {
             PictureType::I => assert!(
                 worst <= 2,
                 "display {i} pixel {at} differs by {worst}: the reconstruction is wrong"
             ),
-            _ if sequence.progressive_sequence => assert!(
+            _ => assert!(
                 psnr >= 50.0 && worst <= 4,
                 "display {i}: psnr {psnr:.1} dB, worst {worst} at {at}"
-            ),
-            // ⚠️ **隔行流的 B 帧场预测还没收敛**（修前实测 PSNR 47 dB、个别像素差 165）。
-            //
-            // 这里卡的是**护栏**，不是达标线：`psnr >= 40 && worst <= 200` 留了约 15%
-            // 余量，够容下已知缺口，但真退化（解错一场、参考帧选错）会立刻掉到 20 dB
-            // 以下，一定红。
-            //
-            // 为什么必须有这条：**一条永远绿、只打印的测试比没有测试更坏** —— 它给的是
-            // 虚假的安全感（AGENTS.md 那条）。根因修掉之后把这里收到和渐进流同档
-            // （`psnr >= 50 && worst <= 4`），并删掉这段说明。
-            _ => assert!(
-                psnr >= 40.0 && worst <= 200,
-                "隔行 B 帧比「已知缺口」还差：display {i} psnr {psnr:.1} dB worst {worst} \
-                 （修前基线 47 dB / 165；掉到这个数以下说明是新回归，不是老缺口）"
             ),
         }
     }
@@ -305,10 +312,7 @@ fn field_pictures_match_the_reference() {
         if i >= available {
             break;
         }
-        let mut ours = Vec::new();
-        ours.extend_from_slice(&frame.y);
-        ours.extend_from_slice(&frame.u);
-        ours.extend_from_slice(&frame.v);
+        let ours = flatten(frame, sequence.chroma_format);
         let want = &expected[i * frame_size..(i + 1) * frame_size];
         let (mut worst, mut at) = (0i32, 0usize);
         let mut sum_sq = 0.0f64;

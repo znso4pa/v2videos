@@ -185,6 +185,11 @@ impl MpgPlayer {
         let (tr, frame) = self.pending.remove(0);
         let pts_ms = ((self.gop_base + u64::from(tr)) as f64 * self.frame_ms).round() as i64;
         self.emitted += 1;
+        // 解码器的平面按 16 对齐的编码高度分配（宏块恒 16×16，而高度不必是
+        // 16 的倍数），会多出几条看不见的行。`VideoFrame` 的消费者历来假设
+        // `y.len() == width * height`，所以在交出去的这一处裁到可见区域。
+        let mut frame = frame;
+        frame.truncate_visible(self.sequence.chroma_format);
         Some(VideoFrame {
             pts_ms,
             // I 帧就是这里的关键帧（seek 的落点候选）。

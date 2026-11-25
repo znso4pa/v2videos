@@ -101,9 +101,9 @@ fn main() -> std::process::ExitCode {
             // 只在最后一轮落盘。这里是**解码序**（`compare` 是显示序），
             // 两条路径互相比对时只要口径一致就够了。
             if dump.is_some() && round + 1 == rounds {
-                dumped.extend_from_slice(&f.y);
-                dumped.extend_from_slice(&f.u);
-                dumped.extend_from_slice(&f.v);
+                // 按**可见区域**拼：解码器的平面按 16 对齐的编码高度分配，
+                // 整平面拼会把尾部补白插到 Y / Cb 之间（长度也变）。
+                f.append_visible(&mut dumped, sequence.chroma_format);
             }
             if matches!(kind, PictureType::I | PictureType::P) {
                 prev_ip = last_ip.take();

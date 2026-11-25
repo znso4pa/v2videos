@@ -109,10 +109,11 @@ pub fn yuv420p_to_rgb24(frame: &Frame) -> Result<Vec<u8>> {
         return Err(Error::Bad("帧的宽或高是 0"));
     }
     let (cw, ch) = (chroma_len(w), chroma_len(h));
-    if frame.y.len() != w * h {
+    // `>=`：解码器的平面在**高度**上按 16 对齐（多出末尾几条看不见的行），行距仍是 `w`。
+    if frame.y.len() < w * h {
         return Err(Error::Bad("亮度平面长度与宽高不符"));
     }
-    if frame.u.len() != cw * ch || frame.v.len() != cw * ch {
+    if frame.u.len() < cw * ch || frame.v.len() < cw * ch {
         return Err(Error::Bad("色度平面长度与宽高不符（不是 4:2:0）"));
     }
     // 色度尺寸恰好是整数倍时 1:1 复制，否则双线性放大（与缩放的像素中心同口径）。
@@ -166,11 +167,12 @@ pub fn rgb24_to_yuv420p(rgb: &[u8], w: u32, h: u32) -> Result<Frame> {
 pub fn yuv420p_to_nv12(frame: &Frame) -> Result<Vec<u8>> {
     let (w, h) = (frame.width as usize, frame.height as usize);
     let (cw, ch) = (chroma_len(w), chroma_len(h));
-    if frame.y.len() != w * h || frame.u.len() != cw * ch || frame.v.len() != cw * ch {
+    if frame.y.len() < w * h || frame.u.len() < cw * ch || frame.v.len() < cw * ch {
         return Err(Error::Bad("平面长度与宽高不符（不是 4:2:0）"));
     }
     let mut out = Vec::with_capacity(w * h + 2 * cw * ch);
-    out.extend_from_slice(&frame.y);
+    // 只取可见的 `w * h` —— 平面尾部可能有 16 对齐补出来的行。
+    out.extend_from_slice(&frame.y[..w * h]);
     for i in 0..cw * ch {
         out.push(frame.u[i]);
         out.push(frame.v[i]);
