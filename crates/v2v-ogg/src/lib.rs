@@ -746,14 +746,17 @@ fn samples_to_ms(samples: i64, rate: u32) -> i64 {
     }
 }
 
-/// 扫文件尾拿总时长（毫秒）。
+/// 扫文件尾拿**总采样数与采样率**。
 ///
-/// 为什么单独一个函数：Ogg 没有全局头，总时长只体现在**最后一页的
+/// 为什么单独一个函数：Ogg 没有全局头，总长度只体现在**最后一页的
 /// `granule_position`** 上，顺序读要读完整份文件才知道。这里从尾部往回找
 /// 最后一个 `OggS` 再解析 —— 与 `ffprobe` 的做法一致。
 ///
+/// 返回 `(总采样数, 采样率)`。两样一起给是因为它们来自同一趟扫描：采样率在
+/// 文件最前面那一页、granule 在最后一页，分开做就要读两遍头。
+///
 /// `r` 必须可 seek；调用后位置会被改到别处。
-pub fn duration_ms<R: Read + Seek>(r: &mut R) -> Result<Option<u64>> {
+pub fn stream_length<R: Read + Seek>(r: &mut R) -> Result<Option<(u64, u32)>> {
     let end = r.seek(SeekFrom::End(0))?;
     if end < HEADER_SIZE as u64 {
         return Ok(None);
@@ -788,13 +791,19 @@ pub fn duration_ms<R: Read + Seek>(r: &mut R) -> Result<Option<u64>> {
         let mut pr = PageReader::new(&tail[idx..]);
         if let Ok(Some(p)) = pr.next_page() {
             if p.granule >= 0 {
-                let samples = p.granule as u64;
-                return Ok(Some(samples * 1000 / id.sample_rate.max(1) as u64));
+                return Ok(Some((p.granule as u64, id.sample_rate)));
             }
         }
         from = idx;
     }
     Ok(None)
+}
+
+/// 扫文件尾拿总时长（毫秒）。
+///
+/// 就是 [`stream_length`] 换算一下 —— 不要各写一份尾部扫描，两处迟早会漂。
+pub fn duration_ms<R: Read + Seek>(r: &mut R) -> Result<Option<u64>> {
+    Ok(stream_length(r)?.map(|(samples, rate)| samples * 1000 / rate.max(1) as u64))
 }
 
 #[cfg(test)]

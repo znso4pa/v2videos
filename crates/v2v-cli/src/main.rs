@@ -49,9 +49,10 @@ v2v —— 批量转码（纯 Rust：解封装 → 解码 → 编码 → 封装�
 选项：
   -o, --out-dir <DIR>   输出目录（默认：与输入同目录）
   -q, --qscale <1..31>  量化尺度（默认 6；越大文件越小、越糊）
-      --mp4             输出 .mp4（MPEG-4 Part 2 + AAC），默认输出 .wmv（MP43 in ASF）
-      --wav             只抽音频成 .wav（PCM16）。不看视频轨 —— `.ogg` 这类纯音频
-                        输入只有这条路能走（.wmv / .mp4 都要视频轨来定帧率）
+      --mp4             输出 .mp4（MPEG-4 Part 2 + AAC），默认输出 .wmv（MP43 in ASF）。
+                        输入**没有视频轨**时（`.ogg` / `.m4a`）走纯音频 MP4：
+                        `moov` 里只有一条 `soun` 轨，没有视频编码器
+      --wav             只抽音频成 .wav（PCM16）。不看视频轨 —— 纯音频输入最省的一条路
       --pcm             .mp4 的音频用未压缩 PCM（sowt）而不是 AAC
       --aac-bitrate N   .mp4 走 AAC 时的目标码率（默认 128000 bit/s）
       --no-ms           关掉 AAC 的 M/S 立体声（默认开；只为对比测量）
@@ -89,16 +90,19 @@ trim / concat（**不重编码**，只搬样本 —— 画质与源逐字节相�
   ASF（.wmv）  MP42 / MP43 / WMV1 / WMV2 / WMV3（VC-1）视频 + WMA 音频
   AVI（.avi）  同上（ffmpeg 写 mp4v 时 FourCC 是 FMP4 / DIVX / XVID）
   MP4（.mp4）  mp4v（MPEG-4 Part 2）或 avc1（H.264，**仅 macOS** 硬解）+ AAC / PCM
+  Ogg（.ogg）  只有 Vorbis 音频（不认 Theora）—— 纯音频输入
   纯 Rust 能解的视频：MP42 / MP43 / WMV1 / WMV2 / WMV3 / mp4v；
   H.264 只有 macOS 的 VideoToolbox 一条路（别的平台上明确报不支持）。
 
 两条输出路：
-  .wmv  视频重编码成 MP43，音频**直通**（零损失）。会做 PSNR 校验。
+  .wmv  视频重编码成 MP43，音频**直通**（零损失）。会做 PSNR 校验。**必须有视频轨**。
   .mp4  视频重编码成 MPEG-4 Part 2（I+P，GOP 由 -g 控制），
-        音频 WMA / MP3 → PCM → **AAC-LC**（默认；`--pcm` 可退回未压缩 PCM）。
+        音频 WMA / MP3 / Vorbis → PCM → **AAC-LC**（默认；`--pcm` 可退回未压缩 PCM）。
         MP43 / WMA 都进不了 MP4 容器，所以这条路**必须**重编码；
         我们只有 mp4v 编码器没有解码器，所以这条路**不做** PSNR 校验。
         -g 0 会编成全 I 帧（文件大得多，但每帧独立可解、适合剪辑）。
+        **没有视频轨的输入**（`.ogg`）走纯音频 MP4 —— 只有一条 `soun` 轨，
+        解 → 编 → 写，没有视频编码器、没有 GOP 并行。
 ";
 
 /// `v2v bench` 的帮助。**单独一份**，因为它和 convert 的选项一个都不重叠 ——
@@ -597,8 +601,14 @@ fn run_convert(it: &mut std::slice::Iter<'_, String>) -> Result<bool, String> {
         match opts.format {
             OutputFormat::Asf => ".wmv / MP43 + 音频直通".to_string(),
             OutputFormat::Mp4 => match opts.audio {
-                Mp4Audio::Aac => format!(".mp4 / MPEG-4 Part 2 + AAC {}", opts.aac_bitrate),
-                Mp4Audio::Pcm => ".mp4 / MPEG-4 Part 2 + PCM".to_string(),
+                // 「纯音频输入」要提一句：那条路没有 MPEG-4 Part 2 轨，只有音频。
+                Mp4Audio::Aac => format!(
+                    ".mp4 / MPEG-4 Part 2 + AAC {}（无视频轨的输入只有音频轨）",
+                    opts.aac_bitrate
+                ),
+                Mp4Audio::Pcm => {
+                    ".mp4 / MPEG-4 Part 2 + PCM（无视频轨的输入只有音频轨）".to_string()
+                }
             },
             OutputFormat::Wav => ".wav / PCM16（只抽音频，不转视频）".to_string(),
         },

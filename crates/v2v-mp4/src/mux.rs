@@ -170,6 +170,18 @@ impl Mp4Muxer {
         Self::assemble(Some(video), Some(audio))
     }
 
+    /// **只有音频轨** —— 纯音频输入（`.ogg` / `.m4a` / 抽出来的音轨）用这个。
+    ///
+    /// 之前只有 `new` / `with_audio` 两个入口，而它们**都要求一条视频轨**，
+    /// 于是「只有音频的 MP4」在本仓根本写不出来：`.ogg` 转 `.mp4` 那条路
+    /// 卡在这里，而不是卡在解码器上。
+    ///
+    /// `mdat` 的铺法与两轨时完全一样，`moov` 里只是少一个 `trak`；
+    /// 轨号也相应变成音频拿 1（不是固定 2）。
+    pub fn audio_only(audio: AudioTrack) -> Self {
+        Self::assemble(None, Some(audio))
+    }
+
     fn assemble(video: Option<VideoTrack>, audio: Option<AudioTrack>) -> Self {
         let mut out = Vec::new();
         out.extend_from_slice(&ftyp());
@@ -245,13 +257,19 @@ impl Mp4Muxer {
         );
         let movie_duration = vdur.max(adur);
 
+        // 轨号按**实际存在的轨**顺序分配（1 起）：只有音频时音频就是 1 号。
+        // 写死「视频 1、音频 2」在纯音频文件里会留一个空号，虽然多数播放器
+        // 不在意，但 `tkhd.track_ID` 与 `mvhd.next_track_ID` 对不上就是错的。
+        let video_id = 1u32;
+        let audio_id = if self.video.is_some() { 2 } else { 1 };
+
         let mut moov = BoxBuilder::new(b"moov");
         moov.child(mvhd(movie_duration, self.track_count() as u32 + 1));
         if let Some(v) = &self.video {
-            moov.child(trak_video(v, 1, &self.video_samples));
+            moov.child(trak_video(v, video_id, &self.video_samples));
         }
         if let Some(a) = &self.audio {
-            moov.child(trak_audio(a, 2, &self.audio_samples));
+            moov.child(trak_audio(a, audio_id, &self.audio_samples));
         }
         self.out.extend_from_slice(&moov.finish());
         self.out
@@ -834,6 +852,57 @@ mod tests {
         }
         assert_eq!(types, vec!["ftyp", "mdat", "moov"]);
         assert_eq!(p, f.len(), "顶层 box 必须正好铺满整个文件");
+    }
+
+    /// 纯音频 MP4：顶层 box 自洽、只有一条 `trak`、轨号是 1、没有 `vide` handler。
+    ///
+    /// 这条是 `.ogg → .mp4` 的地基：封装器写不出纯音频文件，后面全都不用谈。
+    #[test]
+    fn audio_only_file_has_one_track_and_no_video_handler() {
+        let audio = AudioTrack {
+            channels: 2,
+            sample_rate: 48_000,
+            timescale: 48_000,
+            codec: AudioCodec::Pcm {
+                bits: 16,
+                big_endian: false,
+            },
+            avg_bitrate: 0,
+            priming: 0,
+        };
+        let mut m = Mp4Muxer::audio_only(audio);
+        // 10 个采样点，每点 4 字节（立体声 16 位）
+        for _ in 0..10 {
+            m.write_audio(&[0u8; 4], 1).unwrap();
+        }
+        let f = m.finish();
+
+        // 顶层 box 铺满整个文件
+        let mut p = 0;
+        let mut types = Vec::new();
+        while p < f.len() {
+            let size = u32::from_be_bytes(f[p..p + 4].try_into().unwrap()) as usize;
+            types.push(String::from_utf8_lossy(&f[p + 4..p + 8]).to_string());
+            p += size;
+        }
+        assert_eq!(types, vec!["ftyp", "mdat", "moov"]);
+        assert_eq!(p, f.len());
+
+        let count = |t: &[u8; 4]| f.windows(4).filter(|w| *w == t).count();
+        assert_eq!(count(b"trak"), 1, "只该有一条轨");
+        assert_eq!(count(b"soun"), 1, "音频 handler 必须写出来");
+        assert_eq!(count(b"vide"), 0, "不该有视频 handler");
+
+        // `tkhd` 的 track_ID 在 version/flags(4) + creation(4) + modification(4) 之后
+        let tkhd = f.windows(4).position(|w| w == b"tkhd").expect("有 tkhd");
+        let id = u32::from_be_bytes(f[tkhd + 16..tkhd + 20].try_into().unwrap());
+        assert_eq!(id, 1, "只有音频时音频是 1 号轨");
+
+        // `mvhd` 的时长 = 10 个采样点 @48000 → 10*1000/48000 向下取整 = 0 ms；
+        // 所以这里改成看 mvhd 的 timescale 与 next_track_ID 更可靠。
+        let mvhd = f.windows(4).position(|w| w == b"mvhd").expect("有 mvhd");
+        let next_id = u32::from_be_bytes(f[mvhd + 8 + 92..mvhd + 8 + 96].try_into().unwrap());
+        assert_eq!(next_id, 2, "只有一条轨 → next_track_ID = 2");
     }
 
     #[test]

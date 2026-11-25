@@ -816,6 +816,13 @@ struct OggSource {
     d: v2v_ogg::OggDemuxer<BufReader<File>>,
     /// 打开时从**尾页**扫出来的时长（`duration_ms` 需要 seek，所以单独开个句柄）。
     duration_ms: Option<u64>,
+    /// 同一个 granule 换算出的**总采样数** —— 末页的 `granule_position` 是权威值。
+    ///
+    /// ⚠️ 必须**开箱就有**：`audio_total_samples` 的契约是「源里声明的总数」，
+    /// 而 `OggDemuxer::total_samples()` 返回的是「**读到现在**的末页 granule」——
+    /// 读之前是 `None`。拿它当截尾上限就会一声不响地不裁（实测：`.ogg → .mp4 --pcm`
+    /// 多出 640 个采样点）。
+    total_samples: Option<u64>,
 }
 
 impl VideoSource for OggSource {
@@ -840,7 +847,7 @@ impl VideoSource for OggSource {
         Ok(self.d.next_sample()?)
     }
     fn audio_total_samples(&self) -> Option<u64> {
-        self.d.total_samples()
+        self.total_samples
     }
 }
 
@@ -866,14 +873,17 @@ fn open_source(path: &Path) -> Result<Box<dyn VideoSource>, Error> {
     }
     // Ogg：头 4 字节是 `OggS`。
     if n >= 4 && &head[..4] == b"OggS" {
-        // 总时长只体现在**最后一页**的 granule 上，顺序读要读完整份文件才知道；
-        // 这里用第二个句柄从尾部扫一次（`duration_ms` 自己会 seek）。
-        let dur = File::open(path)
+        // 总长度只体现在**最后一页**的 granule 上，顺序读要读完整份文件才知道；
+        // 这里用第二个句柄从尾部扫一次（`stream_length` 自己会 seek）。
+        let len = File::open(path)
             .ok()
-            .and_then(|mut tail| v2v_ogg::duration_ms(&mut tail).ok().flatten());
+            .and_then(|mut tail| v2v_ogg::stream_length(&mut tail).ok().flatten());
+        let total_samples = len.map(|(samples, _)| samples);
+        let duration_ms = len.map(|(samples, rate)| samples * 1000 / rate.max(1) as u64);
         return Ok(Box::new(OggSource {
             d: v2v_ogg::OggDemuxer::open(f)?,
-            duration_ms: dur,
+            duration_ms,
+            total_samples,
         }));
     }
     Err(Error::Unsupported(
@@ -1679,6 +1689,216 @@ fn encode_items(
     Ok((out, key_frames, enc.rate_control_stats().unwrap_or((0, 0))))
 }
 
+/// `.mp4` 那条路的**纯音频**分支：输入没有视频轨（`.ogg` / `.m4a` / 抽出来的音轨）。
+///
+/// 由 [`convert_to_mp4`] 在「没有视频轨、但有音频轨」时分派过来，**解封装器已经开着**
+/// —— 这里不重开一遍文件。
+///
+/// 与两轨路径的差别只有三处：
+/// 1. 没有视频编码器、没有 GOP 并行、没有 PSNR —— 整条链就是「解 → 编 → 写」；
+/// 2. 封装器用 [`v2v_mp4::Mp4Muxer::audio_only`]，`moov` 里只有一个 `trak`；
+/// 3. 时长只由音频决定。
+///
+/// ## 尾巴怎么处理
+///
+/// - **PCM**：一个采样点一条样本，所以按 [`VideoSource::audio_total_samples`]
+///   （末页 granule / 索引里的真实长度）**逐点截断**，多一个点都不写 —— 精确。
+/// - **AAC**：一帧必须是 1024 个采样点，最后一帧只能补零。声明在 `edts`/`elst`
+///   里的时长是按样本数算的，所以解码出来会比源多**不到 1024 个点（< 23 ms）**。
+///   要精确就得让 `elst.segment_duration` 用 granule 的值 —— 见 `TODO.md`。
+/// - **AAC 直通**：帧本来就是源的，不动。
+///
+/// ## `max_frames` / `qscale` 这些参数
+///
+/// 都是**视频**的旋钮，这条路一概不用。`--no-audio` 在这里是自相矛盾
+/// （纯音频输出不写音频 = 空文件），直接报错。
+fn convert_audio_to_mp4(
+    output: &Path,
+    opts: &ConvertOptions,
+    bytes_in: u64,
+    mut demux: Box<dyn VideoSource>,
+) -> Result<ConvertReport, Error> {
+    if !opts.copy_audio {
+        return Err(Error::Unsupported(
+            "输入没有视频轨，`.mp4` 输出就只有音频 —— `--no-audio` 会得到一个空文件".into(),
+        ));
+    }
+    let (_, af) = demux
+        .audio_stream()
+        .ok_or_else(|| Error::Unsupported("文件里既没有视频轨也没有音频轨".into()))?;
+    let (channels, sample_rate) = (af.channels, af.sample_rate);
+    if channels == 0 || sample_rate == 0 {
+        return Err(Error::Unsupported(
+            "音频格式信息不完整（声道数或采样率为 0）".into(),
+        ));
+    }
+
+    // 输出也是 AAC 时，AAC 源可以**原样搬帧** —— 与两轨路径同一条理由：
+    // 我们的 AAC 解码器还缺 PNS / 强度立体声（明确报 `Unsupported`），而 ffmpeg
+    // 默认就会用 PNS。拿它解码再编码，等于把本来能无损搬过去的音频卡住。
+    let aac_copy_ok = opts.audio == Mp4Audio::Aac;
+    let plan = plan_audio(demux.as_ref(), true, aac_copy_ok)?
+        .ok_or_else(|| Error::Unsupported("文件里没有音频轨".into()))?;
+    let aac_copy = matches!(plan.kind, AudioSource::AacCopy);
+    let point = plan.point;
+
+    // 编码器必须先建 —— `AudioSpecificConfig` 是它吐出来的，而 `stsd` 建好就改不了。
+    let mut aac = match (&plan.kind, opts.audio) {
+        (AudioSource::AacCopy, _) => None,
+        (_, Mp4Audio::Aac) => Some(v2v_aac::Encoder::new(v2v_aac::EncoderConfig {
+            channels: channels as u8,
+            sample_rate,
+            bitrate: opts.aac_bitrate,
+            threads: opts.threads,
+            ms_stereo: opts.ms_stereo,
+            kb_window: false,
+        })?),
+        (_, Mp4Audio::Pcm) => None,
+    };
+
+    // 时间基一律取采样率：AAC 一帧 1024 个 tick，PCM 一个点 1 个 tick，
+    // 两种都能正好落在秒上，不用管帧率。
+    let track = match (aac_copy, aac.as_ref()) {
+        (true, _) => v2v_mp4::AudioTrack {
+            channels,
+            sample_rate,
+            timescale: sample_rate,
+            avg_bitrate: af.avg_bytes_per_sec * 8,
+            codec: v2v_mp4::AudioCodec::Es {
+                object_type: 0x40, // MPEG-4 Audio
+                // 直通时 DSI 必须用**源**的 AudioSpecificConfig。
+                decoder_specific_info: af.extra.clone(),
+            },
+            // 源的 priming 还在帧里（不解码就没法丢），照两轨路径声明 1024。
+            priming: 1024,
+        },
+        (false, Some(enc)) => v2v_mp4::AudioTrack {
+            channels,
+            sample_rate,
+            timescale: sample_rate,
+            avg_bitrate: opts.aac_bitrate,
+            codec: v2v_mp4::AudioCodec::Es {
+                object_type: 0x40,
+                decoder_specific_info: enc.audio_specific_config().to_bytes(),
+            },
+            // AAC 编解码链的净延迟 = 一帧。不声明音频整体晚 23 ms，而所有
+            // 「能不能解 / 帧数 / 时长」的判据都不会报警。
+            priming: 1024,
+        },
+        (false, None) => v2v_mp4::AudioTrack {
+            channels,
+            sample_rate,
+            timescale: sample_rate,
+            avg_bitrate: sample_rate * channels as u32 * 16,
+            codec: v2v_mp4::AudioCodec::Pcm {
+                bits: 16,
+                big_endian: false,
+            },
+            // PCM 没有编码器延迟。
+            priming: 0,
+        },
+    };
+    let mut mux = v2v_mp4::Mp4Muxer::audio_only(track);
+
+    let anum = plan.stream;
+    let mut decoder = match plan.kind {
+        AudioSource::Decode(d) => Some(d),
+        _ => None,
+    };
+    let mut skip_left = plan.skip;
+    // 真实长度（末页 granule）—— PCM 用它逐点截断。
+    let limit = demux.audio_total_samples();
+    let mut written = 0usize;
+    let mut pending: Vec<Vec<f32>> = Vec::new();
+    let mut marks: Vec<usize> = Vec::new();
+
+    while let Some(s) = demux.next()? {
+        if s.stream != anum {
+            continue;
+        }
+        if aac_copy {
+            // 一个样本就是一帧，时间基是采样率 —— 时长写 1024。
+            mux.write_audio(&s.data, AAC_FRAME_SAMPLES as u32)?;
+            written += AAC_FRAME_SAMPLES;
+            continue;
+        }
+        let mut pcm = match decoder.as_mut() {
+            Some(d) => d
+                .decode_to_pcm(&s.data)
+                .map_err(|e| Error::Unsupported(format!("音频解码失败：{e}")))?,
+            None => s.data,
+        };
+        if skip_left > 0 {
+            let drop = (skip_left * point).min(pcm.len());
+            pcm.drain(..drop);
+            skip_left -= drop / point;
+        }
+        if pcm.is_empty() {
+            continue;
+        }
+
+        if let Some(enc) = aac.as_mut() {
+            push_aac_pcm(&mut pending, &mut marks, &pcm, point, channels as usize, 0);
+            // `emit` 的回调签名不带 `Result`（串行版和并行版共用同一份实现），
+            // 所以写失败先存下来，出了闭包再报 —— 不要吞掉。
+            let mut err: Option<Error> = None;
+            {
+                let mut emit = |d: &[u8], dur: u32, _at: usize| {
+                    if err.is_none() {
+                        if let Err(e) = mux.write_audio(d, dur) {
+                            err = Some(Error::Mp4(e));
+                        }
+                    }
+                };
+                drain_aac_frames(enc, &mut pending, &mut marks, &mut emit, &mut written)?;
+            }
+            if let Some(e) = err {
+                return Err(e);
+            }
+        } else {
+            // PCM：一个采样点一条样本。超过真实长度的点直接不写。
+            for c in pcm.chunks_exact(point) {
+                if limit.is_some_and(|t| written as u64 >= t) {
+                    break;
+                }
+                mux.write_audio(c, 1)?;
+                written += 1;
+            }
+        }
+    }
+
+    // AAC 的尾巴：不足一帧的补零编出去（不编就丢掉最多 1023 个点）。
+    if let Some(enc) = aac.as_mut() {
+        let mut err: Option<Error> = None;
+        {
+            let mut emit = |d: &[u8], dur: u32, _at: usize| {
+                if err.is_none() {
+                    if let Err(e) = mux.write_audio(d, dur) {
+                        err = Some(Error::Mp4(e));
+                    }
+                }
+            };
+            flush_aac(enc, &mut pending, &mut marks, &mut emit, &mut written)?;
+        }
+        if let Some(e) = err {
+            return Err(e);
+        }
+    }
+
+    let bytes = mux.finish();
+    std::fs::write(output, &bytes)?;
+    Ok(ConvertReport {
+        frames: 0, // 这条路不解视频
+        key_frames: 0,
+        audio_payloads: written,
+        skipped_audio: 0,
+        bytes_in,
+        bytes_out: bytes.len() as u64,
+        psnr_db: None,
+        video_kbps: None,
+    })
+}
+
 /// `.mp4`（MPEG-4 Part 2 in MP4）那条路。
 ///
 /// 与 `.wmv` 那条的三个实质差别：
@@ -1707,9 +1927,13 @@ fn convert_to_mp4(
     let bytes_in = std::fs::metadata(input)?.len();
     let mut demux = open_source(input)?;
 
-    let track = demux
-        .video_stream()
-        .ok_or_else(|| Error::Unsupported("文件里没有视频轨（或没有格式信息）".into()))?;
+    // 没有视频轨 —— 纯音频输入（`.ogg` / `.m4a` / 抽出来的音轨）。
+    //
+    // 这条路以前直接报错，于是 `.ogg` 只能 `--wav`：Vorbis 解码器写得再对，
+    // 也进不了 MP4。现在分派到专门的分支，**复用已经打开的解封装器**。
+    let Some(track) = demux.video_stream() else {
+        return convert_audio_to_mp4(output, opts, bytes_in, demux);
+    };
     let (vnum, w, h) = (track.number, track.width, track.height);
 
     // 源里那条音频轨的格式（有没有音频、采样率多少）—— 封装器的 `stsd` 要用。

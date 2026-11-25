@@ -240,11 +240,11 @@ fn output_targets(af: Option<&crate::AudioFormat>) -> (Vec<&'static str>, Option
             vec!["mp4"],
             Some("音频是 MP3：`.wmv` 那条路的音频只直通 WMA，要转它得加 `--no-audio`".into()),
         ),
-        // Vorbis（Ogg）：`.ogg` 里通常**只有音频**，而 `.wmv` / `.mp4` 两条路都要
-        // 视频轨（要写 VOL / 定帧率），所以只有抽轨成 WAV 这一条。
+        // Vorbis（Ogg）：`.ogg` 里通常**只有音频**，走 `.mp4` 的**纯音频**分支
+        // （`moov` 里只有一个 `trak`），或者抽轨成 WAV。`.wmv` 没有纯音频的路。
         Some(AudioKind::Vorbis) => (
-            vec!["wav"],
-            Some("音频是 Vorbis（Ogg）：`.wmv` / `.mp4` 都要视频轨，只能 `--wav` 抽轨".into()),
+            vec!["mp4", "wav"],
+            Some("音频是 Vorbis（Ogg）：`.wmv` 那条路要视频轨，只能 `--mp4` 或 `--wav`".into()),
         ),
         None => (
             vec!["wmv", "mp4"],
@@ -529,5 +529,20 @@ mod tests {
             let (targets, _) = output_targets(Some(&af));
             assert_eq!(targets, vec!["mp4"]);
         }
+    }
+
+    /// Vorbis（`.ogg`）：纯音频输入，能去 `--mp4`（只有音频轨的 MP4）或 `--wav`，
+    /// **不能**去 `.wmv` —— 那条路的音频是直通 WMA，而且要有视频轨来写 VOL。
+    #[test]
+    fn vorbis_goes_to_mp4_and_wav_but_not_wmv() {
+        let af = crate::AudioFormat {
+            format_tag: v2v_ogg::VORBIS_FORMAT_TAG,
+            channels: 2,
+            sample_rate: 44100,
+            ..Default::default()
+        };
+        let (targets, note) = output_targets(Some(&af));
+        assert_eq!(targets, vec!["mp4", "wav"]);
+        assert!(note.unwrap().contains("--mp4"));
     }
 }
