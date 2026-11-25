@@ -40,13 +40,20 @@ def copyright_lines(path):
     """读 `path` 开头第一个 `/* ... */`，返回里面原样的版权/署名行。
 
     返回值已剥掉注释的 ` * ` 装饰与首尾空白，顺序与源文件一致。
-    读不到文件或开头不是块注释时返回 `[]`（调用方负责如实呈现）。
+    开头不是块注释、或注释里确实没有版权行时返回 `[]`（调用方照实呈现）。
+
+    **文件读不到则抛 `FileNotFoundError`，不返回 `[]`** —— 这两件事必须分开：
+    「这个文件没有版权行」和「我没找到这个文件」看起来一样，写进 NOTICE 却是
+    「漏了别人的署名」。后者是许可瑕疵，而它不影响编译、不影响测试，
+    只会静静地留在产物里。
     """
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
             head = f.read(8192)
-    except OSError:
-        return []
+    except OSError as e:
+        raise FileNotFoundError(
+            f"读不到上游源文件 {path} —— 生成器需要一个 FFmpeg 源码目录作为参数"
+        ) from e
     m = re.match(r"\s*/\*(.*?)\*/", head, re.S)
     if not m:
         return []

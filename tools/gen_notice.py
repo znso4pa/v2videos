@@ -74,6 +74,14 @@ def crate_lines(names, per_line=3):
 
 
 def main():
+    # 先确认上游源码在：**不能一边找不到文件一边写「该文件头没有版权行」** ——
+    # 那等于把「我没读到」写成「人家没署名」，产物照样能过编译和测试。
+    if not os.path.isdir(os.path.join(SRC, "libavcodec")):
+        sys.exit(
+            f"找不到 FFmpeg 源码目录 {SRC}/libavcodec。\n"
+            f"用法：python3 tools/gen_notice.py /path/to/ffmpeg-{FFMPEG_VERSION}\n"
+            "（NOTICE 里的版权行是从上游源文件里现读的，没有源码就不能重新生成。）"
+        )
     out = []
     w = out.append
 
