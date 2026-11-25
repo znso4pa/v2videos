@@ -367,6 +367,76 @@ impl Ctx<'_, '_> {
         }
     }
 
+    /// **整像素 MV**（任意方向）且无亮度补偿时的亮度快路：预测就是参考块本身，
+    /// 直接按行从参考帧拷进当前帧，**不经过本地缓冲**。
+    ///
+    /// ## 为什么值得单开一条
+    ///
+    /// 通用路径是「`load_ref` 拷进 `buf`（`k = 17 + 2·mspel`，四分之一像素时 19×19）
+    /// → 插值核再从 `buf` 拷出 16×16」。而 MV 落在整像素上时，那两趟拷贝搬的是
+    /// **同一份字节**：插值核在 `hmode == vmode == 0` 时就是 `s(0)`，即原样复制。
+    ///
+    /// 已有的一条快路只管 `mv == (0, 0)`；这里把它推广到**任意整像素 MV**。
+    ///
+    /// ⚠️ **别把归因当收益**：`load_ref` 连同它里面的 `memmove` 一共占解码 10.4%，
+    /// 但那 10.4% 里还包含**色度**（每个宏块两次 9×9）和**非整像素**的亮度块 ——
+    /// 那些这一刀都吃不掉。本改动端到端实测 **−1.2%**（720p 全片、三轮交替：
+    /// 4.21 → 4.16 ms/帧，三次都更低、分布不重叠）。
+    ///
+    /// ## 边界
+    ///
+    /// 只处理「16×16 源块整块在画面内」的情况。越界时 `load_ref` 要做边缘复制，
+    /// 那条路**必须照旧走** —— 在这里重写一遍就等于把「只在边界上才走、因而最难验」
+    /// 的那条路径复制成两份。
+    ///
+    /// 返回 `true` 表示亮度已经写完，调用方跳过亮度的通用路径。
+    fn try_integer_luma(
+        &mut self,
+        dir: usize,
+        dx: usize,
+        dy: usize,
+        mx: i32,
+        my: i32,
+        avg: bool,
+    ) -> bool {
+        // MV 一律是**四分之一像素单位**（两种 mspel 模式都是），所以「整像素」= 能被 4 整除。
+        if mx & 3 != 0 || my & 3 != 0 {
+            return false;
+        }
+        // 亮度补偿会改预测值 —— 那是 `apply_ic` 的活，不能省。
+        if if dir == 0 { self.use_ic } else { self.use_ic_next } {
+            return false;
+        }
+        let (ix, iy) = ((mx >> 2) as isize, (my >> 2) as isize);
+        let (w, h) = (
+            (self.mb_width * 16) as isize,
+            (self.mb_height * 16) as isize,
+        );
+        let (sx, sy) = (dx as isize + ix, dy as isize + iy);
+        if sx < 0 || sy < 0 || sx + 16 > w || sy + 16 > h {
+            return false;
+        }
+        let (sx, sy) = (sx as usize, sy as usize);
+        let stride = self.plane_stride(0);
+        let (src, dst) = if dir == 0 {
+            (&self.ref_planes.y, &mut self.planes.y)
+        } else {
+            (&self.next_planes.y, &mut self.planes.y)
+        };
+        for j in 0..16 {
+            let d = (dy + j) * stride + dx;
+            let s = (sy + j) * stride + sx;
+            if avg {
+                for i in 0..16 {
+                    dst[d + i] = ((dst[d + i] as u32 + src[s + i] as u32 + 1) >> 1) as u8;
+                }
+            } else {
+                dst[d..d + 16].copy_from_slice(&src[s..s + 16]);
+            }
+        }
+        true
+    }
+
     /// `ff_vc1_mc_1mv()`（渐进式）：P 帧的**前向**运动补偿。
     pub(crate) fn mc_1mv(&mut self, mbx: usize, mby: usize) {
         self.mc_1mv_dir(mbx, mby, 0, false);
@@ -476,62 +546,68 @@ impl Ctx<'_, '_> {
         uvsrc_y = uvsrc_y.clamp(-8, (self.mb_height * 8) as i32);
 
         let mut buf = [0u8; BUF * BUF];
-        let k = 17 + 2 * mspel;
-        self.load_ref(dir, 0, src_x, src_y, k, mspel, &mut buf);
-        if use_ic {
-            self.apply_ic(dir, 0, &mut buf, k, src_y - mspel as i32);
-        }
-        let base = mspel * BUF_STRIDE + mspel;
         let rnd = self.hdr.rnd as i32;
         let rnd_bit = self.hdr.rnd;
-        let dxy_mspel = (((my & 3) << 2) | (mx & 3)) as usize;
-        let dxy_hpel = ((my & 2) | ((mx & 2) >> 1)) as usize;
-        if avg {
-            // 先算到临时块里，再与帧里已有的那一份平均（上游 `op_avg`：
-            // `(a + b + 1) >> 1`，`b` 是**已经夹到 0..255** 的插值结果）。
-            let mut tmp = [0u8; 16 * 16];
-            if mspel != 0 {
-                let mut tmpi = [0i16; (16 + 3) * 16];
-                mspel_mc::<16>(
-                    &mut tmp,
-                    16,
-                    0,
-                    0,
-                    &buf,
-                    base,
-                    (dxy_mspel & 3) as u32,
-                    (dxy_mspel >> 2) as u32,
-                    rnd,
-                    &mut tmpi,
-                );
-            } else {
-                hpel_mc(&mut tmp, 16, 0, 0, 16, &buf, base, dxy_hpel, rnd_bit);
+        // ---- 快路 2：整像素 MV（非零方向）⇒ 亮度同样不经本地缓冲 ----
+        //
+        // 上面那条只管 `mv == (0, 0)`；这里把同一个理由推广到任意整像素 MV。
+        // 色度不走这条（它的 MV 是 `(mx + (mx&3==3)) >> 1`，整像素亮度照样可能出半像素色度）。
+        if !self.try_integer_luma(dir, dx, dy, mx, my, avg) {
+            let k = 17 + 2 * mspel;
+            self.load_ref(dir, 0, src_x, src_y, k, mspel, &mut buf);
+            if use_ic {
+                self.apply_ic(dir, 0, &mut buf, k, src_y - mspel as i32);
             }
-            let dst = self.plane_mut(0);
-            for j in 0..16 {
-                for i in 0..16 {
-                    let o = (dy + j) * stride + dx + i;
-                    dst[o] = ((dst[o] as u32 + tmp[j * 16 + i] as u32 + 1) >> 1) as u8;
+            let base = mspel * BUF_STRIDE + mspel;
+            let dxy_mspel = (((my & 3) << 2) | (mx & 3)) as usize;
+            let dxy_hpel = ((my & 2) | ((mx & 2) >> 1)) as usize;
+            if avg {
+                // 先算到临时块里，再与帧里已有的那一份平均（上游 `op_avg`：
+                // `(a + b + 1) >> 1`，`b` 是**已经夹到 0..255** 的插值结果）。
+                let mut tmp = [0u8; 16 * 16];
+                if mspel != 0 {
+                    let mut tmpi = [0i16; (16 + 3) * 16];
+                    mspel_mc::<16>(
+                        &mut tmp,
+                        16,
+                        0,
+                        0,
+                        &buf,
+                        base,
+                        (dxy_mspel & 3) as u32,
+                        (dxy_mspel >> 2) as u32,
+                        rnd,
+                        &mut tmpi,
+                    );
+                } else {
+                    hpel_mc(&mut tmp, 16, 0, 0, 16, &buf, base, dxy_hpel, rnd_bit);
                 }
-            }
-        } else {
-            let dst = self.plane_mut(0);
-            if mspel != 0 {
-                let mut tmp = [0i16; (16 + 3) * 16];
-                mspel_mc::<16>(
-                    dst,
-                    stride,
-                    dx,
-                    dy,
-                    &buf,
-                    base,
-                    (dxy_mspel & 3) as u32,
-                    (dxy_mspel >> 2) as u32,
-                    rnd,
-                    &mut tmp,
-                );
+                let dst = self.plane_mut(0);
+                for j in 0..16 {
+                    for i in 0..16 {
+                        let o = (dy + j) * stride + dx + i;
+                        dst[o] = ((dst[o] as u32 + tmp[j * 16 + i] as u32 + 1) >> 1) as u8;
+                    }
+                }
             } else {
-                hpel_mc(dst, stride, dx, dy, 16, &buf, base, dxy_hpel, rnd_bit);
+                let dst = self.plane_mut(0);
+                if mspel != 0 {
+                    let mut tmp = [0i16; (16 + 3) * 16];
+                    mspel_mc::<16>(
+                        dst,
+                        stride,
+                        dx,
+                        dy,
+                        &buf,
+                        base,
+                        (dxy_mspel & 3) as u32,
+                        (dxy_mspel >> 2) as u32,
+                        rnd,
+                        &mut tmp,
+                    );
+                } else {
+                    hpel_mc(dst, stride, dx, dy, 16, &buf, base, dxy_hpel, rnd_bit);
+                }
             }
         }
 
