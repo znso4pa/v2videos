@@ -12,7 +12,7 @@
 //! | `RlTable` / `Vlc`（前缀码容器） | AC escape：MP43 有三种、含义不同；这里是统一表挑最短 |
 //! | `Frame`、`Error`/`Result`、`ZIGZAG` | DC/AC **预测**：tie-break 判据不同（MP43 是 `<=`，这里是 `<`） |
 //! | `tables::RL_INTRA_*`（同一张表） | DC 缩放表：MP43 用 `OLD_Y_DC_SCALE`，这里用 `ff_mpeg4_y_dc_scale_table` |
-//! | `Planes` / `mc_params` / `mc_luma16` / `mc_chroma8` / `mc_mb`（半像素 MC） | **运动矢量 VLC**：MP43 是 1100 项的 `ff_msmp4_mv_table`，这里是 33 项的 `ff_mvtab` |
+//! | `Planes` / `mc_params` / `mc_luma16` / `mc_chroma8`（半像素 MC） | **运动矢量 VLC**：MP43 是 1100 项的 `ff_msmp4_mv_table`，这里是 33 项的 `ff_mvtab` |
 //! | `idct_put` / `idct_add`（重建） | 帧间 RL 表的**取用方式**：MP43 按 qscale 分档，这里用第 0 档（恒等） |
 //!
 //! ## I 帧的处理顺序（每一步的顺序都是语法的一部分，不能换）
@@ -72,7 +72,7 @@
 //! 所以每帧重建与跨帧复用**结果相同** —— 重建更省心，也就没有跨帧脏状态可错。
 
 use v2v_kernel::{fdct, fdct_i, idct_add, idct_put, BitWriter, Error, Result};
-use v2v_kernel::mc::{mc_chroma8, mc_luma16, mc_mb, mc_params, mid_pred, sad_luma16, Frame, Planes, ZIGZAG};
+use v2v_kernel::mc::{mc_chroma8, mc_luma16, mc_params, mid_pred, sad_luma16, Frame, Planes, ZIGZAG};
 use v2v_kernel::rl::RlTable;
 
 use crate::header::{
@@ -1182,12 +1182,26 @@ impl PState<'_> {
         let pred = self.mv_predict(mbx, mby);
         let (mv, inter_sad) = self.motion_estimate(mbx, mby, pred);
         let p = mc_params(mbx, mby, mv, self.pw, self.refp.ph);
-        let mut pred16 = [0u8; 256];
-        mc_luma16(&mut pred16, 16, 0, 0, self.refp, &p, NO_ROUNDING);
-        let mut predu = [0u8; 64];
-        let mut predv = [0u8; 64];
-        mc_chroma8(&mut predu, 8, 0, 0, self.refp, 0, &p, NO_ROUNDING);
-        mc_chroma8(&mut predv, 8, 0, 0, self.refp, 1, &p, NO_ROUNDING);
+        // ⚠️ **预测直接铺进 `cur`**，不落临时缓冲。
+        //
+        // `cur` 在这一刻只是本宏块的草稿：帧间赢了就在它上面叠残差
+        // （`reconstruct_inter` 是 `idct_add`），帧内赢了就整块覆盖
+        // （`reconstruct_intra` 是 `idct_put`，6 个块全写）。所以先铺预测是安全的。
+        //
+        // 省掉的是「MC 写进 16×16 / 8×8 的临时缓冲 → 再逐行拷进 `cur`」这一趟。
+        // 代价是 MC 现在按帧步长（`cur.pw`）散着写，而临时缓冲是连续的 ——
+        // 实测两者**基本抵消**：80 s 样本同一会话内交替五轮取最快，
+        // 基线 25.46 s / 本版 24.42 s，而「只做前两处改动」的版本在上一会话量到
+        // 24.46 s —— 也就是说这一趟拷贝的收益落在噪声里。
+        // 留它是因为**少一份状态**（一个函数 + 三个临时缓冲），不是因为更快。
+        // 想再要速度得动 MC 本身，不是这一趟拷贝。
+        let refp = self.refp;
+        {
+            let cur = &mut self.cur;
+            mc_luma16(&mut cur.y, cur.pw, mbx * 16, mby * 16, refp, &p, NO_ROUNDING);
+            mc_chroma8(&mut cur.u, cur.pw / 2, mbx * 8, mby * 8, refp, 0, &p, NO_ROUNDING);
+            mc_chroma8(&mut cur.v, cur.pw / 2, mbx * 8, mby * 8, refp, 1, &p, NO_ROUNDING);
+        }
 
         let mut qb = [[0i32; 64]; 6];
         for (n, slot) in qb.iter_mut().enumerate() {
@@ -1198,27 +1212,26 @@ impl PState<'_> {
                 for r in 0..8usize {
                     for c in 0..8usize {
                         res[r * 8 + c] = self.sy[(oy + r) * self.pw + ox + c] as i32
-                            - pred16[((n >> 1) * 8 + r) * 16 + (n & 1) * 8 + c] as i32;
+                            - self.cur.y[(oy + r) * self.pw + ox + c] as i32;
                     }
                 }
             } else {
                 let cw = self.pw / 2;
-                let (plane, prd) = if n == 4 {
-                    (self.su, &predu)
-                } else {
-                    (self.sv, &predv)
-                };
+                let plane = if n == 4 { self.su } else { self.sv };
+                let cur_plane = if n == 4 { &self.cur.u } else { &self.cur.v };
                 for r in 0..8usize {
                     for c in 0..8usize {
-                        res[r * 8 + c] =
-                            plane[(mby * 8 + r) * cw + mbx * 8 + c] as i32 - prd[r * 8 + c] as i32;
+                        res[r * 8 + c] = plane[(mby * 8 + r) * cw + mbx * 8 + c] as i32
+                            - cur_plane[(mby * 8 + r) * cw + mbx * 8 + c] as i32;
                     }
                 }
             }
             let mut coef = [0i32; 64];
             fdct_i(&res, 8, &mut coef);
+            // 走**特化到帧间**的那一份：`intra` 在这里恒为 false，交给 `quantize`
+            // 会多留一条运行期分支（这是整条链上最大的单项，值得绕开分发器）。
             for (k, v) in coef.iter().enumerate() {
-                slot[k] = self.quant.quantize(k, *v, false);
+                slot[k] = self.quant.quantize_ac::<false>(k, *v);
             }
             if self.trellis {
                 trellis_levels(&self.quant, self.rl_inter, &coef, slot, self.quant.lambda());
@@ -1290,12 +1303,13 @@ impl PState<'_> {
                 self.ac.restore(mbx, mby, ac_snap);
             }
             w.append(&wi);
+            // 两条分支都不再「贴预测」：`mb` 开头就把 MC 结果写进 `cur` 了，
+            // 而这一段（ME 之后到定胜负）没有任何东西动过 `cur` 的像素
+            // —— `intra_candidate` 只算系数、不重建。所以此刻 `cur` 里就是预测。
             if skip {
                 self.mv[mby * self.mb_w + mbx] = (0, 0);
-                mc_mb(&mut self.cur, self.refp, mbx, mby, (0, 0), NO_ROUNDING);
             } else {
                 self.mv[mby * self.mb_w + mbx] = mv;
-                mc_mb(&mut self.cur, self.refp, mbx, mby, mv, NO_ROUNDING);
                 reconstruct_inter(&mut self.cur, mbx, mby, &qb, &self.quant);
             }
         }
@@ -1474,12 +1488,27 @@ impl Quant {
 
     /// `dequant` 的逆：取让重建值离 `f` 最近的 `level`。
     ///
-    /// ⚠️ **除法全部换成了倒数乘法**：三条路各有一个运行期除数（`qmul` / `8·step` / `2·step`），
+    /// **唯一的数值核心**：`INTRA` 是**编译期**常量。
+    ///
+    /// ## 为什么是 const generic
+    ///
+    /// 这个函数每个 AC 系数都要走一次 —— 720p 的 P 帧每宏块 6×64 = 384 次，
+    /// 实测占视频编码 CPU 的 **30%**，是整条链上最大的单项。原来 `intra` 是运行时
+    /// `bool`，循环里因此留着「查哪张表 / 用哪个上限 / 要不要加偏置」三条分支。
+    /// 变成 const 之后这些全在编译期消掉，实测循环体从 17 条指令降到 8 条
+    /// （产物**逐字节不变**，见下面夹取的说明）。
+    ///
+    /// ⚠️ **实现只有这一份**：`quantize` 只是按运行时 `bool` 分发到两个特化。
+    /// 别再抄第二份 —— 抄了迟早会漂。
+    ///
+    /// ## 除法全部换成了倒数乘法
+    ///
+    /// ⚠️ 三条路各有一个运行期除数（`qmul` / `8·step` / `2·step`），
     /// 而 `sdiv` 一条要几十周期、这里每个 AC 系数都要走一次（实测占整条 `.mp4` 链路的 7.5%）。
     /// 除数在一帧里是常数（逐系数那两条各 64 个值），所以 `new` 里算一次倒数即可。
     /// **值与原式逐位相同** —— 见 `quantize_matches_division` 测试（与 `div_round` 对拍）。
     #[inline(always)]
-    fn quantize(&self, k: usize, f: i32, intra: bool) -> i32 {
+    fn quantize_ac<const INTRA: bool>(&self, k: usize, f: i32) -> i32 {
         if f == 0 {
             return 0;
         }
@@ -1492,13 +1521,13 @@ impl Quant {
             let r = if a >= 0 { q } else { -q };
             let v = if f > 0 { r.max(0) } else { r.min(0) };
             // ⚠️ 这条**提前 return**，别漏了夹取（见下面 `lim` 的说明）。
-            let lim = if intra { 1023 } else { 2047 };
+            let lim = if INTRA { 1023 } else { 2047 };
             return v.clamp(-lim, lim);
         }
-        let step = self.step(k, intra);
-        let v = if intra {
+        let v = if INTRA {
             // 帧内：重建电平在 `step/16` 的整数倍上。偏置 = `INTRA_BIAS_EIGHTHS`/8 个步长
             // （`4` 就是四舍五入；写成 8 倍只是为了让更小的偏置也能取整数）。
+            let step = self.step(k, true);
             let n = (f.unsigned_abs() as u64) * 128 + (INTRA_BIAS_EIGHTHS * step) as u64;
             ((n * self.intra_inv[k]) >> 48) as i32
         } else {
@@ -1508,17 +1537,35 @@ impl Quant {
             // `div_round(N, 2·step)` 的 N = `|f|·32 − step`，而它自己还要 `+ b/2 = + step`
             // —— 两项正好抵消，所以分子就是 `|f|·32`。
             // 原式那条 `N ≤ 0 ⇒ 结果 ≤ 0 ⇒ .max(0) = 0` 也自动成立（`|f|·32 ≤ step` 时商为 0）。
+            //
+            // 注意这里**不查 `step`** —— 它已经被折进 `inter_inv[k]` 了，白查一次。
             let num = (f.unsigned_abs() as u64) * 32;
             ((num * self.inter_inv[k]) >> 48) as i32
         };
-        let v = if f < 0 { -v } else { v };
         // ⚠️ **电平必须夹进位流装得下的范围**，而且**重建要用同一个值** ——
         // ESC3 的 level 字段是 12 位有符号（`& 0xfff`），超了会**静默回绕**：
         // 编码器按原值重建、解码器读到的是回绕后的值，两边就此分叉。
         // 帧间直接写电平 ⇒ ±2047；帧内写的是「电平 − 预测」，而预测取自邻居**同样被夹过**
         // 的电平 ⇒ 两边各 ±1023 就够保证差分 ≤ 2046。
-        let lim = if intra { 1023 } else { 2047 };
-        v.clamp(-lim, lim)
+        //
+        // `v` 一定是**非负**的（无符号乘 + 右移），所以「先取符号再双边夹」和
+        // 「先夹到 `[0, lim]` 再取符号」结果完全相同 —— 后者少一对 `cmp/csel`。
+        let lim = if INTRA { 1023 } else { 2047 };
+        let v = v.min(lim);
+        if f < 0 {
+            -v
+        } else {
+            v
+        }
+    }
+
+    #[inline(always)]
+    fn quantize(&self, k: usize, f: i32, intra: bool) -> i32 {
+        if intra {
+            self.quantize_ac::<true>(k, f)
+        } else {
+            self.quantize_ac::<false>(k, f)
+        }
     }
 
     /// 帧间块的失配控制（只有 `quant_type = 1` 做，见结构体文档）。
