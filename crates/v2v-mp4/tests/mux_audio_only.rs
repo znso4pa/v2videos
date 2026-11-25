@@ -66,6 +66,7 @@ fn pcm_track() -> AudioTrack {
         avg_bitrate: 0,
         // PCM 没有编码器预热。
         priming: 0,
+        presentation_samples: None,
     }
 }
 

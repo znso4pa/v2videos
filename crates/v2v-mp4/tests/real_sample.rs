@@ -498,6 +498,7 @@ fn muxes_video_plus_pcm_audio_and_keeps_both_intact() {
             avg_bitrate: 0,
             // PCM 没有编码器延迟。
             priming: 0,
+            presentation_samples: None,
         },
     );
 

@@ -59,6 +59,7 @@ fn audio_track() -> AudioTrack {
         },
         avg_bitrate: 128_000,
         priming: 0,
+        presentation_samples: None,
     }
 }
 

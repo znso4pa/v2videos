@@ -125,6 +125,21 @@ fn corr(a: &[i16], b: &[i16], lag: isize, n: usize) -> f64 {
     dot / (ea.sqrt() * eb.sqrt())
 }
 
+/// 两路 PCM 的 SNR（dB）。**只在「同一段内容」上比** —— 用来判「尾巴有没有被截掉」，
+/// 不当成 AAC 的质量判据（见文件头）。
+fn snr_db(a: &[i16], b: &[i16]) -> f64 {
+    let (mut se, mut sp) = (0f64, 0f64);
+    for (x, y) in a.iter().zip(b) {
+        let (x, y) = (f64::from(*x), f64::from(*y));
+        se += (x - y) * (x - y);
+        sp += x * x;
+    }
+    if se == 0.0 {
+        return f64::INFINITY;
+    }
+    10.0 * (sp / se).log10()
+}
+
 /// 跑一次转换，返回 (报告, 输出路径)。
 fn convert(input: &Path, audio: Mp4Audio, stem: &str) -> (v2v_cli::ConvertReport, PathBuf) {
     let dir = unique_temp(stem);
@@ -299,6 +314,33 @@ fn ogg_to_mp4_aac_is_one_track_and_aligned_at_lag_zero() {
         best.1 > 0.5,
         "lag 0 的相关系数只有 {:.3} —— 解出来的东西和源几乎无关",
         best.1
+    );
+
+    // ---- 长度与尾巴：**一个真样本都不能少** ----
+    //
+    // ⚠️ 这里曾经少 384 个真样本。AAC 编码器是 MDCT + 50% 重叠，有一帧前瞻
+    // （`output[k] = input[k-1]`）：喂完最后一个输入块之后不额外推一帧，
+    // 它永远出不来。长度正好是 1024 的整数倍时丢满 1024 个（23 ms），
+    // 而「帧数 / 时长 / 能不能解」这些判据**全都不报警**。
+    //
+    // 容差 48 个采样点（≈1 ms）：`elst.segment_duration` 的单位是影片时间轴的
+    // 毫秒（1 ms = 44.1 个采样点），精度到不了采样点 —— 这是**尺子**的上限，
+    // 不是被测物的。再往上收紧就得把 `mvhd` 的时间基调细（会改动所有产物）。
+    let diff = ours.len() as i64 - reference.len() as i64;
+    assert!(
+        diff.abs() <= 48,
+        "解码出来 {} 个采样点，源 {} 个（差 {diff}，超过 1 ms）",
+        ours.len(),
+        reference.len()
+    );
+    // 尾巴必须是**真内容**，不是补零 —— 长度对了但尾巴是静音同样是错的。
+    let n = ours.len().min(reference.len());
+    let tail = 2048.min(n);
+    let tail_snr = snr_db(&ours[n - tail..], &reference[n - tail..]);
+    println!("末尾 {tail} 个样本的 SNR = {tail_snr:.1} dB");
+    assert!(
+        tail_snr > 10.0,
+        "末尾的 SNR 只有 {tail_snr:.1} dB —— 尾巴被截断或补成静音了"
     );
 
     let _ = std::fs::remove_dir_all(mp4.parent().unwrap());

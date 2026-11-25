@@ -116,6 +116,15 @@ pub struct AudioTrack {
     /// 后者会让编码器失去预热、第一帧的质量反而变差。
     /// PCM 这类无延迟的编码填 0。
     pub priming: u32,
+    /// **真正要播的采样点数**（不含编码器预热，也不含末帧补零）。`None` = 不知道。
+    ///
+    /// 有它才能把 `elst` 的 `segment_duration` 写成**精确**的时长：AAC 一帧必须是
+    /// 1024 个采样点，最后一帧只能补零，而 `stts` 里的总样本数把那段补零也算进去了。
+    /// 不声明的话播放器会把末尾那点静音也放出来 —— 实测比源长 640 个采样点（约 15 ms），
+    /// 而「能不能解 / 帧数 / 码率」这些判据**全都不会报警**，只有时长对不上。
+    ///
+    /// PCM 这类一个采样点一条样本的轨不需要它（本来就没有补零），填 `None` 即可。
+    pub presentation_samples: Option<u64>,
 }
 
 /// 一个已写入 `mdat` 的样本。
@@ -251,10 +260,15 @@ impl Mp4Muxer {
             &self.video_samples,
             self.video.as_ref().map(|v| v.timescale),
         );
-        let adur = track_duration_ms(
-            &self.audio_samples,
-            self.audio.as_ref().map(|a| a.timescale),
-        );
+        // 音频这条要用**要播的**时长：`mvhd` 是「影片多长」，把编码器预热和末帧补零
+        // 算进去会让影片比实际内容长（AAC 一帧 1024 点，最多差 23 ms）。
+        let adur = match &self.audio {
+            Some(a) => {
+                let media: u64 = self.audio_samples.iter().map(|s| s.duration as u64).sum();
+                presentation_ms(a, media)
+            }
+            None => 0,
+        };
         let movie_duration = vdur.max(adur);
 
         // 轨号按**实际存在的轨**顺序分配（1 起）：只有音频时音频就是 1 号。
@@ -334,18 +348,19 @@ fn trak_video(v: &VideoTrack, track_id: u32, samples: &[SampleRec]) -> BoxBuilde
 
 fn trak_audio(a: &AudioTrack, track_id: u32, samples: &[SampleRec]) -> BoxBuilder {
     let media_duration: u64 = samples.iter().map(|s| s.duration as u64).sum();
-    let track_duration = media_duration * MOVIE_TIMESCALE as u64 / a.timescale as u64;
+    // `tkhd` 写的是**要播的**时长，不是「样本总数 × 帧长」—— 后者含预热与末帧补零。
+    let presentation = presentation_ms(a, media_duration);
 
     let mut trak = BoxBuilder::new(b"trak");
     // 音频轨的 `tkhd`：宽高为 0、音量为满、`alternate_group` 为 1（与 ffmpeg 一致）。
-    trak.child(tkhd(track_id, track_duration, 0, 0, 0x0100, 1));
-    // `edts` / `elst`：告诉播放器「跳过开头 `priming` 个采样点」。
+    trak.child(tkhd(track_id, presentation, 0, 0, 0x0100, 1));
+    // `edts` / `elst`：告诉播放器「跳过开头 `priming` 个采样点，只播 `presentation` 那么长」。
     //
     // ⚠️ `media_time` 用的单位是**本轨的 media timescale**（音频轨就是采样率），
     // 而 `segment_duration` 用的是**影片时间轴**（`mvhd` 的 timescale = 1000）。
     // 两个单位不一样 —— AGENTS.md 里就记着这条（当初在别的项目上踩过）。
-    if a.priming > 0 {
-        trak.child(edts(a.priming, a.timescale, track_duration));
+    if a.priming > 0 || a.presentation_samples.is_some() {
+        trak.child(edts(a.priming, presentation));
     }
     trak.child(mdia(
         b"soun",
@@ -355,6 +370,35 @@ fn trak_audio(a: &AudioTrack, track_id: u32, samples: &[SampleRec]) -> BoxBuilde
         minf_audio(a, samples),
     ));
     trak
+}
+
+/// 音频轨在**影片时间轴**上的时长（毫秒）。
+///
+/// - 知道确切采样数（`presentation_samples`）就用它 —— 那是**唯一**能同时去掉
+///   预热和末帧补零的口径；
+/// - 否则退回「样本总数 − 预热」，与加入这个字段之前**逐字节相同**（`None` 时
+///   两个路径算的是同一个数，只是减法的先后顺序不同，见下面的注释）。
+fn presentation_ms(a: &AudioTrack, media_duration: u64) -> u64 {
+    let ts = u64::from(a.timescale).max(1);
+    let total = media_duration * MOVIE_TIMESCALE as u64 / ts;
+    match a.presentation_samples {
+        // 夹一下：`stts` 里只有 `media_duration` 个样本，声明比它还长就是错的
+        // （截断的文件会让调用方给的「真实长度」大于实际写进去的量）。
+        //
+        // ⚠️ **四舍五入**，与 `v2v-ogg::samples_to_ms` 同口径（ffmpeg 的 `av_rescale`
+        // 也是这个行为）。这里的精度上限是 `MOVIE_TIMESCALE`（1 ms = 44.1 个采样点），
+        // 所以 `elst` 的时长**不可能**精确到采样点 —— 实测 882048 个采样点写成
+        // 20001 ms，解码回来是 882044 个（少 4 个，0.09 ms）。要更准只能把
+        // `mvhd` 的时间基调细，那会改动**所有**已产出的文件，不值。
+        Some(n) => (n.min(media_duration) * MOVIE_TIMESCALE as u64 + ts / 2) / ts,
+        // ⚠️ 这里的减法**必须**在毫秒上做（`total - priming_ms`），不要写成
+        // `(media_duration - priming) * 1000 / ts` —— 后者会多一次舍入，
+        // 已经写出去的文件时长会差 1 ms。
+        None => {
+            let priming_ms = u64::from(a.priming) * MOVIE_TIMESCALE as u64 / ts;
+            total.saturating_sub(priming_ms)
+        }
+    }
 }
 
 /// `edts`（edit box）—— 一条 `elst` 条目：「跳过开头的编码器预热，之后是正片」。
@@ -372,16 +416,13 @@ fn trak_audio(a: &AudioTrack, track_id: u32, samples: &[SampleRec]) -> BoxBuilde
 ///
 /// AGENTS.md 里记着同一条坑（`elst.segment_duration` 是 movie 时间轴、
 /// `media_time` 是媒体时间轴，两个单位不一样）。
-fn edts(priming: u32, media_timescale: u32, track_duration: u64) -> BoxBuilder {
-    // 预热段在**影片时间轴**上的长度。
-    let priming_movie =
-        u64::from(priming) * u64::from(MOVIE_TIMESCALE) / u64::from(media_timescale).max(1);
-
+fn edts(priming: u32, segment_ms: u64) -> BoxBuilder {
     let mut elst = BoxBuilder::new(b"elst");
     elst.full(0, 0); // version 0 / flags
     elst.u32(1); // entry_count
-                 // segment_duration：正片在影片时间轴上的长度 = 总时长 − 预热段。
-    elst.u32(track_duration.saturating_sub(priming_movie) as u32);
+                 // segment_duration：正片在影片时间轴上的长度。调用方已经把它算准了
+                 // （有 `presentation_samples` 时是精确值，不是「总时长 − 预热」）。
+    elst.u32(segment_ms as u32);
     // media_time：**从媒体时间轴的哪里开始播** = 预热了多少个采样点。
     // `-1` 在 `elst` 里是「空编辑」的约定值，但正片编辑用真实的起始点。
     elst.u32(priming);
@@ -869,6 +910,7 @@ mod tests {
             },
             avg_bitrate: 0,
             priming: 0,
+            presentation_samples: None,
         };
         let mut m = Mp4Muxer::audio_only(audio);
         // 10 个采样点，每点 4 字节（立体声 16 位）
@@ -1023,6 +1065,7 @@ mod tests {
                 },
                 avg_bitrate: 0,
                 priming: 0,
+                presentation_samples: None,
             },
         );
         m.write_video(&[1, 2, 3], true, 512).unwrap();

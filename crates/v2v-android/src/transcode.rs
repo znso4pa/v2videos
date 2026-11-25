@@ -551,6 +551,9 @@ pub fn wmv_to_mp4_hw_with(
                     avg_bitrate: audio_bitrate,
                     // 我们的 AAC 有 2048 采样点的编码器延迟，写进 edts/elst。
                     priming: 2048,
+                    // 这条路不知道真实长度（样本是 MediaCodec 编的，`stts` 里含
+                    // 预热与末帧补零）—— 退回「样本数 − 预热」。
+                    presentation_samples: None,
                 }),
                 _ => None,
             };

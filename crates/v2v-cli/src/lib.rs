@@ -1756,6 +1756,10 @@ fn convert_audio_to_mp4(
         (_, Mp4Audio::Pcm) => None,
     };
 
+    // 真实采样点数（末页 granule）—— 只有 Ogg 有。两个用途：
+    // ① `elst` 的 `segment_duration`（去掉末帧补零）；② PCM 逐点截断。
+    let total_samples = demux.audio_total_samples();
+
     // 时间基一律取采样率：AAC 一帧 1024 个 tick，PCM 一个点 1 个 tick，
     // 两种都能正好落在秒上，不用管帧率。
     let track = match (aac_copy, aac.as_ref()) {
@@ -1771,6 +1775,9 @@ fn convert_audio_to_mp4(
             },
             // 源的 priming 还在帧里（不解码就没法丢），照两轨路径声明 1024。
             priming: 1024,
+            // 直通时不知道源的真实长度（`stts` 的样本数含预热与补零，
+            // 而我们不解码、也就没法反推）。让它退回「样本数 − 预热」。
+            presentation_samples: None,
         },
         (false, Some(enc)) => v2v_mp4::AudioTrack {
             channels,
@@ -1784,6 +1791,9 @@ fn convert_audio_to_mp4(
             // AAC 编解码链的净延迟 = 一帧。不声明音频整体晚 23 ms，而所有
             // 「能不能解 / 帧数 / 时长」的判据都不会报警。
             priming: 1024,
+            // **末尾那点补零要靠它去掉**：一帧必须 1024 个点，最后一帧只能补零，
+            // 而 `stts` 把补零也算进样本数。声明真实长度，播放器才不会多放那点静音。
+            presentation_samples: total_samples,
         },
         (false, None) => v2v_mp4::AudioTrack {
             channels,
@@ -1796,6 +1806,8 @@ fn convert_audio_to_mp4(
             },
             // PCM 没有编码器延迟。
             priming: 0,
+            // 一个采样点一条样本，没有补零 —— 时长天然精确，不需要额外声明。
+            presentation_samples: None,
         },
     };
     let mut mux = v2v_mp4::Mp4Muxer::audio_only(track);
@@ -1807,7 +1819,7 @@ fn convert_audio_to_mp4(
     };
     let mut skip_left = plan.skip;
     // 真实长度（末页 granule）—— PCM 用它逐点截断。
-    let limit = demux.audio_total_samples();
+    let limit = total_samples;
     let mut written = 0usize;
     let mut pending: Vec<Vec<f32>> = Vec::new();
     let mut marks: Vec<usize> = Vec::new();
@@ -2046,6 +2058,8 @@ fn convert_to_mp4(
                 // ⚠️ 我们的解封装器还不读源的 `edts`/`elst`，拿不到它声明的真实值；
                 // 1024 是 AAC-LC 的定值，也是 ffmpeg 自己的写法。
                 priming: 1024,
+                // 直通时不知道源的真实长度（`stts` 的样本数含预热与补零，不解码就反推不出来）。
+                presentation_samples: None,
             },
         ),
         (Some(af), Some(a)) => {
@@ -2073,6 +2087,9 @@ fn convert_to_mp4(
                     // 对齐搜索的包络粒度太粗，周期性素材上真峰被假峰盖过。
                     // 换成**逐样本**互相关（真峰必须显著地赢）才量准。细节见 `TODO.md`。
                     priming: 1024,
+                    // 两轨这条路拿不到源的**真实采样数**（ASF / AVI 没有 granule），
+                    // 所以时长仍按「样本数 − 预热」估 —— 与加这个字段之前逐字节相同。
+                    presentation_samples: None,
                 },
             )
         }
@@ -2090,6 +2107,8 @@ fn convert_to_mp4(
                 },
                 // PCM 没有编码器延迟（样本就是裸采样）。
                 priming: 0,
+                // 一个采样点一条样本，没有补零 —— 时长天然精确。
+                presentation_samples: None,
             },
         ),
         _ => v2v_mp4::Mp4Muxer::new(vtrack),
@@ -2900,10 +2919,22 @@ fn drain_aac_frames(
     }
 }
 
-/// 收尾：把不足一帧的尾巴补零编出去。
+/// 收尾：把不足一帧的尾巴补零编出去，**再推一帧全零把最后一帧挤出来**。
 ///
-/// 不丢尾巴的话，输出的音频会比源短最多 1023 个采样点（约 23 ms）——
-/// 听感上就是最后那一点点被切掉了。
+/// ## 为什么必须多推一帧
+///
+/// 我们的 AAC 编码器是 **MDCT + 50% 重叠**，有**恰好一帧的前瞻**：
+/// 喂进去第 k 个输入块，吐出来的是第 k−1 个块（`output[k] = input[k-1]`，
+/// 而 `output[0]` 是预热，解码出来接近全零）。所以喂完最后一个输入块之后，
+/// **它的内容还在编码器里**，必须再喂一帧（零）才能把它推出来。
+///
+/// 不多推这一帧的后果是**尾巴丢最多 1024 个真样本**（23 ms）：
+/// 实测 20 秒的样本源里 `882048` 个点，输出只覆盖到 `881664`，**少 384 个**；
+/// 长度正好是 1024 的整数倍时会丢满 1024 个。而「能不能解 / 帧数 / 码率」
+/// 这些判据**全都不报警** —— 只有「解码出来的采样点数」对得上才看得见。
+///
+/// 补完零之后 `stts` 的总样本数会比真实长度多（预热 1024 + 尾部补零），
+/// 那部分由 `elst` 的 `segment_duration`（`presentation_samples`）去掉。
 fn flush_aac(
     enc: &mut v2v_aac::Encoder,
     pending: &mut Vec<Vec<f32>>,
@@ -2912,21 +2943,36 @@ fn flush_aac(
     audio_samples: &mut usize,
 ) -> Result<(), Error> {
     let have = pending.first().map_or(0, |p| p.len());
-    if have == 0 {
+    // 一个采样点都没喂过（空音频）—— 没有「最后一帧」要挤，也别凭空造一帧。
+    // `pending.len()` 是声道数：`push_aac_pcm` 第一次进来就 resize 好，
+    // 之后 `drain` 只清空每个声道的 Vec、不动外层长度。
+    if pending.is_empty() {
         return Ok(());
     }
-    // 补零到 1024（残留的尾巴本来就没有真实样本，补零是唯一合法的编法）。
-    let planes: Vec<Vec<f32>> = pending
-        .iter_mut()
-        .map(|p| {
-            let mut v = std::mem::take(p);
-            v.resize(AAC_FRAME_SAMPLES, 0.0);
-            v
-        })
-        .collect();
-    let streams = enc.encode_frames(&[v2v_aac::Frame { planes }])?;
-    // 尾巴排在所有样本之后 —— 串行版用 `usize::MAX` 作载荷序号，这里沿用。
-    marks.clear();
+    // ① 残留的尾巴补零到 1024 编出去（这是最后一个**有内容**的输入块）。
+    if have > 0 {
+        let planes: Vec<Vec<f32>> = pending
+            .iter_mut()
+            .map(|p| {
+                let mut v = std::mem::take(p);
+                v.resize(AAC_FRAME_SAMPLES, 0.0);
+                v
+            })
+            .collect();
+        let streams = enc.encode_frames(&[v2v_aac::Frame { planes }])?;
+        // 尾巴排在所有样本之后 —— 串行版用 `usize::MAX` 作载荷序号，这里沿用。
+        marks.clear();
+        emit(&streams[0], AAC_FRAME_SAMPLES as u32, usize::MAX);
+        *audio_samples += AAC_FRAME_SAMPLES;
+    }
+    // ② 再推一帧**全零**：把上面那一块（或本来就填满的最后一块）从编码器里挤出来。
+    //
+    // ⚠️ 这一帧**无条件**要发 —— `have == 0`（长度正好是 1024 的整数倍）时
+    // 最后那个满块同样还卡在编码器里，漏了它就是整整 1024 个真样本。
+    let ch = pending.len().max(1);    let zeros: Vec<v2v_aac::Frame> = vec![v2v_aac::Frame {
+        planes: vec![vec![0.0f32; AAC_FRAME_SAMPLES]; ch],
+    }];
+    let streams = enc.encode_frames(&zeros)?;
     emit(&streams[0], AAC_FRAME_SAMPLES as u32, usize::MAX);
     *audio_samples += AAC_FRAME_SAMPLES;
     Ok(())

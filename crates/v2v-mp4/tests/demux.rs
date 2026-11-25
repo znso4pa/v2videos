@@ -27,6 +27,7 @@ fn sample_file() -> Vec<u8> {
         },
         avg_bitrate: 128_000,
         priming: 0,
+        presentation_samples: None,
     };
     let mut m = Mp4Muxer::with_audio(vt, at);
     for i in 0..5u8 {
