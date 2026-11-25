@@ -75,7 +75,8 @@ crates/
   v2v-cli           `v2v` 命令行：**批量转码**（解封装 → 解码 → 编码 → 封装）+
                     无损剪切 / 拼接 + **扫描器**（只读头部，报能转的）+ `v2v bench`
                     （测量写成 TSV、可选对着基线卡回归）+ **`--wav` 抽轨**
-                    （纯音频输入，如 `.ogg`，只有这条路走得通）
+                    （纯音频输入，如 `.ogg`）+ **纯音频 MP4**（`.ogg → .mp4`，
+                    `moov` 里只有一条 `soun` 轨）
   v2v-bench         性能测量的**格式与寿命管理**：TSV 读写 / 机器指纹 / 回归比较 —— **零依赖**，
                     自己不测量任何东西（见 `bench/README.md`）
 tools/
@@ -316,7 +317,8 @@ cargo test -p v2v-cli --test determinism
 | **解码**   | MS-MPEG-4 v3（**MP43**）、**WMV1**（WMV7）与 **WMV2**（WMV8）：I 帧 + P 帧（skip、MV 预测、半像素运动补偿、帧间残差）。三版共用骨架，**分叉在帧头与几处版本常量**上：`pict_type` 位宽、ext header 的位置、变长/定长的第三 escape、`ff_wmv1_scantable` 那套扫描表、DC 预测的平手方向与缩放（`scale != 8` 时走 `FASTDIV`，对负数**向下取整**）。**WMV2 另有一整套**：逐宏块 skip 表（4 种粒度）、按 qscale 挑的 CBP 表、`mspel` 四抽头半像素 + 逐宏块 `hshift`、**ABT**（4×8 / 8×4，含自己的扫描表与第二个半块）、**环路滤波**（逐宏块就地滤，skip 宏块也要滤）、以及 **IntraX8**（`j_type` —— 一个按 8×8 块走的内帧子解码器：12 种空间预测 + 自己的环路滤波 + 自己的熵编码，`extradata` 的能力位置位时**每个 I 帧**都归它） | 与 `ffmpeg` **逐像素**对：MP43 / WMV1 / WMV2 各自的真样本**每一帧最大差 0**（WMV2 **六份样本共 24321 帧**，其中 **126 帧走 IntraX8**；含 `mspel`、ABT、环路滤波、边缘复制那些分支） |
 | **解码**   | **VC-1 / WMV3**（`v2v-vc1`）：**整条链路**——序列头（容器 extradata 的 `STRUCT_C`）→ 帧头（含位平面）→ 宏块层（I / P：DC/AC 预测、系数解码）→ 逆变换（8×8 与 **ABT** 三种 8×4 / 4×8 / 4×4）→ 运动补偿（**四分之一 / 半像素**插值、亮度补偿 IC）→ 环路滤波 → YUV420P。范围限定 **Main profile / 渐进 / I-P**；Advanced profile、B 帧、隔行明确报错 | 两条**外部**判据：① 位游标 —— I 帧宏块层解完落在帧尾（差一位就跑偏几十位），把「语法解对」与「像素重建对不对」分开；② `ffmpeg` 吐 `yuv420p` 裸帧边解边比，**整片 3719 帧逐帧逐像素 0 差**（`crates/vc1/tests/frames.rs`）。帧头那层另对 `ffmpeg -debug pict`：真样本 1920×1080 **3719 帧的 `pict_type` 与两张位平面 `(imode, invert)` 全同** |
 | **解码**   | **Vorbis I**（`v2v-vorbis`）：码本（**非 canonical** —— 按「最左可用叶子」分配，抄 canonical 会全错）/ floor 1（分段折线 + Bresenham）/ residue 0·1·2（含 type 2 的拆交织）/ 声道耦合（方波极坐标逆变换）/ 长短块与 **hybrid 窗** / IMDCT + 重叠相加。缺 floor 0（LSP） | 对 `ffmpeg` 解同一份真样本（48 kHz 立体声、13192 个包、1255 万个样本）：**SNR 133.5 dB、最大偏差 4.8e-7**（就是 f32 精度）。块序列覆盖 **906 次短短 / 321 次长短切换（hybrid 窗）/ 11964 次长长** —— 短窗那条路是真走到的，不是「碰巧全绿」。单线程解码 **×706 实时**（371 ms 解 4 分 21 秒，1.79× 于首版；提速前后 f32 位模式摘要完全一致） |
-| **抽轨**   | `v2v convert --wav in.ogg`：解封装 → 解码 → 写 44 字节 RIFF/PCM16 头，**不解视频、不重编码**。唯一一条不要求视频轨的路 | 真样本（48 kHz 立体声、4 分 21 秒）：采样点数与 `ffmpeg` **完全相等**（12,551,956），逐样本**最大差 1 LSB**（s16 舍入），峰值非静音 |
+| **抽轨**   | `v2v convert --wav in.ogg`：解封装 → 解码 → 写 44 字节 RIFF/PCM16 头，**不解视频、不重编码** | 真样本（48 kHz 立体声、4 分 21 秒）：采样点数与 `ffmpeg` **完全相等**（12,551,956），逐样本**最大差 1 LSB**（s16 舍入），峰值非静音 |
+| **纯音频封装** | `v2v convert --mp4 in.ogg`：`Mp4Muxer::audio_only` 写**只有一条 `soun` 轨**的 MP4（`moov` 里一个 `trak`、轨号 1、没有 `stss`）。音频走 AAC-LC（默认，`priming: 1024`）或 `sowt` PCM（`--pcm`） | ① 封装层：`ffprobe` 认成 1 条流 / `pcm_s16le` / 声道与采样率不变，`ffmpeg` 解出来的 PCM 与写入的**逐字节相同**（`v2v-mp4/tests/mux_audio_only.rs`）；② 端到端：`--pcm` 的产物解出来与 `--wav` **逐字节相同**、采样点数等于末页 `granule`；AAC 的产物与源**在 lag 0 对齐**（相关系数 0.998，lag ±1024 只有 0.726 —— 专抓 `priming` 漏声明） |
 | **编码**   | MP43 **I 帧 + P 帧**：正向 DCT + 量化 + DC / RL 熵编码、运动估计（整像素粗搜 + 半像素细化）、skip 宏块                                    | 编出来的 I+P 序列交给 `ffmpeg` 解，与自己的解码器**逐像素一致**                                                       |
 | **编码**   | MPEG-4 Part 2（`v2v-mp4v`）**I 帧 + P 帧**：DC / AC 预测（逐宏块比位数择优）、运动估计（**三起点菱形搜索 + 时间预测**，半像素细化）、中值 MV 预测、skip 宏块、逐宏块帧内/帧间判决；量化走 **MPEG 型**（`quant_type = 1`，规范默认 CSF 矩阵）+ **系数级 RD（trellis，默认关）**；`--video-bitrate` 时**逐帧调 qscale** 的码率控制 | 编出来的流交给 `ffmpeg` 解；与它的 mpeg4 同 qscale 比：**体积 0.96–1.06×、PSNR 在 ±0.1 dB 内、SSIM 每档更高**（§6 按分辨率扫了一遍，**那是 2026-10-16 的 320×240 语料**；2026-11-06 换新语料复测见 §7 —— 同 qscale 下 PSNR −4.2 ~ +2.2 dB，**同体积下真内容打平**）；**视频载荷比全 I 帧小 2.3 倍**；码率控制实测命中目标（371→373、621→618 kbps） |
 | **解码**   | MPEG-4 Part 2（`v2v-mp4v` 的 `decode`）：I / P、**H.263 与 MPEG 矩阵两种量化**（含帧间失配控制）、16×16 半像素 —— 修了七个「能跑但不对」的 bug（`^` 优先级、亮度用错色度 DC 表、escape 步进、符号扩展、伪中值、resync 误拒、**escape 内层 level 没反量化**） | 两条判据同一把尺（`ffmpeg -idct 2 -fps_mode passthrough`）：自己编的 I P P P I P P P **逐像素 0 差**；**ffmpeg 自己编的流**（独立来源）10 帧全解、也 0 差 |
@@ -340,14 +342,17 @@ cargo test -p v2v-cli --test determinism
 v2v convert in.wmv -o out/
 
 # .mp4：视频重编码成 MPEG-4 Part 2（-g 给 GOP，默认 250 帧 ≈ 10 秒；0 = 全 I 帧），
-#       音频 WMA / MP3 → PCM → **AAC-LC**（--pcm 可退回未压缩 PCM）
+#       音频 WMA / MP3 / Vorbis → PCM → **AAC-LC**（--pcm 可退回未压缩 PCM）
 v2v convert --mp4 -g 12 in.wmv -o out/
 
 # .mp4 输入（H.264 硬解 + AAC 直通）→ 再出 .mp4
 v2v convert --mp4 in.mp4 -o out/
 
-# 只抽音频成 .wav（PCM16）：不解视频、不重编码。**不看视频轨** ——
-# `.ogg`（Vorbis）这类纯音频输入只有这条路走得通
+# 纯音频输入（.ogg）：没有视频轨，照样出 .mp4 —— moov 里只有一条 soun 轨
+v2v convert --mp4 in.ogg -o out/          # AAC-LC（默认）
+v2v convert --mp4 --pcm in.ogg -o out/    # 未压缩 PCM，逐字节可验
+
+# 只抽音频成 .wav（PCM16）：不解视频、不重编码。**不看视频轨**
 v2v convert --wav in.ogg -o out/
 
 # 无损剪切 / 拼接：只搬样本，不解码、不重编码（只能切在关键帧上）
@@ -1002,7 +1007,7 @@ C 内核位于 MIT crate `v2v-mpeg12-c`，播放器直接链接该内核。独�
 | **ASF**（`.wmv` / `.wma`） | ✅   | ✅   | 只做单视频流 + 单音频流（音频**直通**，不重编码）；不做加密、多视频轨、非标准的纠错标志                                        |
 | **AVI**（RIFF）           | ✅   | ❌   | 只读 —— `.wmv → .avi` 没人要，写它没有用例。不认 OpenDML（`AVIX` 分块 / `indx`），遇到明确报 `Unsupported` 而不是假装支持 |
 | **MPEG-PS**（`.mpg` / `.dat` / `.vob`） | ✅ | ❌ | `v2v-mpegps` 读取 MPEG-1/2 Program Stream，供 MPEG-1/2 视频解码和播放。 |
-| **Ogg**（`.ogg` / `.oga`） | ✅（Vorbis） | ❌ | `v2v-ogg`：页层完整（跨页续接的包、CRC 可开、截断与坏页明确报错）、逐包时间戳对 `ffprobe`；Vorbis 解码在 `v2v-vorbis`。CLI 侧接了 **`--wav` 抽轨**（纯音频输入没有视频轨，`.wmv` / `.mp4` 都走不了）。**只认 Vorbis** —— Opus / Theora / FLAC / Speex / Skeleton 识别后报 `Unsupported`；不做链式（chained）Ogg 的时间轴拼接；**C ABI 还没接** |
+| **Ogg**（`.ogg` / `.oga`） | ✅（Vorbis） | ✅（纯音频） | `v2v-ogg`：页层完整（跨页续接的包、CRC 可开、截断与坏页明确报错）、逐包时间戳对 `ffprobe`；Vorbis 解码在 `v2v-vorbis`。CLI 侧接了 **`--wav` 抽轨**和 **`--mp4` 纯音频 MP4**（`Mp4Muxer::audio_only`：`moov` 里只有一个 `trak`，轨号 1、没有 `stss`）。**只认 Vorbis** —— Opus / Theora / FLAC / Speex / Skeleton 识别后报 `Unsupported`；不做链式（chained）Ogg 的时间轴拼接；**C ABI 还没接** |
 | **MP4** / ISOBMFF        | ✅   | ✅   | 解封装（`Mp4Demuxer`）：非分片、`moov` 在头或尾都行、`stco` 与 `co64` 都认、`ctts` 算进 PTS 并按 **PTS** 出样本。C ABI 通过 `v2v_probe` 和 `v2v_demux_*` 暴露 MP4，按包编号 seek 暂未支持。不做分片 MP4（`moof`）、`edts`/`elst` 编辑列表、加密（`encv`/`enca`）、H.265/AV1 的 sample entry |
 
 ### 视频编码
@@ -1027,7 +1032,7 @@ C 内核位于 MIT crate `v2v-mpeg12-c`，播放器直接链接该内核。独�
 | **WMA v1 / v2**     | ✅       | ❌       | 不写编码器 —— 往 `.wma` 走时音频是**直通**，重编码没有用例                            |
 | **AAC-LC**          | ✅（对 `ffmpeg` ±1 LSB） | ✅       | 解码缺 **PNS**、**IS**、`pulse_data`、`gain_control`、SBR/PS（都明确报 `Unsupported`）；编码缺 **PNS**、**IS**、LTP |
 | **MP3** | ✅ MPEG-1 / 2 / 2.5 Layer III | ❌ | 纯 Rust 或可选 mpg123 FFI，支持 AVI / ASF 音轨。纯 Rust 的 8 kHz mixed block 暂未覆盖。 |
-| **Vorbis** | ✅ | ❌ | `v2v-vorbis`：floor 1 / residue 0·1·2 / 耦合 / hybrid 窗全做，对 `ffmpeg` 解真样本 **SNR 133.5 dB**（f32 精度级）。CLI：`v2v convert --wav in.ogg` 抽轨，采样点数与 `ffmpeg` **完全相等**、逐样本 **≤ 1 LSB**。缺 **floor 0**（LSP，现存编码器都不用）；Ogg **封装**未实现；**C ABI 还没接** |
+| **Vorbis** | ✅ | ❌ | `v2v-vorbis`：floor 1 / residue 0·1·2 / 耦合 / hybrid 窗全做，对 `ffmpeg` 解真样本 **SNR 133.5 dB**（f32 精度级）。**另用 `libvorbis`（sox）当第二把尺**：同一份 `.ogg` 三方对账，我们 vs libvorbis **99.4 dB / 最大 1 LSB**、ffmpeg vs libvorbis 67.7 dB（也 ≤1 LSB）—— 三方在合规流上一致。CLI：`--wav` 抽轨与 `--mp4` 纯音频 MP4，采样点数与 `ffmpeg` **完全相等**、逐样本 **≤ 1 LSB**。缺 **floor 0**（LSP，现存编码器都不用）；Ogg **封装**未实现；**C ABI 还没接** |
 | **PCM**（`sowt`）     | ✅（直通）  | ✅（直通）  | 未压缩，进出都是原字节                                                    |
 
 ### 已知与 `ffmpeg` 的差异
