@@ -123,44 +123,60 @@ impl ChannelSynth {
         self.primed = false;
     }
 
-    /// IMDCT + 加窗 + 重叠相加。`coefs` 长度 = `n/2`；返回本块能输出的样本。
+    /// IMDCT + 加窗 + 重叠相加。`coefs` 长度 = `n/2`；本块能输出的样本写进 `out`。
     ///
-    /// 第一块只做 priming，返回空。
-    pub fn synthesize(
+    /// 第一块只做 priming，`out` 被清空。
+    ///
+    /// **写进调用方的缓冲**（而不是返回 `Vec`）是为了让整条解码链零分配：
+    /// 真样本上这是 5 万块，每块一个 4 KiB 的 `Vec` 分配 + 释放。
+    pub fn synthesize_into(
         &mut self,
         plan: &mut ImdctPlan,
         coefs: &[f32],
         window: &Window,
-    ) -> Vec<f32> {
+        out: &mut Vec<f32>,
+    ) {
         let n = window.samples.len();
         debug_assert_eq!(coefs.len(), n / 2);
-        self.block.clear();
-        self.block.resize(n, 0.0);
+        // ⚠️ **只在长度变了才 `resize`**。原来是无条件 `clear() + resize(n, 0.0)`，
+        // 那是每块一次 8 KiB 的 memset —— 而 `ImdctPlan::apply` 本来就写满
+        // 全部 `2n` 个样本（`put_imdct_sample` 对每个 `j ∈ [0, n)` 写两处，
+        // 合起来正好覆盖 `[0, 2n)`；由 `imdct_apply_writes_every_sample` 钉住）。
+        // 真样本上是 5 万块 × 8 KiB ≈ **400 MB 白写的 0**。
+        if self.block.len() != n {
+            self.block.resize(n, 0.0);
+        }
         plan.apply(coefs, &mut self.block);
         for (s, w) in self.block.iter_mut().zip(&window.samples) {
             *s *= w;
         }
-        self.overlap_add(window)
+        self.overlap_add(window, out);
     }
 
-    /// 把 `self.block`（**已经乘过窗**）叠进输出，返回本块完成的区间。
-    fn overlap_add(&mut self, window: &Window) -> Vec<f32> {
+    /// 把 `self.block`（**已经乘过窗**）叠进 `out`，`out` 里是本块完成的区间。
+    fn overlap_add(&mut self, window: &Window, out: &mut Vec<f32>) {
         let n = self.block.len();
         if !self.primed {
             self.pending.clear();
             self.pending.extend_from_slice(&self.block[n / 2..]);
             self.prev_n = n;
             self.primed = true;
-            return Vec::new();
+            out.clear();
+            return;
         }
 
         let np = self.prev_n;
         let out_len = np / 4 + n / 4;
-        let mut out = vec![0f32; out_len];
+        // 长度没变时 `resize` 不清零 —— 所以下面要**自己清**上一块没盖到的那段。
+        if out.len() != out_len {
+            out.resize(out_len, 0.0);
+        }
 
         // 上一块的右半 = 输出区间的前 `Np/2` 个样本（它自己的坐标里从中心开始）。
         let keep = self.pending.len().min(out_len);
         out[..keep].copy_from_slice(&self.pending[..keep]);
+        // `[keep, out_len)` 上一轮留的是旧内容，必须清零：下面是对它做 `+=`。
+        out[keep..].fill(0.0);
 
         // 当前块：`cur[i]` 落在输出下标 `i + Np/4 - N/4`。只加窗口非零的那一段，
         // 越界的部分直接丢掉（流不合法时也不至于 panic）。
@@ -175,7 +191,6 @@ impl ChannelSynth {
         self.pending.clear();
         self.pending.extend_from_slice(&self.block[n / 2..]);
         self.prev_n = n;
-        out
     }
 }
 
@@ -183,6 +198,20 @@ impl ChannelSynth {
 mod tests {
     use super::*;
     use std::f64::consts::PI;
+
+    /// 测试用的一步合成：把 `synthesize_into` 包成「返回一个 Vec」。
+    ///
+    /// 生产路径不这么用（那是零分配的那一半），但测试里读起来更直白。
+    fn synthesize(
+        st: &mut ChannelSynth,
+        plan: &mut ImdctPlan,
+        coefs: &[f32],
+        w: &Window,
+    ) -> Vec<f32> {
+        let mut out = Vec::new();
+        st.synthesize_into(plan, coefs, w, &mut out);
+        out
+    }
 
     /// 规范意义上的 IMDCT（朴素 O(n²) 实现，直接从公式写）：
     ///
@@ -301,20 +330,20 @@ mod tests {
 
         // 短→长：256/4 + 2048/4 = 576
         let mut st = ChannelSynth::new();
-        assert!(st.synthesize(&mut plan_s, &vec![0f32; 128], &short).is_empty());
-        let out = st.synthesize(&mut plan_l, &vec![0f32; 1024], &long_hybrid);
+        assert!(synthesize(&mut st, &mut plan_s, &vec![0f32; 128], &short).is_empty());
+        let out = synthesize(&mut st, &mut plan_l, &vec![0f32; 1024], &long_hybrid);
         assert_eq!(out.len(), 576);
 
         // 长→短：也是 576
         let mut st = ChannelSynth::new();
-        assert!(st.synthesize(&mut plan_l, &vec![0f32; 1024], &long_hybrid).is_empty());
-        let out = st.synthesize(&mut plan_s, &vec![0f32; 128], &short);
+        assert!(synthesize(&mut st, &mut plan_l, &vec![0f32; 1024], &long_hybrid).is_empty());
+        let out = synthesize(&mut st, &mut plan_s, &vec![0f32; 128], &short);
         assert_eq!(out.len(), 576);
 
         // 等长：2048/4 + 2048/4 = 1024
         let mut st = ChannelSynth::new();
-        st.synthesize(&mut plan_l, &vec![0f32; 1024], &long_plain);
-        let out = st.synthesize(&mut plan_l, &vec![0f32; 1024], &long_plain);
+        synthesize(&mut st, &mut plan_l, &vec![0f32; 1024], &long_plain);
+        let out = synthesize(&mut st, &mut plan_l, &vec![0f32; 1024], &long_plain);
         assert_eq!(out.len(), 1024);
     }
 
@@ -389,7 +418,7 @@ mod tests {
             }
             let coefs = naive_mdct(&seg);
             let mut plan = ImdctPlan::new(n / 2, 2.0 / (n / 2) as f64);
-            let out = st.synthesize(&mut plan, &coefs, &w);
+            let out = synthesize(&mut st, &mut plan, &coefs, &w);
 
             if k == 0 {
                 assert!(out.is_empty(), "第一块只 priming");

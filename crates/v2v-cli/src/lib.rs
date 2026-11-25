@@ -1575,11 +1575,13 @@ impl AudioDecoder {
             // 单位差在听感上就是「一片死寂」或「满幅噪声」，而且不会报任何错 ——
             // 所以这里走 `planar_to_s16`（它自己负责定标、夹紧与四舍五入）。
             Self::Vorbis(d) => {
-                let planes = d.decode(data).map_err(|e| e.to_string())?;
-                if planes.is_empty() {
+                // `decode_planes` 返回解码器**内部**的缓冲（零分配），`None` 表示
+                // 这个包没有输出 —— 第一个包只 priming。别用 `decode`：那是它的
+                // 拷贝版，会把每包 4 KiB × 声道数再复制一遍。
+                let Some(planes) = d.decode_planes(data).map_err(|e| e.to_string())? else {
                     return Ok(Vec::new()); // 第一个包只 priming
-                }
-                let s16 = v2v_vorbis::planar_to_s16(&planes);
+                };
+                let s16 = v2v_vorbis::planar_to_s16(planes);
                 let mut out = Vec::with_capacity(s16.len() * 2);
                 for v in s16 {
                     out.extend_from_slice(&v.to_le_bytes());

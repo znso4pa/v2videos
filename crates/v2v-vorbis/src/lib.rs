@@ -98,13 +98,30 @@ pub struct Decoder {
     plans: [Option<ImdctPlan>; 2],
     synths: Vec<ChannelSynth>,
     /// 每个声道的谱（长度 = 块大小 / 2）。
+    ///
+    /// residue **直接写在这里**（不再先解进一个临时 `Vec<Vec<f32>>` 再搬过来）：
+    /// 原来那条路每包要分配 `ch` 个 4 KiB 的 Vec，搬到 `spectra` 时要么
+    /// `mem::take`（那就得再分配一个）、要么 `copy_from_slice`（那就是
+    /// 每包 8 KiB 的 memcpy）。两条都不如「直接写进目标」。
     spectra: Vec<Vec<f32>>,
-    /// 每个声道的 floor 解码结果（`None` = 本帧未使用）。
-    floor_pkts: Vec<Option<Floor1Packet>>,
+    /// 逐声道的最终输出（**每包复用**）。`decode_planes` 直接返回它。
+    out_planes: Vec<Vec<f32>>,
+    /// `residue` 阶段「哪些声道属于这个 submap」（复用）。
+    chans_buf: Vec<usize>,
+    /// `residue` 阶段的 do_not_decode 标记（复用）。
+    dnd_buf: Vec<bool>,
+    /// 每个声道的 floor 解码结果（**逐包复用**，见 `Floor1Packet` 的注释）。
+    floor_pkts: Vec<Floor1Packet>,
+    /// 本包每个声道的 floor 是否「被使用」（`false` = 本帧未使用，全零）。
+    floor_used: Vec<bool>,
     /// 每包的 floor 结果「未使用」标记（复用，不每包分配）。
     no_residue: Vec<bool>,
     /// residue 的暂存（分类号 / 交织 / 分区转置）。
     residue_scratch: residue::Scratch,
+    /// floor 曲线 × residue 的落点（长度 = 块大小 / 2）。**每包复用**：
+    /// 原来每包 `vec![0f32; half]` 一次分配 + 一次 4 KiB 清零，而 `curve()` 本来
+    /// 就会写满它 —— 那两笔开销是白付的。
+    curve: Vec<f32>,
     /// 窗缓存。索引见 `window_slot`：长块的 4 种（prev, next）组合 + 短块 1 种。
     ///
     /// 窗只依赖 `(长/短, prev_flag, next_flag)` —— 一共 **5 种**，而原来每包
@@ -135,9 +152,14 @@ impl Decoder {
             plans: [None, None],
             synths: (0..ch).map(|_| ChannelSynth::new()).collect(),
             spectra: vec![Vec::new(); ch],
-            floor_pkts: (0..ch).map(|_| None).collect(),
+            out_planes: vec![Vec::new(); ch],
+            chans_buf: Vec::new(),
+            dnd_buf: Vec::new(),
+            floor_pkts: (0..ch).map(|_| Floor1Packet::new()).collect(),
+            floor_used: vec![false; ch],
             no_residue: vec![false; ch],
             residue_scratch: residue::Scratch::new(),
+            curve: Vec::new(),
             windows: [None, None, None, None, None],
         })
     }
@@ -162,16 +184,20 @@ impl Decoder {
         }
     }
 
-    /// 解一个音频包，返回**逐声道**的 PCM。
+    /// 解一个音频包，把逐声道 PCM 写进内部缓冲，返回它的切片。
     ///
-    /// 长度可能为 0：第一个包只用来 priming（规范 4.3.8「Data is not returned
-    /// from the first frame」），之后每包输出 `上一块/4 + 本块/4` 个样本。
-    /// 包损坏（不是音频包、头部读到包尾）时返回空的 `Vec`，不报错 —— 规范要求
-    /// 「忽略这个包，不尝试解成音频」。
-    pub fn decode(&mut self, packet: &[u8]) -> Result<Vec<Vec<f32>>> {
+    /// 返回 `None` = 本包没有输出：第一个包只用来 priming（规范 4.3.8
+    /// 「Data is not returned from the first frame」），或者这根本不是音频包
+    /// （规范要求「忽略这个包，不尝试解成音频」）。之后每包输出
+    /// `上一块/4 + 本块/4` 个样本。
+    ///
+    /// **返回内部缓冲的切片**（而不是 `Vec<Vec<f32>>`）是为了让整条链零分配：
+    /// 真样本上是 5 万次「每声道一个 4 KiB `Vec`」的分配 + 释放。
+    /// 下次调用本方法会覆盖它，所以拿到的切片**不能跨包持有**。
+    pub fn decode_planes(&mut self, packet: &[u8]) -> Result<Option<&[Vec<f32>]>> {
         let mut bit = BitReader::new(packet);
         let Some(head) = read_packet_head(&mut bit, &self.setup)? else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
 
         let ch = self.channels();
@@ -194,48 +220,79 @@ impl Decoder {
         let mapping = &self.setup.mappings[self.setup.modes[head.mode].mapping as usize];
 
         // 1) floor：按声道顺序解。
-        let mut no_residue = vec![false; ch];
+        // 复用 `self.no_residue`（原来这里 `vec![false; ch]` 每包分配一次，
+        // 而结构体上**本来就有**这个字段 —— 一直没被用上）。
+        if self.no_residue.len() != ch {
+            self.no_residue.resize(ch, false);
+        }
         for i in 0..ch {
             let submap = mapping.mux[i] as usize;
             let Floor::Type1(f) = &self.setup.floors[mapping.submap_floor[submap] as usize];
-            let pkt = f.decode(&mut bit, &self.setup.codebooks)?;
-            no_residue[i] = pkt.is_none();
-            self.floor_pkts[i] = pkt;
+            let used =
+                f.decode_into(&mut bit, &self.setup.codebooks, &mut self.floor_pkts[i])?;
+            self.floor_used[i] = used;
+            self.no_residue[i] = !used;
         }
 
         // 2) 未使用的声道经耦合会变成「有内容」——两个都得解。
         for i in 0..mapping.magnitude.len() {
             let m = mapping.magnitude[i] as usize;
             let a = mapping.angle[i] as usize;
-            if !no_residue[m] || !no_residue[a] {
-                no_residue[m] = false;
-                no_residue[a] = false;
+            if !self.no_residue[m] || !self.no_residue[a] {
+                self.no_residue[m] = false;
+                self.no_residue[a] = false;
             }
         }
 
         // 3) residue：按 submap 顺序。
         for s in 0..mapping.submaps {
-            let chans: Vec<usize> = (0..ch).filter(|&j| mapping.mux[j] as usize == s).collect();
+            {
+                let chans = &mut self.chans_buf;
+                chans.clear();
+                chans.extend((0..ch).filter(|&j| mapping.mux[j] as usize == s));
+            }
+            let chans: &[usize] = &self.chans_buf;
             if chans.is_empty() {
                 continue;
             }
             let residue_index = mapping.submap_residue[s] as usize;
             let residue = &self.setup.residues[residue_index];
-            let mut out: Vec<Vec<f32>> = chans.iter().map(|_| vec![0f32; half]).collect();
-            let dnd: Vec<bool> = chans.iter().map(|&j| self.no_residue[j]).collect();
+
+            // 复用缓冲：长度对齐到 `half`，内容清零（`decode_views` 是 `+=` 上去的）。
+            // **直接清 `spectra` 本身** —— residue 就写在这里，不需要中间缓冲。
+            for &j in chans {
+                let dst = &mut self.spectra[j];
+                if dst.len() != half {
+                    dst.resize(half, 0.0);
+                } else {
+                    dst.fill(0.0);
+                }
+            }
             {
-                let mut views: Vec<&mut [f32]> =
-                    out.iter_mut().map(|v| v.as_mut_slice()).collect();
+                let dnd = &mut self.dnd_buf;
+                dnd.clear();
+                for &j in chans {
+                    dnd.push(self.no_residue[j]);
+                }
+            }
+            {
+                let dnd: &[bool] = &self.dnd_buf;
+                // `iter_mut` 保证每个元素只借一次，所以能同时拿到 `chans` 里
+                // 那几个声道的可变切片 —— 它们互不重叠。
+                let mut views: Vec<&mut [f32]> = self
+                    .spectra
+                    .iter_mut()
+                    .enumerate()
+                    .filter(|(j, _)| chans.contains(j))
+                    .map(|(_, v)| v.as_mut_slice())
+                    .collect();
                 residue.decode_views(
                     &mut bit,
                     &self.setup.codebooks,
                     &mut views,
-                    &dnd,
+                    dnd,
                     &mut self.residue_scratch,
                 )?;
-            }
-            for (k, &j) in chans.iter().enumerate() {
-                self.spectra[j] = std::mem::take(&mut out[k]);
             }
         }
 
@@ -271,22 +328,43 @@ impl Decoder {
 
         // 5) floor 曲线 × residue → 谱 → IMDCT → 叠加。
         let bs0 = self.info.blocksize_0;
-        let mut curve = vec![0f32; half];
-        let mut out: Vec<Vec<f32>> = Vec::with_capacity(ch);
+        if self.curve.len() != half {
+            self.curve.resize(half, 0.0);
+        }
+        if self.out_planes.len() != ch {
+            self.out_planes.resize_with(ch, Vec::new);
+        }
+        let mut any = false;
         for i in 0..ch {
-            curve.fill(0.0);
-            if let Some(pkt) = &self.floor_pkts[i] {
+            let curve = &mut self.curve;
+            if self.floor_used[i] {
                 let submap = mapping.mux[i] as usize;
                 let Floor::Type1(f) = &self.setup.floors[mapping.submap_floor[submap] as usize];
-                f.curve(pkt, &mut curve);
-            }
-            for (c, s) in curve.iter_mut().zip(&self.spectra[i]) {
-                *c *= s;
+                // 曲线 × residue **一趟写出来**（`curve_mul`），不用先写一遍曲线、
+                // 再整条读回来乘一遍 —— 那多出 4 KiB 读 + 4 KiB 写，每包每声道。
+                // `curve()` 写满 `curve` 的前提由 `curve_writes_every_sample` 钉住，
+                // 融合版的逐位等价由 `curve_mul_matches_curve_then_multiply` 钉住。
+                f.curve_mul(&self.floor_pkts[i], &self.spectra[i], curve);
+            } else {
+                curve.fill(0.0);
             }
             let plan = plan_for(&mut self.plans, half, bs0);
-            out.push(self.synths[i].synthesize(plan, &curve, window));
+            self.synths[i].synthesize_into(plan, curve, window, &mut self.out_planes[i]);
+            any |= !self.out_planes[i].is_empty();
         }
-        Ok(out)
+        Ok(if any { Some(&self.out_planes) } else { None })
+    }
+
+    /// 解一个音频包，返回**逐声道**的 PCM（拥有所有权）。
+    ///
+    /// 这是 `decode_planes` 的拷贝版，只为兼容与测试保留 ——
+    /// **生产路径走 `decode_planes`**，否则每包都要把
+    /// 「4 KiB × 声道数」再复制一遍，等于把刚省下的分配又付回去。
+    pub fn decode(&mut self, packet: &[u8]) -> Result<Vec<Vec<f32>>> {
+        match self.decode_planes(packet)? {
+            Some(planes) => Ok(planes.iter().map(|p| p.to_vec()).collect()),
+            None => Ok(Vec::new()),
+        }
     }
 }
 

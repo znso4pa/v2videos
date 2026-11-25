@@ -124,3 +124,29 @@ fn put_imdct_sample(out: &mut [f32], n: usize, j: usize, value: f32) {
         out[j - n / 2] = value;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `apply` 必须写满 `out` 的**每一个**样本 —— 这是 `ChannelSynth` 省掉
+    /// 每块 8 KiB memset 的前提（`synthesize` 里只在长度变了才 `resize`）。
+    ///
+    /// 判据用 NaN 预填：漏写的位置会留下 NaN，然后「NaN 乘窗」还是 NaN、
+    /// 叠进输出还是 NaN —— 最后是一声爆音，而且**不会报任何错**。
+    #[test]
+    fn imdct_apply_writes_every_sample() {
+        for n in [2usize, 8, 64, 128, 1024] {
+            let coefs: Vec<f32> = (0..n).map(|i| (i as f32 * 0.37).sin()).collect();
+            let mut plan = ImdctPlan::new(n, 1.0);
+            let mut out = vec![f32::NAN; 2 * n];
+            plan.apply(&coefs, &mut out);
+            let leaked = out.iter().position(|v| v.is_nan());
+            assert!(
+                leaked.is_none(),
+                "n={n}：apply 没写满 out，下标 {} 还是 NaN",
+                leaked.unwrap()
+            );
+        }
+    }
+}
