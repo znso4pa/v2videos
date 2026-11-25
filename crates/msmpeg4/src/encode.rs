@@ -438,20 +438,31 @@ impl Encoder {
                     if n < 4 {
                         let ox = mbx * 16 + (n & 1) * 8;
                         let oy = mby * 16 + (n >> 1) * 8;
+                        // 按行切好切片再迭代：每行只查一次边界，内层是纯乘加，
+                        // 编译器能向量化。逐下标写法每轮要做两次边界检查。
                         for r in 0..8usize {
-                            for c in 0..8usize {
-                                let s = y[(oy + r) * pw + ox + c] as i32;
-                                let d = cur.y[(oy + r) * pw + ox + c] as i32;
-                                res[r * 8 + c] = s - d;
+                            let base = (oy + r) * pw + ox;
+                            let src = &y[base..base + 8];
+                            let prd = &cur.y[base..base + 8];
+                            for (o, (&s, &d)) in res[r * 8..r * 8 + 8]
+                                .iter_mut()
+                                .zip(src.iter().zip(prd.iter()))
+                            {
+                                *o = s as i32 - d as i32;
                             }
                         }
                     } else {
                         let cw = pw / 2;
                         let (plane, prd) = if n == 4 { (&u, &cur.u) } else { (&v, &cur.v) };
                         for r in 0..8usize {
-                            for c in 0..8usize {
-                                let s = plane[(mby * 8 + r) * cw + mbx * 8 + c] as i32;
-                                res[r * 8 + c] = s - prd[(mby * 8 + r) * cw + mbx * 8 + c] as i32;
+                            let base = (mby * 8 + r) * cw + mbx * 8;
+                            let src = &plane[base..base + 8];
+                            let pre = &prd[base..base + 8];
+                            for (o, (&s, &d)) in res[r * 8..r * 8 + 8]
+                                .iter_mut()
+                                .zip(src.iter().zip(pre.iter()))
+                            {
+                                *o = s as i32 - d as i32;
                             }
                         }
                     }
