@@ -159,6 +159,11 @@ impl Residue {
             return Ok(());
         }
         let classwords = codebooks[self.classbook].dimensions;
+        if classwords == 0 {
+            // 分类码本的维度是 0 的话，`partition_count` 永远不前进 —— 死循环。
+            // 这种流是非法的，明确报出来，别挂在那儿。
+            return Err(Error::Bad("分类码本的维度是 0".into()));
+        }
         let classifications_per_vector = self.classifications as u32;
 
         // 分类号按「声道 × 分区」排成一条，免得每包分配 `Vec<Vec<u8>>`。
@@ -175,13 +180,16 @@ impl Residue {
                         if do_not_decode[j] {
                             continue;
                         }
-                        let mut t = codebooks[self.classbook].decode_scalar(bit)? as u32;
+                        let t = codebooks[self.classbook].decode_scalar(bit)? as u32;
                         // 一个分类码字里塞了 classwords 个分类号，**从高位往低位**取。
-                        let row = j * partitions + partition_count;
-                        for i in (0..classwords).rev() {
-                            classifications[row + i] = (t % classifications_per_vector) as u8;
-                            t /= classifications_per_vector;
-                        }
+                        unpack_classifications(
+                            t,
+                            classwords,
+                            classifications_per_vector,
+                            partitions,
+                            partition_count,
+                            &mut classifications[j * partitions..(j + 1) * partitions],
+                        );
                     }
                 }
                 for _ in 0..classwords {
@@ -225,6 +233,37 @@ pub struct Scratch {
 impl Scratch {
     pub fn new() -> Self {
         Self::default()
+    }
+}
+
+/// 把一个分类码字拆成 `classwords` 个分类号，写进**本声道**那一行 `dst`。
+///
+/// 规范 8.6.2 的伪码是「从 `classwords-1` 往 0 取、每步取一个低位」，
+/// 也就是**最高位落在 `start`**、最低位落在 `start + classwords - 1`。
+///
+/// ⚠️ **`start + classwords` 会越过本声道的分区数** —— `partitions` 不一定是
+/// `classwords` 的整数倍。越过的位置按规范**丢掉**，但低位**仍然要除**：
+/// 少除一次，剩下的几个位置就整体错位了。
+///
+/// 这条边界不判就是写穿行尾：最后一个声道直接 panic（实测 libvorbis 编的 `.ogg`：
+/// `index out of bounds: the len is 15 but the index is 15`），前面的声道则会踩进
+/// 下一个声道的分类号 —— 后者被后写的覆盖掉，所以只有最后一个声道会喊疼。
+#[inline]
+fn unpack_classifications(
+    mut word: u32,
+    classwords: usize,
+    classes: u32,
+    partitions: usize,
+    start: usize,
+    dst: &mut [u8],
+) {
+    debug_assert_eq!(dst.len(), partitions);
+    for i in (0..classwords).rev() {
+        let cls = (word % classes) as u8;
+        word /= classes;
+        if start + i < partitions {
+            dst[start + i] = cls;
+        }
     }
 }
 
@@ -275,4 +314,41 @@ fn decode_partition(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unpack_classifications;
+
+    /// 位序：最高位落在 `start`。
+    ///
+    /// `word = 5`、`classes = 3` → 三进制 `012`，所以三个位置依次是 0 / 1 / 2。
+    /// 写反了（从 `start` 开始放低位）就是 `2 / 1 / 0` —— 分类号错位会让
+    /// 后面的分区挑错码本，而**不会**报任何错。
+    #[test]
+    fn classification_digits_are_most_significant_first() {
+        let mut dst = [0xffu8; 3];
+        unpack_classifications(5, 3, 3, 3, 0, &mut dst);
+        assert_eq!(dst, [0, 1, 2]);
+    }
+
+    /// 末尾那一组字只有一部分落得下 —— 落不下的**丢掉**，前面的不能动。
+    ///
+    /// 这就是那个 panic 的最小复现：`partitions = 4`、`classwords = 3`、
+    /// `start = 3`，老代码会去写 `dst[4]` 和 `dst[5]`。
+    #[test]
+    fn classification_word_stops_at_the_last_partition() {
+        let mut dst = [0xeeu8; 4];
+        // word = 5 → 高位到低位 0 / 1 / 2，只有 i=0（start+0=3）落得下。
+        unpack_classifications(5, 3, 3, 4, 3, &mut dst);
+        assert_eq!(dst, [0xee, 0xee, 0xee, 0]);
+    }
+
+    /// `start` 正好等于 `partitions`（一个都放不下）时也不能越界。
+    #[test]
+    fn classification_word_can_be_entirely_out_of_range() {
+        let mut dst = [0x11u8; 2];
+        unpack_classifications(12345, 4, 3, 2, 2, &mut dst);
+        assert_eq!(dst, [0x11, 0x11]);
+    }
 }
