@@ -43,10 +43,12 @@
 
 mod crc;
 mod error;
+mod mux;
 mod page;
 
 pub use crc::{crc32, crc32_page};
 pub use error::{Error, Result};
+pub use mux::{OggMuxer, DEFAULT_PAGE_PACKETS};
 pub use page::{
     Page, PageFlags, PageReader, CAPTURE, GRANULE_NONE, HEADER_SIZE, MAX_BODY, READ_BUFFER_SIZE,
 };

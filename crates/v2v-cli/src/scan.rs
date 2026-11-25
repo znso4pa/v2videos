@@ -241,10 +241,14 @@ fn output_targets(af: Option<&crate::AudioFormat>) -> (Vec<&'static str>, Option
             Some("音频是 MP3：`.wmv` 那条路的音频只直通 WMA，要转它得加 `--no-audio`".into()),
         ),
         // Vorbis（Ogg）：`.ogg` 里通常**只有音频**，走 `.mp4` 的**纯音频**分支
-        // （`moov` 里只有一个 `trak`），或者抽轨成 WAV。`.wmv` 没有纯音频的路。
+        // （`moov` 里只有一个 `trak`）、抽轨成 WAV，或者 `--ogg` 重封装。
+        // `.wmv` 没有纯音频的路。
         Some(AudioKind::Vorbis) => (
-            vec!["mp4", "wav"],
-            Some("音频是 Vorbis（Ogg）：`.wmv` 那条路要视频轨，只能 `--mp4` 或 `--wav`".into()),
+            vec!["mp4", "wav", "ogg"],
+            Some(
+                "音频是 Vorbis（Ogg）：`.wmv` 那条路要视频轨，只能 `--mp4` / `--wav` / `--ogg`"
+                    .into(),
+            ),
         ),
         None => (
             vec!["wmv", "mp4"],
@@ -542,7 +546,7 @@ mod tests {
             ..Default::default()
         };
         let (targets, note) = output_targets(Some(&af));
-        assert_eq!(targets, vec!["mp4", "wav"]);
+        assert_eq!(targets, vec!["mp4", "wav", "ogg"]);
         assert!(note.unwrap().contains("--mp4"));
     }
 }

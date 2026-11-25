@@ -53,6 +53,8 @@ v2v —— 批量转码（纯 Rust：解封装 → 解码 → 编码 → 封装�
                         输入**没有视频轨**时（`.ogg` / `.m4a`）走纯音频 MP4：
                         `moov` 里只有一条 `soun` 轨，没有视频编码器
       --wav             只抽音频成 .wav（PCM16）。不看视频轨 —— 纯音频输入最省的一条路
+      --ogg             重封装成 .ogg（只搬页、重算 CRC，码流逐字节不变）。
+                        输入必须是 Ogg —— 本仓没有 Vorbis 编码器
       --pcm             .mp4 的音频用未压缩 PCM（sowt）而不是 AAC
       --aac-bitrate N   .mp4 走 AAC 时的目标码率（默认 128000 bit/s）
       --no-ms           关掉 AAC 的 M/S 立体声（默认开；只为对比测量）
@@ -496,6 +498,7 @@ fn run_convert(it: &mut std::slice::Iter<'_, String>) -> Result<bool, String> {
             }
             "--mp4" => opts.format = OutputFormat::Mp4,
             "--wav" => opts.format = OutputFormat::Wav,
+            "--ogg" => opts.format = OutputFormat::Ogg,
             "--pcm" => opts.audio = Mp4Audio::Pcm,
             "--aac-bitrate" => {
                 opts.aac_bitrate = it
@@ -589,6 +592,7 @@ fn run_convert(it: &mut std::slice::Iter<'_, String>) -> Result<bool, String> {
         OutputFormat::Mp4 => "未实现（.mp4 这条路没接 PSNR 校验）",
         // 抽轨没有视频，也就没有 PSNR 可算。
         OutputFormat::Wav => "不适用（WAV 只有音频）",
+        OutputFormat::Ogg => "不适用（重封装，不改码流）",
     };
     let vbr = match opts.video_bitrate {
         Some(b) => format!("，视频目标 {} kbps", b / 1000),
@@ -611,6 +615,7 @@ fn run_convert(it: &mut std::slice::Iter<'_, String>) -> Result<bool, String> {
                 }
             },
             OutputFormat::Wav => ".wav / PCM16（只抽音频，不转视频）".to_string(),
+            OutputFormat::Ogg => ".ogg / 重封装（只搬页，码流逐字节不变）".to_string(),
         },
         opts.qscale,
         if opts.keyframe_interval == 0 {

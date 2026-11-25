@@ -434,6 +434,14 @@ pub enum OutputFormat {
     /// 都要求有视频轨（要写 VOL / 定帧率），于是 Vorbis 解码器即使写对了也
     /// 用不出来。WAV 不需要任何编码器，是「解码器能出声」最短的那条路。
     Wav,
+    /// **Ogg 重封装**（`.ogg` → `.ogg`）：只搬页、不改码流。
+    ///
+    /// 为什么只有「重封装」而不是「编码成 Vorbis」：本仓**没有 Vorbis 编码器**。
+    /// 所以这条路的价值在「规范化」—— 重新算 CRC、按规范重写页头与段表，
+    /// 把 CRC 坏掉 / 分页不规范的 `.ogg` 修成合规文件。码流**逐字节不变**。
+    ///
+    /// 输入必须是 Ogg（别的容器进来会明确报「没有 Vorbis 编码器」）。
+    Ogg,
 }
 
 impl OutputFormat {
@@ -442,12 +450,13 @@ impl OutputFormat {
             OutputFormat::Asf => "wmv",
             OutputFormat::Mp4 => "mp4",
             OutputFormat::Wav => "wav",
+            OutputFormat::Ogg => "ogg",
         }
     }
 
     /// 这条路是不是**只要音频**（不看视频轨）。
     pub fn audio_only(self) -> bool {
-        matches!(self, OutputFormat::Wav)
+        matches!(self, OutputFormat::Wav | OutputFormat::Ogg)
     }
 }
 
@@ -991,7 +1000,71 @@ pub fn convert_file(
         OutputFormat::Asf => convert_to_asf(input, output, opts),
         OutputFormat::Mp4 => convert_to_mp4(input, output, opts),
         OutputFormat::Wav => convert_to_wav(input, output, opts),
+        OutputFormat::Ogg => convert_to_ogg(input, output),
     }
+}
+
+/// Ogg **重封装**：页进页出，码流一个字节都不动。
+///
+/// 判据是「产物与原文件**逐字节相同**」（`crates/v2v-ogg/tests/remux_real.rs`）——
+/// 所以这条路的正确性不靠「听起来没问题」，靠字节。
+///
+/// ⚠️ 只做重封装，**不做剪切**：无损剪切要改 `granule` 的**基准**（每页的
+/// `granule_position` 是绝对采样位置，剪掉开头之后要整体减去偏移），
+/// 而 Vorbis 每个包的采样数不解码是推不出来的。那是下一步的事。
+fn convert_to_ogg(input: &Path, output: &Path) -> Result<ConvertReport, Error> {
+    let bytes_in = std::fs::metadata(input)?.len();
+    let file = File::open(input)?;
+    let mut reader = std::io::BufReader::new(file);
+    // 先看魔数：不是 Ogg 的话下面的 `PageReader` 会报「不是合法 Ogg」，
+    // 但那样说不清「为什么不能把 `.wmv` 转成 `.ogg`」。
+    {
+        use std::io::Read;
+        let mut head = [0u8; 4];
+        let n = reader.read(&mut head)?;
+        if n < 4 || &head != v2v_ogg::CAPTURE {
+            return Err(Error::Unsupported(
+                "`.ogg` 输出只做**重封装**，而本仓没有 Vorbis 编码器 —— \
+                 输入必须是 Ogg（别的容器转不成 Vorbis）"
+                    .into(),
+            ));
+        }
+        use std::io::{Seek, SeekFrom};
+        reader.seek(SeekFrom::Start(0))?;
+    }
+
+    let mut pages = v2v_ogg::PageReader::new(reader);
+    let mut mux: Option<v2v_ogg::OggMuxer> = None;
+    let mut payloads = 0usize;
+    let mut page_count = 0usize;
+    while let Some(p) = pages.next_page()? {
+        let m = mux.get_or_insert_with(|| v2v_ogg::OggMuxer::new(p.serial));
+        payloads += p.packet_count();
+        m.write_page(&p.segments, &p.body, p.granule, p.flags.continued())?;
+        page_count += 1;
+    }
+    let bytes = match mux {
+        Some(m) => m.finish(),
+        None => {
+            return Err(Error::Unsupported(
+                "文件里一页都没有（不是合法 Ogg）".into(),
+            ))
+        }
+    };
+    if page_count == 0 {
+        return Err(Error::Unsupported("文件里一页都没有".into()));
+    }
+    std::fs::write(output, &bytes)?;
+    Ok(ConvertReport {
+        frames: 0,
+        key_frames: 0,
+        audio_payloads: payloads,
+        skipped_audio: 0,
+        bytes_in,
+        bytes_out: bytes.len() as u64,
+        psnr_db: None,
+        video_kbps: None,
+    })
 }
 
 /// 并行那条路**最多攒多少字节的帧**在内存里（`--threads > 1` 时）。
