@@ -42,20 +42,29 @@ fn sample_path() -> Option<std::path::PathBuf> {
     }
 }
 
-/// 一次完整解码：返回 (摘要, 总样本数, 包数)。
+/// 一次完整解码：返回 (摘要, 总样本数, 包数, 声道数, 采样率)。
 ///
 /// 只量**解码**：拆包用的是 `Cursor`（零 syscall），所以这里的时间就是
 /// 「拿到包之后要花多少」。
-fn decode_once(bytes: &[u8]) -> (u64, usize, usize) {
+///
+/// ⚠️ 采样率/声道数**从识别头里读**，不许硬编码：这里原来写死 48 000，
+/// 而手边那份样本是 44 100 —— 于是报出来的「551.25 s / ×898」是错的，
+/// 真实是 600 s / ×977。硬编码的具体数值迟早炸，而且炸得像被测物的问题。
+fn decode_once(bytes: &[u8]) -> (u64, usize, usize, usize, u32) {
     let mut r = v2v_ogg::PacketReader::new(std::io::Cursor::new(bytes));
     let mut id: Option<Vec<u8>> = None;
     let mut dec: Option<Decoder> = None;
     let mut digest = Digest::new();
     let (mut samples, mut packets) = (0usize, 0usize);
+    let (mut channels, mut rate) = (0usize, 0u32);
 
     while let Some(p) = r.next_packet().expect("拆包") {
         // 三个头包按 `\xNNvorbis` 的包类型位区分；音频包的包类型位是 0。
         if p.data.starts_with(b"\x01vorbis") {
+            // 识别头：`\x01vorbis` + 版本(4) + 声道(1) + 采样率(4, LE) + ...
+            assert!(p.data.len() >= 16, "识别头只有 {} 字节", p.data.len());
+            channels = p.data[11] as usize;
+            rate = u32::from_le_bytes([p.data[12], p.data[13], p.data[14], p.data[15]]);
             id = Some(p.data);
             continue;
         }
@@ -76,7 +85,8 @@ fn decode_once(bytes: &[u8]) -> (u64, usize, usize) {
             packets += 1;
         }
     }
-    (digest.0, samples, packets)
+    assert!(channels > 0 && rate > 0, "识别头没解析出声道/采样率");
+    (digest.0, samples, packets, channels, rate)
 }
 
 #[test]
@@ -93,22 +103,34 @@ fn decode_throughput() {
         .unwrap();
 
     // 先跑一次拿摘要（也是预热）。
-    let (digest, samples, packets) = decode_once(&bytes);
+    let (digest, samples, packets, channels, rate) = decode_once(&bytes);
 
     const ROUNDS: usize = 7;
     let mut best = f64::INFINITY;
     for _ in 0..ROUNDS {
         let t = Instant::now();
-        let (d, _, _) = decode_once(&bytes);
+        let (d, _, _, _, _) = decode_once(&bytes);
         let ms = t.elapsed().as_secs_f64() * 1e3;
         assert_eq!(d, digest, "同一份输入两次解出不同结果 —— 解码器不确定");
         best = best.min(ms);
     }
 
-    let per_channel = samples / 2; // 样本数按声道累加
-    let seconds = per_channel as f64 / 48_000.0;
+    let per_channel = samples / channels;
+    let seconds = per_channel as f64 / f64::from(rate);
+    // 「总样本数对不对得上」是比「快不快」更靠前的一关：少解一半也能很好看。
+    let declared = v2v_ogg::duration_ms(&mut std::io::Cursor::new(&bytes))
+        .ok()
+        .flatten()
+        .map(|ms| ms as f64 / 1e3);
+    if let Some(declared) = declared {
+        let drift = (seconds - declared).abs();
+        assert!(
+            drift < 0.5,
+            "解出 {seconds:.2} s，而容器声明 {declared:.2} s —— 差 {drift:.2} s，不是同一段音频"
+        );
+    }
     eprintln!(
-        "decode: {best:.1} ms / {packets} 包 / {per_channel} 样本/声道 / {seconds:.2} s 音频"
+        "decode: {best:.1} ms / {packets} 包 / {per_channel} 样本/声道 / {seconds:.2} s 音频（{rate} Hz × {channels}）"
     );
     eprintln!(
         "        实时倍速 ×{:.1}，每秒音频 {:.1} ms，每包 {:.1} µs",
@@ -119,10 +141,13 @@ fn decode_throughput() {
     eprintln!("        摘要 {digest:016x}");
 }
 
-/// 单独量 IMDCT：真样本一共 26384 次（13192 包 × 2 声道，几乎全是长块）。
+/// 单独量 IMDCT。
 ///
 /// 这条是为了**归因**：总耗时里到底有多少是变换本身，多少是熵解码。
 /// 判据不是「快不快」，是「它占多少」—— 占得少就别再往那儿使劲。
+///
+/// `REPS` 是 26384 —— 手边那份样本（25841 包 × 2 声道）的量级。**它只是个量级**，
+/// 不是精确包数：换样本时不用改，因为这条要的是「每次多少 µs」，不是总数。
 #[test]
 #[ignore = "归因用：cargo test -p v2v-vorbis --release --test decode_bench imdct_cost -- --ignored --nocapture"]
 fn imdct_cost() {
