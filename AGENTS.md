@@ -8,7 +8,7 @@
 
 ## 现状
 
-**链路已经打通到 `.wmv → .mp4`**：**24 个 crate、约 9.4 万行 Rust（含测试）**，**零第三方运行时依赖**
+**链路已经打通到 `.wmv → .mp4`**：**24 个 crate、约 9.6 万行 Rust（含测试）**，**零第三方运行时依赖**
 （`Cargo.lock` 里只有本仓的包，外加 `cc` 那条**构建**链 —— 只服务 `v2v-android` 的 C shim）。
 
 ```text
@@ -35,6 +35,10 @@ vc1        VC-1（WMV3）解码（I / P，含 ABT / ¼ 像素 MC / 环路滤波�
 mpeg12     MPEG-1/2 解码（I / P / B、隔行、4:2:2 / 4:4:4）—— **本 crate 自身零 unsafe，
            且依赖闭包里也没有 unsafe**（kernel 的 NEON 是 opt-in feature，这里不开），当参考实现
 v2v-mpeg12-simd  同一内核的 unsafe / FFI 变体，可单独编 .so / .a
+v2v-mpeg12-c     原创 **C / NEON 运动补偿内核**（MIT，独立 crate）：默认不编，
+           `neon` feature 才拉 `cc` 编 C 并注册到 `v2v-mpeg12` 的钩子；
+           与上面那个 simd 变体的区别是**它不带任何包装符号**，所以不会被
+           链进 `v2v-capi` 的导出表
 mp4v       MPEG-4 Part 2 编码（I / P + 码率控制）**+ 解码**（I / P）
 aac        AAC-LC 编码（MDCT / 短窗 / TNS / Huffman / 码率控制）**+ 解码**（结构 / 谱 /
            反量化 / M-S / TNS / IMDCT + 重叠相加，对 ffmpeg ±1 LSB）
