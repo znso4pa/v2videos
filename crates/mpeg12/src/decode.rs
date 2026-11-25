@@ -932,6 +932,14 @@ pub fn idct_cols_scalar(b: &[i32; 64], out: &mut [i32; 64]) {
 /// 快路（整块在内）与原来**逐字节相同**，只多一次比较。
 #[inline(always)]
 fn store_row(row: &[u8; 8], out: &mut [u8], base: usize) {
+    // ⚠️ 这条快路不能省。写成「先算 `n = min(8, 剩余)` 再 `copy_from_slice(&row[..n])`」
+    // 时长度是**运行时**的，`copy_from_slice` 会退化成一次 `memmove` 调用 ——
+    // 实测每帧 20 万次 8 字节 memmove 占自耗时 **23%**（`sample` 排序：
+    // `_platform_memmove` 19% + `memcpy` 4%）。定长 8 字节这里才会被内联成两条 mov。
+    if base + 8 <= out.len() {
+        out[base..base + 8].copy_from_slice(row);
+        return;
+    }
     let n = out.len().saturating_sub(base).min(8);
     if n == 0 {
         return; // 整块都在行外
@@ -1029,20 +1037,58 @@ fn store_pred_block(
         4 | 6 | 8 | 10 => &reference.u,
         _ => &reference.v,
     };
-    let pred = predict_block(
-        ref_plane, plane_width, rw, rh, origin_x, origin_y, mv_x, mv_y, chroma, row_step, 1,
-        chroma_format,
-    );
-    let plane = match block {
+    let dst = match block {
         0..=3 => &mut frame.y,
         4 | 6 | 8 | 10 => &mut frame.u,
         _ => &mut frame.v,
     };
     let base = origin_y * plane_width + origin_x;
+
+    // ⚠️ **整像素 + 无残差：直接从参考行拷到目标行，不经 `[u8; 64]` 临时缓冲。**
+    //
+    // 原来这条路上每个块要「读 64 字节进临时缓冲、再从临时缓冲写 64 字节出去」。
+    // 低码率流里几乎全是这种块（跳过宏块 / 零残差），实测 `predict_block` 20% +
+    // `store_pixels` 9% 的自耗时，拷两次是白烧一半。
+    //
+    // 判据：与 `predict_block` 的 `(fx, fy) == (0, 0)` 分支**逐字节等价** ——
+    // 它做的就是 `reference[sy + j*row_step][sx..sx+8]` 逐行拷。
+    // `row_step` 对隔行 DCT / 场运动是 2（**参考行**隔行取），而目标行步是 `stride`
+    // （隔行 DCT 时同样是 2 倍行宽），两者都要按各自的步长走。
+    // 越界的情形直接放行走通用路径 —— 那条有边缘复制。
+    if residual.is_none() {
+        let (mx, my) = plane_mv(mv_x, mv_y, chroma, chroma_format);
+        if mx & 1 == 0 && my & 1 == 0 {
+            let (sx, sy) = (
+                origin_x as isize + (mx >> 1) as isize,
+                origin_y as isize + (my >> 1) as isize,
+            );
+            let last = 7 * row_step as isize; // 第 8 行相对第 1 行的行偏移
+            if sx >= 0
+                && sy >= 0
+                && sx + 8 <= rw as isize
+                && sy + last < rh as isize
+                && base + 7 * stride + 8 <= dst.len()
+            {
+                let (sx, sy) = (sx as usize, sy as usize);
+                let step = row_step as usize;
+                for j in 0..8 {
+                    let s = (sy + j * step) * plane_width + sx;
+                    let d = base + j * stride;
+                    dst[d..d + 8].copy_from_slice(&ref_plane[s..s + 8]);
+                }
+                return;
+            }
+        }
+    }
+
+    let pred = predict_block(
+        ref_plane, plane_width, rw, rh, origin_x, origin_y, mv_x, mv_y, chroma, row_step, 1,
+        chroma_format,
+    );
     if let Some(residual) = residual {
-        store_pred(&pred, residual, plane, stride, base);
+        store_pred(&pred, residual, dst, stride, base);
     } else {
-        store_pixels(&pred, plane, stride, base);
+        store_pixels(&pred, dst, stride, base);
     }
 }
 
@@ -1508,6 +1554,22 @@ pub fn mc8_backend() -> &'static str {
 /// 亮度：整数部分 `mv >> 1`、小数位 `mv & 1`。
 /// 色度：先把矢量按 `mv / 2`（向零截断）缩到色度采样，再 `>> 1` 取整数、
 /// `& 1` 取小数 —— 这两步不能合成 `mv >> 2`，负矢量会差一格。
+/// 把亮度矢量缩到当前平面的矢量：色度先按 `mv / 2`（**向零截断**）缩到色度采样。
+///
+/// ⚠️ 不能合成 `mv >> 2` —— 负矢量会差一格（`-1 / 2 == 0` 而 `-1 >> 2 == -1`）。
+#[inline]
+fn plane_mv(mv_x: i32, mv_y: i32, chroma: bool, chroma_format: u8) -> (i32, i32) {
+    if !chroma {
+        return (mv_x, mv_y);
+    }
+    let (hs, vs) = match chroma_format {
+        1 => (2, 2),
+        2 => (2, 1),
+        _ => (1, 1),
+    };
+    (mv_x / hs, mv_y / vs)
+}
+
 fn predict_block(
     reference: &[u8],
     stride: usize,
@@ -1523,16 +1585,7 @@ fn predict_block(
     chroma_format: u8,
 ) -> [u8; 64] {
     let _g = prof::on().then(|| prof::Guard::new(prof::MC));
-    let (mx, my) = if chroma {
-        let (hs, vs) = match chroma_format {
-            1 => (2, 2),
-            2 => (2, 1),
-            _ => (1, 1),
-        };
-        (mv_x / hs, mv_y / vs)
-    } else {
-        (mv_x, mv_y)
-    };
+    let (mx, my) = plane_mv(mv_x, mv_y, chroma, chroma_format);
     let ix = mx >> 1;
     let iy = (my >> 1) * mv_y_scale;
     let fx = mx & 1;
