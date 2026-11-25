@@ -9,6 +9,10 @@
 //!
 //! 无 C、无 FFI、零依赖（除共用的 `v2v-container`）。
 //!
+//! 读路径**自带缓冲**（[`READ_BUFFER_SIZE`]，256 KiB）：一页是「页头 + 段表 + 页体」
+//! 三次读，未缓冲时一页就撞三次系统调用。调用方**不需要**再套 `BufReader`
+//! （套了只是多一次拷贝，结果一样）。
+//!
 //! ## 支持范围
 //!
 //! - **页层**：完整。多逻辑流（按 `serial` 分）同时可读、跨页续接的包、CRC 校验
@@ -43,7 +47,9 @@ mod page;
 
 pub use crc::{crc32, crc32_page};
 pub use error::{Error, Result};
-pub use page::{Page, PageFlags, PageReader, CAPTURE, GRANULE_NONE, HEADER_SIZE, MAX_BODY};
+pub use page::{
+    Page, PageFlags, PageReader, CAPTURE, GRANULE_NONE, HEADER_SIZE, MAX_BODY, READ_BUFFER_SIZE,
+};
 pub use v2v_container::{fourcc_string, AudioFormat, Sample, Stream, StreamKind, VideoFormat};
 
 use std::collections::HashMap;

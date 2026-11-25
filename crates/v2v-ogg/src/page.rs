@@ -21,7 +21,7 @@
 //!    把「段」当「包」会让每个大包被切成好几块 —— 而且解出来的音频
 //!    听起来只是「有杂音」，不会报错。
 
-use std::io::Read;
+use std::io::{BufReader, Read};
 
 use crate::crc;
 use crate::error::{Error, Result};
@@ -34,6 +34,18 @@ pub const HEADER_SIZE: usize = 27;
 
 /// 页体的最大字节数（255 个段 × 每段最多 255 字节）。
 pub const MAX_BODY: usize = 255 * 255;
+
+/// 页层读缓冲的字节数。
+///
+/// 一页要分**三次**读：27 字节页头、段表、页体。底层若是未缓冲的 `File`，
+/// 一页就撞三次系统调用 —— 5 MB / 1200 页的样本实测 **3601 次、每次约 0.64 µs**，
+/// 占整条解封装的一半时间；同一份数据放进内存只要 2.5 ms。
+///
+/// 取 256 KiB 而不是 `BufReader` 默认的 8 KiB：**一页最长 65 307 字节**
+/// （27 + 255 + 255×255），8 KiB 装不下一页，页体的那次读会绕过缓冲区
+/// 直接落到底层 —— 缓冲就白加了。256 KiB 装得下四页最长页、几十页常见页。
+/// 只是读取粒度，**不改变任何字节语义**。
+pub const READ_BUFFER_SIZE: usize = 256 * 1024;
 
 /// `granule_position` 里表示「没有包结束」的哨兵值。
 pub const GRANULE_NONE: i64 = -1;
@@ -95,8 +107,11 @@ impl Page {
 /// 按页读 `R`。
 ///
 /// 只做「字节 → 页」，不做拆包、不做时间戳 —— 那两层在 [`crate::PacketReader`]。
+///
+/// **自带读缓冲**（[`READ_BUFFER_SIZE`]），调用方不需要再套 `BufReader`：
+/// 页是「页头 + 段表 + 页体」三次读，未缓冲时一页就撞三次系统调用。
 pub struct PageReader<R> {
-    r: R,
+    r: BufReader<R>,
     verify_crc: bool,
     crc_errors: u64,
     /// 已经读了多少字节，用来在报错时给出偏移。
@@ -107,7 +122,7 @@ pub struct PageReader<R> {
 impl<R: Read> PageReader<R> {
     pub fn new(r: R) -> Self {
         Self {
-            r,
+            r: BufReader::with_capacity(READ_BUFFER_SIZE, r),
             // **默认不校验**：CRC 要对每页的每个字节查一次表，是纯粹的额外成本，
             // 而 ffmpeg 默认也不校验（它只在 `-err_detect crccheck` 时算）。
             // 真正的用途是**测试与排查**，所以做成可开。
@@ -401,5 +416,69 @@ mod tests {
         assert_eq!(&pk[0][..255], &[0xAAu8; 255][..]);
         assert_eq!(&pk[0][255..], b"yz");
         assert!(prefix.is_empty(), "包已经结束，不该再有遗留");
+    }
+
+    /// 数底层 `read` 调用次数的包装。
+    struct Counting<'a> {
+        data: &'a [u8],
+        calls: u64,
+        /// 每次最多返回多少字节（模拟短读；`None` 表示一次给完）。
+        cap: Option<usize>,
+    }
+
+    impl Read for Counting<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.calls += 1;
+            let mut n = buf.len().min(self.data.len());
+            if let Some(c) = self.cap {
+                n = n.min(c);
+            }
+            buf[..n].copy_from_slice(&self.data[..n]);
+            self.data = &self.data[n..];
+            Ok(n)
+        }
+    }
+
+    /// **性能判据**：页层的读次数必须由缓冲区大小决定，不由页数决定。
+    ///
+    /// 一页是三次读（页头 / 段表 / 页体）。不缓冲时 100 页 = 300 次系统调用，
+    /// 这个代价**不会体现在任何产物字节里** —— 只能靠数调用来钉住。
+    /// 改回不缓冲，这条立刻红（300 > 2）。
+    #[test]
+    fn page_reads_are_buffered() {
+        let mut bytes = Vec::new();
+        for i in 0..100u32 {
+            bytes.extend_from_slice(&build_page(0, i as i64, 1, i, &[4], b"abcd"));
+        }
+        let mut c = Counting { data: &bytes, calls: 0, cap: None };
+        let mut r = PageReader::new(&mut c);
+        let mut n = 0;
+        while r.next_page().unwrap().is_some() {
+            n += 1;
+        }
+        assert_eq!(n, 100);
+        drop(r);
+        assert!(c.calls <= 2, "100 页只该读 1~2 次，实际 {}", c.calls);
+    }
+
+    /// 短读（一次只给 7 字节）时也要拼得对 —— `Read` 允许一次只给几字节，
+    /// 重填与 `read_exact` 的循环必须接得住。这是正确性判据，不是性能判据。
+    #[test]
+    fn short_reads_still_parse() {
+        let mut bytes = Vec::new();
+        for i in 0..20u32 {
+            // 页体 300 字节，跨多个段，故意让重填发生在页中间。
+            bytes.extend_from_slice(&build_page(0, i as i64, 9, i, &[200, 100], &[0x5Au8; 300]));
+        }
+        let mut c = Counting { data: &bytes, calls: 0, cap: Some(7) };
+        let mut r = PageReader::new(&mut c);
+        let mut n = 0;
+        while let Some(p) = r.next_page().unwrap() {
+            assert_eq!(p.body, vec![0x5Au8; 300], "第 {n} 页页体");
+            assert_eq!(p.sequence, n as u32);
+            n += 1;
+        }
+        assert_eq!(n, 20);
+        drop(r);
     }
 }

@@ -45,6 +45,10 @@ crates/
   v2v-mp4           MP4 / ISOBMFF **封装**（ftyp / mdat / moov；音频 AAC 或 PCM）
                     **+ 解封装**（`Mp4Demuxer`：非分片、`stco`/`co64`、`ctts` 算进 PTS）
   v2v-mpegps        MPEG-1/2 **program stream** 解封装（`.mpg` / `.dat` / `.vob` 那类 PS 容器）
+  v2v-ogg           Ogg 解封装：页（含跨页续接的包）/ 流识别 / 逐包时间戳。
+                    只往下解 **Vorbis 的容器层**；Opus / Theora / FLAC / Speex / Skeleton
+                    识别出来但明确报 `Unsupported`。包时长由 `PacketTiming` 外部喂，
+                    容器不依赖任何编解码器；页层自带 256 KiB 读缓冲
   mpeg12            MPEG-1/2 **解码**（本 crate 自身零 unsafe，**且依赖闭包里也没有 unsafe**
                     —— kernel 的 NEON 是 opt-in feature，这里不开；当参考实现/oracle）：MPEG-1 的 I/P/B；
                     MPEG-2 的 progressive 帧图、隔行帧图的场 DCT / 场运动、4:2:2 / 4:4:4 色度
@@ -301,7 +305,7 @@ cargo test -p v2v-cli --test determinism
 
 | 链路分段     | 做到了什么                                                                                                       | 怎么算验证过                                                                                          |
 | -------- | ----------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
-| **解封装**  | ASF / WMV（`v2v-asf`）、AVI（`v2v-avi`）、MPEG-1/2 PS（`v2v-mpegps`）、MP4 / ISOBMFF（`v2v-mp4::Mp4Demuxer`，**已进 C ABI**，`V2V_CONTAINER_MP4`）                    | 与 `ffprobe` 逐字段对：轨道、尺寸、包数、关键帧数；MP4 逐包对 `stts`/`stsz`/`stss`/`stco` 与 `ffprobe` 相同 |
+| **解封装**  | ASF / WMV（`v2v-asf`）、AVI（`v2v-avi`）、MPEG-1/2 PS（`v2v-mpegps`）、MP4 / ISOBMFF（`v2v-mp4::Mp4Demuxer`，**已进 C ABI**，`V2V_CONTAINER_MP4`）、Ogg / Vorbis（`v2v-ogg`，**容器层**，未接 CLI / C ABI）                    | 与 `ffprobe` 逐字段对：轨道、尺寸、包数、关键帧数；MP4 逐包对 `stts`/`stsz`/`stss`/`stco` 与 `ffprobe` 相同；Ogg 逐包对 `packet=size` / `pts` 与末页 `granule` |
 | **解码**   | MS-MPEG-4 v3（**MP43**）、**WMV1**（WMV7）与 **WMV2**（WMV8）：I 帧 + P 帧（skip、MV 预测、半像素运动补偿、帧间残差）。三版共用骨架，**分叉在帧头与几处版本常量**上：`pict_type` 位宽、ext header 的位置、变长/定长的第三 escape、`ff_wmv1_scantable` 那套扫描表、DC 预测的平手方向与缩放（`scale != 8` 时走 `FASTDIV`，对负数**向下取整**）。**WMV2 另有一整套**：逐宏块 skip 表（4 种粒度）、按 qscale 挑的 CBP 表、`mspel` 四抽头半像素 + 逐宏块 `hshift`、**ABT**（4×8 / 8×4，含自己的扫描表与第二个半块）、**环路滤波**（逐宏块就地滤，skip 宏块也要滤）、以及 **IntraX8**（`j_type` —— 一个按 8×8 块走的内帧子解码器：12 种空间预测 + 自己的环路滤波 + 自己的熵编码，`extradata` 的能力位置位时**每个 I 帧**都归它） | 与 `ffmpeg` **逐像素**对：MP43 / WMV1 / WMV2 各自的真样本**每一帧最大差 0**（WMV2 **六份样本共 24321 帧**，其中 **126 帧走 IntraX8**；含 `mspel`、ABT、环路滤波、边缘复制那些分支） |
 | **解码**   | **VC-1 / WMV3**（`v2v-vc1`）：**整条链路**——序列头（容器 extradata 的 `STRUCT_C`）→ 帧头（含位平面）→ 宏块层（I / P：DC/AC 预测、系数解码）→ 逆变换（8×8 与 **ABT** 三种 8×4 / 4×8 / 4×4）→ 运动补偿（**四分之一 / 半像素**插值、亮度补偿 IC）→ 环路滤波 → YUV420P。范围限定 **Main profile / 渐进 / I-P**；Advanced profile、B 帧、隔行明确报错 | 两条**外部**判据：① 位游标 —— I 帧宏块层解完落在帧尾（差一位就跑偏几十位），把「语法解对」与「像素重建对不对」分开；② `ffmpeg` 吐 `yuv420p` 裸帧边解边比，**整片 3719 帧逐帧逐像素 0 差**（`crates/vc1/tests/frames.rs`）。帧头那层另对 `ffmpeg -debug pict`：真样本 1920×1080 **3719 帧的 `pict_type` 与两张位平面 `(imode, invert)` 全同** |
 | **编码**   | MP43 **I 帧 + P 帧**：正向 DCT + 量化 + DC / RL 熵编码、运动估计（整像素粗搜 + 半像素细化）、skip 宏块                                    | 编出来的 I+P 序列交给 `ffmpeg` 解，与自己的解码器**逐像素一致**                                                       |
@@ -981,6 +985,7 @@ cargo build --release -p v2v-capi --no-default-features --features mpeg12-c -j 2
 | **ASF**（`.wmv` / `.wma`） | ✅   | ✅   | 只做单视频流 + 单音频流（音频**直通**，不重编码）；不做加密、多视频轨、非标准的纠错标志                                        |
 | **AVI**（RIFF）           | ✅   | ❌   | 只读 —— `.wmv → .avi` 没人要，写它没有用例。不认 OpenDML（`AVIX` 分块 / `indx`），遇到明确报 `Unsupported` 而不是假装支持 |
 | **MPEG-PS**（`.mpg` / `.dat` / `.vob`） | ✅ | ❌ | `v2v-mpegps` 读取 MPEG-1/2 Program Stream，供 MPEG-1/2 视频解码和播放。 |
+| **Ogg**（`.ogg` / `.oga`） | ✅（Vorbis） | ❌ | `v2v-ogg`：页层完整（跨页续接的包、CRC 可开、截断与坏页明确报错）、逐包时间戳对 `ffprobe`。**只认 Vorbis** —— Opus / Theora / FLAC / Speex / Skeleton 识别后报 `Unsupported`；不做链式（chained）Ogg 的时间轴拼接；**还没接 CLI / C ABI** |
 | **MP4** / ISOBMFF        | ✅   | ✅   | 解封装（`Mp4Demuxer`）：非分片、`moov` 在头或尾都行、`stco` 与 `co64` 都认、`ctts` 算进 PTS 并按 **PTS** 出样本。C ABI 通过 `v2v_probe` 和 `v2v_demux_*` 暴露 MP4，按包编号 seek 暂未支持。不做分片 MP4（`moof`）、`edts`/`elst` 编辑列表、加密（`encv`/`enca`）、H.265/AV1 的 sample entry |
 
 ### 视频编码
@@ -1005,7 +1010,7 @@ cargo build --release -p v2v-capi --no-default-features --features mpeg12-c -j 2
 | **WMA v1 / v2**     | ✅       | ❌       | 不写编码器 —— 往 `.wma` 走时音频是**直通**，重编码没有用例                            |
 | **AAC-LC**          | ✅（对 `ffmpeg` ±1 LSB） | ✅       | 解码缺 **PNS**、**IS**、`pulse_data`、`gain_control`、SBR/PS（都明确报 `Unsupported`）；编码缺 **PNS**、**IS**、LTP |
 | **MP3** | ✅ MPEG-1 / 2 / 2.5 Layer III | ❌ | 纯 Rust 或可选 mpg123 FFI，支持 AVI / ASF 音轨。纯 Rust 的 8 kHz mixed block 暂未覆盖。 |
-| **Vorbis** | ❌ | ❌ | Ogg 封装与 Vorbis 编解码待实现。 |
+| **Vorbis** | ❌ | ❌ | Ogg **容器层**已实现（`v2v-ogg`）；Vorbis 解码器与 Ogg 封装未实现。 |
 | **PCM**（`sowt`）     | ✅（直通）  | ✅（直通）  | 未压缩，进出都是原字节                                                    |
 
 ### 已知与 `ffmpeg` 的差异

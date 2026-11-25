@@ -8,7 +8,7 @@
 
 ## 现状
 
-**链路已经打通到 `.wmv → .mp4`**：**20 个 crate、约 8.5 万行 Rust（含测试）**，**零第三方运行时依赖**
+**链路已经打通到 `.wmv → .mp4`**：**23 个 crate、约 9.2 万行 Rust（含测试）**，**零第三方运行时依赖**
 （`Cargo.lock` 里只有本仓的包，外加 `cc` 那条**构建**链 —— 只服务 `v2v-android` 的 C shim）。
 
 ```text
@@ -18,11 +18,16 @@ tables     从 FFmpeg 数据文件生成的码表 —— **本仓唯一的 LGPL 
 v2v-asf    ASF（.wmv / .wma）解封装 **+ 封装**（多载荷打包 + Simple Index）
 v2v-avi    AVI（RIFF）解封装
 v2v-mpegps MPEG-1/2 program stream（`.mpg` / `.dat` / `.vob`）解封装
+v2v-ogg    Ogg 解封装（页 / 跨页包重组 / 流识别 / 时间戳）—— **只有 Vorbis 的容器层**：
+           识别出 Opus / Theora / FLAC / Speex / Skeleton 后明确报 `Unsupported`；
+           包时长由 `PacketTiming` 外部喂，容器不依赖任何编解码器
 v2v-kernel 编解码器**共用的信号处理内核**：位读写 / VLC / RL 表容器 / FDCT / IDCT / FFT /
            帧缓冲（`Frame` / `Planes`）/ 运动补偿 / SAD / 宏块层预测 / NEON
            —— 全仓唯一允许 `unsafe` 的地方，且只有 `simd` 一个模块
 msmpeg4    MP42 / MP43 / WMV1 / WMV2 解码（I / P，WMV2 含 IntraX8）**+ MP43 编码**（I / P，含运动估计）
 wma        WMA v1 / v2 解码（**只有解码器**）
+mp3        MPEG-1 / 2 / 2.5 Layer III 顺序解码（跨载荷分帧 + 比特池）
+v2v-audio-ffi  可选的原生音频适配层，目前只有 libmpg123 解码
 vc1        VC-1（WMV3）解码（I / P，含 ABT / ¼ 像素 MC / 环路滤波；**只有解码器**）
 mpeg12     MPEG-1/2 解码（I / P / B、隔行、4:2:2 / 4:4:4）—— **本 crate 自身零 unsafe，
            且依赖闭包里也没有 unsafe**（kernel 的 NEON 是 opt-in feature，这里不开），当参考实现

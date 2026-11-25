@@ -28,8 +28,8 @@ use v2v_ogg::{duration_ms, OggDemuxer, PacketTiming, StreamKind, VORBIS_FORMAT_T
 
 /// 测试用的「包时长」：这个样本全是常量长块（2048），推进量恒为 1024。
 ///
-/// 真实的 Vorbis 实现要从 setup 头里读模式表（见 `v2v-vorbis`），
-/// 这里只为了把**容器**这一层单独验干净。
+/// 真实的 Vorbis 实现要从 setup 头里读模式表（本仓还没有 Vorbis 解码器，
+/// 见 README 的能力矩阵），这里只为了把**容器**这一层单独验干净。
 struct ConstantLongBlock;
 
 impl PacketTiming for ConstantLongBlock {
