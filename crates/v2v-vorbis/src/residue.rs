@@ -83,17 +83,18 @@ impl Residue {
         self.kind
     }
 
-    /// 解一组向量。`out[j]` 是第 j 个声道在本 submap 里的谱（长度 = 块大小 / 2）。
+    /// 解一组声道。`views[j]` 是第 j 个声道的谱切片（长度 = 块大小 / 2）。
     ///
     /// 包尾读完按规范算**正常**：保留已经解出来的部分，剩下的保持 0。
-    pub fn decode(
+    pub fn decode_views(
         &self,
         bit: &mut BitReader,
         codebooks: &[Codebook],
-        out: &mut [Vec<f32>],
+        views: &mut [&mut [f32]],
         do_not_decode: &[bool],
+        scratch: &mut Scratch,
     ) -> Result<()> {
-        match self.decode_inner(bit, codebooks, out, do_not_decode) {
+        match self.decode_inner(bit, codebooks, views, do_not_decode, scratch) {
             Ok(()) | Err(Error::Eop) => Ok(()),
             Err(e) => Err(e),
         }
@@ -103,31 +104,37 @@ impl Residue {
         &self,
         bit: &mut BitReader,
         codebooks: &[Codebook],
-        out: &mut [Vec<f32>],
+        views: &mut [&mut [f32]],
         do_not_decode: &[bool],
+        scratch: &mut Scratch,
     ) -> Result<()> {
-        debug_assert_eq!(do_not_decode.len(), out.len());
+        debug_assert_eq!(do_not_decode.len(), views.len());
         if self.kind == 2 {
             // 交织成一条长向量，按 type 1 解，最后拆回去。
             if do_not_decode.iter().all(|&x| x) {
                 return Ok(()); // 全都不解 → 一个都不解
             }
-            let ch = out.len();
-            let n = out.first().map(|v| v.len()).unwrap_or(0);
-            let mut flat = vec![0f32; n * ch];
+            let ch = views.len();
+            let n = views.first().map(|v| v.len()).unwrap_or(0);
+            // 把交织缓冲「借出来」：`decode_core` 还要用 `scratch` 的另一半，
+            // 直接同时借两个字段做不到，`mem::take` 是最省事的切分。
+            let mut flat = std::mem::take(&mut scratch.flat);
+            flat.clear();
+            flat.resize(n * ch, 0.0);
             {
                 let mut one: [&mut [f32]; 1] = [flat.as_mut_slice()];
-                self.decode_core(bit, codebooks, &mut one, &[false])?;
+                self.decode_core(bit, codebooks, &mut one, &[false], scratch)?;
             }
             for j in 0..ch {
+                let dst = &mut views[j];
                 for i in 0..n {
-                    out[j][i] = flat[i * ch + j];
+                    dst[i] = flat[i * ch + j];
                 }
             }
+            scratch.flat = flat;
             return Ok(());
         }
-        let mut views: Vec<&mut [f32]> = out.iter_mut().map(|v| v.as_mut_slice()).collect();
-        self.decode_core(bit, codebooks, &mut views, do_not_decode)
+        self.decode_core(bit, codebooks, views, do_not_decode, scratch)
     }
 
     /// 骨架：分类码字 → 每个 pass 按分类挑码本 → 逐分区解 VQ。规范 8.6.2。
@@ -135,11 +142,12 @@ impl Residue {
         &self,
         bit: &mut BitReader,
         codebooks: &[Codebook],
-        out: &mut [&mut [f32]],
+        views: &mut [&mut [f32]],
         do_not_decode: &[bool],
+        scratch: &mut Scratch,
     ) -> Result<()> {
-        let ch = out.len();
-        let actual_size = out.first().map(|v| v.len()).unwrap_or(0);
+        let ch = views.len();
+        let actual_size = views.first().map(|v| v.len()).unwrap_or(0);
         let begin = self.begin.min(actual_size);
         let end = self.end.min(actual_size);
         let n_to_read = end.saturating_sub(begin);
@@ -152,7 +160,12 @@ impl Residue {
         }
         let classwords = codebooks[self.classbook].dimensions;
         let classifications_per_vector = self.classifications as u32;
-        let mut classifications = vec![vec![0u8; partitions]; ch];
+
+        // 分类号按「声道 × 分区」排成一条，免得每包分配 `Vec<Vec<u8>>`。
+        let Scratch { classifications, partition, .. } = scratch;
+        let need = ch * partitions;
+        classifications.clear();
+        classifications.resize(need, 0);
 
         for pass in 0..8 {
             let mut partition_count = 0usize;
@@ -164,9 +177,9 @@ impl Residue {
                         }
                         let mut t = codebooks[self.classbook].decode_scalar(bit)? as u32;
                         // 一个分类码字里塞了 classwords 个分类号，**从高位往低位**取。
+                        let row = j * partitions + partition_count;
                         for i in (0..classwords).rev() {
-                            classifications[j][i + partition_count] =
-                                (t % classifications_per_vector) as u8;
+                            classifications[row + i] = (t % classifications_per_vector) as u8;
                             t /= classifications_per_vector;
                         }
                     }
@@ -179,12 +192,12 @@ impl Residue {
                         if do_not_decode[j] {
                             continue;
                         }
-                        let vqclass = classifications[j][partition_count] as usize;
+                        let vqclass = classifications[j * partitions + partition_count] as usize;
                         let vqbook = self.books[vqclass][pass];
                         if vqbook >= 0 {
                             let offset = begin + partition_count * self.partition_size;
                             let book = &codebooks[vqbook as usize];
-                            self.decode_partition(book, bit, out[j], offset)?;
+                            decode_partition(self.kind, book, bit, views[j], offset, self.partition_size, partition)?;
                         }
                     }
                     partition_count += 1;
@@ -193,41 +206,73 @@ impl Residue {
         }
         Ok(())
     }
+}
 
-    /// 解一个分区（规范 8.6.3 / 8.6.4 的差别就在这里的下标）。
-    fn decode_partition(
-        &self,
-        book: &Codebook,
-        bit: &mut BitReader,
-        v: &mut [f32],
-        offset: usize,
-    ) -> Result<()> {
-        let dim = book.dimensions;
-        let n = self.partition_size;
-        if self.kind == 0 {
-            let step = n / dim;
-            for i in 0..step {
-                let entry = book.decode_vector(bit)?;
-                for j in 0..dim {
-                    let k = offset + i + j * step;
-                    if k < v.len() {
-                        v[k] += entry[j];
-                    }
-                }
-            }
-        } else {
-            let mut i = 0usize;
-            while i < n {
-                let entry = book.decode_vector(bit)?;
-                for j in 0..dim {
-                    let k = offset + i + j;
-                    if k < v.len() {
-                        v[k] += entry[j];
-                    }
-                }
-                i += dim;
+/// 解码时的可复用暂存 —— 免得每包都分配。
+///
+/// 大小由**流参数**决定（声道数 / 分区数 / 分区大小），所以按需扩容就够；
+/// 内容每包都被完整重写，不需要清零。
+#[derive(Default)]
+pub struct Scratch {
+    /// `ch * partitions` 个分类号（按声道分行）。
+    classifications: Vec<u8>,
+    /// type 2 的交织缓冲（`ch * n`）。
+    flat: Vec<f32>,
+    /// 一个分区的转置缓冲（`<= partition_size`）。
+    partition: Vec<f32>,
+}
+
+impl Scratch {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// 解一个分区（规范 8.6.3 / 8.6.4 的差别就在这里的下标）。
+///
+/// 两条路径都先把这一分区的分量按**位流顺序**解进 `tmp`，再整段相加 ——
+/// 这样内层就是两条 `chunks` 迭代器对齐的循环，没有逐元素的分支。
+fn decode_partition(
+    kind: u8,
+    book: &Codebook,
+    bit: &mut BitReader,
+    v: &mut [f32],
+    offset: usize,
+    n: usize,
+    tmp: &mut Vec<f32>,
+) -> Result<()> {
+    let dim = book.dimensions;
+    tmp.clear();
+    if kind == 0 {
+        let step = n / dim;
+        for _ in 0..step {
+            tmp.extend_from_slice(book.decode_vector(bit)?);
+        }
+        let span = step * dim;
+        let end = (offset + span).min(v.len());
+        if offset >= end {
+            return Ok(()); // 整段都在谱外：位已经消费了，值丢弃
+        }
+        let dst = &mut v[offset..end];
+        // 转置相加：第 j 段（长度 step）加上每个分量的第 j 个元素。
+        for (j, out_chunk) in dst.chunks_mut(step).enumerate() {
+            for (s, e) in out_chunk.iter_mut().zip(tmp.chunks_exact(dim)) {
+                *s += e[j];
             }
         }
-        Ok(())
+    } else {
+        // type 1（type 2 也走这里）：分区内顺序摆。
+        let mut i = 0usize;
+        while i < n {
+            let entry = book.decode_vector(bit)?;
+            for j in 0..dim {
+                let k = offset + i + j;
+                if k < v.len() {
+                    v[k] += entry[j];
+                }
+            }
+            i += dim;
+        }
     }
+    Ok(())
 }

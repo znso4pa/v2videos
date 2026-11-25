@@ -24,6 +24,11 @@ pub struct Codebook {
     nodes: Vec<[i32; 2]>,
     /// 单条目码本：读一个值恒返回它，并从流里**吞掉一位**。
     single: Option<usize>,
+    /// 快速查表：下标 = 接下来 `FAST_BITS` 位，值 = `(码长 << 24) | 符号`。
+    ///
+    /// `0` 表示「这个前缀的码字比 `FAST_BITS` 长」→ 退回逐位走树。
+    /// 规范里的码本绝大多数码长 ≤ 10，所以命中率很高。
+    fast: Vec<u32>,
     /// VQ 查表（lookup type 1 / 2）。type 0 没有。
     pub vq: Option<Vq>,
 }
@@ -99,16 +104,30 @@ impl Codebook {
             }
         };
 
-        Ok(Self { dimensions, entries, lengths, nodes, single, vq })
+        let fast = build_fast_table(&nodes);
+        Ok(Self { dimensions, entries, lengths, nodes, single, fast, vq })
     }
 
     /// 解一个 Huffman 符号（条目下标）。规范 3.2.1「huffman decision tree」。
+    #[inline]
     pub fn decode_scalar(&self, bit: &mut BitReader) -> Result<usize> {
         if let Some(sym) = self.single {
             // 规范 errata 20150226：单条目码本「吞一位」，读到的值不计（0 / 1 都行）。
             bit.read(1)?;
             return Ok(sym);
         }
+        // 快路径：一次看 `FAST_BITS` 位查表。
+        if let Some(idx) = bit.peek(FAST_BITS) {
+            let e = self.fast[idx as usize];
+            if e != 0 {
+                bit.consume(e >> 24);
+                return Ok((e & 0x00ff_ffff) as usize);
+            }
+        }
+        // 慢路径：码字比 `FAST_BITS` 长（或已到包尾），逐位走树。
+        //
+        // 试过「一次 `peek(16)` 在本地走树」：逐位读的代价没有想象中大
+        // （`read(1)` 已经是窗口 + 移位），实测持平，不值得多那 30 行。
         let mut node = 0usize;
         for _ in 0..32 {
             let b = bit.read(1)? as usize;
@@ -125,6 +144,7 @@ impl Codebook {
     }
 
     /// 解一个 VQ 向量（VQ 上下文）。返回的是查表里的切片，不分配。
+    #[inline]
     pub fn decode_vector(&self, bit: &mut BitReader) -> Result<&[f32]> {
         let vq = self
             .vq
@@ -144,6 +164,52 @@ impl Codebook {
     pub fn codeword_lengths(&self) -> &[u8] {
         &self.lengths
     }
+}
+
+/// 快表宽度（位）。规范里的码本码长绝大多数 ≤ 10。
+///
+/// 取 10 是**量出来的**：真样本里 55.5% 的条目 ≤ 10 位，而 12 位（16 KiB / 码本）
+/// 实测**更慢** —— 表越大越容易把 L1 挤掉，命中率涨的那点不够赔。10 位的表是
+/// 4 KiB / 码本，正好在 L1 的舒适区。
+///
+/// 没命中的（码字 > 10 位）走 `decode_scalar` 的第二段：逐位走树。
+const FAST_BITS: u32 = 10;
+
+/// 从二叉树建「一次看 `FAST_BITS` 位」的查表。
+///
+/// 位是 **LSB 优先**的：读到的第 `d` 位是下标 `idx` 的第 `d` 位。所以一条深度
+/// `d`、码字为 `code` 的叶子，命中所有「低 `d` 位等于 `code`」的下标 ——
+/// 从 `code` 起、步长 `1 << d` 填满即可。
+fn build_fast_table(nodes: &[[i32; 2]]) -> Vec<u32> {
+    let mut t = vec![0u32; 1usize << FAST_BITS];
+    if nodes.len() <= 1 {
+        return t; // 单条目码本不建树，走 `single` 分支
+    }
+    // 显式栈：`(节点, 码字, 深度)`。码本最多几百个叶子，递归也不会爆，
+    // 但这里不需要递归。
+    let mut stack = vec![(0usize, 0u32, 0u32)];
+    while let Some((node, code, depth)) = stack.pop() {
+        if depth >= FAST_BITS {
+            continue; // 更深的码字留给慢路径
+        }
+        for b in 0..2u32 {
+            let next = nodes[node][b as usize];
+            let c = code | (b << depth);
+            if next < 0 {
+                let sym = (-next - 1) as u32;
+                let packed = ((depth + 1) << 24) | sym;
+                let step = 1usize << (depth + 1);
+                let mut i = c as usize;
+                while i < t.len() {
+                    t[i] = packed;
+                    i += step;
+                }
+            } else if next > 0 {
+                stack.push((next as usize, c, depth + 1));
+            }
+        }
+    }
+    t
 }
 
 /// 按规范的「最左可用叶子」规则建树。规范 3.2.1 图 4 的那段文字。

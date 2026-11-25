@@ -49,6 +49,11 @@ pub struct Floor1 {
     /// 每个下标在 list order 里的低 / 高邻居（预测要用）。
     low: Vec<usize>,
     high: Vec<usize>,
+    /// 反 dB 表（规范 10.1）。**在 setup 时算一次**。
+    ///
+    /// 原来是每次 `curve()` 现算：256 次 `powf`，而 `curve()` 是**每包每声道**
+    /// 一次 —— 一份 4 分钟的真样本要算 675 万次 `powf`。表是常量，没理由重算。
+    inverse_db: [f32; 256],
 }
 
 /// 一个包的 floor 1 解码结果（曲线合成第 1 步之后）。
@@ -161,6 +166,7 @@ impl Floor1 {
             sorted,
             low,
             high,
+            inverse_db: inverse_db_table(),
         })
     }
 
@@ -268,7 +274,7 @@ impl Floor1 {
 
     /// 曲线合成（第 2 步 + 反 dB 查表），写满 `out`（长度 = 块大小 / 2）。
     pub fn curve(&self, pkt: &Floor1Packet, out: &mut [f32]) {
-        let table = inverse_db_table();
+        let table = &self.inverse_db;
         let n = out.len();
         let mult = self.multiplier;
 
@@ -283,17 +289,12 @@ impl Floor1 {
             }
             hy = pkt.y[idx] * mult;
             hx = self.x_list[idx] as usize;
-            render_line(lx, ly, hx, hy, out);
+            render_line(lx, ly, hx, hy, table, out);
             lx = hx;
             ly = hy;
         }
         if hx < n {
-            render_line(hx, hy, n, hy, out);
-        }
-
-        for v in out.iter_mut() {
-            let i = (*v as usize).min(255);
-            *v = table[i];
+            render_line(hx, hy, n, hy, table, out);
         }
     }
 }
@@ -315,7 +316,24 @@ fn render_point(x0: i32, y0: i32, x1: i32, y1: i32, x: i32) -> i32 {
 /// 规范 9.2.7：把 `[x0, x1)` 之间的整数折线写进 `out`。
 ///
 /// 注意端点：`x0` 写、`x1` **不写**（下一次调用从 `x1` 开始写）。
-fn render_line(x0: usize, y0: i32, x1: usize, y1: i32, out: &mut [f32]) {
+/// 把「反 dB 表的整数索引」钳到 `[0, 255]`。
+///
+/// 与原来的 `(*v as usize).min(255)` **逐值等价**：Rust 的浮点→整数转换是
+/// 饱和的，负数变 0；而这里的 `y` 是整数，`clamp` 就是同一个意思。
+#[inline]
+fn db_index(y: i32) -> usize {
+    y.clamp(0, 255) as usize
+}
+
+/// 画一条从 `(x0,y0)` 到 `(x1,y1)` 的线（`[x0, x1)` 端点语义），**直接写反 dB 表的值**。
+///
+/// 原来写的是整数 `y`，再由 `curve()` 走一遍整条曲线查表 —— 那是两遍 1024 个样本。
+/// 合成一遍之后少一遍全量读写（真样本上约 4%）。
+///
+/// 表作为参数传进来，是为了让「线的几何」还能被单独测：测试传一张恒等表，
+/// 断言就还是原来那些整数。
+#[inline]
+fn render_line(x0: usize, y0: i32, x1: usize, y1: i32, table: &[f32; 256], out: &mut [f32]) {
     let n = out.len();
     if x0 >= n {
         return;
@@ -333,7 +351,7 @@ fn render_line(x0: usize, y0: i32, x1: usize, y1: i32, out: &mut [f32]) {
     let sy = if dy < 0 { base - 1 } else { base + 1 };
     let ady = ady - base.abs() * adx;
 
-    out[x0] = y as f32;
+    out[x0] = table[db_index(y)];
     for x in (x0 + 1)..x1 {
         err += ady;
         if err >= adx {
@@ -342,7 +360,7 @@ fn render_line(x0: usize, y0: i32, x1: usize, y1: i32, out: &mut [f32]) {
         } else {
             y += base;
         }
-        out[x] = y as f32;
+        out[x] = table[db_index(y)];
     }
 }
 
@@ -379,13 +397,28 @@ mod tests {
     /// `render_line` 写 `[x0, x1)`：端点归属错一位，整条曲线就整体平移。
     #[test]
     fn render_line_endpoints() {
+        // 恒等表：让断言还是「线的几何」本身，而不是反 dB 表的数值。
+        let mut ident = [0f32; 256];
+        for (i, v) in ident.iter_mut().enumerate() {
+            *v = i as f32;
+        }
         let mut out = vec![0f32; 8];
-        render_line(2, 10, 6, 10, &mut out);
+        render_line(2, 10, 6, 10, &ident, &mut out);
         assert_eq!(out, vec![0.0, 0.0, 10.0, 10.0, 10.0, 10.0, 0.0, 0.0]);
 
         // 斜线：(0,0) → (4,4)：0,1,2,3 写在 0..4
         let mut out = vec![0f32; 8];
-        render_line(0, 0, 4, 4, &mut out);
+        render_line(0, 0, 4, 4, &ident, &mut out);
         assert_eq!(out[..5], [0.0, 1.0, 2.0, 3.0, 0.0]);
+
+        // 钳位：负值落到 0、超过 255 落到 255。
+        //
+        // (0,-40) → (4,900)：dy=940, adx=4 → base=235, ady=940-235·4=0，
+        // 所以 y 依次是 -40 / 195 / 430 / 665 → 索引 0 / 195 / 255 / 255。
+        // 这条钉的是「原来的 `y as usize` + `min(255)`」被换成 `clamp` 之后仍然等价：
+        // 少了下界的钳位，负值会绕成一个巨大的 usize。
+        let mut out = vec![0f32; 8];
+        render_line(0, -40, 4, 900, &ident, &mut out);
+        assert_eq!(out[..4], [0.0, 195.0, 255.0, 255.0]);
     }
 }

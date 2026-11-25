@@ -40,7 +40,7 @@ pub use setup::{Floor, Mapping, Mode, Setup};
 
 use bit::BitReader;
 use floor::Floor1Packet;
-use synth::{build_window, ChannelSynth};
+use synth::{build_window, ChannelSynth, Window};
 use v2v_kernel::ImdctPlan;
 
 /// 规范 9.1.1 的 `ilog`，同时供子模块以 `crate::ilog` 取用。
@@ -101,6 +101,26 @@ pub struct Decoder {
     spectra: Vec<Vec<f32>>,
     /// 每个声道的 floor 解码结果（`None` = 本帧未使用）。
     floor_pkts: Vec<Option<Floor1Packet>>,
+    /// 每包的 floor 结果「未使用」标记（复用，不每包分配）。
+    no_residue: Vec<bool>,
+    /// residue 的暂存（分类号 / 交织 / 分区转置）。
+    residue_scratch: residue::Scratch,
+    /// 窗缓存。索引见 `window_slot`：长块的 4 种（prev, next）组合 + 短块 1 种。
+    ///
+    /// 窗只依赖 `(长/短, prev_flag, next_flag)` —— 一共 **5 种**，而原来每包
+    /// 现算一遍：2048 个样本、每个样本 1~2 次 `sin`/`cos`。一份 4 分钟的真样本
+    /// 是 13192 包 × 约 3000 次三角函数 ≈ **4000 万次**，全是可以省掉的。
+    windows: [Option<Window>; 5],
+}
+
+/// 窗缓存的下标。短块的 prev/next 标志被 `build_window` 忽略（恒对称），所以合一个槽。
+#[inline]
+fn window_slot(long: bool, prev_flag: bool, next_flag: bool) -> usize {
+    if long {
+        (prev_flag as usize) | ((next_flag as usize) << 1)
+    } else {
+        4
+    }
 }
 
 impl Decoder {
@@ -116,6 +136,9 @@ impl Decoder {
             synths: (0..ch).map(|_| ChannelSynth::new()).collect(),
             spectra: vec![Vec::new(); ch],
             floor_pkts: (0..ch).map(|_| None).collect(),
+            no_residue: vec![false; ch],
+            residue_scratch: residue::Scratch::new(),
+            windows: [None, None, None, None, None],
         })
     }
 
@@ -154,13 +177,20 @@ impl Decoder {
         let ch = self.channels();
         let n = if head.long { self.info.blocksize_1 } else { self.info.blocksize_0 };
         let half = n / 2;
-        let window = build_window(
-            n,
-            self.info.blocksize_0,
-            head.long,
-            head.prev_flag,
-            head.next_flag,
-        );
+        // 窗按 (长/短, prev, next) 缓存 —— 见 `windows` 字段的注释。
+        let slot = window_slot(head.long, head.prev_flag, head.next_flag);
+        if self.windows[slot].is_none() {
+            self.windows[slot] = Some(build_window(
+                n,
+                self.info.blocksize_0,
+                head.long,
+                head.prev_flag,
+                head.next_flag,
+            ));
+        }
+        // 只借 `self.windows`：后面 `self.plans` / `self.synths` 的可变借用是
+        // 不相交的字段，borrow checker 认这个。
+        let window = self.windows[slot].as_ref().expect("上面刚放进去");
         let mapping = &self.setup.mappings[self.setup.modes[head.mode].mapping as usize];
 
         // 1) floor：按声道顺序解。
@@ -192,8 +222,18 @@ impl Decoder {
             let residue_index = mapping.submap_residue[s] as usize;
             let residue = &self.setup.residues[residue_index];
             let mut out: Vec<Vec<f32>> = chans.iter().map(|_| vec![0f32; half]).collect();
-            let dnd: Vec<bool> = chans.iter().map(|&j| no_residue[j]).collect();
-            residue.decode(&mut bit, &self.setup.codebooks, &mut out, &dnd)?;
+            let dnd: Vec<bool> = chans.iter().map(|&j| self.no_residue[j]).collect();
+            {
+                let mut views: Vec<&mut [f32]> =
+                    out.iter_mut().map(|v| v.as_mut_slice()).collect();
+                residue.decode_views(
+                    &mut bit,
+                    &self.setup.codebooks,
+                    &mut views,
+                    &dnd,
+                    &mut self.residue_scratch,
+                )?;
+            }
             for (k, &j) in chans.iter().enumerate() {
                 self.spectra[j] = std::mem::take(&mut out[k]);
             }
@@ -203,6 +243,13 @@ impl Decoder {
         for i in (0..mapping.magnitude.len()).rev() {
             let m = mapping.magnitude[i] as usize;
             let a = mapping.angle[i] as usize;
+            // 规范 4.3.9 的四象限，**直译**。
+            //
+            // 试过两版「无分支化简」：第一版推错了两个象限（摘要立刻变了，
+            // 这条正是判据的价值）；第二版公式对、逐位相同，但实测**更慢**
+            // （384 ms vs 374 ms）—— 频谱的符号并不像音频那样随机，分支预测
+            // 在这里够用，而 `2·mask−1` 那套乘加是实打实多出来的运算。
+            // 结论：**别按直觉判断分支是否可预测，量。**
             for k in 0..half {
                 let mv = self.spectra[m][k];
                 let av = self.spectra[a][k];
@@ -237,7 +284,7 @@ impl Decoder {
                 *c *= s;
             }
             let plan = plan_for(&mut self.plans, half, bs0);
-            out.push(self.synths[i].synthesize(plan, &curve, &window));
+            out.push(self.synths[i].synthesize(plan, &curve, window));
         }
         Ok(out)
     }
