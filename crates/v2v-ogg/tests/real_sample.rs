@@ -65,7 +65,14 @@ fn demuxes_every_packet_of_the_real_sample() {
     assert_eq!(a.channels, 2);
     assert_eq!(a.sample_rate, 44100);
 
-    // 三个头包原样拼接：魔数分别落在 0 / 30 / 89。
+    // 三个头包原样拼接：按长度字段拆开，长度分别是 30 / 59 / 3247。
+    // 用解析器拆而不是靠搜魔数 —— 注释头里是自由文本，理论上可以含 `\x05vorbis`。
+    let (id_pkt, cm_pkt, setup_pkt) =
+        v2v_ogg::split_vorbis_headers(&a.extra).expect("三个头包要拆得开");
+    assert_eq!((id_pkt.len(), cm_pkt.len(), setup_pkt.len()), (30, 59, 3247));
+    assert_eq!(&id_pkt[..7], b"\x01vorbis");
+    assert_eq!(&cm_pkt[..7], b"\x03vorbis");
+    assert_eq!(&setup_pkt[..7], b"\x05vorbis");
     assert_eq!(a.extra.len(), 30 + 59 + 3247);
     assert_eq!(&a.extra[..7], b"\x01vorbis");
     assert_eq!(&a.extra[30..37], b"\x03vorbis");

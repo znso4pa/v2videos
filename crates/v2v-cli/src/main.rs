@@ -37,7 +37,7 @@ use v2v_cli::{
 };
 
 const USAGE: &str = "\
-v2v —— WMV/ASF 批量转码（纯 Rust：解封装 → 解码 → 编码 → 封装）
+v2v —— 批量转码（纯 Rust：解封装 → 解码 → 编码 → 封装）
 
 用法：
   v2v convert [选项] <输入>...
@@ -50,6 +50,8 @@ v2v —— WMV/ASF 批量转码（纯 Rust：解封装 → 解码 → 编码 →
   -o, --out-dir <DIR>   输出目录（默认：与输入同目录）
   -q, --qscale <1..31>  量化尺度（默认 6；越大文件越小、越糊）
       --mp4             输出 .mp4（MPEG-4 Part 2 + AAC），默认输出 .wmv（MP43 in ASF）
+      --wav             只抽音频成 .wav（PCM16）。不看视频轨 —— `.ogg` 这类纯音频
+                        输入只有这条路能走（.wmv / .mp4 都要视频轨来定帧率）
       --pcm             .mp4 的音频用未压缩 PCM（sowt）而不是 AAC
       --aac-bitrate N   .mp4 走 AAC 时的目标码率（默认 128000 bit/s）
       --no-ms           关掉 AAC 的 M/S 立体声（默认开；只为对比测量）
@@ -489,6 +491,7 @@ fn run_convert(it: &mut std::slice::Iter<'_, String>) -> Result<bool, String> {
                 opts.qscale = v;
             }
             "--mp4" => opts.format = OutputFormat::Mp4,
+            "--wav" => opts.format = OutputFormat::Wav,
             "--pcm" => opts.audio = Mp4Audio::Pcm,
             "--aac-bitrate" => {
                 opts.aac_bitrate = it
@@ -580,6 +583,8 @@ fn run_convert(it: &mut std::slice::Iter<'_, String>) -> Result<bool, String> {
         // `.mp4` 这条路**还没接**校验（不是「没有解码器」—— `v2v-mp4v` 有解码器，
         // 只是 CLI 没把产物解回来比 PSNR）。见 lib.rs 的模块文档。
         OutputFormat::Mp4 => "未实现（.mp4 这条路没接 PSNR 校验）",
+        // 抽轨没有视频，也就没有 PSNR 可算。
+        OutputFormat::Wav => "不适用（WAV 只有音频）",
     };
     let vbr = match opts.video_bitrate {
         Some(b) => format!("，视频目标 {} kbps", b / 1000),
@@ -595,6 +600,7 @@ fn run_convert(it: &mut std::slice::Iter<'_, String>) -> Result<bool, String> {
                 Mp4Audio::Aac => format!(".mp4 / MPEG-4 Part 2 + AAC {}", opts.aac_bitrate),
                 Mp4Audio::Pcm => ".mp4 / MPEG-4 Part 2 + PCM".to_string(),
             },
+            OutputFormat::Wav => ".wav / PCM16（只抽音频，不转视频）".to_string(),
         },
         opts.qscale,
         if opts.keyframe_interval == 0 {

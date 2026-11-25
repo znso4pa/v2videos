@@ -48,7 +48,9 @@ v2v-filter 像素域算子：缩放（bilinear / bicubic，**缩小时核按 src
 v2v-player 顺时播放层：逐帧 / 逐样本、两轨独立、`seek(ms)`
 v2v-android  平台硬编：硬件 H.264（VideoToolbox / MediaCodec）+ WMA→WAV 抽轨（**只有 rlib**）
 v2v-capi   **全仓唯一的 C ABI**：`v2v_*` 一族符号 + 唯一头文件 `crates/v2v-capi/include/v2v.h`
-v2v-cli    `v2v convert`：ASF / AVI / MP4 → `.wmv`（MP43 + 音频直通）或 `.mp4`（mp4v + AAC）
+v2v-cli    `v2v convert`：ASF / AVI / MP4 → `.wmv`（MP43 + 音频直通）或 `.mp4`（mp4v + AAC）；
+           **Ogg（Vorbis）→ `.wav`**（`--wav` 只抽音频 —— `.ogg` 没有视频轨，
+           `.wmv` / `.mp4` 都要视频轨来定帧率）
            **+ `v2v trim` / `v2v concat`**：按关键帧的无损剪切 / 拼接（只搬样本，不解码）
            **+ `v2v scan`**：递归扫目录，**只读头部**，报哪些能转、能转成什么
            **+ `v2v bench`**：测量写成 TSV、可选对着基线卡回归
@@ -164,6 +166,7 @@ cargo build -j 2                # 并发**限 2** —— 见下一节「构建�
 cargo run -p v2v-cli -- convert in.wmv -o out/              # .wmv：MP43 + 音频直通
 cargo run -p v2v-cli -- convert --mp4 -g 12 in.wmv -o out/  # .mp4：mp4v + AAC
 cargo run -p v2v-cli -- convert --mp4 --trellis in.wmv -o out/  # 帧间系数级 RD（慢 5–9×，默认关）
+cargo run -p v2v-cli -- convert --wav in.ogg -o out/          # 只抽音频成 .wav（PCM16）
 
 # 无损剪切 / 拼接（不重编码；只能切在关键帧上，起点向后对齐并报出实际值）
 cargo run -p v2v-cli -- trim --start 10 --end 15 -o cut.wmv in.wmv
@@ -186,6 +189,7 @@ V2V_ASF_SAMPLE=/path/x.wmv cargo test -p v2v-vc1 --release --test frames -- --no
 | ------------------------ | ----------------------------------------------- |
 | `V2V_ASF_SAMPLE`         | 视频逐帧对 `ffmpeg`（msmpeg4 / avi / vc1 / cli；多个样本用 `:` 分隔） |
 | `V2V_WMA_SAMPLE`         | WMA 解码出的 PCM 对 `ffmpeg`（wma）                    |
+| `V2V_OGG_SAMPLE`         | Vorbis 解码对 `ffmpeg`（vorbis：SNR；cli：`.ogg → .wav` 逐样本 ≤ 1 LSB） |
 | `V2V_AUDIO_SAMPLE`       | 音频直通整文件对账（cli，标了 `#[ignore]`）                    |
 | `V2V_MP4_REF` / `V2V_MP4_PCM` | MP4 封装逐 box 对 `ffmpeg` 产的参考件（mp4）              |
 | `V2V_MP4_OUT` / `V2V_MP4_OUT_AV` | 上面那两条把我们的产物**落到哪个路径**（不设就落 `/tmp/v2v_ours*.mp4`） |

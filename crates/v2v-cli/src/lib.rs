@@ -4,14 +4,21 @@
 //!
 //! ## 现状
 //!
-//! - 输入：**ASF（`.wmv`）/ AVI（`.avi`）** 里的 **MP42 / MP43 / WMV1 / WMV2** 视频轨 —— 容器按魔数自动认。
-//!   别的容器 / codec 会明确报 `Unsupported`，不猜、不静默跳过。
-//! - 输出：**两种容器**（`ConvertOptions::format`）
+//! - 输入：**ASF（`.wmv`）/ AVI（`.avi`）/ MP4 / Ogg（`.ogg`）** —— 容器按魔数自动认。
+//!   视频轨认 **MP42 / MP43 / WMV1 / WMV2 / WMV3 / mp4v / avc1（仅硬件）**；
+//!   音频轨认 **WMA / AAC-LC / MP3 / Vorbis / 16 位 PCM**。别的会明确报
+//!   `Unsupported`，不猜、不静默跳过。
+//! - 输出：**三种容器**（`ConvertOptions::format`）
 //!
 //!   | | 视频 | 音频 |
 //!   |---|---|---|
 //!   | `OutputFormat::Asf`（`.wmv`） | MP43 **重编码** | WMA **直通**（载荷原样搬） |
-//!   | `OutputFormat::Mp4`（`.mp4`） | **MPEG-4 Part 2** 重编码（`v2v-mp4v`） | WMA **解码成 PCM**（`sowt`） |
+//!   | `OutputFormat::Mp4`（`.mp4`） | **MPEG-4 Part 2** 重编码（`v2v-mp4v`） | WMA / MP3 / Vorbis **解码** → AAC 或 PCM |
+//!   | `OutputFormat::Wav`（`.wav`） | **没有视频** | 解码成 PCM16（抽轨） |
+//!
+//! ⚠️ **`.wav` 是唯一不要求视频轨的路**。这不是「顺手加的」：`.ogg` 里通常只有
+//! 音频，而 `.wmv` / `.mp4` 两条路都要视频轨（要写 VOL / 定帧率），于是 Vorbis
+//! 解码器即使写对了也一条路都走不通。抽轨是「解码器能出声」最短的那条链。
 //!
 //! ## `.mp4` 那条路为什么必须重编码
 //!
@@ -59,6 +66,9 @@ pub use lossless::{concat, trim, ConcatReport, TrimReport};
 /// 扫描器：递归扫目录，**只读头部**，说出哪些能转、能转成什么。
 pub mod scan;
 pub use scan::{format_table, format_tsv, scan, ScanEntry, Verdict};
+
+/// RIFF/WAVE 头 —— `OutputFormat::Wav` 用，只写不读。
+mod wav;
 
 /// 认 FourCC → 版本，**只放逐像素对账过的版本进来**。
 ///
@@ -418,6 +428,12 @@ pub enum OutputFormat {
     Asf,
     /// MPEG-4 Part 2（`mp4v`）in MP4（`.mp4`）。
     Mp4,
+    /// 只有音频的 **WAV**（PCM16LE）—— 「抽轨」，不解视频、不重编码。
+    ///
+    /// 为什么要有它：`.ogg` 这类**纯音频**输入没有视频轨，`Asf` / `Mp4` 两条路
+    /// 都要求有视频轨（要写 VOL / 定帧率），于是 Vorbis 解码器即使写对了也
+    /// 用不出来。WAV 不需要任何编码器，是「解码器能出声」最短的那条路。
+    Wav,
 }
 
 impl OutputFormat {
@@ -425,7 +441,13 @@ impl OutputFormat {
         match self {
             OutputFormat::Asf => "wmv",
             OutputFormat::Mp4 => "mp4",
+            OutputFormat::Wav => "wav",
         }
+    }
+
+    /// 这条路是不是**只要音频**（不看视频轨）。
+    pub fn audio_only(self) -> bool {
+        matches!(self, OutputFormat::Wav)
     }
 }
 
@@ -548,8 +570,9 @@ pub struct ConvertReport {
     pub key_frames: usize,
     /// 写进输出的音频样本数。
     ///
-    /// ⚠️ 两种容器的单位不同：`.wmv` 是**载荷数**（一个 ASF 载荷可能含多帧）；
-    /// `.mp4` 是 **PCM 采样点**数（一个采样点 = 一条 `stsz` 记录，见 `crates/v2v-mp4`）。
+    /// ⚠️ 三种容器的单位不同：`.wmv` 是**载荷数**（一个 ASF 载荷可能含多帧）；
+    /// `.mp4` 是 **PCM 采样点**数（一个采样点 = 一条 `stsz` 记录，见 `crates/v2v-mp4`）；
+    /// `.wav` 也是 **PCM 采样点**数（全声道算一个），且已经按 `granule` 裁掉了尾巴。
     pub audio_payloads: usize,
     /// 没搬的音频样本数（`copy_audio = false`）。
     pub skipped_audio: usize,
@@ -576,6 +599,8 @@ pub enum Error {
     Avi(v2v_avi::Error),
     Mp4(v2v_mp4::Error),
     Wma(v2v_wma::Error),
+    Ogg(v2v_ogg::Error),
+    Vorbis(v2v_vorbis::Error),
     /// 硬件解码器（VideoToolbox）报的错。它有自己的 `Error` 类型（带 `Io`），
     /// 与 `v2v_kernel::Error` 不通用 —— 这里只留消息，反正 CLI 不做分类重试。
     Hw(String),
@@ -591,6 +616,8 @@ impl std::fmt::Display for Error {
             Error::Avi(e) => write!(f, "AVI 错误：{e}"),
             Error::Mp4(e) => write!(f, "MP4 封装错误：{e}"),
             Error::Wma(e) => write!(f, "WMA 解码错误：{e}"),
+            Error::Ogg(e) => write!(f, "Ogg 解封装错误：{e}"),
+            Error::Vorbis(e) => write!(f, "Vorbis 解码错误：{e}"),
             Error::Hw(s) => write!(f, "硬件解码错误：{s}"),
             Error::Unsupported(s) => write!(f, "不支持：{s}"),
         }
@@ -629,6 +656,16 @@ impl From<v2v_wma::Error> for Error {
         Error::Wma(e)
     }
 }
+impl From<v2v_ogg::Error> for Error {
+    fn from(e: v2v_ogg::Error) -> Self {
+        Error::Ogg(e)
+    }
+}
+impl From<v2v_vorbis::Error> for Error {
+    fn from(e: v2v_vorbis::Error) -> Self {
+        Error::Vorbis(e)
+    }
+}
 
 /// 视频轨的入口信息。
 ///
@@ -656,6 +693,15 @@ trait VideoSource {
     /// `(流号, WAVEFORMATEX)`；没有音频轨就 `None`。
     fn audio_stream(&self) -> Option<(u8, AudioFormat)>;
     fn next(&mut self) -> Result<Option<Sample>, Error>;
+    /// 源里**声明的**音频总采样数（`None` = 容器没写，不猜）。
+    ///
+    /// 只有 Ogg 有这个东西（末页的 `granule_position` 就是权威值），别的容器
+    /// 返回 `None`。用途是**裁掉编码器标了可丢弃的尾巴** —— Vorbis 每块输出
+    /// `Np/4 + N/4` 个采样，最后一个块会超出真实长度几十个采样，不裁的话
+    /// 输出比 `ffmpeg` 长一丁点（实测 44 个采样）。
+    fn audio_total_samples(&self) -> Option<u64> {
+        None
+    }
 }
 
 struct AsfSource(v2v_asf::AsfDemuxer<BufReader<File>>);
@@ -761,6 +807,43 @@ impl VideoSource for AviSource {
     }
 }
 
+/// Ogg（`.ogg` / `.oga`）—— **只有音频**。
+///
+/// 本仓的 Ogg 解封装只认 Vorbis，不认 Theora，所以 `video_stream` 恒为 `None`。
+/// 这也是 `OutputFormat::Wav` 存在的直接原因：`.ogg` 没有视频轨，`.wmv` / `.mp4`
+/// 两条路都要视频轨（要写 VOL / 定帧率），不抽轨就一点都用不出来。
+struct OggSource {
+    d: v2v_ogg::OggDemuxer<BufReader<File>>,
+    /// 打开时从**尾页**扫出来的时长（`duration_ms` 需要 seek，所以单独开个句柄）。
+    duration_ms: Option<u64>,
+}
+
+impl VideoSource for OggSource {
+    fn container_name(&self) -> &'static str {
+        "Ogg"
+    }
+    fn duration_ms(&self) -> Option<u64> {
+        self.duration_ms
+    }
+    fn video_stream(&self) -> Option<VideoTrack> {
+        None
+    }
+    fn audio_stream(&self) -> Option<(u8, AudioFormat)> {
+        let a = self
+            .d
+            .streams()
+            .iter()
+            .find(|s| s.kind == StreamKind::Audio)?;
+        Some((a.number, a.audio.clone()?))
+    }
+    fn next(&mut self) -> Result<Option<Sample>, Error> {
+        Ok(self.d.next_sample()?)
+    }
+    fn audio_total_samples(&self) -> Option<u64> {
+        self.d.total_samples()
+    }
+}
+
 /// 按**魔数**选解封装器（不看扩展名 —— 扩展名会骗人，字节不会）。
 fn open_source(path: &Path) -> Result<Box<dyn VideoSource>, Error> {
     use std::io::{Read, Seek, SeekFrom};
@@ -781,9 +864,103 @@ fn open_source(path: &Path) -> Result<Box<dyn VideoSource>, Error> {
     if n >= 8 && &head[4..8] == b"ftyp" {
         return Ok(Box::new(Mp4Source(v2v_mp4::Mp4Demuxer::new(f)?)));
     }
+    // Ogg：头 4 字节是 `OggS`。
+    if n >= 4 && &head[..4] == b"OggS" {
+        // 总时长只体现在**最后一页**的 granule 上，顺序读要读完整份文件才知道；
+        // 这里用第二个句柄从尾部扫一次（`duration_ms` 自己会 seek）。
+        let dur = File::open(path)
+            .ok()
+            .and_then(|mut tail| v2v_ogg::duration_ms(&mut tail).ok().flatten());
+        return Ok(Box::new(OggSource {
+            d: v2v_ogg::OggDemuxer::open(f)?,
+            duration_ms: dur,
+        }));
+    }
     Err(Error::Unsupported(
-        "认不出容器（目前支持 ASF/.wmv、AVI/.avi 与 MP4/.mp4）".into(),
+        "认不出容器（目前支持 ASF/.wmv、AVI/.avi、MP4/.mp4 与 Ogg/.ogg）".into(),
     ))
+}
+
+/// WAV（PCM16LE）那条路：**只有音频**，不解视频、不重编码。
+///
+/// 这是「解码器能不能出声」最短的一条链：解封装 → 解码 → 写 44 字节头。
+/// 它也是唯一一条**不要求视频轨**的路 —— `.ogg` 这类纯音频输入只有它能走。
+fn convert_to_wav(
+    input: &Path,
+    output: &Path,
+    opts: &ConvertOptions,
+) -> Result<ConvertReport, Error> {
+    // WAV 这条路没有任何可调参数（qscale / GOP / 码率都是视频的），
+    // 但 `--no-audio` 在这里是**自相矛盾**的：抽轨就是把音频拿出来。
+    if !opts.copy_audio {
+        return Err(Error::Unsupported(
+            "WAV 输出就是抽音频，`--no-audio` 与它矛盾".into(),
+        ));
+    }
+    let bytes_in = std::fs::metadata(input)?.len();
+    let mut demux = open_source(input)?;
+
+    let (anum, af) = demux
+        .audio_stream()
+        .ok_or_else(|| Error::Unsupported("文件里没有音频轨".into()))?;
+    let (channels, sample_rate) = (af.channels, af.sample_rate);
+    if channels == 0 {
+        return Err(Error::Unsupported("音频声道数是 0".into()));
+    }
+    // 一个「采样点」= 所有声道各一个 16 位样本。
+    let point = channels as usize * 2;
+    let plan = plan_audio(demux.as_ref(), true, false)?
+        .ok_or_else(|| Error::Unsupported("文件里没有音频轨".into()))?;
+
+    let mut pcm: Vec<u8> = Vec::new();
+    let mut decoder = match plan.kind {
+        AudioSource::Decode(d) => Some(d),
+        // 源本来就是 16 位 PCM：原样搬。
+        AudioSource::Pcm => None,
+        // `aac_copy_ok` 传的是 false，这条路不会出现。
+        AudioSource::AacCopy => {
+            return Err(Error::Unsupported("WAV 输出不能直通 AAC".into()));
+        }
+    };
+    while let Some(s) = demux.next()? {
+        if s.stream != anum {
+            continue;
+        }
+        match decoder.as_mut() {
+            Some(d) => {
+                let chunk = d
+                    .decode_to_pcm(&s.data)
+                    .map_err(|e| Error::Unsupported(format!("音频解码失败：{e}")))?;
+                pcm.extend_from_slice(&chunk);
+            }
+            None => pcm.extend_from_slice(&s.data),
+        }
+    }
+
+    // 裁掉编码器标了「可丢弃」的尾巴。Vorbis 每块输出 `Np/4 + N/4` 个采样，
+    // 最后一块会越过真实长度；`granule_position` 才是权威值。不裁的表现是
+    // 「文件比 ffmpeg 的长几十个采样」—— 不报错，只是多一点尾巴。
+    let mut samples = pcm.len() / point;
+    if let Some(total) = demux.audio_total_samples() {
+        let total = total as usize;
+        if samples > total {
+            samples = total;
+            pcm.truncate(samples * point);
+        }
+    }
+
+    let bytes = wav::wrap_pcm16(channels, sample_rate, &pcm);
+    std::fs::write(output, &bytes)?;
+    Ok(ConvertReport {
+        frames: 0, // 这条路不解视频
+        key_frames: 0,
+        audio_payloads: samples,
+        skipped_audio: 0,
+        bytes_in,
+        bytes_out: bytes.len() as u64,
+        psnr_db: None,
+        video_kbps: None,
+    })
 }
 
 /// 把一个文件转成 `opts.format` 指定的容器。
@@ -803,6 +980,7 @@ pub fn convert_file(
     match opts.format {
         OutputFormat::Asf => convert_to_asf(input, output, opts),
         OutputFormat::Mp4 => convert_to_mp4(input, output, opts),
+        OutputFormat::Wav => convert_to_wav(input, output, opts),
     }
 }
 
@@ -1262,6 +1440,7 @@ enum AudioKind {
     Wma(u8),
     Aac,
     Mp3,
+    Vorbis,
     Pcm,
 }
 
@@ -1271,6 +1450,8 @@ fn classify_audio(af: &AudioFormat) -> Option<AudioKind> {
         0x0161 => Some(AudioKind::Wma(2)),
         0x00FF => Some(AudioKind::Aac),
         v2v_mp3::FORMAT_TAG => Some(AudioKind::Mp3),
+        // Ogg 没有 WAVEFORMATEX，`v2v-ogg` 借 AVI 里 Vorbis 的那个 wFormatTag 来标识。
+        v2v_ogg::VORBIS_FORMAT_TAG => Some(AudioKind::Vorbis),
         0x0001 if af.bits_per_sample == 16 => Some(AudioKind::Pcm),
         _ => None,
     }
@@ -1286,6 +1467,9 @@ pub enum AudioDecoder {
     /// AAC-LC（MP4 的 `mp4a`）。一个样本就是**一帧**，1024 个采样点。
     Aac(v2v_aac::Decoder),
     Mp3(Box<Mp3Decoder>),
+    /// Vorbis（Ogg）。一个样本就是一个包，输出长度不固定
+    /// （`Np/4 + N/4`，第一个包只 priming、输出 0 个）。
+    Vorbis(Box<v2v_vorbis::Decoder>),
 }
 
 impl AudioDecoder {
@@ -1303,6 +1487,22 @@ impl AudioDecoder {
                 Ok(audio_frames_to_pcm(vec![planes]))
             }
             Self::Mp3(d) => d.feed(data).map(audio_frames_to_pcm).map_err(|e| e.to_string()),
+            // ⚠️ Vorbis 吐的是 **±1 归一化**的 f32，而 `audio_frames_to_pcm` 的口径是
+            // **±32768**（WMA / AAC 那两个解码器就是那么吐的）。差一个 32768 倍的
+            // 单位差在听感上就是「一片死寂」或「满幅噪声」，而且不会报任何错 ——
+            // 所以这里走 `planar_to_s16`（它自己负责定标、夹紧与四舍五入）。
+            Self::Vorbis(d) => {
+                let planes = d.decode(data).map_err(|e| e.to_string())?;
+                if planes.is_empty() {
+                    return Ok(Vec::new()); // 第一个包只 priming
+                }
+                let s16 = v2v_vorbis::planar_to_s16(&planes);
+                let mut out = Vec::with_capacity(s16.len() * 2);
+                for v in s16 {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+                Ok(out)
+            }
         }
     }
 }
@@ -1383,8 +1583,20 @@ fn plan_audio(
             let decoder = Mp3Decoder::new(af.channels.into(), af.sample_rate)?;
             Ok(Some(plan(AudioSource::Decode(AudioDecoder::Mp3(Box::new(decoder))), 0)))
         }
+        // Vorbis（Ogg）。`extra` 里是**三个头包原样拼接**，解码器要的是第 1 个
+        // （识别头）和第 3 个（setup 头）—— 中间那个注释头得按长度字段跳过去。
+        Some(AudioKind::Vorbis) => {
+            let (id, _comment, setup) = v2v_ogg::split_vorbis_headers(&af.extra)?;
+            let decoder = v2v_vorbis::Decoder::new(id, setup)?;
+            // **不需要 skip**：Vorbis 的 priming 在解码器内部就处理掉了
+            // （第一个块只做叠加准备、不吐样本），不像 WMA / AAC 那样要外部丢一帧。
+            Ok(Some(plan(
+                AudioSource::Decode(AudioDecoder::Vorbis(Box::new(decoder))),
+                0,
+            )))
+        }
         None => Err(Error::Unsupported(format!(
-            "音频是 0x{:04X}，`.mp4` 这条路支持 WMA、AAC-LC、MP3 与 16 位 PCM；\
+            "音频是 0x{:04X}，`.mp4` 这条路支持 WMA、AAC-LC、MP3、Vorbis 与 16 位 PCM；\
              用 --no-audio 只转视频", af.format_tag
         ))),
     }

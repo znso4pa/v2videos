@@ -18,6 +18,9 @@ mpeg12-c = ["v2v-player/mpeg12-c"]
 v2v-kernel = { path = "../v2v-kernel" }
 v2v-asf = { path = "../v2v-asf" }
 v2v-avi = { path = "../v2v-avi" }
+# `.ogg` 输入：Ogg 容器层 + Vorbis 解码器（两者都只往下解，输出仍走 `.wmv` / `.mp4` / `.wav`）。
+v2v-ogg = { path = "../v2v-ogg" }
+v2v-vorbis = { path = "../v2v-vorbis" }
 v2v-container = { path = "../v2v-container" }
 v2v-msmpeg4 = { path = "../msmpeg4" }
 # VC-1（WMV3）输入：只有解码器，输出仍走 MP43 / mp4v。

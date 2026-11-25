@@ -334,6 +334,65 @@ impl VorbisId {
     }
 }
 
+/// 把 [`AudioFormat::extra`] 拆回三个头包：`(识别头, 注释头, setup 头)`。
+///
+/// `extra` 里是**三个头包原样拼接**（与 ffmpeg 的 `extradata` 同思路），
+/// 而 Vorbis 解码器建实例只需要**识别头**（流参数）和 **setup 头**（码本 / floor /
+/// residue / mapping / mode）—— 所以中间那个注释头必须能跳过去。
+///
+/// 不能靠「搜 `\x05vorbis`」：注释头里装的是 UTF-8 文本，理论上可以含任意字节，
+/// 而这里的分界必须是**确定的**。注释头自带长度字段（vendor 串 + 逐条 comment），
+/// 按规范 5.2 数一遍就知道边界在哪。
+pub fn split_vorbis_headers(extra: &[u8]) -> Result<(&[u8], &[u8], &[u8])> {
+    const ID_LEN: usize = 30; // 识别头长度由规范 4.2.2 定死
+    if extra.len() < ID_LEN || !extra.starts_with(b"\x01vorbis") {
+        return Err(Error::Bad("extra 不是以 Vorbis 识别头开头".into()));
+    }
+    let id = &extra[..ID_LEN];
+    let rest = &extra[ID_LEN..];
+    if !rest.starts_with(b"\x03vorbis") {
+        return Err(Error::Bad("识别头后面不是注释头".into()));
+    }
+
+    // 注释头：7 字节魔数 + vendor 长度 + vendor + 条数 + 逐条 (长度 + 内容) + framing 位
+    let be = |at: usize| -> Result<usize> {
+        let s = rest
+            .get(at..at + 4)
+            .ok_or_else(|| Error::Bad("注释头被截断".into()))?;
+        Ok(u32::from_le_bytes(s.try_into().unwrap()) as usize)
+    };
+    let mut p = 7usize;
+    let vendor = be(p)?;
+    p += 4;
+    p = p
+        .checked_add(vendor)
+        .filter(|&p| p <= rest.len())
+        .ok_or_else(|| Error::Bad("注释头的 vendor 串长度越界".into()))?;
+    let count = be(p)?;
+    p += 4;
+    for _ in 0..count {
+        let len = be(p)?;
+        p = p
+            .checked_add(4)
+            .and_then(|p| p.checked_add(len))
+            .ok_or_else(|| Error::Bad("注释头的 comment 长度溢出".into()))?;
+        if p > rest.len() {
+            return Err(Error::Bad("注释头被截断".into()));
+        }
+    }
+    p += 1; // framing 位
+    if p > rest.len() {
+        return Err(Error::Bad("注释头缺 framing 位".into()));
+    }
+
+    let comment = &rest[..p];
+    let setup = &rest[p..];
+    if !setup.starts_with(b"\x05vorbis") {
+        return Err(Error::Bad("注释头后面不是 setup 头".into()));
+    }
+    Ok((id, comment, setup))
+}
+
 /// Ogg 解封装器。
 ///
 /// 用法是**两段式**：`open` 读完所有头（顺手把 Vorbis 那三个头塞进
@@ -741,6 +800,52 @@ pub fn duration_ms<R: Read + Seek>(r: &mut R) -> Result<Option<u64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 拼一份「识别头 + 注释头 + setup 头」，注释头里故意塞一个**含 `\x05vorbis`
+    /// 的 comment** —— 靠搜魔数分界的那种写法会在这里断错位置。
+    #[test]
+    fn splits_vorbis_headers_by_length_not_by_magic() {
+        let mut id = vec![0u8; 30];
+        id[..7].copy_from_slice(b"\x01vorbis");
+        id[11] = 2;
+        id[12..16].copy_from_slice(&44100u32.to_le_bytes());
+        id[28] = 0xBB;
+        id[29] = 1;
+
+        let vendor = b"v2v-test";
+        let comments: [&[u8]; 2] = [b"TITLE=trap", b"X=\x05vorbis\x03vorbis"];
+        let mut cm = Vec::new();
+        cm.extend_from_slice(b"\x03vorbis");
+        cm.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
+        cm.extend_from_slice(vendor);
+        cm.extend_from_slice(&(comments.len() as u32).to_le_bytes());
+        for c in comments {
+            cm.extend_from_slice(&(c.len() as u32).to_le_bytes());
+            cm.extend_from_slice(c);
+        }
+        cm.push(1); // framing 位
+
+        let setup = b"\x05vorbis\x00\x01\x02payload".to_vec();
+        let mut extra = id.clone();
+        extra.extend_from_slice(&cm);
+        extra.extend_from_slice(&setup);
+
+        let (a, b, c) = split_vorbis_headers(&extra).unwrap();
+        assert_eq!(a, &id[..]);
+        assert_eq!(b, &cm[..]);
+        assert_eq!(c, &setup[..]);
+    }
+
+    /// 截断的注释头必须报错，不能靠「后面看起来像 setup 头」蒙过去。
+    #[test]
+    fn truncated_comment_header_is_rejected() {
+        let mut id = vec![0u8; 30];
+        id[..7].copy_from_slice(b"\x01vorbis");
+        let mut extra = id;
+        extra.extend_from_slice(b"\x03vorbis");
+        extra.extend_from_slice(&99u32.to_le_bytes()); // vendor 长度 99，但后面什么都没有
+        assert!(split_vorbis_headers(&extra).is_err());
+    }
 
     #[test]
     fn identifies_known_codecs() {

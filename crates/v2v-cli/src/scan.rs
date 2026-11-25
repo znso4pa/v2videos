@@ -162,8 +162,27 @@ fn probe(path: &Path) -> ScanEntry {
     entry.duration_ms = src.duration_ms();
 
     let Some(v) = src.video_stream() else {
-        // 纯音频文件（或格式信息缺失）：能开，但没有我们要转的东西。
-        entry.verdict = Verdict::Unsupported("没有视频轨".into());
+        // 纯音频文件：只有 `--wav` 那条路走得了（它不看视频轨）。
+        // `.ogg` 就走这里 —— 别的容器目前也到不了这个分支。
+        if let Some((_, af)) = src.audio_stream() {
+            entry.audio = Some(AudioInfo {
+                codec: audio_codec_name(af.format_tag),
+                channels: af.channels,
+                sample_rate: af.sample_rate,
+            });
+            let (targets, note) = output_targets(Some(&af));
+            if targets.contains(&"wav") {
+                entry.verdict = Verdict::Convertible { targets };
+                entry.note = note;
+                return entry;
+            }
+            entry.verdict = Verdict::Unsupported(format!(
+                "只有音频（{}），且抽不成 WAV",
+                audio_codec_name(af.format_tag)
+            ));
+            return entry;
+        }
+        entry.verdict = Verdict::Unsupported("没有视频轨也没有音频轨".into());
         return entry;
     };
     entry.video = Some(VideoInfo {
@@ -221,6 +240,12 @@ fn output_targets(af: Option<&crate::AudioFormat>) -> (Vec<&'static str>, Option
             vec!["mp4"],
             Some("音频是 MP3：`.wmv` 那条路的音频只直通 WMA，要转它得加 `--no-audio`".into()),
         ),
+        // Vorbis（Ogg）：`.ogg` 里通常**只有音频**，而 `.wmv` / `.mp4` 两条路都要
+        // 视频轨（要写 VOL / 定帧率），所以只有抽轨成 WAV 这一条。
+        Some(AudioKind::Vorbis) => (
+            vec!["wav"],
+            Some("音频是 Vorbis（Ogg）：`.wmv` / `.mp4` 都要视频轨，只能 `--wav` 抽轨".into()),
+        ),
         None => (
             vec!["wmv", "mp4"],
             Some(format!(
@@ -238,6 +263,7 @@ fn audio_codec_name(tag: u16) -> String {
         0x0162 => "WMAPro".into(),
         0x0001 => "PCM".into(),
         v2v_mp3::FORMAT_TAG => "MP3".into(),
+        v2v_ogg::VORBIS_FORMAT_TAG => "Vorbis".into(),
         0x00FF => "AAC-LC".into(),
         other => format!("0x{other:04X}"),
     }
