@@ -207,6 +207,11 @@ pub unsafe extern "C" fn v2v_mux_open(
                                 decoder_specific_info: asc,
                             },
                             priming: a.priming,
+                            // C 侧的结构体没有这个字段，也**不该有**：它描述的是
+                            // 「调用方自己知道要播多少采样点」这种高层信息，而 C API
+                            // 的口径是「给我一轨、我按你喂的样本数写」。
+                            // `None` 让封装器退回「总时长 − 编码器预热」的旧口径。
+                            presentation_samples: None,
                         };
                         Ok(Mux::Mp4(v2v_mp4::Mp4Muxer::with_audio(vtrack, atrack)))
                     }

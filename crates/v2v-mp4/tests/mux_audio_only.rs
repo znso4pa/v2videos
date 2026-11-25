@@ -27,14 +27,35 @@
 //! 静音乘任何系数还是 0，正弦对错位不敏感 —— 两者都能让写坏的封装器
 //! 通过测试（本仓在这上面被骗过两次，见 AGENTS.md）。
 
-use std::process::Command;
+use std::process::{Command, Stdio};
 
-use v2v_mp4::{AudioCodec, AudioTrack, Mp4Muxer};
+use v2v_mp4::{AudioCodec, AudioTrack, Mp4Demuxer, Mp4Muxer};
 
 const CHANNELS: u16 = 2;
 const SAMPLE_RATE: u32 = 44_100;
 /// 采样点数 = 1 秒。
 const POINTS: usize = SAMPLE_RATE as usize;
+
+/// 外部工具在不在。不在就打 `SKIP` 并让测试通过 —— 仓里的统一做法。
+///
+/// ⚠️ 这不是「偷懒跳过」。CI 的 macOS job **故意不装 ffmpeg**（见
+/// `.github/workflows/ci.yml` 里 `ffmpeg: false` 那段：那个 job 的职责是
+/// **可移植性**，不是重复验一遍 oracle）。原来这里写的是
+/// `.expect("跑不了 ffprobe")` —— 于是这个 job 在「找不到工具」上直接红，
+/// 而红的原因与本次改动毫无关系，正是那种「红得没信息」的失败。
+///
+/// 代价是：macOS 上这两条 oracle 判据不跑。所以下面另外有一条
+/// `audio_only_pcm_round_trips_through_our_own_demuxer` —— 它只用本仓的
+/// 解封装器，**不需要外部工具**，CI 两个平台都真跑。
+fn have_tool(name: &str) -> bool {
+    Command::new(name)
+        .arg("-version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
 
 /// 合成确定性 PCM（S16LE，交错）。
 ///
@@ -78,6 +99,10 @@ fn write_file(bytes: &[u8], name: &str) -> std::path::PathBuf {
 
 #[test]
 fn audio_only_pcm_is_read_by_ffmpeg() {
+    if !have_tool("ffprobe") || !have_tool("ffmpeg") {
+        eprintln!("SKIP：找不到 ffprobe / ffmpeg（CI 的 macOS job 按设计不装）");
+        return;
+    }
     let pcm = synth_pcm();
     let point_bytes = CHANNELS as usize * 2;
 
@@ -187,6 +212,10 @@ fn audio_only_pcm_is_read_by_ffmpeg() {
 /// 所以这条不能只测「正好 1 秒」。
 #[test]
 fn audio_only_pcm_keeps_ragged_tail() {
+    if !have_tool("ffmpeg") {
+        eprintln!("SKIP：找不到 ffmpeg（CI 的 macOS job 按设计不装）");
+        return;
+    }
     const POINTS: usize = 1000;
     let point_bytes = CHANNELS as usize * 2;
     let pcm: Vec<u8> = (0..POINTS * point_bytes).map(|i| (i * 37) as u8).collect();
@@ -210,4 +239,55 @@ fn audio_only_pcm_keeps_ragged_tail() {
         POINTS,
         pcm.len()
     );
+}
+
+/// 不需要任何外部工具的往返判据：**自己写、自己读回来**。
+///
+/// 为什么要有这条：上面两条依赖 ffprobe / ffmpeg，而 CI 的 macOS job 按设计
+/// 不装它们 —— 于是「纯音频 MP4」在 macOS 上会变成**零覆盖**。这条只用本仓的
+/// 解封装器，两个平台都真跑。
+///
+/// 它能挡什么、不能挡什么要说清：
+/// - **能挡**：`moov` 里多出一条 `trak`、轨号接错、`stsz`/`stts`/`stco`/`stsc`
+///   填错导致的丢样本 / 错位 / 声道互换 —— 只要解出来的字节与写进去的不同就红。
+/// - **不能挡**：`stsd` / `esds` 的字段写错（我们自己的解封装器会照着自己写错的
+///   格式读回来，两边一起错就看不出来）。那一层只能靠 ffmpeg 那条。
+#[test]
+fn audio_only_pcm_round_trips_through_our_own_demuxer() {
+    let pcm = synth_pcm();
+    let point_bytes = CHANNELS as usize * 2;
+
+    let mut m = Mp4Muxer::audio_only(pcm_track());
+    for chunk in pcm.chunks_exact(point_bytes) {
+        m.write_audio(chunk, 1).expect("写音频样本");
+    }
+    let file = m.finish();
+
+    let mut cur = std::io::Cursor::new(&file);
+    let mut d = Mp4Demuxer::new(&mut cur).expect("读回自己写的文件");
+    let streams = d.streams();
+    assert_eq!(streams.len(), 1, "纯音频 MP4 应该只有 1 条流，实际 {}", streams.len());
+    let a = streams[0].audio.as_ref().expect("这条流应该是音频");
+    assert_eq!(a.channels, CHANNELS, "声道数不对");
+    assert_eq!(a.sample_rate, SAMPLE_RATE, "采样率不对");
+
+    let mut got = Vec::with_capacity(pcm.len());
+    while let Some(s) = d.next_sample().expect("读样本") {
+        got.extend_from_slice(&s.data);
+    }
+    assert_eq!(
+        got.len(),
+        pcm.len(),
+        "解出来的字节数不对（{} vs {}）—— 采样点数丢了或多写了",
+        got.len(),
+        pcm.len()
+    );
+    if let Some(i) = got.iter().zip(&pcm).position(|(a, b)| a != b) {
+        let point = i / point_bytes;
+        let chan = (i % point_bytes) / 2;
+        panic!(
+            "第 {i} 字节（采样点 {point}、声道 {chan}）不同：{:02x} vs {:02x}",
+            got[i], pcm[i]
+        );
+    }
 }
