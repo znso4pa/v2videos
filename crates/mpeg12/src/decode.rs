@@ -115,8 +115,26 @@ pub mod prof {
     ///
     /// 一次 TLS 读（~1 ns），比一次 `Instant::now()`（~20 ns）便宜一个量级，
     /// 所以用它来门控比「先插桩再扔掉」划算。
+    ///
+    /// ⚠️ TLS 读必须留在 `#[cold]` 的独立函数里。写成 `enabled() && SAMPLE.with(..)`
+    /// 时 LLVM 会把 `SAMPLE` 的 **TLS 地址计算提到短路判断之前** —— 于是「剖析关着」
+    /// 也要每次调用付一次 `_tlv_get_addr`。实测（`sample` 自耗时排行）
+    /// `_tlv_get_addr` 占 **2.3%**，调用者正是 `predict_block` / `store_pixels`
+    /// 开头这两行门控。
+    #[inline]
     pub fn on() -> bool {
-        enabled() && SAMPLE.with(|s| s.get())
+        if !enabled() {
+            return false;
+        }
+        sampled_mb()
+    }
+
+    /// 冷路径：真的去读 TLS。**`#[cold]` + `#[inline(never)]` 是必须的**，
+    /// 否则它会和上面那个函数合并，TLS 地址计算又被提回去。
+    #[cold]
+    #[inline(never)]
+    fn sampled_mb() -> bool {
+        SAMPLE.with(|s| s.get())
     }
 
     /// 在每个宏块循环的开头调一次：决定这个宏块要不要插桩。
@@ -2548,6 +2566,9 @@ fn write_b_block(
     } else {
         (&forward.y, &backward.y)
     };
+    // 单向预测（B 帧里前向、后向各占一大片）不要过 `combine_pred`：
+    // 它会把唯一的那份预测**再拷一遍**才返回，而调用方紧接着又拷进平面。
+    // 64 字节看着不多，但这条路径每帧上千个块。
     let pf = if fwd {
         Some(predict_block(
             f_plane, plane_width, rw, rh, origin_x, origin_y, mv_f.0, mv_f.1, chroma, row_step, 1,
@@ -2564,17 +2585,34 @@ fn write_b_block(
     } else {
         None
     };
-    let pred = combine_pred(&pf, &pb);
     let out_plane = match block {
         0..=3 => &mut frame.y,
         4 | 6 | 8 | 10 => &mut frame.u,
         _ => &mut frame.v,
     };
     let base = origin_y * plane_width + origin_x;
-    if let Some(residual) = residual {
-        store_pred(&pred, residual, out_plane, stride, base);
-    } else {
-        store_pixels(&pred, out_plane, stride, base);
+    match (&pf, &pb) {
+        (Some(a), Some(b)) => {
+            let pred = combine_two(a, b);
+            match residual {
+                Some(residual) => store_pred(&pred, residual, out_plane, stride, base),
+                None => store_pixels(&pred, out_plane, stride, base),
+            }
+        }
+        // 单向：直接落盘，不经 `combine_pred` 的第三份拷贝。
+        (Some(pred), None) | (None, Some(pred)) => match residual {
+            Some(residual) => store_pred(pred, residual, out_plane, stride, base),
+            None => store_pixels(pred, out_plane, stride, base),
+        },
+        // 两个方向都没有 —— 宏块类型不允许，但**不 panic**：按「全零预测」落盘，
+        // 让画面偏一块而不是整个播放中断。
+        (None, None) => {
+            let pred = [0u8; 64];
+            match residual {
+                Some(residual) => store_pred(&pred, residual, out_plane, stride, base),
+                None => store_pixels(&pred, out_plane, stride, base),
+            }
+        }
     }
 }
 
@@ -2609,12 +2647,19 @@ fn write_predicted_mb(
 /// 合并前向 / 后向两路预测（双向取平均）。
 fn combine_pred(pf: &Option<[u8; 64]>, pb: &Option<[u8; 64]>) -> [u8; 64] {
     match (pf, pb) {
-        (Some(a), Some(b)) => {
-            std::array::from_fn(|i| ((u16::from(a[i]) + u16::from(b[i]) + 1) >> 1) as u8)
-        }
+        (Some(a), Some(b)) => combine_two(a, b),
         (Some(a), None) | (None, Some(a)) => *a,
         (None, None) => [0; 64],
     }
+}
+
+/// 双向取平均：`(a + b + 1) >> 1`。
+///
+/// 单独拆出来是给 `write_b_block` 用的 —— 它要能**绕开** `Option` 那层，
+/// 单向预测直接落盘，少一次 64 字节拷贝。
+#[inline]
+fn combine_two(a: &[u8; 64], b: &[u8; 64]) -> [u8; 64] {
+    std::array::from_fn(|i| ((u16::from(a[i]) + u16::from(b[i]) + 1) >> 1) as u8)
 }
 
 /// 写一个 B 帧场运动宏块的预测（两场各自前向 / 后向 / 双向）。
