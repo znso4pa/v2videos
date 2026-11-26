@@ -116,8 +116,23 @@ impl MpgPlayer {
         let (width, height) = (sequence.width, sequence.height);
         #[cfg(feature = "mpeg12-c")]
         v2v_mpeg12_c::install();
+        // 池要按 sequence 开缓冲，所以在把它交出去之前先用一眼。
+        #[cfg(feature = "mpeg12-pool")]
+        let pool = (threads > 1)
+            .then(|| v2v_mpeg12_simd::pool::Pool::new(threads, &sequence));
+        // `mut` 只有注入池时才用得到（feature 关着时不该留个多余的 `mut`）。
+        #[cfg_attr(not(feature = "mpeg12-pool"), allow(unused_mut))]
+        let mut dec = PictureDecoder::new(sequence, threads);
+        // opt-in：把常驻线程池注入进去（默认关 —— 它带 unsafe）。
+        //
+        // 这条路只在 `mpeg12-pool` feature 下编出来。不开的时候 `PictureDecoder`
+        // 用默认的 `MtDecoder`（每帧 `scope + spawn`），整条依赖闭包零 unsafe。
+        #[cfg(feature = "mpeg12-pool")]
+        if let Some(pool) = pool {
+            dec.set_parallel(Box::new(pool));
+        }
         Ok(Self {
-            dec: PictureDecoder::new(sequence, threads),
+            dec,
             pictures,
             ready: VecDeque::new(),
             finished: false,

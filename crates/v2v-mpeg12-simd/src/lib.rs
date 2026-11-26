@@ -24,6 +24,23 @@
 
 #![allow(unsafe_code)]
 
+//! ## 本 crate 里的两个 **unsafe 开关**
+//!
+//! | 开关 | 是什么 | 默认 | 实测收益 |
+//! |---|---|---|---|
+//! | `unsafe-kernels`（feature） | `std::arch` / C 写的解码内核 | **关** | 半像素平均 1.3%（**没装**）、IDCT 列通道 0%、C NEON 8×8 MC −4.3% |
+//! | [`pool`] 模块（API） | 切片并行的**常驻线程池** | 调用方才用得到 | 4 线程 **+11.2%**、8 线程 **+16.2%** |
+//!
+//! 两个都**默认不生效**：`unsafe-kernels` 是 cargo feature（不开就是纯安全路径），
+//! 池是一个要显式 `Pool::new(..)` 的 API（`v2v-player` 那边挂在 `mpeg12-pool`
+//! feature 后面）。所以「`v2v-mpeg12` 的依赖闭包零 unsafe」这句话，在默认构建下
+//! **仍然成立**，`crates/v2v-kernel/tests/feature_gate.rs` 那条断言照旧是绿的。
+//!
+//! 池为什么需要 unsafe：常驻 worker 要跨帧拿着 `&mut Frame` 和码流，
+//! `std::thread::scope` 做不到（借用绑在作用域上）。规模是 4 处
+//! `unsafe { &*(ptr) }`，安全性论证写在 [`pool`] 的模块文档里（四条不变量）。
+//! 产物与安全路径**逐字节相同**，`tests/pool.rs` 三条判据钉着。
+
 use std::os::raw::c_char;
 
 /// 版本号，给 FFI 用（宿主 dlopen 之后第一件事就是问它）。
@@ -55,6 +72,7 @@ pub extern "C" fn v2v_mpeg12_simd_kernels() -> u32 {
 // ---------------------------------------------------------------------------
 
 pub mod kernels;
+pub mod pool;
 
 /// 把本 crate 的内核装进解码器（进程内调一次即可）。
 pub use kernels::install;

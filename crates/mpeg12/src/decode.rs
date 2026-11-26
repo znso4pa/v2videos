@@ -3233,6 +3233,47 @@ fn fill_blank_rows(dst: &mut Frame, r0: usize, r1: usize, chroma_format: u8) {
     span.v.fill(128);
 }
 
+// ───────────────── 并行解码的公开助手（安全，无 unsafe）─────────────────
+//
+// `v2v-mpeg12-simd` 的常驻线程池需要自己按行区间准备缓冲、再把结果合并回
+// 结果帧。那两件事的**正确算法**只该有一份 —— 所以在这里导出，那边不重写。
+//
+// ⚠️ 这一组函数**没有任何 unsafe**：`v2v-mpeg12` 的「零 unsafe」承诺不变，
+// 裸指针与生命周期擦除全部在 `v2v-mpeg12-simd` 那一侧。
+
+/// 三个平面的可见尺寸：`(luma_w, luma_h, chroma_w, chroma_h)`。
+///
+/// `luma_h` 是**按 16 对齐的编码高度**（宏块恒 16×16），不是 `Frame.height`。
+/// 并行路径要按这个高度分配缓冲 —— 少分配会让最后一行宏块越界。
+pub fn plane_dims(frame: &Frame, chroma_format: u8) -> (usize, usize, usize, usize) {
+    let w = frame.width as usize;
+    let ph = (frame.height as usize).div_ceil(16) * 16;
+    let (cw, ch) = chroma_dims(chroma_format, w, ph);
+    (w, ph, cw, ch)
+}
+
+/// 把 `src` 的宏块行 `[r0, r1)` 拷进 `dst` 的同一段行。
+///
+/// 并行解码的三个用途，全部走这一份：① worker 把自己那段填成参考帧原样
+/// （跳过宏块的预测就是这个）；② worker 在 I 帧上填底色；③ 主线程把各 worker
+/// 的结果合并回结果帧。
+pub fn copy_rows_pub(dst: &mut Frame, src: &Frame, r0: usize, r1: usize, chroma_format: u8) {
+    copy_rows(dst, src, r0, r1, chroma_format);
+}
+
+/// 把 `dst` 的宏块行 `[r0, r1)` 填成 I 帧的底色（亮度 0、色度 128）。
+pub fn fill_blank_rows_pub(dst: &mut Frame, r0: usize, r1: usize, chroma_format: u8) {
+    fill_blank_rows(dst, r0, r1, chroma_format);
+}
+
+/// 只分配、不拷内容的帧缓冲（`Frame.width` / `height` 按 `sequence` 填）。
+///
+/// 并行路径的结果帧用它 —— 每一行都会被「合并」或「填底色」覆盖，
+/// 所以起手时拷参考帧是白拷（720×576 是 622 KB/帧）。
+pub fn blank_frame_pub(sequence: &SequenceHeader) -> Frame {
+    blank_frame(sequence)
+}
+
 fn row_span(frame: &mut Frame, rs: usize, re: usize, chroma_format: u8) -> RowSpan<'_> {
     let (ylen, ulen) = (frame.y.len(), frame.u.len());
     let lw = frame.width as usize; // 亮度平面一行多少字节（行距 = 可见宽度）
@@ -3247,6 +3288,100 @@ fn row_span(frame: &mut Frame, rs: usize, re: usize, chroma_format: u8) -> RowSp
         u: &mut frame.u[c0..c1],
         v: &mut frame.v[c0..c1],
     }
+}
+
+/// 把一帧切成「(起始宏块行, 结束宏块行, 该组重组的码流)」，每片一组的行区间
+/// **互不重叠、并集覆盖 `[0, mb_h)`**。
+///
+/// 返回 `None` = **不该走并行**：线程数 <= 1、只有一片、或者帧太矮（`mb_h < 4`）。
+/// 这个判断在这里做、而不是让调用方各写一遍 —— 三处消费者
+/// （[`MtDecoder`]、`v2v-mpeg12-simd` 的常驻池、`tests/mt.rs`）必须用同一套切法，
+/// 否则「两条路逐字节相同」这条判据就失去了意义。
+///
+/// ## 为什么按行区间切，不按「每组几片」
+///
+/// 常见流只有 9 片（每片 4 行），按片数切最多用满 5 个线程；按行区间切能把
+/// 36 行均分给 8 个线程。一个 slice 覆盖到下一个 slice 的起始行为止，所以切点
+/// 必须落在**片边界**上（否则某一组会缺行）。
+///
+/// ## ⚠️ 图像头 / 扩展要一起带上
+///
+/// MPEG-2 的 picture coding extension 就在图像头后面、第一个 slice 前面，
+/// `mpeg2_extension()` 是从 `data` 里扫它的。只把 slice 拼给线程，扩展就丢了
+/// → MPEG-2 会按 MPEG-1 的表解，直接报错（或更糟：算出错的像素）。
+pub fn split_frame_groups(
+    sequence: &SequenceHeader,
+    data: &[u8],
+    threads: usize,
+) -> Option<Vec<(usize, usize, Vec<u8>)>> {
+    if threads <= 1 {
+        return None;
+    }
+    let units = crate::split_units(data);
+    let mut slices: Vec<(u8, Vec<u8>)> = Vec::new();
+    let mut head: &[u8] = &[];
+    for (code, payload) in &units {
+        if (0x01..=0xAF).contains(code) {
+            if head.is_empty() {
+                let off = (payload.as_ptr() as usize)
+                    .wrapping_sub(data.as_ptr() as usize)
+                    .saturating_sub(4) // 去掉这个 slice 自己的起始码（下面会重新拼）
+                    .min(data.len());
+                head = &data[..off];
+            }
+            let mut raw = Vec::with_capacity(payload.len() + 4);
+            raw.extend_from_slice(&[0, 0, 1, *code]);
+            raw.extend_from_slice(payload);
+            slices.push((*code, raw));
+        }
+    }
+    let mb_h = (sequence.height as usize).div_ceil(16);
+    if slices.len() <= 1 || mb_h < 4 {
+        return None;
+    }
+
+    let mut groups: Vec<(usize, usize, Vec<u8>)> = Vec::new();
+    let mut cur: Vec<(u8, Vec<u8>)> = Vec::new();
+    let flush = |cur: &mut Vec<(u8, Vec<u8>)>, groups: &mut Vec<(usize, usize, Vec<u8>)>| {
+        if cur.is_empty() {
+            return;
+        }
+        let first = (cur[0].0 as usize).saturating_sub(1);
+        let raw_len: usize = cur.iter().map(|(_, r)| r.len()).sum();
+        let mut with_head = Vec::with_capacity(head.len() + raw_len);
+        with_head.extend_from_slice(head);
+        for (_, r) in cur.drain(..) {
+            with_head.extend_from_slice(&r);
+        }
+        groups.push((first, 0, with_head));
+    };
+    // 第 i 组覆盖的行区间是 `[i*mb_h/threads, (i+1)*mb_h/threads)`；遇到某个 slice
+    // 的起始行已经越过这个上界、并且还没用完线程额度，就切一刀。
+    let threads = threads.min(slices.len());
+    let mut group_index = 0usize;
+    let mut next_boundary = mb_h.div_ceil(threads).max(1);
+    for s in slices {
+        let row = (s.0 as usize).saturating_sub(1);
+        if row >= next_boundary && group_index + 1 < threads {
+            flush(&mut cur, &mut groups);
+            group_index += 1;
+            next_boundary = ((group_index + 1) * mb_h).div_ceil(threads).max(next_boundary + 1);
+        }
+        cur.push(s);
+    }
+    flush(&mut cur, &mut groups);
+
+    // ⚠️ **组的结束行 = 下一组的起始行**（最后一组到帧底）。一个 slice 覆盖到
+    // 下一个 slice 的起始行为止；写成「本组最后一个 slice 的起始行 + 1」会把
+    // 最后一个 slice 之后的行漏掉 —— I 帧那些行没人写，就留着初值。
+    for i in 0..groups.len() {
+        groups[i].1 = if i + 1 < groups.len() {
+            groups[i + 1].0
+        } else {
+            mb_h
+        };
+    }
+    Some(groups)
 }
 
 /// 多线程解码器：**按 slice 的行区间切给多个线程**，各自解自己那几行，最后按行合并。
@@ -3295,81 +3430,13 @@ impl MtDecoder {
         forward: Option<&Frame>,
         backward: Option<&Frame>,
     ) -> Result<Frame, DecodeError> {
-        // 收集这一帧的所有 slice（连同起始码，方便重组码流）。
-        let units = crate::split_units(data);
-        let mut slices: Vec<(u8, Vec<u8>)> = Vec::new();
-        // ⚠️ **图像头 / 扩展要一起带上**：MPEG-2 的 picture coding extension 就在图像头
-        // 后面、第一个 slice 前面，`mpeg2_extension()` 是从 `data` 里扫它的。只把 slice
-        // 拼给线程，扩展就丢了 → MPEG-2 会按 MPEG-1 的表解，直接报错。
-        let mut head: &[u8] = &[];
-        for (code, payload) in &units {
-            if (0x01..=0xAF).contains(code) {
-                if head.is_empty() {
-                    let off = (payload.as_ptr() as usize)
-                        .wrapping_sub(data.as_ptr() as usize)
-                        .saturating_sub(4) // 去掉这个 slice 自己的起始码（下面会重新拼）
-                        .min(data.len());
-                    head = &data[..off];
-                }
-                let mut raw = Vec::with_capacity(payload.len() + 4);
-                raw.extend_from_slice(&[0, 0, 1, *code]);
-                raw.extend_from_slice(payload);
-                slices.push((*code, raw));
-            }
-        }
-        let mb_h = (sequence.height as usize).div_ceil(16);
         // 单线程 / 只有一片 / 帧太小 —— 直接走原路径，别为线程开销买单。
-        if self.threads <= 1 || slices.len() <= 1 || mb_h < 4 {
+        //
+        // ⚠️ 这个判断在切组**之前**：切组要扫一遍码流、还会把每片拼成独立
+        // `Vec`（720×576 一帧 ~40 KB 的拷贝），单线程根本不需要它。
+        let Some(groups) = split_frame_groups(sequence, data, self.threads) else {
             return decode_frame(sequence, picture, data, forward, backward);
-        }
-
-        // 按**行区间**切组，而不是按「每组几片」—— 常见流只有 9 片（每片 4 行），
-        // 按片数切最多用满 5 个线程；按行区间切能把 36 行均分给 8 个线程。
-        // 一个 slice 覆盖到下一个 slice 的起始行为止，所以切点必须落在**片边界**上
-        // （否则某一组会缺行）。做法：按行边界扫，到了下一个线程的行区间就切。
-        let mut groups: Vec<(usize, usize, Vec<u8>)> = Vec::new(); // (起始行, 结束行, 码流)
-        let mut cur: Vec<(u8, Vec<u8>)> = Vec::new();
-        let flush = |cur: &mut Vec<(u8, Vec<u8>)>, groups: &mut Vec<(usize, usize, Vec<u8>)>| {
-            if cur.is_empty() {
-                return;
-            }
-            let first = (cur[0].0 as usize).saturating_sub(1);
-            let last = (cur[cur.len() - 1].0 as usize).saturating_sub(1) + 1;
-            let raw_len: usize = cur.iter().map(|(_, r)| r.len()).sum();
-            let mut with_head = Vec::with_capacity(head.len() + raw_len);
-            with_head.extend_from_slice(head);
-            for (_, r) in cur.drain(..) {
-                with_head.extend_from_slice(&r);
-            }
-            groups.push((first, last, with_head));
         };
-        // 第 i 组覆盖的行区间是 [i*mb_h/threads, (i+1)*mb_h/threads)；遇到某个 slice
-        // 的起始行已经越过这个上界、并且还没用完线程额度，就切一刀。
-        let threads = self.threads.min(slices.len());
-        let mut group_index = 0usize;
-        let mut next_boundary = mb_h.div_ceil(threads).max(1);
-        for s in slices {
-            let row = (s.0 as usize).saturating_sub(1);
-            if row >= next_boundary && group_index + 1 < threads {
-                flush(&mut cur, &mut groups);
-                group_index += 1;
-                next_boundary =
-                    ((group_index + 1) * mb_h).div_ceil(threads).max(next_boundary + 1);
-            }
-            cur.push(s);
-        }
-        flush(&mut cur, &mut groups);
-
-        // ⚠️ **组的结束行 = 下一组的起始行**（最后一组到帧底）。一个 slice 覆盖到
-        // 下一个 slice 的起始行为止；写成「本组最后一个 slice 的起始行 + 1」会把
-        // 最后一个 slice 之后的行漏掉 —— I 帧那些行没人写，就留着初值。
-        for i in 0..groups.len() {
-            groups[i].1 = if i + 1 < groups.len() {
-                groups[i + 1].0
-            } else {
-                mb_h
-            };
-        }
 
         // worker 缓冲：按需分配 / 尺寸变了就重建（跨帧复用，不每帧申请）。
         let want = groups.len();
@@ -3409,6 +3476,7 @@ impl MtDecoder {
         let first_start = groups.first().map(|g| g.0).unwrap_or(0);
         let last_end = groups.last().map(|g| g.1).unwrap_or(0);
         let intra = matches!(picture.picture_type, PictureType::I);
+        let mb_h = (sequence.height as usize).div_ceil(16);
         for (r0, r1) in [(0usize, first_start), (last_end, mb_h)] {
             if r0 >= r1 {
                 continue;
@@ -3463,6 +3531,112 @@ impl MtDecoder {
             copy_rows(&mut out, buf, rs, re, chroma_format);
         }
         Ok(out)
+    }
+}
+
+impl crate::picture::FrameParallel for MtDecoder {
+    /// 与 [`MtDecoder::decode`] 的区别只在**两件事**：
+    ///
+    /// 1. 组由调用方给（它已经用 [`split_frame_groups`] 切好了，且保证非空）；
+    /// 2. 结果**合并回调用方的 `out`**，而不是自己建一个返回。
+    ///
+    /// `out` 的初始内容由调用方负责（没被覆盖的行要保持参考帧原位）。
+    fn decode_into(
+        &mut self,
+        sequence: &SequenceHeader,
+        picture: PictureHeader,
+        forward: Option<&Frame>,
+        backward: Option<&Frame>,
+        groups: Vec<(usize, usize, Vec<u8>)>,
+        out: &mut Frame,
+    ) -> Result<(), DecodeError> {
+        let want = groups.len().min(self.threads);
+        if want == 0 {
+            return Err(DecodeError::new("no_slices", 0, 0));
+        }
+        // worker 缓冲：按需分配 / 尺寸变了就重建（跨帧复用，不每帧申请）。
+        if self.bufs.len() < want
+            || self
+                .bufs
+                .first()
+                .is_some_and(|f| f.width != sequence.width || f.height != sequence.height)
+        {
+            self.bufs.clear();
+            for _ in 0..want {
+                self.bufs.push(Frame {
+                    width: sequence.width,
+                    height: sequence.height,
+                    y: Vec::new(),
+                    u: Vec::new(),
+                    v: Vec::new(),
+                });
+            }
+        }
+        for buf in &mut self.bufs[..want] {
+            // 平面按 16 对齐的高度开（与 `base_frame` 同一个理由）。
+            let (w, ph, cw, ch) = {
+                let probe = Frame {
+                    width: sequence.width,
+                    height: sequence.height,
+                    y: Vec::new(),
+                    u: Vec::new(),
+                    v: Vec::new(),
+                };
+                crate::decode::plane_dims(&probe, sequence.chroma_format)
+            };
+            let _ = w;
+            if buf.y.len() != w * ph {
+                buf.y.resize(w * ph, 0);
+                buf.u.resize(cw * ch, 128);
+                buf.v.resize(cw * ch, 128);
+            }
+        }
+
+        let chroma_format = sequence.chroma_format;
+        let intra = matches!(picture.picture_type, PictureType::I) || forward.is_none();
+        let mut results: Vec<(usize, usize, Result<(), DecodeError>)> = Vec::new();
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for ((rs, re, raw), buf) in groups.into_iter().zip(self.bufs.iter_mut()) {
+                let f = forward;
+                let b = backward;
+                let pic = picture.clone();
+                handles.push((
+                    rs,
+                    re,
+                    scope.spawn(move || {
+                        // ① 把自己那段行区间填成底色（跳过宏块需要「参考帧原位」）。
+                        if intra {
+                            fill_blank_rows(buf, rs, re, chroma_format);
+                        } else if let Some(fwd) = f {
+                            copy_rows(buf, fwd, rs, re, chroma_format);
+                        }
+                        // ② 解自己那几个 slice，写进同一块缓冲。
+                        decode_frame_into(sequence, pic, &raw, f, b, buf)
+                    }),
+                ));
+            }
+            for (rs, re, h) in handles {
+                results.push((
+                    rs,
+                    re,
+                    h.join()
+                        .unwrap_or_else(|_| Err(DecodeError::new("worker panic", 0, 0))),
+                ));
+            }
+        });
+
+        // ③ 按行合并回结果帧（每组一段，互不重叠）。任何一个 worker 失败就整体失败。
+        for (i, (rs, re, res)) in results.into_iter().enumerate() {
+            res?;
+            let buf = &self.bufs[i];
+            copy_rows(out, buf, rs, re, chroma_format);
+        }
+        Ok(())
+    }
+
+    fn width(&self) -> usize {
+        self.threads
     }
 }
 

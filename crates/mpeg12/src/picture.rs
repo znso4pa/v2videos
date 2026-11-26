@@ -23,6 +23,38 @@ use crate::{PictureHeader, PictureType, SequenceHeader};
 /// 一个 GOP 最多多少帧 —— 防御「没有 I 帧的坏流」把内存吃光。
 const MAX_GOP_FRAMES: usize = 600;
 
+/// 「把一帧并行解出来」的策略。
+///
+/// ## 为什么是 trait 而不是直接调 `MtDecoder`
+///
+/// 因为**更好的并行实现住在别的 crate 里**（`v2v-mpeg12-simd` 的常驻线程池
+/// 带 `unsafe`，而本 crate 的「零 unsafe」是拿 `cargo tree` 机器守着的）。
+/// 本 crate 不能反向依赖它，所以让上层把实现**注入**进来 —— 与
+/// [`crate::decode::set_idct_cols`] 同一个思路，只是这个实现带状态
+/// （worker 要跨帧复用），所以是 `&mut self` 的 trait 而不是函数指针。
+///
+/// ## 实现方必须保证
+///
+/// 产物与 [`crate::decode::decode_frame`] **逐字节相同**。`out` 的初始内容由
+/// [`PictureDecoder`] 负责（它按 `split_frame_groups` 的覆盖范围填好底色），
+/// 实现方只管把自己那段行区间解出来、**再合并回 `out`**。
+pub trait FrameParallel {
+    /// `groups` 由 [`crate::decode::split_frame_groups`] 给出（唯一的切法）。
+    /// 返回的 `Err` 原样上报，不吞。
+    fn decode_into(
+        &mut self,
+        sequence: &SequenceHeader,
+        picture: PictureHeader,
+        forward: Option<&Frame>,
+        backward: Option<&Frame>,
+        groups: Vec<(usize, usize, Vec<u8>)>,
+        out: &mut Frame,
+    ) -> Result<(), DecodeError>;
+
+    /// 并行度（`--threads` 报给用户的数字就是它）。
+    fn width(&self) -> usize;
+}
+
 /// 解好、已经按显示序排好的一帧。
 pub struct DecodedFrame {
     /// 显示时间（毫秒）：`(gop 起点 + temporal_reference) × 帧长`。
@@ -53,7 +85,10 @@ pub struct PictureDecoder {
     /// `Some(n)` = 这一段已经摊平，还剩 `n` 个显示位置没吐完。
     flushing: Option<u64>,
     /// 切片级并行；`None` = 单线程。
-    mt: Option<MtDecoder>,
+    ///
+    /// 默认实现是 `MtDecoder`（每帧 `scope + spawn`）；上层可以用
+    /// [`PictureDecoder::set_parallel`] 换成常驻池。
+    par: Option<Box<dyn FrameParallel>>,
 }
 
 impl PictureDecoder {
@@ -73,8 +108,23 @@ impl PictureDecoder {
             pending_key: BTreeMap::new(),
             gop_base: 0,
             flushing: None,
-            mt: (threads > 1).then(|| MtDecoder::new(threads)),
+            par: (threads > 1).then(|| {
+                Box::new(MtDecoder::new(threads)) as Box<dyn FrameParallel>
+            }),
         }
+    }
+
+    /// 换一个并行实现（默认是 `MtDecoder`）。
+    ///
+    /// 上层用它把**带 unsafe 的常驻线程池**注入进来 —— 本 crate 自己不碰
+    /// unsafe，也不依赖那个 crate。
+    pub fn set_parallel(&mut self, p: Box<dyn FrameParallel>) {
+        self.par = Some(p);
+    }
+
+    /// 当前的并行度（没有并行就是 1）。
+    pub fn parallel_width(&self) -> usize {
+        self.par.as_ref().map_or(1, |p| p.width())
     }
 
     pub fn sequence(&self) -> &SequenceHeader {
@@ -114,10 +164,46 @@ impl PictureDecoder {
             self.last_ip.as_ref()
         };
         let backward = self.last_ip.as_ref();
-        let frame = match &mut self.mt {
-            Some(mt) => mt.decode(&self.sequence, header, data, forward, backward),
-            None => decode::decode_frame(&self.sequence, header, data, forward, backward),
-        }?;
+        // 并行只在「切得开」时才走：切法是唯一的（`split_frame_groups`），
+        // 它说 `None`（片太少 / 帧太矮 / 线程 1）就老老实实单线程。
+        let groups = self
+            .par
+            .as_ref()
+            .and_then(|p| decode::split_frame_groups(&self.sequence, data, p.width()));
+        let frame = match (groups, &mut self.par) {
+            (Some(groups), Some(p)) => {
+                let mut out = decode::blank_frame_pub(&self.sequence);
+                // ⚠️ `out` 的初始内容由**这里**负责（并行实现只管自己那几行）：
+                // 没有被任何组覆盖的行保持「参考帧原位 / I 帧底色」。
+                let mb_h = (self.sequence.height as usize).div_ceil(16);
+                let first_start = groups.first().map(|g| g.0).unwrap_or(0);
+                let last_end = groups.last().map(|g| g.1).unwrap_or(0);
+                let intra = matches!(kind, PictureType::I);
+                for (r0, r1) in [(0usize, first_start), (last_end, mb_h)] {
+                    if r0 >= r1 {
+                        continue;
+                    }
+                    match (intra, forward) {
+                        (true, _) | (false, None) => decode::fill_blank_rows_pub(
+                            &mut out,
+                            r0,
+                            r1,
+                            self.sequence.chroma_format,
+                        ),
+                        (false, Some(f)) => decode::copy_rows_pub(
+                            &mut out,
+                            f,
+                            r0,
+                            r1,
+                            self.sequence.chroma_format,
+                        ),
+                    }
+                }
+                p.decode_into(&self.sequence, header, forward, backward, groups, &mut out)?;
+                out
+            }
+            _ => decode::decode_frame(&self.sequence, header, data, forward, backward)?,
+        };
         if matches!(kind, PictureType::I | PictureType::P) {
             self.prev_ip = self.last_ip.take();
             self.last_ip = Some(frame.clone());

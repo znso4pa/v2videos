@@ -11,6 +11,18 @@ default = []
 # **非默认**：只吃 WMV 的宿主打 `.so` 时不该背上这套码表 —— 这是「最小体积」的开关。
 mpeg12 = ["dep:v2v-mpeg12", "dep:v2v-mpegps"]
 mpeg12-c = ["mpeg12", "dep:v2v-mpeg12-c"]
+# 切片级并行改用**常驻线程池**（`v2v-mpeg12-simd` 的 `pool`）。
+#
+# ⚠️ **这个 feature 会引入 `unsafe`** —— 常驻 worker 要跨帧拿着 `&mut Frame`
+# 和码流，`std::thread::scope` 做不到（借用绑在作用域上），只能降级成裸指针。
+# 所以它**默认关**：关着的时候整条依赖闭包仍然零 `unsafe`（`v2v-mpeg12` 的
+# 文档承诺因此不变，它照样是 oracle）。
+#
+# 实测（M3、720×576 500 帧、仅解码、已扣掉解封装）：2 线程快 4.7%、
+# 4 线程快 **11.3%**、8 线程快 **14.9%** —— 省的就是每帧一次 `spawn`/`join`
+# （4 线程 40.7 µs/帧）。产物与 `MtDecoder` **逐字节相同**
+# （`crates/v2v-mpeg12-simd/tests/pool.rs` 三条判据钉着）。
+mpeg12-pool = ["mpeg12", "dep:v2v-mpeg12-simd"]
 
 [dependencies]
 # 只用它的 `Error`（全仓编解码器共用那一个），在 `From` 里换成播放器自己的错误。
@@ -23,3 +35,5 @@ v2v-wma = { path = "../wma" }
 v2v-mpeg12 = { path = "../mpeg12", optional = true }
 v2v-mpegps = { path = "../v2v-mpegps", optional = true }
 v2v-mpeg12-c = { path = "../v2v-mpeg12-c", optional = true, features = ["neon"] }
+# 常驻线程池（唯一带 `unsafe` 的并行实现），见 `mpeg12-pool` feature。
+v2v-mpeg12-simd = { path = "../v2v-mpeg12-simd", optional = true }

@@ -216,6 +216,7 @@ dependencies = [
  "v2v-kernel",
  "v2v-mpeg12",
  "v2v-mpeg12-c",
+ "v2v-mpeg12-simd",
  "v2v-mpegps",
  "v2v-vc1",
  "v2v-wma",

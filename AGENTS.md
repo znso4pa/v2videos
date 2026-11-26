@@ -34,7 +34,11 @@ v2v-audio-ffi  可选的原生音频适配层，目前只有 libmpg123 解码
 vc1        VC-1（WMV3）解码（I / P，含 ABT / ¼ 像素 MC / 环路滤波；**只有解码器**）
 mpeg12     MPEG-1/2 解码（I / P / B、隔行、4:2:2 / 4:4:4）—— **本 crate 自身零 unsafe，
            且依赖闭包里也没有 unsafe**（kernel 的 NEON 是 opt-in feature，这里不开），当参考实现
-v2v-mpeg12-simd  同一内核的 unsafe / FFI 变体，可单独编 .so / .a
+v2v-mpeg12-simd  同一内核的 unsafe / FFI 变体，可单独编 .so / .a。
+           **也是切片并行的常驻线程池所在**（`pool` 模块，4 线程 +11.2% / 8 线程 +16.2%）：
+           池要跨帧拿着 `&mut Frame` 与码流，`thread::scope` 做不到，所以只能是裸指针。
+           默认不启用 —— `v2v-player` 那边挂在 `mpeg12-pool` feature 后面（默认关），
+           于是 `v2v-mpeg12` 的「零 unsafe」承诺在默认构建下仍然成立。
 v2v-mpeg12-c     原创 **C / NEON 运动补偿内核**（MIT，独立 crate）：默认不编，
            `neon` feature 才拉 `cc` 编 C 并注册到 `v2v-mpeg12` 的钩子；
            与上面那个 simd 变体的区别是**它不带任何包装符号**，所以不会被
