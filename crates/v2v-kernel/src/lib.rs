@@ -49,7 +49,7 @@ pub mod simd;
 pub mod vlc;
 
 pub use bitreader::BitReader;
-pub use bitwriter::BitWriter;
+pub use bitwriter::{BitWriter, Mark};
 pub use error::{Error, Result};
 pub use fdct::{fdct, fdct_i, fdct_i_float, fdct_llm};
 pub use fft::fft_in_place;

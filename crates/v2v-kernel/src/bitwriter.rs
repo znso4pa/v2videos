@@ -65,13 +65,43 @@ impl BitWriter {
         self.bytes.len() * 8 + self.nbits as usize
     }
 
+    /// 记一个回退点（见 `rewind`）。
+    pub fn mark(&self) -> Mark {
+        Mark {
+            bytes: self.bytes.len(),
+            cur: self.cur,
+            nbits: self.nbits,
+            bit: self.bit_pos(),
+        }
+    }
+
+    /// 退回到 `mark()` 时的状态。
+    ///
+    /// 用途：**候选先直接写进正式位流，输了再退回来**。这比「写进临时写入器、
+    /// 赢了再 `append`」省两样东西：每宏块一次 `Vec` 分配，以及 `append` 那条
+    /// **逐字节 `put`** 的拷贝。
+    ///
+    /// 能精确回退是因为 `put` **只往尾部 append 字节**、从不改已写出的字节
+    /// （未满一字节的尾位单独存在 `cur`/`nbits` 里）。所以截断 + 恢复尾位就够了。
+    pub fn rewind(&mut self, mark: Mark) {
+        debug_assert!(mark.bytes <= self.bytes.len(), "回退点不在已写出的范围内");
+        self.bytes.truncate(mark.bytes);
+        self.cur = mark.cur;
+        self.nbits = mark.nbits;
+    }
+
     /// 把另一个写入器写出的位（含未满一字节的尾位）原样接到自己后面。
     ///
-    /// P 帧的帧内/帧间判决用：两条路径先各自写进临时写入器比大小，赢的那条
-    /// 整段接进正式位流 —— 保证「比较时的位数」和「实际写出的位数」是同一个数。
+    /// ⚠️ 整字节那一段走 `extend_from_slice`（一次 `memcpy`），不是逐字节 `put`。
+    /// 判决那条路已经改用 `mark`/`rewind`，这里只剩「拼接两段独立位流」的用法。
     pub fn append(&mut self, other: &BitWriter) {
-        for &b in &other.bytes {
-            self.put(b as u32, 8);
+        // 自己停在字节边界上（大多数情况）：整段搬过去，只有尾位要按位拼。
+        if self.nbits == 0 {
+            self.bytes.extend_from_slice(&other.bytes);
+        } else {
+            for &b in &other.bytes {
+                self.put(b as u32, 8);
+            }
         }
         if other.nbits > 0 {
             self.put(other.cur as u32, other.nbits as u32);
@@ -90,6 +120,22 @@ impl BitWriter {
     pub fn finish(mut self) -> Vec<u8> {
         self.align();
         self.bytes
+    }
+}
+
+/// `BitWriter::mark()` 的回退点。
+#[derive(Debug, Clone, Copy)]
+pub struct Mark {
+    bytes: usize,
+    cur: u8,
+    nbits: u8,
+    /// 回退点处的 `bit_pos()` —— 省得调用方自己再记一次。
+    bit: usize,
+}
+
+impl Mark {
+    pub fn bit_pos(&self) -> usize {
+        self.bit
     }
 }
 
@@ -182,5 +228,41 @@ mod tests {
         a.append(&b);
         assert_eq!(a.bit_pos(), 10);
         assert_eq!(a.finish(), vec![0b1011_1111, 0b1000_0000]);
+    }
+
+    #[test]
+    fn append_fast_path_is_bit_exact_on_a_byte_boundary() {
+        // 自己停在字节边界时走的是 `extend_from_slice`（一次 memcpy）而不是逐字节
+        // `put` —— 两条路必须给出同一份字节。
+        let mut a = BitWriter::new();
+        a.put(0xAB, 8);
+        let mut b = BitWriter::new();
+        b.put(0b110, 3);
+        a.append(&b);
+        assert_eq!(a.finish(), vec![0xAB, 0b1100_0000]);
+    }
+
+    /// 回退点必须**精确**：退回之后重新写的位流要与「从没写过那一段」逐字节相同，
+    /// 且 `bit_pos` 也回到原处。这是「候选直接写进正式位流、输了再退」的前提。
+    #[test]
+    fn rewind_restores_the_exact_state() {
+        let mut w = BitWriter::new();
+        w.put(0b10110, 5); // 停在半字节上 —— 尾位那一份状态也要被还原
+        let mark = w.mark();
+        assert_eq!(mark.bit_pos(), 5);
+        w.put(0xFFFF, 16);
+        w.put(0b1, 1);
+        assert_ne!(w.bit_pos(), 5);
+        w.rewind(mark);
+        assert_eq!(w.bit_pos(), 5);
+
+        // 换一条路重写，结果必须与「一开始就写这条」完全相同。
+        let mut reference = BitWriter::new();
+        reference.put(0b10110, 5);
+        for w in [&mut w, &mut reference] {
+            w.put(0b0011, 4);
+            w.put(0x5A, 8);
+        }
+        assert_eq!(w.finish(), reference.finish());
     }
 }

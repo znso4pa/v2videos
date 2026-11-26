@@ -15,6 +15,16 @@ v2v-tables = { path = "../tables", default-features = false, features = ["mp4v"]
 # 相通，语法层各写各的。哪天想从这边借 MS-MPEG-4 的东西，先想清楚它是不是该进 kernel。
 v2v-kernel = { path = "../v2v-kernel" }
 
+[features]
+default = []
+# 只为**单独测 mp4v** 时能对齐真实构建。
+#
+# Cargo 的 feature 是并集：`v2v-cli` 的依赖闭包里有 `msmpeg4`，它已经打开了
+# `v2v-kernel/unsafe-kernels`，所以 mp4v 在 CLI 里跑的本来就是 NEON 内核
+# （`fdct_llm` 那条路）。单独 `cargo run -p v2v-mp4v --example bench_encode`
+# 拿到的却是标量实现 —— 两个数不是一回事，差 8% 左右（1080p，DCT 占 12% vs 3%）。
+unsafe-kernels = ["v2v-kernel/unsafe-kernels"]
+
 [dev-dependencies]
 # 对账测试要把编出来的流封成 MP4 再让 ffmpeg 解，所以容器也要能用。
 v2v-mp4 = { path = "../v2v-mp4" }

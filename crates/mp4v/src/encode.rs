@@ -47,23 +47,30 @@
 //!
 //! `ac_pred` 是**每宏块一个位**。开了之后，本块首行/首列会减掉邻居的首行/首列再编码。
 //! 邻居和本块相似时省码字，不相似时反而费码字。ffmpeg 用一个近似的码率模型打分；
-//! 这里**直接两种都写完、比位数**（`BitWriter::bit_pos`），选短的 —— 小宏块、算得准，
+//! 这里**直接两种都数一遍位数**（见下），选短的 —— 小宏块、算得准，
 //! 而且不需要维护一套码率模型。
 //!
 //! 关键性质：`ac_val`（留给邻居的首行/首列）在**两种情况下都是「预测前」的值**
 //! （解码端加完预测后正好还原成预测前的值），所以试两种**不用回滚网格**，
 //! 这让「比位数」变得很便宜。
 //!
-//! ## 帧内/帧间的判决也是比位数
+//! ## 帧内/帧间的判决也是比位数 —— 但**只数位，不写位流**
 //!
-//! 每条候选都先写进**临时** `BitWriter`，比 `bit_pos()`，赢的那条整段 `append` 进正式位流。
-//! 好处是「比较时的位数」和「实际写出的位数」是同一个数 —— 不需要码率模型，也不会
-//! 出现「模型说便宜、实际更贵」。
+//! 每条候选都要知道「多少位」，可只有一个会真的进产物。所以把「写」抽象成
+//! `Sink`（`BitWriter` 真写、`BitCount` 只累加），同一份语法代码两种用法都能跑：
+//! 「比较时的位数」与「实际写出的位数」**是同一个数**（`Sink` 保证，不是约定），
+//! 又不必为落选的候选付出位拼接与 `Vec` 增长的代价。
+//!
+//! 帧间候选**直接写进正式位流**（先 `mark()` 记回退点），帧内赢了再 `rewind()`
+//! 退回去改写 —— 省掉每宏块一次临时 `BitWriter` 分配与一次逐字节 `append`。
+//!
+//! 帧内那一趟还带**早退**：块系数数到帧间的位数就够了（宏块头只会更多），
+//! 后面的块连 DCT 都不用做。
 //!
 //! 代价是帧内候选会**顺手改掉 DC / AC 网格**（DC 预测本来就要写网格）。所以：
 //! - 试帧内之前先**拍快照**（只拍本宏块会写的那 6 个槽）；
-//! - 帧内赢了 → 保留网格；帧间赢了 → 还原快照（也就是 1024 / 0，与解码端的
-//!   `ff_clean_intra_table_entries` 一致）。
+//! - 帧内赢了 → 保留网格；帧间赢了（或早退）→ 还原快照（也就是 1024 / 0，
+//!   与解码端的 `ff_clean_intra_table_entries` 一致）。
 //!
 //! ## DC / AC 网格**每帧重建**
 //!
@@ -102,7 +109,8 @@ const MV_DIFF_MAX: i32 = 31;
 
 /// `sign_extend(val, 6)` 的值域：绝对 MV 必须落在这里面。
 /// 帧内试编的**预判倍数**：帧间最优 SAD × 它 仍小于「帧内块的 AC 能量」时，
-/// 跳过帧内试编（那一趟要 6 次正向 DCT + 量化 + **两遍**熵编码，是每宏块最贵的一段）。
+/// 跳过帧内试编（那一趟要 6 次正向 DCT + 量化 + **两遍**熵编码的位数统计，
+/// 仍是每宏块最贵的一段 —— 实测这条预判挡掉了 66% 的宏块）。
 ///
 /// 道理：帧内编的是**原始块**（MPEG-4 帧内没有方向预测），代价与「块减去自身均值之后的
 /// 能量」强相关；帧间的代价与残差 SAD 强相关 —— 两者都是同一量纲的绝对差之和，
@@ -495,45 +503,41 @@ impl Encoder {
         // 重建缓冲：**下一帧的 P 要拿它当参考**，所以即使这帧是 I 也要重建。
         let mut cur = Planes::new(pw, ph);
 
-        let mut blocks = [[0i32; 64]; 6];
+        let mut plan = IntraPlan::new();
         for mby in 0..mb_h {
             for mbx in 0..mb_w {
-                // ---- 1. 正向 DCT + 量化 ----
-                for (n, slot) in blocks.iter_mut().enumerate() {
-                    let (plane, stride, px, py) = block_at(&py, &pu, &pv, pw, mbx, mby, n);
-                    let mut coeff = [0i32; 64];
-                    fdct(&plane[py * stride + px..], stride, &mut coeff);
-                    quantize_block(&mut coeff, n, &quant, y_dc_scale, c_dc_scale);
-                    *slot = coeff;
-                }
-
-                // ---- 2. DC 预测（顺序敏感：会就地更新网格）----
-                let mut dc_diff = [0i32; 6];
-                let mut dir = [0usize; 6];
-                for n in 0..6 {
-                    let (pred_level, d) = dc.predict(n, mbx, mby);
-                    dc_diff[n] = blocks[n][0] - pred_level;
-                    dir[n] = d;
-                    dc.update(blocks[n][0], n, mbx, mby);
-                }
-
-                // ---- 3+4+5. AC 预测（两种都试）+ 定 cbp + 写宏块 ----
-                let (best, _) = intra_try(
+                // 1..5 一起走：DCT → 量化 → DC 预测 → AC 预测（两种都数一遍）→
+                // 定 cbp → 写宏块。I 帧没有对手，所以 `limit` 是无穷大（不做早退）。
+                let ok = plan_intra(
+                    &py,
+                    &pu,
+                    &pv,
+                    pw,
+                    &quant,
+                    y_dc_scale,
+                    c_dc_scale,
+                    &mut dc,
+                    &mut ac,
+                    rl,
+                    self.cfg.ac_pred,
                     MbFlavour::IntraI,
                     mbx,
                     mby,
-                    &blocks,
-                    &dc_diff,
-                    &dir,
-                    self.cfg.ac_pred,
-                    rl,
-                    &mut ac,
+                    &mut plan,
+                    u32::MAX,
                 )?;
-                w.append(&best);
+                debug_assert!(ok, "`u32::MAX` 的 limit 不会早退");
+                write_intra_plan(&mut w, MbFlavour::IntraI, &plan, rl)?;
 
                 // ---- 6. 重建（AC 预测不影响重建 —— 解码端会把预测加回来）----
                 reconstruct_intra(
-                    &mut cur, mbx, mby, &blocks, &quant, y_dc_scale, c_dc_scale,
+                    &mut cur,
+                    mbx,
+                    mby,
+                    &plan.blocks,
+                    &quant,
+                    y_dc_scale,
+                    c_dc_scale,
                 );
             }
         }
@@ -613,6 +617,7 @@ impl Encoder {
             rl_intra,
             rl_inter,
             me_cache: MeSadCache::new(),
+            intra: IntraPlan::new(),
         };
         for mby in 0..mb_h {
             for mbx in 0..mb_w {
@@ -694,6 +699,37 @@ fn inter_rl_source() -> RlTable {
 
 // ───────────────────────── 宏块 / 块 写出 ─────────────────────────
 
+/// 位流的接收端：**真的写出去**（`BitWriter`）还是**只数位数**（`BitCount`）。
+///
+/// 判决（帧内 vs 帧间、`ac_pred` 开不开）要比「谁位数少」，那就得先知道位数；
+/// 但候选里只有一个会真的写进产物。所以这里把「写」抽象成 `put`，
+/// 同一份语法代码（`write_ac` / `write_dc` / `write_mb_header` …）两种用法都能跑：
+///
+/// - 计数版编译出来只剩 `+= n`，没有位拼接、没有 `Vec` 增长；
+/// - **实现只有一份**，所以「比较时的位数」和「实际写出的位数」不可能漂
+///   （这是模块文档里那条「不需要码率模型」的承诺的机器保证）。
+trait Sink {
+    fn put(&mut self, v: u32, n: u32);
+}
+
+impl Sink for BitWriter {
+    #[inline(always)]
+    fn put(&mut self, v: u32, n: u32) {
+        BitWriter::put(self, v, n);
+    }
+}
+
+/// 只累计位数。
+#[derive(Debug, Default, Clone, Copy)]
+struct BitCount(u32);
+
+impl Sink for BitCount {
+    #[inline(always)]
+    fn put(&mut self, _v: u32, n: u32) {
+        self.0 += n;
+    }
+}
+
 /// 帧内宏块走哪条语法分支（帧间走 `write_inter_mb`，不在这里）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MbFlavour {
@@ -703,55 +739,16 @@ enum MbFlavour {
     IntraP,
 }
 
-/// 写一个宏块（帧内两路 + 帧间）。`use_ac_pred` 只对帧内有效。
+/// 帧内宏块的**宏块头**：`MCBPC` → `ac_pred` 位 → `CBPY`。
 ///
-/// 帧内：`ac_val` 网格无论走哪条路都要更新，而且存的是**预测前**的值 ——
-/// 解码端加完预测正好还原成它，所以两种写法留下的是同一份网格，
-/// 试两种**不用回滚**（这是「比位数」能做得这么便宜的原因）。
-///
-/// 帧间：`blocks` 是**量化后的残差**，没有独立的 DC 一趟，扫描序恒 zig-zag。
-#[allow(clippy::too_many_arguments)]
-fn write_mb(
-    w: &mut BitWriter,
+/// 单独摘出来是因为「数位数」那条路也要走一遍（`cbp` 决定了 `MCBPC`/`CBPY` 的码长，
+/// 而 `cbp` 要等 6 个块都算完才知道）—— 摘出来才能保证两条路是同一份实现。
+fn write_mb_header<S: Sink>(
+    w: &mut S,
     flavour: MbFlavour,
-    mbx: usize,
-    mby: usize,
-    blocks: &[[i32; 64]; 6],
-    dc_diff: &[i32; 6],
-    dir: &[usize; 6],
+    cbp: usize,
     use_ac_pred: bool,
-    rl_intra: &EncodeRl,
-    ac: &mut AcGrid,
 ) -> Result<()> {
-    // ---- AC 预测：按 n = 0..5 走（块 1 要读块 0 刚存进去的值）----
-    let mut work = *blocks;
-    let mut scan: [&[u8; 64]; 6] = [&ZIGZAG; 6];
-    for n in 0..6 {
-        let cell = cell_of(n, mbx, mby);
-        let nb = ac.neighbor(n, dir[n], (cell.0 as usize, cell.1 as usize));
-        // 存回预测前的首行/首列 —— 必须在读**下一个块**之前做。
-        store_ac_val(ac, n, (cell.0 as usize, cell.1 as usize), &blocks[n]);
-        if use_ac_pred {
-            apply_ac_pred(&mut work[n], &nb, dir[n]);
-        }
-        scan[n] = if !use_ac_pred {
-            &ZIGZAG
-        } else if dir[n] == 0 {
-            &tables::V_SCAN
-        } else {
-            &tables::H_SCAN
-        };
-    }
-
-    // ---- cbp：由**该扫描序下**最后一个非零系数决定 ----
-    let mut cbp = 0usize;
-    for n in 0..6 {
-        if has_ac(&work[n], scan[n]) {
-            cbp |= 1 << (5 - n);
-        }
-    }
-
-    // ---- 宏块头 ----
     match flavour {
         MbFlavour::IntraI => write_intra_mcbpc(w, cbp & 3)?,
         MbFlavour::IntraP => {
@@ -761,12 +758,175 @@ fn write_mb(
     }
     w.put(u32::from(use_ac_pred), 1);
     // 帧内的 CBPY **不取反**（只有帧间才 `^0xF`）。
-    write_cbpy(w, cbp >> 2)?;
+    write_cbpy(w, cbp >> 2)
+}
 
-    // ---- 6 个块：每块先 DC 再 AC ----
+/// 帧内宏块的「预演」：系数、DC 差分，以及**被选中那条** `ac_pred` 的写法与位数。
+///
+/// 为什么要预演：帧内/帧间的判决是「比位数」，而位数只有编完才知道。所以先把
+/// 6 个块的 DCT + 量化 + 预测走完、把两条 `ac_pred` 变体都**数**一遍，拿到确切位数
+/// 再决定写谁 —— 写的时候按这份计划走，不重算、不重比。
+struct IntraPlan {
+    /// 量化后的系数（**预测前**）—— 重建要用它，解码端加完预测还原的就是它。
+    blocks: [[i32; 64]; 6],
+    dc_diff: [i32; 6],
+    /// **预测后**的系数。只在 `ac_pred` 为真时有效；否则写位流用 `blocks`。
+    work: [[i32; 64]; 6],
+    scan: [&'static [u8; 64]; 6],
+    /// 该扫描序下由最后一个非零系数决定的 cbp。
+    cbp: usize,
+    /// 这条变体一共多少位（含宏块头）。
+    bits: u32,
+    ac_pred: bool,
+}
+
+impl IntraPlan {
+    fn new() -> Self {
+        Self {
+            blocks: [[0; 64]; 6],
+            dc_diff: [0; 6],
+            work: [[0; 64]; 6],
+            scan: [&ZIGZAG; 6],
+            cbp: 0,
+            bits: 0,
+            ac_pred: false,
+        }
+    }
+}
+
+/// 走一遍帧内宏块：逐块 `DCT → 量化 → DC 预测 → AC 预测 → 数位数`。
+///
+/// `limit`：块系数一旦数到 `limit` 位就不可能赢（宏块头还没算，只会更多）——
+/// 立刻放弃，后面的块连 DCT 都不用做。P 帧传「帧间候选的位数」，
+/// I 帧传 `u32::MAX`（没有对手，不做早退）。
+///
+/// ⚠️ **放弃时 DC / AC 网格可能只改了一半** —— 调用方必须先拍快照、拿 `false` 就还原。
+/// 返回 `true` 时网格是完整的（帧内赢了就保留它）。
+///
+/// ⚠️ 结果写进调用方给的 `plan`（`PState` 里常驻的那一份），**不按值返回**：
+/// `IntraPlan` 有 3.5 KB，按值返回 + `Option` + `map` 一路搬下来，实测每个宏块要
+/// 多出 3.5 KB 的 `memmove`（1080p 一帧 28 MB），那是 `encode_p_frame` 里
+/// 一百多个 memmove 样本的来源。
+///
+/// ⚠️ 两条 `ac_pred` 变体共用同一份网格：`store_ac_val` 存的是**预测前**的值，
+/// 两种写法留下的网格相同，所以不用回滚（见模块文档）。
+#[allow(clippy::too_many_arguments)]
+fn plan_intra(
+    sy: &[u8],
+    su: &[u8],
+    sv: &[u8],
+    pw: usize,
+    quant: &Quant,
+    y_dc_scale: i32,
+    c_dc_scale: i32,
+    dc: &mut DcGrid,
+    ac: &mut AcGrid,
+    rl_intra: &EncodeRl,
+    use_ac_pred: bool,
+    flavour: MbFlavour,
+    mbx: usize,
+    mby: usize,
+    plan: &mut IntraPlan,
+    limit: u32,
+) -> Result<bool> {
+    let mut dir = [0usize; 6];
+    let mut plain = BitCount(0);
+    let mut with_pred = BitCount(0);
+    // 每个块「有没有写出系数」—— 就是 cbp 那一位，顺手从 `write_ac` 拿回来。
+    let mut nz_plain = [false; 6];
+    let mut nz_pred = [false; 6];
+
     for n in 0..6 {
-        write_dc(w, dc_diff[n], n < 4)?;
-        write_ac(w, rl_intra, &work[n], scan[n], true)?;
+        // ---- 1. 原始像素 → 正向 DCT → 量化 ----
+        let (plane, stride, px, py) = block_at(sy, su, sv, pw, mbx, mby, n);
+        fdct(&plane[py * stride + px..], stride, &mut plan.blocks[n]);
+        quantize_block(&mut plan.blocks[n], n, quant, y_dc_scale, c_dc_scale);
+
+        // ---- 2. DC 预测（会就地更新网格；块 1/2/3 要读块 0 刚写进去的值）----
+        let (pred_level, d) = dc.predict(n, mbx, mby);
+        plan.dc_diff[n] = plan.blocks[n][0] - pred_level;
+        dir[n] = d;
+        dc.update(plan.blocks[n][0], n, mbx, mby);
+
+        // ---- 3. AC 预测：读邻居 → 存**预测前**的首行/首列 → 应用 ----
+        let cell = cell_of(n, mbx, mby);
+        let nb = ac.neighbor(n, d, (cell.0 as usize, cell.1 as usize));
+        store_ac_val(ac, n, (cell.0 as usize, cell.1 as usize), &plan.blocks[n]);
+
+        // ---- 4. 两条变体各数一遍（不写位流）----
+        write_dc(&mut plain, plan.dc_diff[n], n < 4)?;
+        nz_plain[n] = write_ac(&mut plain, rl_intra, &plan.blocks[n], &ZIGZAG, true)?;
+        if use_ac_pred {
+            plan.work[n] = plan.blocks[n];
+            apply_ac_pred(&mut plan.work[n], &nb, d);
+            let scan = if d == 0 { &tables::V_SCAN } else { &tables::H_SCAN };
+            write_dc(&mut with_pred, plan.dc_diff[n], n < 4)?;
+            nz_pred[n] = write_ac(&mut with_pred, rl_intra, &plan.work[n], scan, true)?;
+        }
+
+        // ---- 5. 早退：两条变体都已经数到 `limit` ----
+        let best_so_far = if use_ac_pred {
+            plain.0.min(with_pred.0)
+        } else {
+            plain.0
+        };
+        if best_so_far >= limit {
+            return Ok(false);
+        }
+    }
+
+    // ---- 6. cbp 与宏块头（两条变体的 cbp 可能不同：扫描序与系数都不一样）----
+    // 用 `write_ac` 的返回值拼 cbp，不再单独扫 64 个系数 —— 那个扫法每个宏块要
+    // 走 6×64×2 = 768 次，而且答案在数位数时**已经算过了**。
+    let mut cbp_plain = 0usize;
+    let mut cbp_pred = 0usize;
+    for n in 0..6 {
+        if nz_plain[n] {
+            cbp_plain |= 1 << (5 - n);
+        }
+        if nz_pred[n] {
+            cbp_pred |= 1 << (5 - n);
+        }
+    }
+    let mut hdr = BitCount(0);
+    write_mb_header(&mut hdr, flavour, cbp_plain, false)?;
+    let total_plain = plain.0 + hdr.0;
+    let mut hdr_pred = BitCount(0);
+    if use_ac_pred {
+        write_mb_header(&mut hdr_pred, flavour, cbp_pred, true)?;
+    }
+    let total_pred = with_pred.0 + hdr_pred.0;
+
+    // 并列时选 plain（与原来的 `predicted.bit_pos() < plain.bit_pos()` 一致）。
+    let ac_pred = use_ac_pred && total_pred < total_plain;
+    for n in 0..6 {
+        plan.scan[n] = if !ac_pred {
+            &ZIGZAG
+        } else if dir[n] == 0 {
+            &tables::V_SCAN
+        } else {
+            &tables::H_SCAN
+        };
+    }
+    plan.ac_pred = ac_pred;
+    plan.cbp = if ac_pred { cbp_pred } else { cbp_plain };
+    plan.bits = if ac_pred { total_pred } else { total_plain };
+    Ok(true)
+}
+
+/// 按预演结果写一个帧内宏块。`bits` 与这里写出的位数逐位相同（`Sink` 保证）。
+fn write_intra_plan<S: Sink>(
+    w: &mut S,
+    flavour: MbFlavour,
+    plan: &IntraPlan,
+    rl_intra: &EncodeRl,
+) -> Result<()> {
+    write_mb_header(w, flavour, plan.cbp, plan.ac_pred)?;
+    // 没开 AC 预测时 `work` 里是空的 —— 系数就是 `blocks`。
+    let coefs = if plan.ac_pred { &plan.work } else { &plan.blocks };
+    for n in 0..6 {
+        write_dc(w, plan.dc_diff[n], n < 4)?;
+        write_ac(w, rl_intra, &coefs[n], plan.scan[n], true)?;
     }
     Ok(())
 }
@@ -775,8 +935,8 @@ fn write_mb(
 ///
 /// 顺序：`inter_MCBPC` → CBPY（取反）→ MV → 6 个块的 AC。
 /// **帧间没有 DC 这一趟**，6 个块都是「整块 64 个系数」。
-fn write_inter_mb(
-    w: &mut BitWriter,
+fn write_inter_mb<S: Sink>(
+    w: &mut S,
     cbp: usize,
     mv: (i32, i32),
     pred: (i32, i32),
@@ -819,57 +979,6 @@ fn intra_luma_ac(y: &[u8], stride: usize, mbx: usize, mby: usize) -> u64 {
         }
     }
     acc
-}
-
-fn inter_cbp(blocks: &[[i32; 64]; 6]) -> usize {
-    let mut cbp = 0usize;
-    for (n, b) in blocks.iter().enumerate() {
-        if b.iter().any(|&v| v != 0) {
-            cbp |= 1 << (5 - n);
-        }
-    }
-    cbp
-}
-
-/// 帧内宏块：AC 预测的两种写法都写一遍，返回**位流更短的那条**与它的 `ac_pred` 值。
-///
-/// `ac` 网格两次调用留下的是同一份（存的是「预测前」的值），所以**不用回滚**。
-fn intra_try(
-    flavour: MbFlavour,
-    mbx: usize,
-    mby: usize,
-    blocks: &[[i32; 64]; 6],
-    dc_diff: &[i32; 6],
-    dir: &[usize; 6],
-    use_ac_pred: bool,
-    rl_intra: &EncodeRl,
-    ac: &mut AcGrid,
-) -> Result<(BitWriter, bool)> {
-    let mut plain = BitWriter::new();
-    write_mb(
-        &mut plain, flavour, mbx, mby, blocks, dc_diff, dir, false, rl_intra, ac,
-    )?;
-    if !use_ac_pred {
-        return Ok((plain, false));
-    }
-    let mut predicted = BitWriter::new();
-    write_mb(
-        &mut predicted,
-        flavour,
-        mbx,
-        mby,
-        blocks,
-        dc_diff,
-        dir,
-        true,
-        rl_intra,
-        ac,
-    )?;
-    if predicted.bit_pos() < plain.bit_pos() {
-        Ok((predicted, true))
-    } else {
-        Ok((plain, false))
-    }
 }
 
 // ───────────────────────── P 帧的逐宏块决策 ─────────────────────────
@@ -962,6 +1071,11 @@ struct PState<'a> {
     rl_inter: &'a EncodeRl,
     /// 运动估计的候选 SAD 记忆表（见 `MeSadCache`）。
     me_cache: MeSadCache,
+    /// 帧内候选的预演缓冲 —— **常驻**，每宏块复用。
+    ///
+    /// 按值从 `plan_intra` 返回会一路搬 3.5 KB（`Option` + `map` 各一次），
+    /// 实测每个宏块多出 3.5 KB 的 `memmove`。
+    intra: IntraPlan,
 }
 
 impl PState<'_> {
@@ -1131,51 +1245,6 @@ impl PState<'_> {
         (clamp_mv(best, pred), best_sad)
     }
 
-    /// 帧内候选：把当前帧的**原始像素**当 I 帧宏块编一遍。
-    ///
-    /// ⚠️ 它会**就地更新 DC 网格**（DC 预测本来就要写网格）—— 调用方必须先用
-    /// `snap` 拍快照，输了再 `restore`。
-    fn intra_candidate(
-        &mut self,
-        mbx: usize,
-        mby: usize,
-    ) -> Result<([[i32; 64]; 6], [i32; 6], [usize; 6], bool, BitWriter)> {
-        let mut blocks = [[0i32; 64]; 6];
-        for (n, slot) in blocks.iter_mut().enumerate() {
-            let (plane, stride, px, py) = block_at(self.sy, self.su, self.sv, self.pw, mbx, mby, n);
-            let mut coeff = [0i32; 64];
-            fdct(&plane[py * stride + px..], stride, &mut coeff);
-            quantize_block(
-                &mut coeff,
-                n,
-                &self.quant,
-                self.y_dc_scale,
-                self.c_dc_scale,
-            );
-            *slot = coeff;
-        }
-        let mut dc_diff = [0i32; 6];
-        let mut dir = [0usize; 6];
-        for n in 0..6 {
-            let (pred_level, d) = self.dc.predict(n, mbx, mby);
-            dc_diff[n] = blocks[n][0] - pred_level;
-            dir[n] = d;
-            self.dc.update(blocks[n][0], n, mbx, mby);
-        }
-        let (best, ac_pred) = intra_try(
-            MbFlavour::IntraP,
-            mbx,
-            mby,
-            &blocks,
-            &dc_diff,
-            &dir,
-            self.use_ac_pred,
-            self.rl_intra,
-            &mut self.ac,
-        )?;
-        Ok((blocks, dc_diff, dir, ac_pred, best))
-    }
-
     /// 一个 P 帧宏块：三条候选（skip / 帧间 / 帧内）比位数，赢的写进位流并重建。
     fn mb(&mut self, w: &mut BitWriter, mbx: usize, mby: usize) -> Result<()> {
         // ---------- 帧间候选 ----------
@@ -1204,8 +1273,13 @@ impl PState<'_> {
         }
 
         let mut qb = [[0i32; 64]; 6];
+        // `res` / `coef` 提到宏块外：每块都新声明一次的话，它们的「清零」要付 6 遍
+        // （`fdct_i` 是不透明调用，LLVM 证不出它写满了 64 个 i32，于是那次 memset 留着）。
+        let mut res = [0i32; 64];
+        let mut coef = [0i32; 64];
+        let mut cbp_i = 0usize;
         for (n, slot) in qb.iter_mut().enumerate() {
-            let mut res = [0i32; 64];
+            let mut nonzero = false;
             // ⚠️ **按行取切片再逐元素读**，不要写成 `plane[(oy+r)*pw + ox + c]`。
             // 后者每读一个像素一次边界检查（一块 128 次、一个宏块 768 次），
             // 而且 `pw` 是运行期值，LLVM 证不出「8 个下标都安全」。
@@ -1239,68 +1313,103 @@ impl PState<'_> {
                     }
                 }
             }
-            let mut coef = [0i32; 64];
             fdct_i(&res, 8, &mut coef);
             // 走**特化到帧间**的那一份：`intra` 在这里恒为 false，交给 `quantize`
             // 会多留一条运行期分支（这是整条链上最大的单项，值得绕开分发器）。
+            //
+            // 「这一块有没有系数」顺手在这个循环里记下 —— 它就是 `inter_cbp` 的那一位。
+            // 单独再扫一遍 384 个系数（`iter().any`）是白跑的：这里每个系数都要过一遍。
             for (k, v) in coef.iter().enumerate() {
-                slot[k] = self.quant.quantize_ac::<false>(k, *v);
+                let level = self.quant.quantize_ac::<false>(k, *v);
+                slot[k] = level;
+                nonzero |= level != 0;
             }
             if self.trellis {
                 trellis_levels(&self.quant, self.rl_inter, &coef, slot, self.quant.lambda());
                 // trellis 会在基线电平上 ∓1，可能把刚好在边界上的值顶出去 —— 夹回来。
+                let mut nz = false;
                 for l in slot.iter_mut() {
                     *l = (*l).clamp(-2047, 2047);
+                    nz |= *l != 0;
                 }
+                nonzero = nz;
+            }
+            if nonzero {
+                cbp_i |= 1 << (5 - n);
             }
         }
-        let cbp_i = inter_cbp(&qb);
         let skip = mv == (0, 0) && cbp_i == 0;
 
-        let mut wi = BitWriter::new();
+        // ---------- 帧间候选：**直接写进正式位流** ----------
+        //
+        // 原来是「写进临时 `BitWriter` → 比完再 `append` 过来」。那条路每宏块要一次
+        // `Vec` 分配，`append` 还是**逐字节 `put`** 的拷贝；而且帧内赢了这条就白写。
+        // 现在先记回退点、直接写正式位流，输了 `rewind` 退回去 ——
+        // 位流逐字节相同（`put` 只往尾部 append 字节，回退是精确的）。
+        let mark = w.mark();
         if skip {
             // skip 宏块：一个 `1` 位搞定，MV 恒 (0,0)、没有残差。
-            wi.put(1, 1);
+            w.put(1, 1);
         } else {
-            wi.put(0, 1); // mb coded
-            write_inter_mb(&mut wi, cbp_i, mv, pred, &qb, self.rl_inter)?;
+            w.put(0, 1); // mb coded
+            write_inter_mb(w, cbp_i, mv, pred, &qb, self.rl_inter)?;
         }
+        let inter_bits = (w.bit_pos() - mark.bit_pos()) as u32;
 
         // ---------- 帧内候选（会改 DC / AC 网格，先拍快照）----------
         //
-        // ⚠️ **`skip` 时整段不做**：这时 `wi` 只有那一个 `1` 位，而帧内候选至少要写
-        // 一个宏块类型（`wi2.bit_pos() >= 1`），所以 `wi2.bit_pos() < wi.bit_pos()`
-        // **恒不成立** —— 帧内不可能赢。这不是启发式，是 `bit_pos()` 上的恒等式。
+        // ⚠️ **`skip` 时整段不做**：这时帧间只花了那一个 `1` 位，而帧内至少要一个
+        // 宏块类型（≥ 1 位）再加一个 `ac_pred` 位，所以 `bits < 1` **恒不成立**
+        // —— 帧内不可能赢。这不是启发式，是位数上的恒等式。
         //
-        // 省下的是 6 个块的 `fdct` + 量化 + 写位流（外加 DC/AC 预测），
-        // 而「跳过」的代价只是少写一次 DC/AC 网格 —— 那本来就只在帧内赢时才有用，
-        // 帧间分支里那两句 `restore` 正是它的逆操作。输出**逐字节不变**。
-        let intra = if skip {
-            None
-        } else if inter_sad * INTRA_SKIP_RATIO < intra_luma_ac(self.sy, self.pw, mbx, mby) {
-            // 帧间明显更好 —— 省掉帧内那一趟试编（网格也不用动，与 `skip` 那条同形）。
-            self.intra_skips += 1;
-            None
-        } else {
+        // 帧内这一趟**只数位数不写位流**（`plan_intra`），而且数到 `inter_bits`
+        // 就早退 —— 赢不了就没有必要把 6 个块全算完。
+        let mut snaps = ([0i32; 6], [[0i16; 16]; 6]);
+        let mut tried = false;
+        if !skip && !(inter_sad * INTRA_SKIP_RATIO < intra_luma_ac(self.sy, self.pw, mbx, mby)) {
             let dc_snap = self.dc.snap(mbx, mby);
             let ac_snap = self.ac.snap(mbx, mby);
-            let (ib, _dc_diff, _dir, _ac_pred, wi2) = self.intra_candidate(mbx, mby)?;
-            Some((dc_snap, ac_snap, ib, wi2))
-        };
+            let ok = plan_intra(
+                self.sy,
+                self.su,
+                self.sv,
+                self.pw,
+                &self.quant,
+                self.y_dc_scale,
+                self.c_dc_scale,
+                &mut self.dc,
+                &mut self.ac,
+                self.rl_intra,
+                self.use_ac_pred,
+                MbFlavour::IntraP,
+                mbx,
+                mby,
+                &mut self.intra,
+                inter_bits,
+            )?;
+            if !ok {
+                // 早退：DC / AC 网格可能只改了一半，还原。
+                self.dc.restore(mbx, mby, &dc_snap);
+                self.ac.restore(mbx, mby, &ac_snap);
+            }
+            tried = ok;
+            snaps = (dc_snap, ac_snap);
+        } else if !skip {
+            // 帧间明显更好 —— 省掉帧内那一趟试编（网格也不用动，与 `skip` 那条同形）。
+            self.intra_skips += 1;
+        }
 
         // ---------- 定胜负 ----------
-        let intra_wins = intra
-            .as_ref()
-            .is_some_and(|(_, _, _, wi2)| wi2.bit_pos() < wi.bit_pos());
-        if intra_wins {
-            let (_, _, ib, wi2) = intra.expect("`intra_wins` 已经保证它是 `Some`");
-            // 帧内赢了：DC / AC 网格保留（`intra_candidate` 已经写进去了）。
-            w.append(&wi2);
+        if tried && self.intra.bits < inter_bits {
+            // 帧内赢了：把刚写进去的帧间候选退掉，改写真位流。
+            // DC / AC 网格保留（`plan_intra` 已经写进去了），快照直接丢掉。
+            w.rewind(mark);
+            write_intra_plan(w, MbFlavour::IntraP, &self.intra, self.rl_intra)?;
             reconstruct_intra(
                 &mut self.cur,
                 mbx,
                 mby,
-                &ib,
+                &self.intra.blocks,
                 &self.quant,
                 self.y_dc_scale,
                 self.c_dc_scale,
@@ -1309,16 +1418,16 @@ impl PState<'_> {
             self.mv[mby * self.mb_w + mbx] = (0, 0);
             self.intra_mbs += 1;
         } else {
-            // 帧间赢了：还原网格（= 清成 1024 / 0，等价于解码端的
-            // `ff_clean_intra_table_entries`）。`skip` 时网格根本没被动过，不用还原。
-            if let Some((dc_snap, ac_snap, _, _)) = &intra {
-                self.dc.restore(mbx, mby, dc_snap);
-                self.ac.restore(mbx, mby, ac_snap);
+            // 帧间赢了（位流已经在 `w` 里了）：还原网格（= 清成 1024 / 0，
+            // 等价于解码端的 `ff_clean_intra_table_entries`）。
+            // `skip` 时网格根本没被动过，不用还原。
+            if tried {
+                self.dc.restore(mbx, mby, &snaps.0);
+                self.ac.restore(mbx, mby, &snaps.1);
             }
-            w.append(&wi);
             // 两条分支都不再「贴预测」：`mb` 开头就把 MC 结果写进 `cur` 了，
             // 而这一段（ME 之后到定胜负）没有任何东西动过 `cur` 的像素
-            // —— `intra_candidate` 只算系数、不重建。所以此刻 `cur` 里就是预测。
+            // —— 帧内候选只算系数、不重建。所以此刻 `cur` 里就是预测。
             if skip {
                 self.mv[mby * self.mb_w + mbx] = (0, 0);
             } else {
@@ -1637,11 +1746,6 @@ fn reconstruct_inter(
     }
 }
 
-/// 块在扫描序 `scan` 下有没有 AC 系数（扫描序下标 >= 1）。
-fn has_ac(block: &[i32; 64], scan: &[u8; 64]) -> bool {
-    (1..64).any(|i| block[scan[i] as usize] != 0)
-}
-
 // ───────────────────────── 量化 ─────────────────────────
 
 /// 量化一个块的 64 个自然序系数（就地）。
@@ -1934,32 +2038,66 @@ fn store_ac_val(ac: &mut AcGrid, n: usize, cell: (usize, usize), block: &[i32; 6
 /// `intra` 决定起点：帧内从扫描序**第 1 个**开始（下标 0 是 DC，走单独的 DC VLC）；
 /// 帧间从**第 0 个**开始（帧间没有 DC 这一趟，DC 就是普通 AC 系数）。
 ///
+/// 返回**有没有写出任何系数**。调用方拿它定 cbp：帧内是「该扫描序下有没有 AC」，
+/// 帧间是「有没有任何系数」—— 正好就是同一个问题，不必再单独扫一遍 64 个系数。
+///
+/// ## 为什么是**一趟**而不是「先反向找末尾、再正向写」
+///
+/// 老写法要先反向扫一遍找最后一个非零（`last` 标志只有知道末尾才写得出），再正向扫
+/// 一遍写 —— 一块平均要摸 90~100 个位置。现在**把前一个系数压着不写**：遇到下一个
+/// 非零时才把上一个按 `last = false` 吐出去，循环结束把压着的那个按 `last = true`
+/// 吐出去。写出的顺序与码字**逐位相同**，但只扫一趟（64 个位置）。
+///
 /// 与 MP43 的 `write_ac` **不是一回事**：MP43 的三种 escape 含义不同
 /// （第一 escape 补 level、第二 escape 补 run、第三 escape 明文 1+6+8 位）。
 /// 进程第一次编码时按原码表选好最短码字。写位流与 trellis 读同一份结果。
-fn write_ac(
-    w: &mut BitWriter,
+fn write_ac<S: Sink>(
+    w: &mut S,
     rl: &EncodeRl,
     block: &[i32; 64],
     scan: &[u8; 64],
     intra: bool,
-) -> Result<()> {
+) -> Result<bool> {
     let start = if intra { 1 } else { 0 };
-    let Some(last_index) = (start..64).rev().find(|&i| block[scan[i] as usize] != 0) else {
-        return Ok(());
-    };
-    // `last_non_zero` 初值 = 「起点之前那一个」：帧内是 0（DC），帧间是 -1。
-    let mut last_non_zero: i32 = start as i32 - 1;
-    for i in start..=last_index {
-        let level = block[scan[i] as usize];
+    // ⚠️ **先判空再走**。实测（1080p、q=6、200 帧）平均**每个块只有 0.2 个非零系数** ——
+    // 也就是说 90% 以上的块整块是 0，而下面那趟循环照样要摸 64 个位置。一个块走 64 步
+    // 只为了确认「什么都没有」，是这条链上最贵的一件蠢事（`write_ac` 占 19%）。
+    if !any_nonzero(block, start) {
+        return Ok(false);
+    }
+    // 压着没写的那一个：`(run, level)`。`have` 为假表示还没遇到非零。
+    let mut have = false;
+    let mut pending = (0usize, 0i32);
+    let mut run = 0usize;
+    for i in start..64 {
+        // `& 63`：扫描表里的值本来就都 < 64，掩一下只是为了让 LLVM **证得出**这个下标
+        // 安全 —— 否则每个系数一次边界检查（三个走位一趟、每宏块 192 次）。
+        let level = block[(scan[i] as usize) & 63];
         if level == 0 {
+            run += 1;
             continue;
         }
-        let run = (i as i32 - last_non_zero - 1) as usize;
-        write_rl(w, rl, i == last_index, run, level)?;
-        last_non_zero = i as i32;
+        if have {
+            write_rl(w, rl, false, pending.0, pending.1)?;
+        }
+        pending = (run, level);
+        have = true;
+        run = 0;
     }
-    Ok(())
+    if have {
+        write_rl(w, rl, true, pending.0, pending.1)?;
+    }
+    Ok(have)
+}
+
+/// 块里（从 `start` 起）有没有非零系数。
+///
+/// ⚠️ **不用 `iter().any()`**：它短路，编译器就没法向量化，只能一个元素一个元素地
+/// 分支。换成「按位或」的 fold —— 全 0 才得 0，而且 8 条 i32 一条 NEON 比较，
+/// 一次摸完 64 个（实测比逐元素的 `any()` 快一个数量级）。
+#[inline]
+fn any_nonzero(block: &[i32; 64], start: usize) -> bool {
+    block[start..].iter().fold(0i32, |a, &v| a | v) != 0
 }
 
 /// 非 ESC3 码字的最低位总是符号，只缓存正幅值。每个词条高 6 位存长度，
@@ -2041,7 +2179,7 @@ fn escape3_code(escape: u32, last: bool, run: usize, level: i32) -> u32 {
 /// | ESC3 | `esc` `11` last(1) run(6) 1 level(12) 1 | `len(esc)+23` |
 ///
 /// 严格取最短的（并列时取靠前的候选，与 ffmpeg 的 `len < best` 一致）。
-fn write_rl(w: &mut BitWriter, rl: &EncodeRl, last: bool, run: usize, level: i32) -> Result<()> {
+fn write_rl<S: Sink>(w: &mut S, rl: &EncodeRl, last: bool, run: usize, level: i32) -> Result<()> {
     let (code, len) = rl.code_len(last, run, level);
     debug_assert!(len <= 32, "一次最多写 32 位，ESC3 是 {len} 位");
     w.put(code, len);
@@ -2122,7 +2260,7 @@ fn rl_cost(rl: &EncodeRl, last: bool, run: usize, level: i32) -> u32 {
 /// ## 设计取舍（都是有意的收缩，别当成 bug）
 ///
 /// - **只用于帧间块**：帧内块的扫描序随 AC 预测方向变（`H_SCAN` / `V_SCAN`），
-///   要接进来得连 `intra_try` 的候选一起改 —— 那一层先不动。
+///   要接进来得连帧内/帧间判决那一层一起改 —— 那一层先不动。
 /// - **候选只有 `{L, L∓1}`，且不新增非零系数**（基线为 0 的位置保持 0）：
 ///   收益的大头是「把不划算的系数砍掉」，提电平那一半先不做。
 /// - **`last` 按基线算**：真把基线的「最后一个非零」砍掉时，代价模型会差 1–2 位
@@ -2231,7 +2369,7 @@ fn trellis_levels(
 ///
 /// 值的写法是 `get_xbits` 语义：非负照写，负数是 `(-|v|) ^ ((1<<size)-1)`。
 /// `size > 8` 时后面还有一个 marker 位（值为 1）。
-fn write_dc(w: &mut BitWriter, level: i32, luma: bool) -> Result<()> {
+fn write_dc<S: Sink>(w: &mut S, level: i32, luma: bool) -> Result<()> {
     if !(-2047..=2047).contains(&level) {
         return Err(Error::Bad("DC 差超出 DC 表能表示的范围"));
     }
@@ -2271,7 +2409,7 @@ fn bit_length(v: u32) -> u32 {
 
 /// I 宏块（以及 P 帧里的帧内宏块）的 MCBPC：低 2 位是色度 CBP，
 /// 第 3 位（值 4）表示「本宏块带 dquant」。不做 dquant，所以只用 0..=3。
-fn write_intra_mcbpc(w: &mut BitWriter, cbpc: usize) -> Result<()> {
+fn write_intra_mcbpc<S: Sink>(w: &mut S, cbpc: usize) -> Result<()> {
     let code = *tables::INTRA_MCBPC_CODE
         .get(cbpc)
         .ok_or(Error::Bad("cbpc 越界"))?;
@@ -2284,7 +2422,7 @@ fn write_intra_mcbpc(w: &mut BitWriter, cbpc: usize) -> Result<()> {
 
 /// P 帧的 28 项 MCBPC。索引的含义见 `tables.rs` 里那段注释：
 /// `0..3` 帧间、`4..7` 帧内、`8..15` 带 dquant、`16..19` 8×8 MV、`20..23` stuffing。
-fn write_inter_mcbpc(w: &mut BitWriter, cbpc: usize) -> Result<()> {
+fn write_inter_mcbpc<S: Sink>(w: &mut S, cbpc: usize) -> Result<()> {
     let code = *tables::INTER_MCBPC_CODE
         .get(cbpc)
         .ok_or(Error::Bad("P 帧 cbpc 越界"))?;
@@ -2305,8 +2443,8 @@ fn write_inter_mcbpc(w: &mut BitWriter, cbpc: usize) -> Result<()> {
 /// - MPEG-4 的 **I 帧** 与 **P 帧里的帧内宏块**：直取；
 /// - MPEG-4 的 **帧间宏块**：`cbpy ^ 0xF`（`mpeg4_decode_mb` 帧间分支就是 `get_vlc2(...) ^ 0x0F`）。
 ///
-/// 取反在调用方做（`write_mb` / `write_inter_mb`），这里只管查表。
-fn write_cbpy(w: &mut BitWriter, cbpy: usize) -> Result<()> {
+/// 取反在调用方做（`write_mb_header` / `write_inter_mb`），这里只管查表。
+fn write_cbpy<S: Sink>(w: &mut S, cbpy: usize) -> Result<()> {
     let e = tables::CBPY.get(cbpy).ok_or(Error::Bad("cbpy 越界"))?;
     w.put(u32::from(e[0]), u32::from(e[1]));
     Ok(())
@@ -2319,7 +2457,7 @@ fn write_cbpy(w: &mut BitWriter, cbpy: usize) -> Result<()> {
 /// 解码端 `val = (code - 1) << bit_size` 再补低位、读符号，所以 `code = (|d| - 1) >> bit_size + 1`。
 ///
 /// 我们恒用 `f_code = 1` → `bit_size = 0`，于是 `code = |d|`、不写低位。
-fn write_motion(w: &mut BitWriter, d: i32) -> Result<()> {
+fn write_motion<S: Sink>(w: &mut S, d: i32) -> Result<()> {
     if d == 0 {
         // 零矢量就是 `ff_mvtab[0]`：一个 `1` 位，后面没有符号位也没有低位。
         w.put(1, 1);
@@ -2413,6 +2551,149 @@ mod tests {
             y: vec![luma; (w * h) as usize],
             u: vec![chroma; (w * h / 4) as usize],
             v: vec![chroma; (w * h / 4) as usize],
+        }
+    }
+
+    /// 有纹理的帧（确定性的伪随机），用来让 AC 系数非零 —— 纯色帧的 AC 全是 0，
+    /// 「数位 == 写位」在那种输入上几乎什么都不验。
+    fn textured_frame(w: u32, h: u32) -> Frame {
+        let mut state = 0x1234_5678u32;
+        let mut next = || {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            (state >> 24) as u8
+        };
+        Frame {
+            width: w,
+            height: h,
+            y: (0..w * h).map(|_| next()).collect(),
+            u: (0..w * h / 4).map(|_| next()).collect(),
+            v: (0..w * h / 4).map(|_| next()).collect(),
+        }
+    }
+
+    /// 数位与写位必须是**同一个数**。
+    ///
+    /// 这是帧内/帧间判决的前提：判决比的是「数出来的位数」，产物里是「写出去的位数」。
+    /// 两者一旦漂，画质与体积就会悄悄变（不报错），而且只在某些宏块上漂 —— 最难查的一类。
+    /// 所以对随机系数逐块对拍 `BitCount` 与 `BitWriter`。
+    #[test]
+    fn counting_a_block_matches_writing_it() {
+        let rl_intra = intra_rl_table();
+        let rl_inter = inter_rl_table();
+        let mut state = 0x9e37_79b9u32;
+        let mut next = || {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            state
+        };
+        for case in 0..200 {
+            let mut block = [0i32; 64];
+            for (k, slot) in block.iter_mut().enumerate() {
+                // 大部分是 0（真实块就是这样），少量大电平把 ESC 那几条路也走到。
+                let r = next();
+                *slot = match r % 8 {
+                    0 | 1 | 2 | 3 | 4 => 0,
+                    5 => (r >> 8) as i32 % 7 - 3,
+                    6 => (r >> 8) as i32 % 41 - 20,
+                    _ => (r >> 8) as i32 % 4095 - 2047,
+                };
+                let _ = k;
+            }
+            let intra = case % 2 == 0;
+            let rl = if intra { rl_intra } else { rl_inter };
+            let scan = match case % 6 {
+                0 | 1 => &ZIGZAG,
+                2 | 3 => &tables::V_SCAN,
+                _ => &tables::H_SCAN,
+            };
+
+            let mut count = BitCount(0);
+            write_ac(&mut count, rl, &block, scan, intra).unwrap();
+            let mut w = BitWriter::new();
+            write_ac(&mut w, rl, &block, scan, intra).unwrap();
+            assert_eq!(
+                count.0 as usize,
+                w.bit_pos(),
+                "case {case}: 数出 {} 位、写出 {} 位",
+                count.0,
+                w.bit_pos()
+            );
+
+            // 整块的 DC 也一起对拍（DC 有「位长 VLC + 载荷 + marker」三段）。
+            let level = (next() >> 8) as i32 % 4095 - 2047;
+            let mut count = BitCount(0);
+            write_dc(&mut count, level, intra).unwrap();
+            let mut w = BitWriter::new();
+            write_dc(&mut w, level, intra).unwrap();
+            assert_eq!(count.0 as usize, w.bit_pos(), "DC level={level}");
+        }
+    }
+
+    /// `plan_intra` 数出来的位数必须等于 `write_intra_plan` 写出来的位数，
+    /// 而且**早退的门槛是精确的**：`limit == bits` 要判「赢不了」（`<` 才赢），
+    /// `limit == bits + 1` 要能拿到完整的计划。
+    #[test]
+    fn intra_plan_counts_exactly_what_it_writes() {
+        let (pw, ph) = (32usize, 32usize);
+        let frame = textured_frame(pw as u32, ph as u32);
+        let (sy, su, sv) = pad_planes(&frame, pw, ph);
+        let qscale = 6u8;
+        let quant = Quant::new(qscale, true);
+        let y_dc = i32::from(tables::Y_DC_SCALE[qscale as usize]);
+        let c_dc = i32::from(tables::C_DC_SCALE[qscale as usize]);
+        let rl = intra_rl_table();
+
+        let mut dc = DcGrid::new(pw / 16, ph / 16, y_dc, c_dc);
+        let mut ac = AcGrid::new(pw / 16, ph / 16);
+        let mut plan = IntraPlan::new();
+        for mby in 0..ph / 16 {
+            for mbx in 0..pw / 16 {
+                let ok = plan_intra(
+                    &sy, &su, &sv, pw, &quant, y_dc, c_dc, &mut dc, &mut ac, rl, true,
+                    MbFlavour::IntraI, mbx, mby, &mut plan, u32::MAX,
+                )
+                .unwrap();
+                assert!(ok, "limit 是 u32::MAX，不会早退");
+
+                let mut w = BitWriter::new();
+                write_intra_plan(&mut w, MbFlavour::IntraI, &plan, rl).unwrap();
+                assert_eq!(
+                    plan.bits as usize,
+                    w.bit_pos(),
+                    "({mbx},{mby})：计划说 {} 位、实际写了 {} 位",
+                    plan.bits,
+                    w.bit_pos()
+                );
+                assert!(plan.bits > 0);
+
+                // 门槛边界：早退是**保守**的（宏块头那几位要等 6 个块都数完才知道，
+                // 所以只按「块系数已经够长」判），但它绝不能把「本来会赢」的那条挡掉。
+                //
+                // ⚠️ 边界要拿**同一份网格状态**比：DC 预测读的是邻居格子，换个起点
+                // 数出来的位数就不一样了（第一版拿栅格顺序那一轮的 `plan.bits` 当基准，
+                // 在 (1,0) 上就红 —— 那不是早退的错，是基准取错了）。
+                let fresh = |limit: u32| {
+                    let mut dc = DcGrid::new(pw / 16, ph / 16, y_dc, c_dc);
+                    let mut ac = AcGrid::new(pw / 16, ph / 16);
+                    let mut p = IntraPlan::new();
+                    let ok = plan_intra(
+                        &sy, &su, &sv, pw, &quant, y_dc, c_dc, &mut dc, &mut ac, rl, true,
+                        MbFlavour::IntraI, mbx, mby, &mut p, limit,
+                    )
+                    .unwrap();
+                    (ok, p)
+                };
+                let (ok, p) = fresh(u32::MAX);
+                assert!(ok);
+                let reference = p.bits;
+                for (limit, must_win) in [(reference, false), (reference + 1, true)] {
+                    let (ok, p) = fresh(limit);
+                    // 判决用的就是这一个表达式 —— 与 `mb()` 里那条一致。
+                    assert_eq!(ok && p.bits < limit, must_win, "limit={limit} 时判决变了（bits={reference}）");
+                    if ok {
+                        assert_eq!(p.bits, reference, "早退不该改变数出来的位数");
+                    }
+                }
+            }
         }
     }
 
