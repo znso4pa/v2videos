@@ -1206,23 +1206,36 @@ impl PState<'_> {
         let mut qb = [[0i32; 64]; 6];
         for (n, slot) in qb.iter_mut().enumerate() {
             let mut res = [0i32; 64];
+            // ⚠️ **按行取切片再逐元素读**，不要写成 `plane[(oy+r)*pw + ox + c]`。
+            // 后者每读一个像素一次边界检查（一块 128 次、一个宏块 768 次），
+            // 而且 `pw` 是运行期值，LLVM 证不出「8 个下标都安全」。
+            // 取一次 `&plane[at..at+8]` 只剩每行一次检查。
+            //
+            // 实测 **1.4%**（1080p 200 帧、`--threads 1`，6 轮全正：
+            // 0.81 / 1.98 / 1.33 / 1.91 / 0.06 / 1.55；产物逐字节相同）。
+            // 别指望更多 —— 残差这一圈在整条编码链里只占 2~3%，
+            // 真正的大头是帧内候选（22%）与运动估计（9.4%），归因见 README。
             if n < 4 {
                 let ox = mbx * 16 + (n & 1) * 8;
                 let oy = mby * 16 + (n >> 1) * 8;
-                for r in 0..8usize {
-                    for c in 0..8usize {
-                        res[r * 8 + c] = self.sy[(oy + r) * self.pw + ox + c] as i32
-                            - self.cur.y[(oy + r) * self.pw + ox + c] as i32;
+                for (r, out) in res.chunks_exact_mut(8).enumerate() {
+                    let at = (oy + r) * self.pw + ox;
+                    let s = &self.sy[at..at + 8];
+                    let c = &self.cur.y[at..at + 8];
+                    for (o, (&a, &b)) in out.iter_mut().zip(s.iter().zip(c)) {
+                        *o = a as i32 - b as i32;
                     }
                 }
             } else {
                 let cw = self.pw / 2;
                 let plane = if n == 4 { self.su } else { self.sv };
                 let cur_plane = if n == 4 { &self.cur.u } else { &self.cur.v };
-                for r in 0..8usize {
-                    for c in 0..8usize {
-                        res[r * 8 + c] = plane[(mby * 8 + r) * cw + mbx * 8 + c] as i32
-                            - cur_plane[(mby * 8 + r) * cw + mbx * 8 + c] as i32;
+                for (r, out) in res.chunks_exact_mut(8).enumerate() {
+                    let at = (mby * 8 + r) * cw + mbx * 8;
+                    let s = &plane[at..at + 8];
+                    let c = &cur_plane[at..at + 8];
+                    for (o, (&a, &b)) in out.iter_mut().zip(s.iter().zip(c)) {
+                        *o = a as i32 - b as i32;
                     }
                 }
             }
