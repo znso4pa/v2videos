@@ -3178,6 +3178,29 @@ fn base_frame(sequence: &SequenceHeader, picture_type: PictureType, forward: Opt
     }
 }
 
+/// 只分配、**不拷参考帧**的帧缓冲 —— 并行路径专用。
+///
+/// `base_frame` 在 P/B 帧上会把整个参考帧 `clone` 一遍，理由是「被跳过的宏块
+/// 直接读缓冲区里已有的内容当预测」。但**并行路径里每一行都会被重写**：
+/// 被某个组覆盖的行由最后的合并写满，没被覆盖的行由 `decode_frame_parallel`
+/// 里那次显式 `copy_rows` / `fill_blank_rows` 填 —— 两次的并集就是 `[0, mb_h)`。
+/// 所以那趟整帧拷贝**一个字都留不下来**（720×576 = 622 KB/帧）。
+///
+/// 初始内容因此不可观测；这里给的是 `base_frame` 在「没有参考帧」时的同一组值
+/// （亮度 0、色度 128），万一将来覆盖范围变了，行为与单线程那条路一致。
+fn blank_frame(sequence: &SequenceHeader) -> Frame {
+    let width = sequence.width as usize;
+    let ph = (sequence.height as usize).div_ceil(16) * 16;
+    let (cw, ch) = chroma_dims(sequence.chroma_format, width, ph);
+    Frame {
+        width: sequence.width,
+        height: sequence.height,
+        y: vec![0u8; width * ph],
+        u: vec![128u8; cw * ch],
+        v: vec![128u8; cw * ch],
+    }
+}
+
 /// 一段**宏块行** `[rs, re)` 在三个平面上对应的字节区间。
 ///
 /// ⚠️ 行号要先乘平面宽度才是字节偏移 —— 直接把宏块行号当下标用，会把
@@ -3380,7 +3403,9 @@ impl MtDecoder {
         }
 
         // 结果帧：只需要「没有被任何组覆盖的行」有底色（被覆盖的行由合并写满）。
-        let mut out = base_frame(sequence, picture.picture_type, forward);
+        // ⚠️ 用 `blank_frame` 而不是 `base_frame`：后者会整帧 `clone` 参考帧，
+        // 而那 622 KB 会被下面每一行都覆盖掉 —— 见 `blank_frame` 的说明。
+        let mut out = blank_frame(sequence);
         let first_start = groups.first().map(|g| g.0).unwrap_or(0);
         let last_end = groups.last().map(|g| g.1).unwrap_or(0);
         let intra = matches!(picture.picture_type, PictureType::I);
