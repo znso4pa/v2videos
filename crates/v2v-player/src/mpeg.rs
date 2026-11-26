@@ -28,37 +28,26 @@
 use std::collections::VecDeque;
 use std::path::Path;
 
-use v2v_mpeg12::{PictureType, SequenceHeader, decode, split_pictures, split_units};
+use v2v_mpeg12::picture::{DecodedFrame, PictureDecoder};
+use v2v_mpeg12::{PictureHeader, SequenceHeader, decode, split_pictures, split_units};
 use v2v_mpegps::PsDemuxer;
 
 use crate::{Error, Result, VideoFrame};
 
-/// 一个 GOP 的缓冲上限：超过就当作「没有 I 帧的坏流」，明确报错而不是吃满内存。
-const MAX_GOP_FRAMES: usize = 600;
-
 /// MPEG-1/2 顺时播放器（**只有视频**）。
 pub struct MpgPlayer {
-    sequence: SequenceHeader,
-    /// 还没解的 picture（解码序）。
-    pictures: VecDeque<(v2v_mpeg12::PictureHeader, Vec<u8>)>,
-    /// 解码序的两路参考帧。
-    last_ip: Option<decode::Frame>,
-    prev_ip: Option<decode::Frame>,
-    /// 当前 GOP 已解、待按显示序交出的帧。
-    pending: Vec<(u32, decode::Frame)>,
-    /// 这一批里哪些 tr 是 I 帧（交出时要带 `key_frame`）。
-    pending_key: std::collections::BTreeMap<u32, bool>,
-    /// 已交出多少帧（= 显示序的下标，也是 PTS 的基准）。
-    emitted: u64,
-    /// `pending` 里第一帧的显示序号起点。
-    gop_base: u64,
-    /// 已经摊平、正在按显示序吐出的那一段有多长（吐完再把 `gop_base` 往前推）。
-    flushing: Option<u64>,
-    frame_ms: f64,
+    /// 解码序 → 显示序的状态机。**与 CLI 的 `.mpg` → `.mp4` 转码链路共用同一份**
+    /// （`v2v_mpeg12::picture::PictureDecoder`）—— 同一份码流走两条路必须出同样的
+    /// 像素和同样的 PTS，所以不能各写一份。
+    dec: PictureDecoder,
+    /// 还没喂进去的 picture（解码序）。
+    pictures: VecDeque<(PictureHeader, Vec<u8>)>,
+    /// 已经解好、还没交出去的帧（显示序）。
+    ready: VecDeque<DecodedFrame>,
+    /// 码流收过尾了（`finish` 调过一次）。
+    finished: bool,
     width: u32,
     height: u32,
-    /// `None` = 单线程；`Some` = 切片级并行（`open_with_threads`）。
-    mt: Option<decode::MtDecoder>,
 }
 
 impl MpgPlayer {
@@ -124,28 +113,16 @@ impl MpgPlayer {
         if pictures.is_empty() {
             return Err(Error::Bad("没有 picture start code".into()));
         }
-        let frame_ms = if sequence.frame_rate_milli > 0 {
-            1000.0 / (sequence.frame_rate_milli as f64 / 1000.0)
-        } else {
-            1000.0 / 30.0
-        };
         let (width, height) = (sequence.width, sequence.height);
         #[cfg(feature = "mpeg12-c")]
         v2v_mpeg12_c::install();
         Ok(Self {
-            sequence,
+            dec: PictureDecoder::new(sequence, threads),
             pictures,
-            last_ip: None,
-            prev_ip: None,
-            pending: Vec::new(),
-            pending_key: std::collections::BTreeMap::new(),
-            emitted: 0,
-            gop_base: 0,
-            flushing: None,
-            frame_ms,
+            ready: VecDeque::new(),
+            finished: false,
             width,
             height,
-            mt: (threads > 1).then(|| decode::MtDecoder::new(threads)),
         })
     }
 
@@ -160,7 +137,7 @@ impl MpgPlayer {
     }
 
     pub fn frame_ms(&self) -> f64 {
-        self.frame_ms
+        self.dec.frame_ms()
     }
 
     /// 视频总帧数（picture 个数，含 B 帧）。
@@ -171,110 +148,35 @@ impl MpgPlayer {
     /// 取下一帧（**显示序**）。`None` = 放完了。
     pub fn next_video(&mut self) -> Result<Option<VideoFrame>> {
         loop {
-            if let Some(frame) = self.take_pending() {
-                return Ok(Some(frame));
+            if let Some(f) = self.ready.pop_front() {
+                return Ok(Some(VideoFrame {
+                    pts_ms: f.pts_ms,
+                    key_frame: f.key_frame,
+                    width: self.width,
+                    height: self.height,
+                    y: f.frame.y,
+                    u: f.frame.u,
+                    v: f.frame.v,
+                }));
             }
-            // 缓冲空了 —— 解下一个 GOP。
-            if self.pictures.is_empty() {
-                // 收尾：把最后一段按显示序吐出去。
-                if !self.pending.is_empty() {
-                    self.flush_gop();
-                    continue;
+            // 手里没有现成的帧 —— 喂一张 picture 进去，或者收尾。
+            let Some((header, data)) = self.pictures.pop_front() else {
+                if self.finished {
+                    return Ok(None);
                 }
-                return Ok(None);
-            }
-            self.decode_next_picture()?;
+                self.finished = true;
+                let got = self
+                    .dec
+                    .finish()
+                    .map_err(|e| Error::Bad(format!("MPEG 解码失败：{e:?}")))?;
+                self.ready.extend(got);
+                continue;
+            };
+            let got = self
+                .dec
+                .push(header, &data)
+                .map_err(|e| Error::Bad(format!("MPEG 解码失败：{e:?}")))?;
+            self.ready.extend(got);
         }
-    }
-
-    /// 缓冲里按显示序取一帧。
-    fn take_pending(&mut self) -> Option<VideoFrame> {
-        // ⚠️ **只有摊平过的那一段才能交**：解码序里 B 帧排在它的参考帧后面，
-        // 一边解一边交就会把 P 帧先交出去（实测第 1 帧就差 229）。
-        if self.flushing.is_none() {
-            return None;
-        }
-        if self.pending.is_empty() {
-            // 这一段吐完了 —— 把显示序的起点往前推，等下一段。
-            if let Some(len) = self.flushing.take() {
-                self.gop_base += len;
-                self.pending_key.clear(); // 这一段吐完了，关键帧表跟着作废
-            }
-            return None;
-        }
-        self.pending.sort_by_key(|(tr, _)| *tr);
-        let (tr, frame) = self.pending.remove(0);
-        let pts_ms = ((self.gop_base + u64::from(tr)) as f64 * self.frame_ms).round() as i64;
-        self.emitted += 1;
-        // 解码器的平面按 16 对齐的编码高度分配（宏块恒 16×16，而高度不必是
-        // 16 的倍数），会多出几条看不见的行。`VideoFrame` 的消费者历来假设
-        // `y.len() == width * height`，所以在交出去的这一处裁到可见区域。
-        let mut frame = frame;
-        frame.truncate_visible(self.sequence.chroma_format);
-        Some(VideoFrame {
-            pts_ms,
-            // I 帧就是这里的关键帧（seek 的落点候选）。
-            key_frame: self.pending_key.get(&tr).copied().unwrap_or(false),
-            width: self.width,
-            height: self.height,
-            y: frame.y,
-            u: frame.u,
-            v: frame.v,
-        })
-    }
-
-    /// 把当前 GOP 按显示序摊平（新的 I 帧到来 / EOS 时调）。
-    ///
-    /// ⚠️ **不能在这里推 `gop_base`**：这些帧还没交出去，它们的 PTS 用的就是
-    /// 当前这个 base。推到 `take_pending` 吐完最后一帧时再做。
-    fn flush_gop(&mut self) {
-        self.pending.sort_by_key(|(tr, _)| *tr);
-        let n = self
-            .pending
-            .last()
-            .map(|(tr, _)| u64::from(*tr) + 1)
-            .unwrap_or(0)
-            .max(self.pending.len() as u64);
-        self.flushing = Some(n);
-    }
-
-    /// 解一张 picture（解码序）。遇到新的 I 帧就把上一段摊平。
-    fn decode_next_picture(&mut self) -> Result<()> {
-        // 新 GOP 的起点：**先摊平上一段、把这张 I 帧留在队里**（别 pop，否则丢帧）。
-        if let Some((header, _)) = self.pictures.front() {
-            if matches!(header.picture_type, PictureType::I) && !self.pending.is_empty() {
-                self.flush_gop();
-                return Ok(());
-            }
-        }
-        let (header, data) = self.pictures.pop_front().expect("调用方查过非空");
-        let kind = header.picture_type;
-        let tr = header.temporal_reference;
-        if matches!(kind, PictureType::D) {
-            return Ok(());
-        }
-        let forward = if matches!(kind, PictureType::B) {
-            self.prev_ip.as_ref()
-        } else {
-            self.last_ip.as_ref()
-        };
-        let backward = self.last_ip.as_ref();
-        let frame = match &mut self.mt {
-            Some(mt) => mt.decode(&self.sequence, header, &data, forward, backward),
-            None => decode::decode_frame(&self.sequence, header, &data, forward, backward),
-        }
-        .map_err(|e| Error::Bad(format!("MPEG 解码失败：{e:?}")))?;
-        if matches!(kind, PictureType::I | PictureType::P) {
-            self.prev_ip = self.last_ip.take();
-            self.last_ip = Some(frame.clone());
-        }
-        if matches!(kind, PictureType::I) {
-            self.pending_key.insert(tr, true);
-        }
-        self.pending.push((tr, frame));
-        if self.pending.len() > MAX_GOP_FRAMES {
-            return Err(Error::Bad("一个 GOP 超过 600 帧，疑似没有 I 帧的坏流".into()));
-        }
-        Ok(())
     }
 }
