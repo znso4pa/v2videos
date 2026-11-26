@@ -81,7 +81,16 @@ pub struct AsfDemuxer<R: Read> {
     /// 按流编号标记该流是否在 Stream Properties 里声明过。
     known: Vec<bool>,
     packet_size: usize,
-    packet_buf: Vec<u8>,
+    /// 数据区的**块缓冲**：一次从底层读一大块，包从里面切。
+    ///
+    /// ⚠️ 不要退回「每个包一次 `read_exact`」。底层是 `BufReader`，而它的 `read`
+    /// 在**请求长度小于缓冲容量**时会把数据先从内部缓冲 `copy_from_slice` 出来 ——
+    /// 于是每个字节都被搬两遍（内核 → BufReader，BufReader → 包缓冲）。实测
+    /// 700 MB 的样本：`read` 62 ms + `memmove` 35 ms，占整条音频解码的 **40%**。
+    /// 请求 ≥ 缓冲容量时 `BufReader` 才直接读进调用方的缓冲（只搬一遍）。
+    block: Vec<u8>,
+    block_pos: usize,
+    block_filled: usize,
     min_packet_size: u32,
     preroll_ms: u32,
     total_packets: u64,
@@ -121,7 +130,9 @@ impl<R: Read> AsfDemuxer<R> {
         Ok(Self {
             reader,
             packet_size: h.info.max_packet_size.max(1) as usize,
-            packet_buf: Vec::new(),
+            block: Vec::new(),
+            block_pos: 0,
+            block_filled: 0,
             min_packet_size: h.info.min_packet_size,
             preroll_ms: h.info.preroll_ms,
             total_packets: h.total_packets,
@@ -179,27 +190,60 @@ impl<R: Read> AsfDemuxer<R> {
             self.done = true;
             return Ok(());
         }
-        let mut buf = std::mem::take(&mut self.packet_buf);
-        buf.resize(self.packet_size, 0);
-        let filled = self.reader.read_full(&mut buf)?;
+        if self.block_filled - self.block_pos < self.packet_size {
+            self.refill_block()?;
+        }
+        let avail = self.block_filled - self.block_pos;
         // 尾部不完整的包：**按文件结束处理，不报错**。真实世界里截断/残缺的文件很常见，
         // ffmpeg 也是容忍的；把它当致命错误会让「文件差最后几字节」整个读不出来。
-        let truncated = filled < self.packet_size;
-        if truncated {
+        let truncated = avail < self.packet_size;
+        if avail == 0 {
             self.done = true;
-            if filled == 0 {
-                self.packet_buf = buf;
-                return Ok(());
-            }
+            return Ok(());
         }
+        let n = avail.min(self.packet_size);
         self.packets_read += 1;
-        let r = self.process_packet(&buf[..filled]);
-        self.packet_buf = buf;
+        // `process_packet` 要 `&mut self`，所以把块**借出去**（与原来 `packet_buf`
+        // 的 `mem::take` 同一个手法）。
+        let block = std::mem::take(&mut self.block);
+        let start = self.block_pos;
+        let r = self.process_packet(&block[start..start + n]);
+        self.block = block;
+        self.block_pos += n;
         if truncated {
             // 残缺的尾巴解到一半失败是预期的：已经拿到的东西都留下了。
+            self.done = true;
             return Ok(());
         }
         r
+    }
+
+    /// 把块缓冲补满：未消费的尾巴挪到开头，再一次读一大块。
+    fn refill_block(&mut self) -> Result<()> {
+        let rest = self.block_filled - self.block_pos;
+        if self.block_pos > 0 {
+            self.block.copy_within(self.block_pos..self.block_filled, 0);
+            self.block_pos = 0;
+            self.block_filled = rest;
+        }
+        // 请求量要**大于 `BufReader` 的容量**，否则它又会先拷一遍（见 `block` 字段）。
+        // 上限按「还剩多少个包」截，避免读到索引区去。
+        //
+        // ⚠️ 全程 `saturating_*`：`total_packets` 来自文件头，被改坏的文件里是任意 u64
+        // —— 这里乘出溢出会让「残缺文件绝不 panic」那条判据红掉（实测过一次）。
+        let left = (self.total_packets.saturating_sub(self.packets_read) as usize)
+            .saturating_mul(self.packet_size);
+        let want = self
+            .packet_size
+            .saturating_mul(64)
+            .max(1 << 20)
+            .min(left);
+        if self.block.len() < rest + want {
+            self.block.resize(rest + want, 0);
+        }
+        let n = self.reader.read_full(&mut self.block[rest..rest + want])?;
+        self.block_filled = rest + n;
+        Ok(())
     }
 
     fn process_packet(&mut self, buf: &[u8]) -> Result<()> {
@@ -528,6 +572,9 @@ impl<R: Read + Seek> AsfDemuxer<R> {
         }
         self.packets_read = n;
         self.done = false;
+        // 块缓冲跟着作废：游标已经跳走，里面的字节是旧位置的。
+        self.block_pos = 0;
+        self.block_filled = 0;
         self.reader
             .seek_to(self.data_start + n * self.packet_size as u64)
     }
