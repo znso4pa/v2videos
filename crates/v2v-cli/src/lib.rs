@@ -449,13 +449,7 @@ pub fn input_codec_name(fourcc: u32) -> Option<&'static str> {
 ///
 /// 认哪个 FourCC 由 [`classify_video`] 决定（扫描器查的是同一张表）；这里只负责
 /// 「照类别把解码器建起来」。
-fn open_video_decoder(
-    fourcc: u32,
-    extra: &[u8],
-    w: u32,
-    h: u32,
-    threads: usize,
-) -> Result<VideoDecoder, Error> {
+fn open_video_decoder(fourcc: u32, extra: &[u8], w: u32, h: u32) -> Result<VideoDecoder, Error> {
     match classify_video(fourcc)? {
         InputCodec::Mp4v => {
             // ⚠️ **extradata 可能是空的**：AVI 的 `strf` 常只有 40 字节，ffmpeg 把 VOL
@@ -496,8 +490,18 @@ fn open_video_decoder(
         InputCodec::Mpeg12 => {
             // `extra` 是 sequence header 那一小段 ES（[`MpegSource`] 在打开时切出来的）。
             let sequence = mpeg12_sequence(extra)?;
+            // ⚠️ **这里恒用 1**，不接 `--threads`。
+            //
+            // `--threads` 的文档语义是「**编码**线程数」。把它顺手接到解码上，实测
+            // 是负优化：500 帧 720×576 上 `--threads 4` 比 1 **慢 26%**
+            // （2.40 → 3.02 s user）。原因是 MPEG-1/2 的切片并行本身只有 1.5×，
+            // 而它每帧要 spawn 一次、还多拷两趟整帧 —— 在「解码只占这条链路三成」
+            // 的场景下，那些开销比并行省下来的多。
+            //
+            // 真要开，得先有独立开关 + 先把切片并行的扩展性做上去（见 TODO），
+            // 别偷偷借编码的线程数。
             Ok(VideoDecoder::Mpeg12(
-                v2v_mpeg12::picture::PictureDecoder::new(sequence, threads),
+                v2v_mpeg12::picture::PictureDecoder::new(sequence, 1),
             ))
         }
     }
@@ -1358,7 +1362,7 @@ fn convert_to_asf(
         .ok_or_else(|| Error::Unsupported("文件里没有视频轨（或没有格式信息）".into()))?;
     let (vnum, w, h) = (track.number, track.width, track.height);
 
-    let mut dec = open_video_decoder(track.fourcc, &track.extra, w, h, opts.threads)?;
+    let mut dec = open_video_decoder(track.fourcc, &track.extra, w, h)?;
     let mut enc = Encoder::new(EncoderConfig {
         qscale: opts.qscale,
         keyframe_interval: opts.keyframe_interval,
@@ -2434,7 +2438,7 @@ fn convert_to_mp4(
         _ => v2v_mp4::Mp4Muxer::new(vtrack),
     };
 
-    let mut dec = open_video_decoder(track.fourcc, &track.extra, w, h, opts.threads)?;
+    let mut dec = open_video_decoder(track.fourcc, &track.extra, w, h)?;
     let mut frames = 0usize;
     let mut key_frames = 0usize;
     let mut skipped_audio = 0usize;
