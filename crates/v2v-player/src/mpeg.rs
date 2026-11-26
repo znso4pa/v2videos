@@ -57,18 +57,38 @@ pub struct MpgPlayer {
     frame_ms: f64,
     width: u32,
     height: u32,
+    /// `None` = 单线程；`Some` = 切片级并行（`open_with_threads`）。
+    mt: Option<decode::MtDecoder>,
 }
 
 impl MpgPlayer {
     /// 打开一个 MPEG program stream。整文件读进内存 —— PS 没有索引，
     /// 逐包扫一遍才知道每帧在哪，边扫边解反而更慢（实测素材都是几十 MB 级）。
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_threads(path, 1)
+    }
+
+    /// 同 [`MpgPlayer::open`]，但用 `threads` 个线程做**切片级**并行解码。
+    ///
+    /// 并行只在「一帧里有多个 slice」时有效 —— MPEG-1/2 的编码器通常每个宏块行
+    /// 一个 slice（实测 720×576 是 36 个），所以基本都吃得到。产物与单线程
+    /// **逐字节相同**（`mpeg12` 的 `tests/mt.rs` 钉着这条）。
+    ///
+    /// ⚠️ 默认是 1：线程数不是越多越好。实测 720×576 上 2 线程 1.16×、
+    /// 4 线程 1.72×、**8 线程回落到 1.62×** —— 每帧的 worker 填底色与行合并
+    /// 是纯内存流量，核一多就撞带宽。要开就开 4 左右。
+    pub fn open_with_threads(path: &Path, threads: usize) -> Result<Self> {
         let bytes = std::fs::read(path).map_err(|e| Error::Bad(format!("读不了文件：{e}")))?;
-        Self::from_bytes(&bytes)
+        Self::from_bytes_with_threads(&bytes, threads)
     }
 
     /// 同上，但从内存里的字节开始（测试用）。
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        Self::from_bytes_with_threads(bytes, 1)
+    }
+
+    /// 同 [`MpgPlayer::from_bytes`]，带线程数（见 [`MpgPlayer::open_with_threads`]）。
+    pub fn from_bytes_with_threads(bytes: &[u8], threads: usize) -> Result<Self> {
         let mut demux = PsDemuxer::new(bytes.to_vec());
         let mut es = Vec::new();
         while let Some(packet) = demux.next_packet() {
@@ -125,6 +145,7 @@ impl MpgPlayer {
             frame_ms,
             width,
             height,
+            mt: (threads > 1).then(|| decode::MtDecoder::new(threads)),
         })
     }
 
@@ -238,8 +259,11 @@ impl MpgPlayer {
             self.last_ip.as_ref()
         };
         let backward = self.last_ip.as_ref();
-        let frame = decode::decode_frame(&self.sequence, header, &data, forward, backward)
-            .map_err(|e| Error::Bad(format!("MPEG 解码失败：{e:?}")))?;
+        let frame = match &mut self.mt {
+            Some(mt) => mt.decode(&self.sequence, header, &data, forward, backward),
+            None => decode::decode_frame(&self.sequence, header, &data, forward, backward),
+        }
+        .map_err(|e| Error::Bad(format!("MPEG 解码失败：{e:?}")))?;
         if matches!(kind, PictureType::I | PictureType::P) {
             self.prev_ip = self.last_ip.take();
             self.last_ip = Some(frame.clone());

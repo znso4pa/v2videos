@@ -46,6 +46,22 @@ pub struct V2vMpegStreamInfo {
 /// `path` 必须是 NUL 结尾的 UTF-8 字符串。
 #[no_mangle]
 pub unsafe extern "C" fn v2v_mpeg_open(path: *const std::ffi::c_char) -> *mut V2vMpeg {
+    unsafe { open_impl(path, 1) }
+}
+
+/// 同 [`v2v_mpeg_open`]，但用 `threads` 个线程做切片级并行解码（`<= 1` 等价于它）。
+///
+/// # Safety
+/// 同 [`v2v_mpeg_open`]。
+#[no_mangle]
+pub unsafe extern "C" fn v2v_mpeg_open_threads(
+    path: *const std::ffi::c_char,
+    threads: i32,
+) -> *mut V2vMpeg {
+    unsafe { open_impl(path, threads.max(1) as usize) }
+}
+
+unsafe fn open_impl(path: *const std::ffi::c_char, threads: usize) -> *mut V2vMpeg {
     guard_ptr(|| {
         let p = match unsafe { cstr(path, "path") } {
             Ok(s) => s,
@@ -54,7 +70,7 @@ pub unsafe extern "C" fn v2v_mpeg_open(path: *const std::ffi::c_char) -> *mut V2
                 return std::ptr::null_mut();
             }
         };
-        match MpgPlayer::open(Path::new(p)) {
+        match MpgPlayer::open_with_threads(Path::new(p), threads) {
             Ok(pl) => Box::into_raw(Box::new(V2vMpeg { p: pl, frame: None })),
             Err(e) => {
                 rc(&e);

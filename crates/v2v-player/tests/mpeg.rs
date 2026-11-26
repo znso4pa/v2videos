@@ -52,3 +52,37 @@ fn display_order_matches_ffmpeg() {
     eprintln!("比了 {n} 帧（参考共 {available} 帧），最差 {worst}");
     assert!(n >= available, "只交出 {n} 帧，参考有 {available} 帧");
 }
+
+/// 切片级并行（`open_with_threads`）交出的帧必须与单线程**逐字节相同**。
+///
+/// 为什么这条要单独有：并行只改「谁来解哪几行」，不该改任何像素。解码器那一层
+/// 已经由 `mpeg12/tests/mt.rs` 钉着，但**播放器**这一层多了一件事 ——
+/// 按 `temporal_reference` 重排 + 参考帧的 `clone`，两者都得跟着对上。
+/// 而且这条不需要参考件，只要一份样本。
+#[test]
+#[ignore = "needs V2V_MPEG12_SAMPLE (a .mpg)"]
+fn threads_produce_identical_frames() {
+    let sample = std::env::var("V2V_MPEG12_SAMPLE").expect("set V2V_MPEG12_SAMPLE");
+    let path = Path::new(&sample);
+
+    let mut single = v2v_player::mpeg::MpgPlayer::open_with_threads(path, 1).expect("打开");
+    let mut parallel = v2v_player::mpeg::MpgPlayer::open_with_threads(path, 4).expect("打开");
+
+    let mut n = 0usize;
+    loop {
+        let a = single.next_video().expect("单线程解一帧");
+        let b = parallel.next_video().expect("并行解一帧");
+        match (a, b) {
+            (None, None) => break,
+            (Some(a), Some(b)) => {
+                assert_eq!(a.pts_ms, b.pts_ms, "第 {n} 帧 PTS 不同");
+                assert_eq!(a.key_frame, b.key_frame, "第 {n} 帧关键帧标记不同");
+                assert!(a.y == b.y && a.u == b.u && a.v == b.v, "第 {n} 帧像素不同");
+                n += 1;
+            }
+            (a, b) => panic!("第 {n} 帧一有一没有：单线程 {:?} / 并行 {:?}", a.is_some(), b.is_some()),
+        }
+    }
+    eprintln!("{n} 帧逐字节一致（1 线程 vs 4 线程）");
+    assert!(n > 0, "一帧都没解出来");
+}
