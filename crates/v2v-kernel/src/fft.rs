@@ -64,7 +64,10 @@ fn twiddles(size: usize) -> Vec<(f64, f64)> {
 }
 
 /// 取第 `size` 级的旋转因子；4096 点以内共用缓存。
-fn twiddles_for(size: usize) -> &'static [(f64, f64)] {
+///
+/// `pub(crate)` 是给 `simd` 里的 NEON 版用的 —— 两边必须用**同一张表**，
+/// 各算一份就会因为 `sin_cos` 的末位差异而不再逐位相同。
+pub(crate) fn twiddles_for(size: usize) -> &'static [(f64, f64)] {
     let slot = size.trailing_zeros() as usize;
     assert!(slot >= 1, "FFT 长度必须是至少为 2 的二次幂，拿到 {size}");
     let idx = slot - 1;
@@ -91,6 +94,12 @@ fn bit_reverse_permute(re: &mut [f64], im: &mut [f64]) {
         re.swap(i, j);
         im.swap(i, j);
     }
+}
+
+/// 给 `simd::fft` 用：NEON 版只换「级」，位反转走这里（纯访存，向量化没意义）。
+#[cfg(all(feature = "unsafe-kernels", target_arch = "aarch64"))]
+pub(crate) fn bit_reverse_permute_pub(re: &mut [f64], im: &mut [f64]) {
+    bit_reverse_permute(re, im);
 }
 
 /// 预先算好的位反转配对（只留 `i < j` 那一半）。
@@ -222,6 +231,31 @@ pub fn fft_in_place(re: &mut [f64], im: &mut [f64]) {
         return;
     }
 
+    // NEON 版只换「级」的实现，位反转与旋转因子表都共用 —— 于是两边逐位相同
+    // 不是「设计目标」而是「同一串运算」。判据见 `neon_matches_scalar`。
+    #[cfg(all(feature = "unsafe-kernels", target_arch = "aarch64"))]
+    {
+        crate::simd::fft::stages_neon(re, im);
+    }
+    #[cfg(not(all(feature = "unsafe-kernels", target_arch = "aarch64")))]
+    {
+        fft_in_place_scalar(re, im);
+    }
+}
+
+/// 纯标量实现 —— **oracle**。开了 `unsafe-kernels` 之后生产路径不再走它，
+/// 但它是 `neon_matches_scalar` 的对照物，也是别的架构上唯一的实现。
+///
+/// ⚠️ 判据是「逐位相同」（比 `to_bits()`），不是「差值很小」：浮点的舍入顺序
+/// 一旦变了，AAC / WMA / Vorbis 三条线已有的对账判据全部作废。
+pub fn fft_in_place_scalar(re: &mut [f64], im: &mut [f64]) {
+    let len = re.len();
+    assert!(len.is_power_of_two(), "FFT 长度必须是二次幂，拿到 {len}");
+    assert_eq!(len, im.len(), "re / im 长度不一致：{len} vs {}", im.len());
+    if len < 2 {
+        return;
+    }
+
     bit_reverse_permute(re, im);
 
     let mut size = 2usize;
@@ -298,6 +332,48 @@ mod tests {
         }
     }
 
+    /// NEON 版相对标量版到底快多少 —— **归因用**。
+    ///
+    /// 端到端只看得到「WMA 快了几个百分点」，那个数里混着 I/O 与别的内核；
+    /// 这条把 FFT 单独拎出来，用来判断「还值不值得往 SIMD 上投」。
+    ///
+    /// `cargo test -p v2v-kernel --features unsafe-kernels --release --lib \
+    ///   fft_neon_throughput -- --ignored --nocapture`
+    #[test]
+    #[ignore = "归因用"]
+    fn fft_neon_throughput() {
+        for &n in &[128usize, 256, 512, 1024, 2048] {
+            let reps = if n <= 256 { 8000 } else { 2000 };
+            let base_re: Vec<f64> = (0..n).map(|i| ((i * 37 % 101) as f64) * 1e-2).collect();
+            let base_im: Vec<f64> = (0..n).map(|i| ((i * 53 % 97) as f64) * 1e-2).collect();
+            let (mut re, mut im) = (base_re.clone(), base_im.clone());
+            let (mut bs, mut bn) = (f64::INFINITY, f64::INFINITY);
+            for _ in 0..7 {
+                re.copy_from_slice(&base_re);
+                im.copy_from_slice(&base_im);
+                let t = std::time::Instant::now();
+                for _ in 0..reps {
+                    fft_in_place_scalar(&mut re, &mut im);
+                }
+                bs = bs.min(t.elapsed().as_secs_f64() * 1e9 / reps as f64);
+                std::hint::black_box(&re);
+
+                re.copy_from_slice(&base_re);
+                im.copy_from_slice(&base_im);
+                let t = std::time::Instant::now();
+                for _ in 0..reps {
+                    fft_in_place(&mut re, &mut im);
+                }
+                bn = bn.min(t.elapsed().as_secs_f64() * 1e9 / reps as f64);
+                std::hint::black_box(&re);
+            }
+            eprintln!(
+                "fft n={n:5}: 标量 {bs:8.0} ns | 分发 {bn:8.0} ns | ×{:.2}",
+                bs / bn
+            );
+        }
+    }
+
     /// **逐位**参考实现：位反转之后一级一级地跑，不做融合。
     ///
     /// 这就是融合之前的生产代码（连位反转都是原来那个现算版本）。融合只该省访存，
@@ -368,6 +444,46 @@ mod tests {
     fn rejects_a_length_that_is_not_a_power_of_two() {
         let (mut re, mut im) = (vec![0.0; 6], vec![0.0; 6]);
         fft_in_place(&mut re, &mut im);
+    }
+
+    /// `fft_in_place`（可能是 NEON）必须与 [`fft_in_place_scalar`] **逐位**相同。
+    ///
+    /// 判据是 `to_bits()`，不是「差值很小」：NEON 版只要偷偷用了 `vfmaq_f64`，
+    /// 末位就会变，而那会让 AAC / WMA / Vorbis 三条线已有的对账判据全部作废 ——
+    /// 症状是「解码结果和以前不完全一样」，却查不出是谁改的。
+    ///
+    /// 没有 NEON 的架构上这条测试恒真（两个调用是同一个函数），留着是因为
+    /// 它零成本，而漏掉的代价很大。
+    #[test]
+    fn neon_matches_scalar() {
+        for shift in 1..=11u32 {
+            let n = 1usize << shift;
+            let mut state = 0x5eed_1234u32 ^ n as u32;
+            let mut next = || {
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                (state >> 8) as f64 / 65536.0 - 1.0
+            };
+            let re: Vec<f64> = (0..n).map(|_| next() * 1000.0).collect();
+            let im: Vec<f64> = (0..n).map(|_| next() * 1000.0).collect();
+
+            let (mut want_re, mut want_im) = (re.clone(), im.clone());
+            fft_in_place_scalar(&mut want_re, &mut want_im);
+            let (mut got_re, mut got_im) = (re.clone(), im.clone());
+            fft_in_place(&mut got_re, &mut got_im);
+
+            for k in 0..n {
+                assert_eq!(
+                    got_re[k].to_bits(),
+                    want_re[k].to_bits(),
+                    "n={n}：实部第 {k} 项与标量版不是逐位相同"
+                );
+                assert_eq!(
+                    got_im[k].to_bits(),
+                    want_im[k].to_bits(),
+                    "n={n}：虚部第 {k} 项与标量版不是逐位相同"
+                );
+            }
+        }
     }
 
     /// 直接按定义算的 DFT —— oracle。`X[k] = Σ_j x[j]·e^{-2πijk/n}`。

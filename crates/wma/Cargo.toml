@@ -10,7 +10,14 @@ license.workspace = true
 v2v-tables = { path = "../tables", default-features = false, features = ["wma"] }
 # IMDCT 的 FFT 与 Huffman 用的前缀码解码，都走共享内核（AGENTS.md 不变量 3：
 # 谁都要用的东西不许复刻第二份）—— 与 aac 的 MDCT 是同一个函数。
-v2v-kernel = { path = "../v2v-kernel" }
+#
+# `unsafe-kernels`：FFT 的「级」走 NEON f64（2 lane）。这是**逐位等价**的替换
+# （`v2v-kernel` 的 `neon_matches_scalar` 比 `to_bits()` 钉住），所以下游
+# WMA / AAC / Vorbis 的产物一个字节都不会变。不开就是纯标量，只是慢。
+#
+# ⚠️ Cargo 的 feature 是并集：这里一开，同一个构建里的 `v2v-kernel` 整体都带上，
+# 于是 aac / vorbis 的 FFT 也走 NEON —— 那是同一份代码、同一份判据，不是第二份。
+v2v-kernel = { path = "../v2v-kernel", features = ["unsafe-kernels"] }
 
 [dev-dependencies]
 # 集成测试要拿真样本的音频载荷（经 ASF 解封装）。

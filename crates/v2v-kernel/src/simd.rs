@@ -33,6 +33,9 @@
 
 #![allow(unsafe_code)]
 
+#[cfg(all(feature = "unsafe-kernels", target_arch = "aarch64"))]
+pub(crate) mod fft;
+
 /// 一条 16×16 候选的 SAD（含半像素相位，插值在寄存器里做，不出临时数组）。
 ///
 /// - `cur`：当前宏块（行优先 16×16，256 字节）。
