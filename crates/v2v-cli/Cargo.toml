@@ -32,11 +32,14 @@ v2v-aac = { path = "../aac" }
 v2v-wma = { path = "../wma" }
 v2v-mp3 = { path = "../mp3" }
 v2v-audio-ffi = { path = "../v2v-audio-ffi", optional = true, features = ["mpg123"] }
-# `v2v bench` 的测量对象。⚠️ 这两个**只服务 bench**，`convert` 那条路不用它们：
-#   - `v2v-player` 把「解封装 + 解码」接成一个能逐帧取数的循环，bench 量的就是它，
-#     自己再写一遍就等于同一件事有两个说法；
-#   - `mpeg12` feature 让 `.mpg` 也能进同一个入口（`convert` 不处理 MPEG-PS）。
+# `v2v bench` 的测量对象 + `.mpg` 输入的解码引擎。
+#   - `v2v-player` 把「解封装 + 解码」接成一个能逐帧取数的循环，bench 量的就是它；
+#   - `convert` 的 `.mpg` 那条路**不复用 `MpgPlayer`**，而是直接用下面两个 crate ——
+#     它要的是「一个 picture 一个样本」，而 `MpgPlayer` 是整文件顺时播放。
+#     出帧顺序那一套（`PictureDecoder`）两边是**同一份实现**，不各写一份。
 v2v-player = { path = "../v2v-player", features = ["mpeg12"] }
+v2v-mpeg12 = { path = "../mpeg12" }
+v2v-mpegps = { path = "../v2v-mpegps" }
 # `.mp4` 输入的 H.264 走**硬件解码**（只有 macOS 有）。别处编得动、运行时明确报不支持 ——
 # 纯 Rust 的 H.264 解码器没有计划（见 README「还没做（解码侧）」）。
 v2v-android = { path = "../v2v-android" }

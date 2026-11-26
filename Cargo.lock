@@ -108,6 +108,8 @@ dependencies = [
  "v2v-mp3",
  "v2v-mp4",
  "v2v-mp4v",
+ "v2v-mpeg12",
+ "v2v-mpegps",
  "v2v-msmpeg4",
  "v2v-ogg",
  "v2v-player",

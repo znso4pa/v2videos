@@ -124,6 +124,17 @@ pub const WMV3: u32 = u32::from_le_bytes(*b"WMV3");
 /// H.264 的 sample entry FourCC（MP4 的 `avc1`）。`extra` 是 avcC。
 const AVC1: u32 = u32::from_le_bytes(*b"avc1");
 
+/// MPEG-1/2 的**合成** FourCC。
+///
+/// MPEG program stream 里视频轨没有 FourCC，只有流号（`0xE0..=0xEF`）—— 但本文件
+/// 的管线是按「`VideoTrack.fourcc` → 解码器」分派的，`VideoSource` 的实现要往里
+/// 填一个值。这里自己造一个：`mpg2` 不是任何真实 FourCC，不会和别的容器撞上，
+/// 而 [`fourcc_string`] 会把它渲染成 `mpg2`（扫描器/日志里可读）。
+///
+/// 它与真实 FourCC 的区别只在「从哪来」，之后完全一样：进 [`classify_video`]，
+/// 走同一条分派。
+pub const MPEG12: u32 = u32::from_le_bytes(*b"mpg2");
+
 /// 输入视频解码器。
 ///
 /// 存在的理由：VC-1 与 MS-MPEG-4 **不是同一套骨架**（帧头、宏块层、变换、MC 全不同），
@@ -145,6 +156,13 @@ pub enum VideoDecoder {
     /// 它与上面三个的形状不一样：**异步 + 重排**，见 [`H264HwDecoder`]。
     #[cfg(target_os = "macos")]
     H264Hw(H264HwDecoder),
+    /// MPEG-1/2（program stream 里的视频轨）。
+    ///
+    /// 它与上面四个的形状也不一样：**解码序 ≠ 显示序**，喂进去一张 picture
+    /// 可能一帧都吐不出来（B 帧要等后面的参考帧），也可能一次吐出整个 GOP。
+    /// 那套「一段一段摊平」的逻辑住在 `v2v_mpeg12::picture::PictureDecoder`，
+    /// 与播放器共用同一份实现。
+    Mpeg12(v2v_mpeg12::picture::PictureDecoder),
 }
 
 /// H.264 硬件解码器 + **重排缓冲**。
@@ -249,6 +267,25 @@ impl VideoDecoder {
                 )])
             }
             Self::Mp4v(d) => Ok(vec![(d.decode(data)?, pts_ms)]),
+            Self::Mpeg12(d) => {
+                // `data` 是**一张 picture 的 ES**（含起始码）—— `MpegSource` 一个样本
+                // 给一张。图像头要在这里再解析一次：`Sample` 只装字节，装不下头。
+                let units = v2v_mpeg12::split_units(data);
+                let Some((_, payload)) = units.iter().find(|(code, _)| *code == 0x00) else {
+                    return Err(Error::Unsupported(
+                        "这个样本里没有 picture start code（MPEG-PS 的包被切坏了？）".into(),
+                    ));
+                };
+                let header = v2v_mpeg12::PictureHeader::parse(payload).ok_or_else(|| {
+                    Error::Unsupported("picture header 解析失败（不是 MPEG-1/2？）".into())
+                })?;
+                let got = d
+                    .push(header, data)
+                    .map_err(|e| Error::Unsupported(format!("MPEG 解码失败：{e:?}")))?;
+                // 解码序里 B 帧排在参考帧后面 —— 这一张往往**一帧都吐不出来**，
+                // 也可能把整个 GOP 一次摊平。所以是 Vec 不是 Option。
+                Ok(mpeg12_frames(got))
+            }
             #[cfg(target_os = "macos")]
             Self::H264Hw(hw) => {
                 let got = hw
@@ -303,9 +340,38 @@ impl VideoDecoder {
                 }
                 hw.drain(true)
             }
+            // ⚠️ MPEG-1/2 **必须**调：最后一个 GOP 还压在里面（没有下一个 I 帧来
+            // 触发摊平）。不排空就整块丢 —— 与 H.264 那条 90→74 是同一类坑。
+            Self::Mpeg12(d) => {
+                let got = d
+                    .finish()
+                    .map_err(|e| Error::Unsupported(format!("MPEG 解码失败：{e:?}")))?;
+                Ok(mpeg12_frames(got))
+            }
             _ => Ok(Vec::new()),
         }
     }
+}
+
+/// [`v2v_mpeg12::picture::DecodedFrame`] → 管线认识的 `(Frame, pts_ms)`。
+///
+/// 那边的 `Frame` 已经裁到**可见高度**（`truncate_visible`），所以这里的
+/// `width` / `height` 与平面长度是自洽的。
+fn mpeg12_frames(got: Vec<v2v_mpeg12::picture::DecodedFrame>) -> Vec<(Frame, i64)> {
+    got.into_iter()
+        .map(|f| {
+            (
+                Frame {
+                    width: f.frame.width,
+                    height: f.frame.height,
+                    y: f.frame.y,
+                    u: f.frame.u,
+                    v: f.frame.v,
+                },
+                f.pts_ms,
+            )
+        })
+        .collect()
 }
 
 /// 「这个 FourCC 走哪个解码器」—— 全仓**唯一**一张输入编码表。
@@ -328,6 +394,8 @@ enum InputCodec {
     H264,
     /// MS-MPEG-4（MP42 / MP43 / WMV1 / WMV2）。
     Msmpeg4(Version),
+    /// MPEG-1/2（program stream 里的视频轨；合成 FourCC [`MPEG12`]）。
+    Mpeg12,
 }
 
 /// 非 macOS 上 `avc1` 的拒绝理由 —— [`classify_video`] 与 [`open_video_decoder`]
@@ -338,6 +406,11 @@ const NO_H264: &str =
 
 /// FourCC → 解码器类别。认不出（或这个平台上没有解码器）就明确报错。
 fn classify_video(fourcc: u32) -> Result<InputCodec, Error> {
+    // MPEG-1/2 用**我们自己造的** FourCC（见 [`MPEG12`]）—— 它只会由
+    // [`MpegSource`] 填进来，别的容器不会给出这个值。
+    if fourcc == MPEG12 {
+        return Ok(InputCodec::Mpeg12);
+    }
     // MPEG-4 Part 2 的 FourCC 有一堆别名：AVI 里 ffmpeg 写 `FMP4`，MP4 里是 `mp4v`，
     // DivX / Xvid 编码器写 `DIVX` / `XVID` —— 都是同一条语法，交给同一个解码器。
     if matches!(fourcc, FMP4 | MP4V | DIVX | XVID) {
@@ -366,6 +439,7 @@ pub fn input_codec_name(fourcc: u32) -> Option<&'static str> {
         Ok(InputCodec::Mp4v) => Some("mp4v"),
         Ok(InputCodec::Vc1) => Some("WMV3"),
         Ok(InputCodec::H264) => Some("H.264"),
+        Ok(InputCodec::Mpeg12) => Some("MPEG-1/2"),
         Ok(InputCodec::Msmpeg4(v)) => Some(v.name()),
         Err(_) => None,
     }
@@ -380,6 +454,7 @@ fn open_video_decoder(
     extra: &[u8],
     w: u32,
     h: u32,
+    threads: usize,
 ) -> Result<VideoDecoder, Error> {
     match classify_video(fourcc)? {
         InputCodec::Mp4v => {
@@ -418,7 +493,40 @@ fn open_video_decoder(
             Err(Error::Unsupported(NO_H264.into()))
         }
         InputCodec::Msmpeg4(version) => Ok(VideoDecoder::Msmpeg4(make_decoder(version, extra)?)),
+        InputCodec::Mpeg12 => {
+            // `extra` 是 sequence header 那一小段 ES（[`MpegSource`] 在打开时切出来的）。
+            let sequence = mpeg12_sequence(extra)?;
+            Ok(VideoDecoder::Mpeg12(
+                v2v_mpeg12::picture::PictureDecoder::new(sequence, threads),
+            ))
+        }
     }
+}
+
+/// 从 `extra`（sequence header 那一小段 ES）里把 [`SequenceHeader`] 解出来。
+///
+/// ⚠️ **MPEG-2 的序列扩展必须一起应用**：`SequenceHeader::parse` 只认
+/// sequence header 本身，帧率扩展 / 色度格式 / 隔行这些都在后面的
+/// `sequence extension`（起始码 `0xB5`）里。不应用的话会把 MPEG-2 当 MPEG-1 解
+/// —— 表选错、色度格式错，输出「看着像那么回事」但对不上。
+fn mpeg12_sequence(extra: &[u8]) -> Result<v2v_mpeg12::SequenceHeader, Error> {
+    let units = v2v_mpeg12::split_units(extra);
+    let mut sequence = units
+        .iter()
+        .find(|(code, _)| *code == 0xB3)
+        .and_then(|(_, payload)| v2v_mpeg12::SequenceHeader::parse(payload))
+        .ok_or_else(|| Error::Unsupported("MPEG 视频流里没有 sequence header".into()))?;
+    sequence.mpeg2 = v2v_mpeg12::has_sequence_extension(extra);
+    if sequence.mpeg2 {
+        if let Some(ext) = units
+            .iter()
+            .find(|(code, _)| *code == 0xB5)
+            .and_then(|(_, payload)| v2v_mpeg12::SequenceExtension::parse(payload))
+        {
+            sequence.apply_sequence_extension(&ext);
+        }
+    }
+    Ok(sequence)
 }
 
 /// 输出容器。
@@ -711,6 +819,15 @@ trait VideoSource {
     fn audio_total_samples(&self) -> Option<u64> {
         None
     }
+    /// 源里**有**音频、但我们解不了时的说明（`None` = 没有这种情况）。
+    ///
+    /// 存在的理由：`audio_stream()` 返回 `None` 有两个截然不同的含义 ——
+    /// 「本来就没有音轨」和「有，但解不了」。前者照常转，后者**必须说出来**，
+    /// 否则用户拿到一个没声音的文件还以为我们转对了。目前只有 MPEG-PS 会给出
+    /// `Some`（MP2 / AC-3 没有解码器）。
+    fn undecodable_audio(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 struct AsfSource(v2v_asf::AsfDemuxer<BufReader<File>>);
@@ -860,6 +977,121 @@ impl VideoSource for OggSource {
     }
 }
 
+/// MPEG program stream（`.mpg` / `.mpeg` / `.dat` / `.vob`）—— **只有视频**。
+///
+/// 与别的 `VideoSource` 不同，这里一个 `Sample` 是**一张 picture 的 ES**
+/// （含它自己的 picture start code），不是容器包。理由：MPEG-1/2 的解码单位就是
+/// picture，而 PS 的包边界与 picture 边界毫无关系 —— 按包喂进去还得在解码器里
+/// 重新攒一遍，等于把同一件事拆成两半做。切 picture 用的是 `split_pictures`，
+/// 与播放器同一份。
+///
+/// ## 音频
+///
+/// **不解**：MPEG-1 的音轨是 MP2（Layer II），本仓没有它的解码器。
+/// `audio_stream()` 恒为 `None`，但 [`VideoSource::undecodable_audio`] 会告诉调用方
+/// 「源里其实有音频，只是解不了」—— 让上层**明确报错或明确跳过**，而不是悄悄丢掉。
+struct MpegSource {
+    /// 还没交出去的 picture（解码序）。
+    pictures: VecDeque<(v2v_mpeg12::PictureHeader, Vec<u8>)>,
+    /// sequence header 那一小段 ES（从 `0xB3` 到第一张 picture）—— 建解码器要用。
+    head: Vec<u8>,
+    width: u32,
+    height: u32,
+    frame_ms: f64,
+    /// 已经交出多少个样本（PTS 就是 `index × frame_ms`）。
+    index: u64,
+    /// 源里有没有音频包。
+    has_audio: bool,
+}
+
+impl MpegSource {
+    fn open(path: &Path) -> Result<Self, Error> {
+        let bytes = std::fs::read(path)?;
+        let mut demux = v2v_mpegps::PsDemuxer::new(bytes);
+        let mut es: Vec<u8> = Vec::new();
+        let mut has_audio = false;
+        while let Some(packet) = demux.next_packet() {
+            if packet.is_video() {
+                es.extend_from_slice(&demux.data()[packet.range.clone()]);
+            } else if packet.is_audio() {
+                has_audio = true;
+            }
+        }
+        if es.is_empty() {
+            return Err(Error::Unsupported(
+                "MPEG program stream 里没有视频（只有音频的 PS？）".into(),
+            ));
+        }
+        let pictures = v2v_mpeg12::split_pictures(&es);
+        let Some((_, first)) = pictures.first() else {
+            return Err(Error::Unsupported(
+                "MPEG 视频流里没有 picture start code".into(),
+            ));
+        };
+        // `head` 必须在把 `pictures` 变成 owned 之前切出来（它借的是 `es`）。
+        let first_off = first.as_ptr() as usize - es.as_ptr() as usize;
+        let head = es[..first_off].to_vec();
+        let sequence = mpeg12_sequence(&head)?;
+        let frame_ms = if sequence.frame_rate_milli > 0 {
+            1000.0 / (sequence.frame_rate_milli as f64 / 1000.0)
+        } else {
+            1000.0 / 30.0
+        };
+        Ok(Self {
+            pictures: pictures
+                .into_iter()
+                .map(|(header, data)| (header, data.to_vec()))
+                .collect(),
+            head,
+            width: sequence.width,
+            height: sequence.height,
+            frame_ms,
+            index: 0,
+            has_audio,
+        })
+    }
+}
+
+impl VideoSource for MpegSource {
+    fn container_name(&self) -> &'static str {
+        "MPEG-PS"
+    }
+    fn duration_ms(&self) -> Option<u64> {
+        Some((self.pictures.len() as f64 * self.frame_ms).round() as u64)
+    }
+    fn video_stream(&self) -> Option<VideoTrack> {
+        Some(VideoTrack {
+            // PS 里视频是流号 `0xE0..=0xEF`；下游只需要一个**稳定的**编号。
+            number: 1,
+            width: self.width,
+            height: self.height,
+            fourcc: MPEG12,
+            extra: self.head.clone(),
+        })
+    }
+    fn audio_stream(&self) -> Option<(u8, AudioFormat)> {
+        None
+    }
+    fn undecodable_audio(&self) -> Option<&'static str> {
+        self.has_audio.then_some(
+            "MPEG-PS 里的音轨是 MP2 / AC-3，本仓没有这两种解码器；加 `--no-audio` 只转视频",
+        )
+    }
+    fn next(&mut self) -> Result<Option<Sample>, Error> {
+        let Some((header, data)) = self.pictures.pop_front() else {
+            return Ok(None);
+        };
+        let timestamp_ms = (self.index as f64 * self.frame_ms).round() as i64;
+        self.index += 1;
+        Ok(Some(Sample {
+            stream: 1,
+            key_frame: matches!(header.picture_type, v2v_mpeg12::PictureType::I),
+            timestamp_ms,
+            data,
+        }))
+    }
+}
+
 /// 按**魔数**选解封装器（不看扩展名 —— 扩展名会骗人，字节不会）。
 fn open_source(path: &Path) -> Result<Box<dyn VideoSource>, Error> {
     use std::io::{Read, Seek, SeekFrom};
@@ -880,6 +1112,11 @@ fn open_source(path: &Path) -> Result<Box<dyn VideoSource>, Error> {
     if n >= 8 && &head[4..8] == b"ftyp" {
         return Ok(Box::new(Mp4Source(v2v_mp4::Mp4Demuxer::new(f)?)));
     }
+    // MPEG program stream：`00 00 01 BA`（pack header 的起始码）。
+    // 放在最后不影响别的分支 —— 这四字节不会和 ASF / AVI / ftyp / OggS 撞上。
+    if n >= 4 && head[..4] == [0x00, 0x00, 0x01, 0xBA] {
+        return Ok(Box::new(MpegSource::open(path)?));
+    }
     // Ogg：头 4 字节是 `OggS`。
     if n >= 4 && &head[..4] == b"OggS" {
         // 总长度只体现在**最后一页**的 granule 上，顺序读要读完整份文件才知道；
@@ -896,7 +1133,7 @@ fn open_source(path: &Path) -> Result<Box<dyn VideoSource>, Error> {
         }));
     }
     Err(Error::Unsupported(
-        "认不出容器（目前支持 ASF/.wmv、AVI/.avi、MP4/.mp4 与 Ogg/.ogg）".into(),
+        "认不出容器（目前支持 ASF/.wmv、AVI/.avi、MP4/.mp4、Ogg/.ogg 与 MPEG-PS/.mpg）".into(),
     ))
 }
 
@@ -1121,7 +1358,7 @@ fn convert_to_asf(
         .ok_or_else(|| Error::Unsupported("文件里没有视频轨（或没有格式信息）".into()))?;
     let (vnum, w, h) = (track.number, track.width, track.height);
 
-    let mut dec = open_video_decoder(track.fourcc, &track.extra, w, h)?;
+    let mut dec = open_video_decoder(track.fourcc, &track.extra, w, h, opts.threads)?;
     let mut enc = Encoder::new(EncoderConfig {
         qscale: opts.qscale,
         keyframe_interval: opts.keyframe_interval,
@@ -2025,6 +2262,14 @@ fn convert_to_mp4(
 
     // 源里那条音频轨的格式（有没有音频、采样率多少）—— 封装器的 `stsd` 要用。
     let src_audio = demux.audio_stream().map(|(_, af)| af);
+    // ⚠️ `audio_stream() == None` 有两种意思：「本来就没音轨」和「有，但解不了」。
+    // 后者不能悄悄跳过 —— 用户会拿到一个没声音的文件还以为转对了。目前只有
+    // MPEG-PS 会落到这里（MP2 / AC-3 没有解码器），报错里直接给做法。
+    if let Some(note) = demux.undecodable_audio() {
+        if opts.copy_audio {
+            return Err(Error::Unsupported(note.into()));
+        }
+    }
     // 「输出也是 AAC」才谈得上直通：源是 AAC、输出要 PCM 的话还是得解码。
     let aac_copy_ok = opts.copy_audio && opts.audio == Mp4Audio::Aac;
     let mut audio = plan_audio(demux.as_ref(), opts.copy_audio, aac_copy_ok)?;
@@ -2189,7 +2434,7 @@ fn convert_to_mp4(
         _ => v2v_mp4::Mp4Muxer::new(vtrack),
     };
 
-    let mut dec = open_video_decoder(track.fourcc, &track.extra, w, h)?;
+    let mut dec = open_video_decoder(track.fourcc, &track.extra, w, h, opts.threads)?;
     let mut frames = 0usize;
     let mut key_frames = 0usize;
     let mut skipped_audio = 0usize;

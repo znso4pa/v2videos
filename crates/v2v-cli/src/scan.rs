@@ -204,6 +204,17 @@ fn probe(path: &Path) -> ScanEntry {
         return entry;
     }
 
+    // 源里有音频、但我们解不了（目前只有 MPEG-PS 的 MP2 / AC-3）：视频能转，
+    // 但**必须**加 `--no-audio`，否则 `convert` 会直接报错。扫描器得和它说同一件事
+    // —— 「扫描说能转、转的时候失败」是最难查的一类不一致。
+    if let Some(note) = src.undecodable_audio() {
+        entry.verdict = Verdict::Convertible {
+            targets: vec!["wmv", "mp4"],
+        };
+        entry.note = Some(note.to_string());
+        return entry;
+    }
+
     let (targets, note) = output_targets(af.as_ref());
     entry.verdict = Verdict::Convertible { targets };
     entry.note = note;
