@@ -1245,7 +1245,7 @@ I 块、取位数更少的那个 —— FFmpeg 的 `mb_decision=0` 默认**不�
 | ----------------------- | --- | --- | --------------------------------------------------------------------------------------- |
 | **ASF**（`.wmv` / `.wma`） | ✅   | ✅   | 只做单视频流 + 单音频流（音频**直通**，不重编码）；不做加密、多视频轨、非标准的纠错标志                                        |
 | **AVI**（RIFF）           | ✅   | ❌   | 只读 —— `.wmv → .avi` 没人要，写它没有用例。不认 OpenDML（`AVIX` 分块 / `indx`），遇到明确报 `Unsupported` 而不是假装支持 |
-| **MPEG-PS**（`.mpg` / `.dat` / `.vob`） | ✅ | ❌ | `v2v-mpegps` 读取 MPEG-1/2 Program Stream，供 MPEG-1/2 视频解码和播放。 |
+| **MPEG-PS**（`.mpg` / `.dat` / `.vob`） | ✅ | ❌ | `v2v-mpegps` 读取 MPEG-1/2 Program Stream，供 MPEG-1/2 视频解码、播放与 **`convert` 转码**。`convert` 按魔数 `00 00 01 BA` 认出它；一个 `Sample` 是**一张 picture 的 ES**（解码单位就是 picture，PS 的包边界与它无关）。音轨是 MP2 / AC-3，本仓**没有解码器** —— 这类输入必须加 `--no-audio`，否则明确报错（`VideoSource::undecodable_audio`，不会悄悄丢掉一条音轨） |
 | **Ogg**（`.ogg` / `.oga`） | ✅（Vorbis） | ✅（纯音频） | `v2v-ogg`：页层完整（跨页续接的包、CRC 可开、截断与坏页明确报错）、逐包时间戳对 `ffprobe`；Vorbis 解码在 `v2v-vorbis`。CLI 侧接了 **`--wav` 抽轨**和 **`--mp4` 纯音频 MP4**（`Mp4Muxer::audio_only`：`moov` 里只有一个 `trak`，轨号 1、没有 `stss`）。**只认 Vorbis** —— Opus / Theora / FLAC / Speex / Skeleton 识别后报 `Unsupported`；不做链式（chained）Ogg 的时间轴拼接；**C ABI 还没接** |
 | **MP4** / ISOBMFF        | ✅   | ✅   | 解封装（`Mp4Demuxer`）：非分片、`moov` 在头或尾都行、`stco` 与 `co64` 都认、`ctts` 算进 PTS 并按 **PTS** 出样本。C ABI 通过 `v2v_probe` 和 `v2v_demux_*` 暴露 MP4，按包编号 seek 暂未支持。不做分片 MP4（`moof`）、`edts`/`elst` 编辑列表、加密（`encv`/`enca`）、H.265/AV1 的 sample entry |
 
